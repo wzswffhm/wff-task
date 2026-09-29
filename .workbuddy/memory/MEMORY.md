@@ -8,10 +8,41 @@
 
 | 目录 | 内容 |
 |---|---|
-| `Harbor/` | harbor 题包工作区（原 harbor 仓库，已合并） |
+| `Harbor/` | 共享基础设施：`.dsh/skills/`（skill 快照）、`scripts/`、环境文档、`分类说明.md` |
+| `harbor-16/` | **harbor-16** skill 产物：内部 RL 题包（`zq*` 批次、`block-storage-*`） |
+| `harbor-sota/` | **harbor-sota** skill 产物：外发供应商题包（`wff-eval-*`，含 gating/graded/golden_output） |
 | `OBM/` | `Benchmark/`（第三方数据集）、`work/`（实验产物）、`output/`（结果） |
-| `skills/` | 8 套 skill：`harbor-16`、`harbor-sota`、`harbor-work`、`caveman`、`obm-*`（4 套） |
+| `skills/` | skill 集合：`OBM`（统一 OBM skill）、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman` |
 | `.workbuddy/` | 会话记忆 |
+
+## skills/OBM 统一 skill
+
+原 4 个 `obm-*` 目录已整合为单一 `OBM` skill（原目录已删除）。结构：
+
+- 根目录 = **production 主流程**（OpenAI 兼容接口版），frontmatter `name: OBM`
+- `subskills/production-trae/` = Trae 手动版生产（备选，与主流程**互斥**，references 不同）
+- `subskills/review/` = proposal 内容审查
+- `subskills/run-qc/` = 本地跑题与质检
+
+路由表在 `skills/OBM/SKILL.md`，安装说明在 `skills/OBM/README.md`。
+子流程 frontmatter 名称已加 `OBM-` 前缀（`OBM-production-trae`、`OBM-review`、`OBM-run-qc`）。
+
+## Harbor 内容分类判定依据
+
+区分内部 RL 题包与外发题包：
+
+| 特征 | harbor-16（内部 RL） | harbor-sota（外发供应商） |
+|---|---|---|
+| `task.toml` schema | 1.3 | 1.4 |
+| 评分 | `tests/quality.toml` + pytest 程序化 | `tests/graded/judge.toml` + `tests/gating/gating.toml` |
+| 参考答案 | `solution/`（oracle.patch） | `solution/golden_output/` + `tests/golden_output/` |
+| 命名 | `zq*` 飞书作业号 / assignment_id | 供应商+领域+分类+时间，L2~L5 分级 |
+
+详见 `Harbor/分类说明.md`。
+
+## ⚠️ 安全
+
+`Harbor/check.md` 含**明文 API Key**（阿里云 MaaS OPENAI_API_KEY），已随仓库推送至 GitHub 私有仓库。用户当时选择不处理，**建议轮换该 Key**。
 
 **重要**：`Harbor/` 与 `skills/` 原本是独立 git 仓库，其内层 `.git` 已按需求移除，**现为普通目录**。原远程 `wzswffhm/harbor` 与 `wzswffhm/wff-skills` 已不再由本地同步。
 

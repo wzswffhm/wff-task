@@ -1,5 +1,5 @@
 ---
-name: Harbor 16
+name: harbor-16
 description: >-
   Harbor Coding RL 出题到交付全流程（选题、Oracle、Reward Kit rubrics、baseline/oracle 校准、
   难度门、打 zip、飞书回写）；支持 16 路并发完整批次、跨完整批次的透明选样与本地证据留存。

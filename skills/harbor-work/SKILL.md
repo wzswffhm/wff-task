@@ -1,5 +1,5 @@
 ---
-name: Harbor Work
+name: harbor-work
 description: "Complete a LabelX Alibaba office-agent annotation as role A or B, using the bundled Chinese rules and a supplied subTaskId. Review all applicable stages, with priority on instruction, rubric evaluation, and minimal rubric repair; independently score the deliverable and present the completed A/B result for the user's confirmation before submission."
 ---
 
