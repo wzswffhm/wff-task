@@ -1,0 +1,25 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。netlink 路径的 `-persist` 长驻模式已补上并验证。
+
+## 改动内容
+
+**`nbd-client.c`**
+- **CONNECT 带死链超时**：`netlink_configure()` 增加 `NBD_ATTR_DEAD_CONN_TIMEOUT`——用了 `-T`/`-dead-timeout`（或 nbdtab `dead-timeout`）就发指定值，否则 persist 下默认 30 秒。
+- **连完不退出**：netlink 分支在 `netlink_configure()` 后若处于 persist 模式，进入 `persist_mode_main()`：加入 `nbd_mc_group` 组播组，pselect 挂住监听链路事件，收到 SIGINT/SIGTERM 才干净退出。
+- **断了退避重连 + reconfigure**：`persist_callback()` 收到 `NBD_CMD_LINK_DEAD` 且设备索引匹配时置标志；主循环检测到后经 `reconnect_with_backoff()`（1s 起指数退避、封顶 180s，失败则开启新一轮直至成功）重连并重新协商，再经 `netlink_reconfigure()` 发 `NBD_CMD_RECONFIGURE` 把新 socket 塞回内核。协商后校验 export 尺寸变化（与 ioctl 路径一致）。
+- **新选项**：`-dead-timeout|-T 秒`，nbdtab 对应 `dead-timeout`；usage 同步更新。
+- **ioctl 老逻辑未动**：重连循环原样保留，仅把开关换成 `persist_mode`（解析完命令行和 nbdtab 后置位），行为与原来 `cont` 相同，nbdtab 里的 `persist` 标志从此在两条路径都生效。
+
+**`nbdclt.h`**：CLIENT 增加 `persist_mode`、`dead_conn_timeout`；新增 `saved_connection_t`（缓存 addrinfo 供重连复用）/`persist_connection_t`。
+
+**测试**（沿用上游 mock 方案）：`tests/run/libnl_mock.c` 扩展组播/reconfigure 校验，`tests/run/simple_test` 新增 `persist` 用例，`tests/run/Makefile.am` 注册。
+
+**文档**：`nbd-client.8`、`nbdtab.5` 增补 `-dead-timeout` 与 netlink persist 行为说明。
+
+## 验证
+
+- `make` 零告警（含 NOTLS 变体单独编译核查）。
+- `make check`：parse 6/6、code 5/5、run 18/18 全过（4 个 skip 为既有环境原因：未编 GnuTLS/cwrap）。
+- 用 shim 向 mock 注入 `LINK_DEAD` 事件做了端到端演练：确认 CONNECT 带超时属性（显式值与默认 30 均验证）→ 收到事件 → 1s 退避后对真实 nbd-server 重连并重新协商 → mock 校验通过 `NBD_CMD_RECONFIGURE`（索引正确）→ 继续驻留监听；事件索引与本机设备不符时被正确忽略。
+
+一点说明：上游对应提交（5b2d384c9d）里重连函数其实没接进循环、`persist_mode` 也从未置位，本实现在其结构上把这条回路真正接通了。

@@ -1,0 +1,30 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+treefiles 选项现在真正生效了。数据不再落到单一文件,而是按 4 KiB 块拆进一棵文件树,读写、TRIM、零填充、持久化都已验证。
+
+## 改动内容
+
+`treefiles.c`(原来是空壳)— 实现了四个函数:
+- `construct_path()`:把设备偏移映射成树内路径。块号 = `pos/4096`,按 1024 进制展开,每层一个数字;目录名 `TREEXXXX`,叶子块文件 `FILEXXXX`。树的深度由 `filesize` 决定,保证每个目录 ≤1024 个条目。
+- `mkdir_path()`:递归建目录。
+- `open_treefile()`:构造路径 + 按需建目录 + 打开(带 `O_CREAT` 才建文件),用每客户端互斥锁串行化。
+- `delete_treefile()`:删除指定偏移对应的块文件。
+
+`nbd-server.c`:
+- `parse_cfile()`:treefiles 必须配 `filesize`;优先级高于 `multifile`;拒绝与 splice/waitfile 混用。
+- `setupexport()`:treefiles 分支——大小取配置的 filesize,块文件惰性创建。
+- `rawexpread()/rawexpwrite()`:新增 treefiles 分支,读写都按单块文件裁剪;未写块读回零(不建文件);尊重 F_SYNC/FUA。
+
+`nbdsrv.c`/`nbdsrv.h`:CLIENT 加 `treefiles_lock`;`exptrim()` 对 treefiles 导出删除被完整覆盖块的块文件。
+
+## 过程中修掉的一个 bug
+
+部分写入的块文件,读它时会撞上文件 EOF 返回错误而非补零。完整性回放测试暴露了它(`Read failed: File exists`)。已在 `treeexpread` 里对短读补零。
+
+## 验证
+
+- 官方测试:`make check` 全绿——tests/code 5/5、tests/parse 6/6、tests/run 17/17(含 `tree`、`rotree`;4 个 TLS/inetd 跳过是构建未开 GnuTLS/ISSERVER 的既有环境原因)。
+- 完整性回放:50 MiB treefiles 导出跑通 `integrity-test.tr` 全部 68990 条事务,含数据内容校验。
+- 新增 `tests/run/treefiles_check.py`(协议级检查器):跨块写、零读、TRIM 删文件并读回零、部分 TRIM 保留、两级树、尾部短块、越界拒绝、重启持久化——67 项全过。
+- 顺手补回 `tests/run/simple_test`、`cwrap_test` 丢失的执行位(之前 `make check` 因此全挂)。
+
+普通导出(不带 treefiles)路径未改动,回归全部通过。

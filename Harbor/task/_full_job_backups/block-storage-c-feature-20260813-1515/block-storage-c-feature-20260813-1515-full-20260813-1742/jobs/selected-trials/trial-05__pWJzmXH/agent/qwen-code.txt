@@ -1,0 +1,29 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 此前只有个空壳(`treefiles.c` 里一行注释,`F_TREEFILES` 标志解析了却没人用,导出照样落到单文件)。现在按 man 页(`nbd-server.5.sgml.in`)描述的行为补上了。
+
+## 实现的行为(man 页语义)
+
+- 配了 `treefiles = true` 的导出,`exportname` 变成一棵文件树的根目录;数据按 4096 字节块(`TREEPAGESIZE`)拆分存储,每级目录最多 1024 个条目(`TREEDIRSIZE`),嵌套深度由 `filesize` 决定
+  - 4 MiB(1024 块)→ 块文件直接放在根目录下:`nbd.tree/0000` … `nbd.tree/1023`
+  - 8 MiB(2048 块)→ 多一层:`nbd.tree/0000/0122`、`nbd.tree/0001/0476`
+- 块文件按需自动创建(含中间目录);从未写过的块读回是全零;TRIM 整块时删除对应文件,部分覆盖的块只把被 trim 的字节清零
+- `filesize` 必填(无法自动探测树的大小),缺了会在客户端连接时报错拒绝
+- 与 `multifile` 同时给出时 treefiles 优先(man 页规定);与 `splice`/`waitfile` 互斥,配置解析阶段直接报错
+
+## 改动
+
+| 文件 | 内容 |
+|---|---|
+| `treefiles.c` | 从空壳补全:`construct_path`(偏移→路径,含嵌套深度计算)、`mkdir_path`、`open_treefile`(带 mutex 的按需建目录/建文件)、`delete_treefile`、新增 `trim_treefiles` |
+| `treefiles.h` | 只加了一个 `trim_treefiles` 声明,原有四个函数签名未动 |
+| `nbd-server.c` | `setupexport` 增加 treefiles 分支;`rawexpread`/`rawexpwrite` 分支到 `treefiles_read/write`(按块边界截断,跨块请求由原有 `_fully` 循环续读/续写);`expflush` 对 treefiles 直接返回 0;`parse_cfile` 加互斥校验 |
+| `nbdsrv.c` | `exptrim` 增加 treefiles 分支 |
+| `tests/run/simple_test`、`cwrap_test` | 只是补回丢失的可执行位(否则 `make check` 全部 Permission denied,与代码无关) |
+
+普通导出(单文件/multifile/COW/splice 等)的代码路径没有改动。
+
+## 验证
+
+- `make check` 全绿:tests/run 17 项通过(含 `tree`、`rotree`、`integrity`/`integrityhuge`),tests/code 5/5,tests/parse 6/6;4 项 SKIP 是构建未开 GnuTLS/syslog 的既有跳过(TLS×3、inetd)
+- 另写了个小型 NBD 客户端做端到端校验,全部通过:未写块读零、非对齐跨块写→读回、重连后数据仍在、越界写报错、整块 trim 后读零且盘上文件被删、部分 trim 只清零被 trim 的字节、8 MiB 导出的嵌套路径正确;1024 个块文件逐字节比对全对
+- 普通导出复查:仍是单个文件,行为未变

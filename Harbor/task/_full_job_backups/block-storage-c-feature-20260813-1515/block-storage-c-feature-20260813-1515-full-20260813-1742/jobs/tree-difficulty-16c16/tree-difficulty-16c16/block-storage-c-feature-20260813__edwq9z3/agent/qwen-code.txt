@@ -1,0 +1,25 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。treefiles 选项现在真正生效了:配了它的导出数据按 4K 块拆到 `exportname/TREEXXXX/.../FILEXXXX` 文件树里,普通导出行为不变。
+
+## 改动内容
+
+**`treefiles.c`**(原来只有一句 "not implemented",按 `treefiles.h` 既定接口实现):
+- `construct_path()` — 偏移→路径映射:块号(pos/4096)按 1024 进制逐级展开成 `TREEXXXX` 目录 + `FILEXXXX` 文件,每层目录最多 1024 项,层级数由 filesize 决定
+- `open_treefile()` — 按需打开块文件;写模式下文件不存在时自动建目录树并创建 4096 字节的块文件,只读模式下用匿名临时零文件兜底(未写过的块读出全零)
+- `delete_treefile()` / `mkdir_path()` — 删块文件、逐级建目录
+
+**`nbd-server.c`** 接入读写路径:
+- `get_filepos()` — treefiles 时每次 I/O 定位到对应块文件(块内偏移 = a % 4096,单次 I/O 上限到块尾)
+- `rawexpread/rawexpwrite/rawexpsplice` — I/O 后关闭按需打开的 fd
+- `setupexport()` — treefiles 导出没有单一 backing file,尺寸取 filesize,块文件按需生成;`expflush()` 对应改为 sync 文件系统
+- `parse_cfile()` — 按 man 文档强制要求 `filesize`(树导出无文件可自动探测尺寸),缺失时启动即报错
+
+**`nbdsrv.c`** `exptrim()` — treefiles 的 TRIM 改为删除被完整覆盖的块文件(man 文档说的 "marked as unused 即删文件"),部分覆盖的边缘块保留。
+
+## 验证结果
+
+- 干净编译,零警告
+- `make check` 全过:28 个测试 PASS,包括之前形同虚设的 `tree`/`rotree`;4 个 SKIP 是本来就有的环境性跳过(未编译 GnuTLS、inetd 需 syslog 构建)
+- 用临时 Python NBD 客户端做了协议级验证,22 项断言全过:跨块写读回一致、未写块读零、目录结构与偏移一一对应、TRIM 只删整块且删后读零、部分覆盖块不被误删、**重启 server 后数据仍在**(落在树上的文件持久生效)、缺 filesize 拒绝启动
+
+验证脚本留在 `/tmp/treefiles_check.py` 和 `/tmp/treefiles_run.sh`,需要复查可以直接跑;不想要删掉即可。

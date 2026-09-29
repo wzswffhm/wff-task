@@ -1,0 +1,22 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+`treefiles` 补上了。之前 `treefiles.c` 只有一句 "not implemented" 的注释,选项被解析、被打印、却从不生效。现在按 man 文档(nbd-server.5)描述的行为实现了:
+
+## 实现
+
+**`treefiles.c/h`**(原为空壳):导出设备按 4096 字节块拆分,每块一个文件,挂在以导出名为根的文件树下;每级目录最多 1024 个条目,目录深度由 `filesize` 推算。
+- `construct_path()` — 偏移 → 块号 → 按 1024 进制分解成 `exportname/TREExxxx/.../FILExxxx` 路径
+- `open_treefile()` — 按需创建目录和块文件(在客户端锁下,避免线程竞争)
+- `delete_treefile()` / `mkdir_path()` — 删除块文件、递归建目录
+- `treeexpread()` — 块文件不存在或读越界一律返回全零(设备初始为零);`treeexpwrite()` — 按块边界分段写,尊重 `sync`/FUA;`treeexptrim()` — 整块 trim 直接删文件,块内部分 trim 打洞
+
+**`nbd-server.c`**:`setupexport` 增加 treefiles 分支(要求必须配 `filesize`,自动建树根目录,只读导出缺树时全零伺候);`rawexpread/rawexpwrite/expflush/expwrite_zeroes` 按标志分派到 tree 实现(write_zeroes 直接删块文件,因为"文件不存在"与"全零"等价);配置解析时拒绝 `treefiles` 与 `splice`/`waitfile` 混用;`multifile` 同时给出时按文档由 treefiles 优先。**`nbdsrv.c/h`**:`exptrim` 分派;CLIENT 增加 `treemutex`。普通导出的代码路径未动。
+
+## 验证
+
+- `make check` 全绿(28 项,含 `tree`/`rotree` 及所有普通导出回归测试;TLS/inetd 跳过系环境原因)
+- 磁盘布局核对:4MiB 导出落成 1024 个 4KiB 的 `FILExxxx`(不再是单个大文件);8MiB 导出正确嵌套出 `TREE0000/`、`TREE0001/`
+- 自制协议客户端做了 44 项内容级检查:非对齐写、跨三个块文件的写、设备尾部部分写、未写区读零、跨块大块读、TRIM/WRITE_ZEROES 后文件删除且读零、断线重连数据仍在 —— 全部通过
+- 用 `integrity-test.tr`(6.9 万笔带内容校验的事务回放)对 50MiB treefiles 导出回放,通过
+- 错误路径:缺 `filesize` 拒连、导出名是普通文件拒连、非法组合在配置解析期报错
+
+顺手做了两件小事:仓库自带的 `tree` 测试原先不检查数据落点(所以实现缺失时也能"过"),现在断言树目录确实被创建;另外 `tests/run/simple_test`、`cwrap_test` 在这份拷贝里丢了执行位导致 `make check` 全军覆没,已恢复。

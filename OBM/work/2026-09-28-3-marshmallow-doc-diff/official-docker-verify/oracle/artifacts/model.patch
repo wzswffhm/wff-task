@@ -1,0 +1,131 @@
+diff --git a/src/marshmallow/schema.py b/src/marshmallow/schema.py
+index 8024dfe1..3ec19143 100644
+--- a/src/marshmallow/schema.py
++++ b/src/marshmallow/schema.py
+@@ -837,6 +837,126 @@ class Schema(metaclass=SchemaMeta):
+             return typing.cast("dict[str, list[str]]", exc.messages)
+         return {}
+ 
++    def document_diff(
++        self,
++        left,
++        right,
++        *,
++        include_unknown: bool = False,
++        ignore_fields: typing.Sequence[str] = (),
++    ) -> list[dict[str, typing.Any]]:
++        """Compute an ordered, schema-aware description of the changes needed to
++        turn the serialized representation of `left` into that of `right`.
++
++        Both arguments may be dumpable objects (in which case they are serialized
++        with :meth:`dump` first) or already-serialized dictionaries. The result is
++        a list of change records, each a dictionary with the keys ``op``
++        (``"add"``, ``"remove"`` or ``"change"``), ``path`` (a dotted field name
++        with ``[i]`` suffixes for list positions), ``left`` and ``right`` (the
++        values on each side; the absent side is ``None``).
++
++        Traversal follows the schema: ``Nested`` fields are descended into using
++        the nested schema, and ``List`` fields are compared position by position
++        (recursing for nested elements). Records are emitted in schema/declaration
++        order, then by list index, so the result is deterministic.
++
++        :param left: The "before" object or serialized document.
++        :param right: The "after" object or serialized document.
++        :param include_unknown: If ``True``, keys present in the documents but not
++            declared on the schema are compared at the top level. If ``False`` they
++            are ignored.
++        :param ignore_fields: Field names to exclude from the comparison.
++        :return: A list of change-record dictionaries (empty when the documents
++            are equivalent under the schema).
++        """
++        left_doc = left if isinstance(left, dict) else self.dump(left)
++        right_doc = right if isinstance(right, dict) else self.dump(right)
++        ignore = set(ignore_fields)
++        changes: list[dict[str, typing.Any]] = []
++        self._diff_document(self, left_doc, right_doc, "", changes, include_unknown, ignore)
++        return changes
++
++    def _diff_document(self, schema, left, right, prefix, changes, include_unknown, ignore):
++        fields = schema.fields
++        for name, field in fields.items():
++            if name in ignore:
++                continue
++            path = f"{prefix}.{name}" if prefix else name
++            in_l = name in left
++            in_r = name in right
++            if not in_l and not in_r:
++                continue
++            if in_l and not in_r:
++                changes.append({"op": "remove", "path": path, "left": left[name], "right": None})
++                continue
++            if in_r and not in_l:
++                changes.append({"op": "add", "path": path, "left": None, "right": right[name]})
++                continue
++            self._diff_value(field, left[name], right[name], path, changes, include_unknown, ignore)
++        if include_unknown:
++            known = set(fields)
++            for key in sorted(set(left) | set(right)):
++                if key in known or key in ignore:
++                    continue
++                lpath = f"{prefix}.{key}" if prefix else key
++                in_l = key in left
++                in_r = key in right
++                if in_l and not in_r:
++                    changes.append({"op": "remove", "path": lpath, "left": left[key], "right": None})
++                elif in_r and not in_l:
++                    changes.append({"op": "add", "path": lpath, "left": None, "right": right[key]})
++                elif left[key] != right[key]:
++                    changes.append({"op": "change", "path": lpath, "left": left[key], "right": right[key]})
++
++    def _diff_value(self, field, lv, rv, path, changes, include_unknown, ignore):
++        if isinstance(field, ma_fields.Nested):
++            many = bool(getattr(field, "many", False) or getattr(field.schema, "many", False))
++            if many:
++                if lv is None or rv is None:
++                    if lv != rv:
++                        changes.append({"op": "change", "path": path, "left": lv, "right": rv})
++                    return
++                n = max(len(lv), len(rv))
++                for i in range(n):
++                    ipath = f"{path}[{i}]"
++                    in_l = i < len(lv)
++                    in_r = i < len(rv)
++                    if in_l and not in_r:
++                        changes.append({"op": "remove", "path": ipath, "left": lv[i], "right": None})
++                    elif in_r and not in_l:
++                        changes.append({"op": "add", "path": ipath, "left": None, "right": rv[i]})
++                    else:
++                        self._diff_document(field.schema, lv[i], rv[i], ipath, changes, include_unknown, ignore)
++                return
++            if lv is None or rv is None or not isinstance(lv, dict) or not isinstance(rv, dict):
++                if lv != rv:
++                    changes.append({"op": "change", "path": path, "left": lv, "right": rv})
++                return
++            self._diff_document(field.schema, lv, rv, path, changes, include_unknown, ignore)
++            return
++        if isinstance(field, ma_fields.List):
++            self._diff_sequence(field.inner, lv, rv, path, changes, include_unknown, ignore)
++            return
++        if lv != rv:
++            changes.append({"op": "change", "path": path, "left": lv, "right": rv})
++
++    def _diff_sequence(self, inner_field, lv, rv, path, changes, include_unknown, ignore):
++        if lv is None or rv is None:
++            if lv != rv:
++                changes.append({"op": "change", "path": path, "left": lv, "right": rv})
++            return
++        n = max(len(lv), len(rv))
++        for i in range(n):
++            ipath = f"{path}[{i}]"
++            in_l = i < len(lv)
++            in_r = i < len(rv)
++            if in_l and not in_r:
++                changes.append({"op": "remove", "path": ipath, "left": lv[i], "right": None})
++            elif in_r and not in_l:
++                changes.append({"op": "add", "path": ipath, "left": None, "right": rv[i]})
++            else:
++                self._diff_value(inner_field, lv[i], rv[i], ipath, changes, include_unknown, ignore)
++
+     ##### Private Helpers #####
+ 
+     def _do_load(

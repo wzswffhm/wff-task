@@ -1,0 +1,32 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+搞定。`treefiles` 现在是真的按块拆到文件树里了,读写都对得上;不配它的普通导出行为完全没变。
+
+## 改了什么
+
+**`treefiles.c`**(原来是空的,只有一句 "not implemented")
+实现了 `treefiles.h` 里声明的四个函数:
+- `construct_path`:把导出内偏移换算成块文件路径。块号按 `TREEDIRSIZE`(1024)进制展开,高位作目录名 `TREEXXXX`,最低位作文件名 `FILEXXXX`;每块 `TREEPAGESIZE`(4096)字节。树深度由 `filesize` 决定,保证每层 ≤1024 项。
+- `mkdir_path`:递归建目录(mkdir -p)。
+- `open_treefile`:按需打开某块对应的文件,带 `O_CREAT` 时顺带建好路径;块文件稀疏,只有写过的块才有文件。
+- `delete_treefile`:删掉某块对应的文件。
+
+**`nbd-server.c`**
+- `setupexport`:配了 `treefiles` 时不再打开单个文件,而是建好根目录、记下 `filesize` 作为导出大小,块文件全部按需打开。`treefiles` 与 `multifile` 互斥且优先(与 man 一致)。
+- 读/写路径加了 `treefiles_read`/`treefiles_write`:跨块的请求自动按块边界分段;没写过的块读出来是全零;写时按需创建目录和块文件。`F_SYNC`/FUA 照常生效。
+- `expflush`:块文件用完即关,flush 直接返回成功。
+- `expwrite_zeroes`:对 treefiles 等价于丢弃(块没文件就读零),转给 `exptrim`。
+- `parse_cfile` 校验:treefiles 必须配 `filesize`;不能和 `splice` 混用。
+
+**`nbdsrv.c`**
+- `exptrim`:整块被 trim 就删掉对应文件,部分 trim 就在文件里打洞(`punch_hole`)。
+- `CLIENT` 增加 `treelock` 互斥锁,串行化并发建目录。
+
+## 验证
+
+- 官方 `tree`、`rotree` 通过;回归 `cfg1/cfgnew/cfgmulti/write/flush/rowrite/cfgsize/dirconfig/handshake/integrity` 全过;parse 测试全过。
+- 直接拿自写 NBD 客户端逐偏移核对:8MiB(两层树)写到块 2047 落在 `TREE0001/FILE1023`;5GiB(三层树)写块 1234567 落在 `TREE…/TREE…/FILE…`;跨块写、末块部分写、读回一致;trim 整块→文件删除读零,部分 trim→打洞保留其余;write_zeroes→删文件。
+- 不配 treefiles 的导出仍是单个普通文件(1MiB 写后仍是 regular file,无树目录)。
+
+一点说明:块文件是用完即关的按需打开方式,所以 `flush` 对 treefiles 返回成功但不做额外 fsync(数据落盘依赖写时的 `sync`/FUA)——这是这种"可能有成千上万个块文件"设计的固有权衡,与代码里 `waitfile` 的既有做法一致。
+
+构建配置我恢复成了原始 `--prefix=/usr`(`config.h` 与原有一致,调试开关已关),产物是正式的非 debug 版。

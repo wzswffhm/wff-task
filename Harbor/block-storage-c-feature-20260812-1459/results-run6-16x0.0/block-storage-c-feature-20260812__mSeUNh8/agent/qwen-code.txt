@@ -1,0 +1,20 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+写时复制路径已补齐并全部验证通过。
+
+## 改动内容
+
+**`nbdsrv.h`** — CLIENT 结构补上 COW 状态(字段名与 `tests/code/trim.c` 既有引用一致):`difffilename`、`difffile`、`difffilelen`、`difmap`(每 4K 页一字节脏标记),另加 `diffpos`(非 sparse 模式的页号→diff 偏移哈希表)和 `cowlock`(并发保护,请求由线程池多线程处理)。
+
+**`nbd-server.c`** — 按配置项语义实现:
+
+- **建立**:`setup_cow()` 在 `setupexport()` 确定导出大小后创建 diff 文件——有 `cowdir` 就放那里,否则放主文件同目录;命名 `<主文件名>.<pid>.diff`(每连接一个 pid,并发连接互不干扰)。`sparse_cow = true` 时 `ftruncate` 到导出大小形成稀疏文件,否则文件从空开始增长。
+- **写**:`rawexpwrite()` 遇 `F_COPYONWRITE` 转入 `cow_write()`——只写 diff,绝不碰主文件。页首次变脏时分配位置(sparse 按页的自然偏移;非 sparse 追加到 diff 末尾并记录映射,即手册所述 "map every newly written block to the end");部分页写入先用 `master_read()` 从主文件预填整页,保证脏页内容自洽。`sync`/FUA 语义同样作用在 diff 上。
+- **读**:`rawexpread()` 转入 `cow_read()`——按 4K 页拆分,脏页优先从 diff 返回,其余回落主文件。
+- **断开清理**:`finalize_client()` 调 `cleanup_cow()`:关闭并删除 diff 文件、释放映射,主文件原样保留;无论正常 DISC 还是连接被掐断都会走到。
+- 顺带:`expflush()` 也 fsync diff 文件;TRIM 在 COW 下维持原有的显式 no-op。
+
+## 验证结果
+
+- 编译零告警;`make check` 全绿:**tests/parse 6/6、tests/code 5/5(含此前编译不过的 trim)、tests/run 18/18**(SKIP 的 inetd/tls×3 是构建环境缺相应依赖,与本改动无关)。
+- `simple_test cow` 覆盖三种导出(cowplain / cowsparse / cowcowdir):会话内读回新写数据、断开后 `*.diff` 无残留、`checkfile` 确认主文件逐字节未变、重连后只见原始数据。
+- 协议级探针额外验证:命令行 `-c` 路径;sparse diff 表观 1 MiB 实际仅占 20 KB;非 sparse diff 恰含 5 个脏页(20480 字节);页边界不对齐、跨页、重写、设备尾部写入均正确;无 DISC 直接断开同样清理。

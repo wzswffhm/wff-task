@@ -1,0 +1,62 @@
+{
+  "benchmark": "deepSWE",
+  "candidate_title": "Staged multi-key write batch with atomic commit, rollback and crash recovery for a SQLite-backed disk cache",
+  "upstream_repo": "grantjenks/python-diskcache",
+  "base_commit": "323787f507a6456c56cce213156a78b17073fe00",
+  "scenario_goal": "Let an application stage several cache writes (set/add/delete/touch/incr) and make them become visible as one unit only when the batch exits successfully. Before commit, the staged writes are invisible to every other cache handle and process; on exception, explicit rollback, or process crash mid-batch, the cache must return to its pre-batch state and leave no orphaned value files behind.",
+  "actors": [
+    "A writer thread or process opening a batch on a cache directory",
+    "Other processes and other cache handles reading and writing the same directory concurrently",
+    "A crash or hard exit that kills the process between staging a value and committing it",
+    "The cache reopened later, which must discard any unfinished batch"
+  ],
+  "domain_objects": [
+    "The cache key/value index persisted in SQLite",
+    "Value files stored on disk and referenced by index rows",
+    "A staging area that holds pending writes for the current batch",
+    "Per-key metadata: expire time, tag, size, mode, filename",
+    "Aggregate views: item count, total volume, iteration order, statistics"
+  ],
+  "workflow": [
+    "Open a batch on a cache handle",
+    "Issue arbitrary mixes of writes and deletes, including deleting then re-setting the same key and setting then deleting it",
+    "Read inside the batch and observe the staged state while other handles observe the committed state",
+    "Exit the batch: success commits every staged change at once; an exception discards them",
+    "Reopen the cache after a crash and observe that the unfinished batch is discarded"
+  ],
+  "state_and_lifecycle": [
+    "A pending write is neither visible nor counted until commit",
+    "Commit moves every staged row into the live index inside one transaction and releases superseded files",
+    "Rollback removes staged rows and the files they own",
+    "An unfinished batch found at open time is rolled back before the cache is used",
+    "Expiration, tag eviction and culling only apply to committed rows; staged rows join them after commit"
+  ],
+  "conflicts_failures_recovery": [
+    "Two processes open batches on the same directory at the same time and commit independently",
+    "A process crashes after staging files but before commit; files must be reclaimed",
+    "A crash in the middle of commit must not leave a half-applied batch",
+    "Concurrent independent writes outside the batch must not be blocked by an open batch",
+    "Nesting a batch inside a batch must raise a clear error instead of silently merging"
+  ],
+  "observable_outcomes": [
+    "Batch commit makes every staged key visible at the same instant; rollback leaves none of them",
+    "A second cache handle sees nothing until commit",
+    "Item count and total volume change only after commit",
+    "Expired and tagged keys written in a batch behave like ordinary keys after commit",
+    "The consistency checker reports no unknown files after any rollback or crash"
+  ],
+  "verifier_behaviors": [
+    "Distinguish real atomic commit/rollback from writes that leak visibility early",
+    "Distinguish correct crash recovery from implementations that leave orphan files or half-applied rows",
+    "Distinguish correct staging from implementations that block or corrupt concurrent writers",
+    "Check that aggregate views ignore staged rows and that expiration and tag eviction apply after commit",
+    "Re-check a fixed set of existing single-key behaviours so they do not regress"
+  ],
+  "task_difficulties": [
+    "Choosing where staged writes live so that reads inside the batch see them while every other handle and process does not, and so that commit is a single atomic transition",
+    "Ordering file writes, index updates and old-file deletion so that a crash at any point leaves a state that reopening can repair without orphan files or half-applied rows",
+    "Keeping staged writes out of expiration, tag eviction, culling, counting and volume until commit, then making them join all of those at once, including delete-then-set and set-then-delete on one key"
+  ],
+  "capability_type": "persistence-and-recovery",
+  "reference_task": null
+}

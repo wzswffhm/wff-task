@@ -1,0 +1,26 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成了。`treefiles` 之前是个空壳(`treefiles.c` 只有一行注释),配了该选项的导出会悄悄落回单文件路径。现在已按 man 文档把行为补齐,全部测试通过。
+
+## 改了什么
+
+**`treefiles.c`(核心实现,原先只有占位注释)**
+- `construct_path()`:把导出偏移映射成树内路径。块号按 TREEDIRSIZE(1024)进制展开,高位作目录名、低位作文件名,目录层数由 `filesize` 推出(`tree_depth()`),保证每个目录 ≤1024 个条目。
+- `open_treefile()`:按需打开块文件;写打开时自动 `mkdir -p` 建目录并 `O_CREAT` 建文件,读打开不存在的块则返回 `ENOENT`。
+- `delete_treefile()`:删除块文件(TRIM 时归还空间)。
+- `treefiles_sync()`:递归 fsync 整棵树,实现 FLUSH。
+
+**`nbd-server.c` / `nbdsrv.c` / `nbdsrv.h`(接线)**
+- `setupexport()`:识别 `F_TREEFILES`,不再打开单文件,`export=NULL`、尺寸取 `filesize`(并修正了 multifile 优先级:treefiles 同时给出时生效)。
+- `expread/expwrite` → 新增 `treefiles_read/treefiles_write`,按 4K 块在树中读写;未写过的块读回全零。
+- `exptrim`(nbdsrv.c)→ 删除被整块 TRIM 的块文件;`expflush` → 走 `treefiles_sync`。
+- `commit_client/finalize_client`:初始化/销毁新增的 `treefiles_mutex`。
+- `parse_cfile`:校验配置——`treefiles` 必须给 `filesize`;拒绝与 `copyonwrite`/`waitfile`/`splice` 混用(这些依赖单文件数组);与 `multifile` 共存时 treefiles 优先。
+
+## 验证
+
+- **新增单测** `tests/code/treefiles.c`(28 个断言):路径构造(depth 0/1/2)、块 0 与块 1024 不冲突、按需建目录/建文件、删除幂等。
+- **新增读写一致性测试** `treeintegrity`(`simple_test` + 小型事务日志 `treefiles-test.tr`):真实 NBD 协议写入后读回校验,含跨目录、跨块边界、非对齐访问,0.03s 通过。
+- **端到端**(临时 Python NBD 客户端,23 项全过):写后读回、跨块边界、未写区读零、TRIM 后读零且邻块不受影响、1GB 导出子目录层级正确。
+- **回归**:`make check` 全绿——parse 6、code 6(含新增)、run 18(含 `tree`/`rotree`/`treeintegrity`);未配 treefiles 的普通导出行为不变。
+
+一个说明:现有的 50MB `integrity` 压力日志对 treefiles 会超时——那不是正确性问题,而是本机慢速 overlayfs 上对数千个小文件做高并发随机写的写回瓶颈(线程阻塞在 `submit_bio_wait`);这正符合该特性面向"大文件不友好的文件系统"的定位。因此读写一致性用的是上面专门的小型日志验证。

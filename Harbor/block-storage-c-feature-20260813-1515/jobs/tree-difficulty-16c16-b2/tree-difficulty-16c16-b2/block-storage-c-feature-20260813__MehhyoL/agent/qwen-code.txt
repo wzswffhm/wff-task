@@ -1,0 +1,26 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成了。`treefiles` 之前只有配置解析(选项被读进 `F_TREEFILES` 标志位),`treefiles.c` 是一句 "not implemented" 的空壳,所以数据照旧落进单个文件。现在按 man 文档(`nbd-server(5)`)描述的行为补齐了:
+
+## 实现
+
+**`treefiles.c` / `treefiles.h`**(原先是 stub):
+- 树的深度由 `filesize` 决定:取最小的 d 使 `1024^d × 4096 ≥ filesize`;块号按 1024 进制拆成 d 位,映射为 `exportname/TREE%04d/.../FILE%04d`(4 MiB → 1 层 1024 个 FILE;8 MiB → `TREE0000`、`TREE0001` 两个子目录)
+- `construct_path` / `mkdir_path` / `open_treefile`(按需创建目录和块文件,带 mutex 串行化创建)/ `delete_treefile`
+
+**`nbd-server.c` / `nbdsrv.c` 接入**:
+- `setupexport`:treefiles 导出不打开单一大文件,只建根目录、用配置的 `filesize` 作为设备大小(只读导出允许目录尚不存在,读全零)
+- `rawexpread` / `rawexpwrite`:按 4 KiB 块切分请求;写时按需建块文件,不存在的块读作全零,短文件/空洞补零
+- `exptrim`:整块被 trim → 删除对应块文件;部分块 → 打洞(man 文档说"块被标记未使用时删除文件")
+- `expflush`:只 fsync 上次 flush 以来写脏的块文件(脏集跟踪)。最初我对每次 flush 遍历整棵树做 fsync,结果一致性测试 trace 里 1191 个 FLUSH 直接把服务器拖死,改成脏集后通过
+- `parse_cfile`:treefiles 必须配 `filesize`,与 copyonwrite/waitfile/splice/temporary 组合报错,与 multifile 同配时按 man 文档以 treefiles 优先
+
+普通导出(不带 treefiles)的代码路径没有改动。
+
+## 验证(`make check` 全绿:6+6+17 项)
+
+- **tests/run/tree**(加强过):8 MiB 全盘写入后,检查盘上确实是 2 个 TREE 目录 × 1024 个 4096 字节 FILE,且拼接内容 == 写入数据;再对 50 MiB treefiles 导出重放 `integrity-test.tr`(68990 个请求,逐 512 字节校验读回内容)
+- **新增单测 `tests/code/treefiles.c`**:路径映射(1/2/3 层深度)、按需创建、删除语义
+- 另用临时协议客户端验证过:跨块/非对齐写、部分块写、覆盖写、远端偏移、trim 整块/部分块、FUA/flush、未写块读零、杀掉重启后只读挂载数据仍在
+- 无效配置(缺 filesize、与 copyonwrite 混用)在启动时报错退出;rotree 只读导出拒绝写,行为不变
+
+顺手修了两个测试框架的小问题:`simple_test`/`cwrap_test` 缺执行位(导致 `make check` 全部 Permission denied),以及 `nlconnect` 用例漏初始化 `retval` 引起的 dash 告警。

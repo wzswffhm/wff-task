@@ -1,0 +1,28 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成了。`treefiles` 选项现在按 man 文档描述的行为工作:数据按 4KiB 块拆到一棵文件树里,读写对得上,不配该选项的普通导出行为不变。
+
+## 问题根源
+`treefiles.c` 是空的(只有一句 "not implemented" 注释),`F_TREEFILES` 标志从配置解析出来后在 I/O 路径里从未被使用——所以配了跟没配一样,数据还是落进单个文件。
+
+## 实现内容
+
+**`treefiles.c`(核心,从零实现)**
+- `construct_path`:把设备偏移映射成块文件路径。块号按 `TREEDIRSIZE`(1024)进制展开,高位是 `TREEXXXX` 目录、最低位是 `FILEXXXX` 叶子文件,树深由 `filesize` 决定(4MiB→1 层平铺,8MiB→2 层…)
+- `mkdir_path` / `open_treefile`:按需创建目录和块文件
+- `delete_treefile`:trim 时删除整块的块文件
+- `flush_treefiles`:flush 时递归 fsync 所有块文件
+
+**接线**
+- `nbd-server.c`:`setupexport` 增加 treefiles 分支(强制要求 `filesize`,否则拒绝);新增 `treeexpread`/`treeexpwrite`(不存在的块读作全零、短文件末尾补零),`rawexpread`/`rawexpwrite`/`rawexpsplice`/`expflush` 按 `F_TREEFILES` 分发
+- `nbdsrv.c`:`exptrim` 增加 `treetrim`(整块→删文件,部分块→打洞)
+- `nbdsrv.h`:CLIENT 加 `tree_lock` 互斥锁,串行化多线程下的树创建
+
+## 验证
+- **完整 `make check` 全绿**:`tree`、`rotree` 通过,其余无回归(`trim` 单元测试也过,证明非 treefiles 的 `exptrim` 路径没变)。SKIP 的只有 `inetd`(需 syslog)和 `tls*`(未编 GnuTLS),均为环境原因,与本次改动无关。
+- **端到端**(自写 Python NBD 客户端):8MiB 导出确实生成 2 层树(2048 个块文件);逐块写入不同图案后读回全部一致;跨页/非对齐写入正确;**重启后数据仍在**;trim 后块文件被删、读回全零;未写区域读作全零。
+
+## 两个附带修正
+- `tests/run/simple_test`、`cwrap_test` 在这个 checkout 里丢了可执行位,导致 `make check` 直接报 "Permission denied",已补回 `+x`。
+- 最终交付为干净的生产构建(默认 `-g -O2`,无调试宏),编译无 warning。
+
+一个说明:现有的 `tree` 测试本身只做写吞吐、不回读校验,真正"读写对得上"是靠上面的端到端客户端验证的。

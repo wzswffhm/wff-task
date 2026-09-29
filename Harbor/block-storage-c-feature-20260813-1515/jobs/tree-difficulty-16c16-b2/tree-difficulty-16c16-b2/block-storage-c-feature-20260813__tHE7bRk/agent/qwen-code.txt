@@ -1,0 +1,24 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+搞定。`treefiles` 之前是个空壳(`treefiles.c` 只有一句 "not implemented",配了该选项的导出仍走普通单文件路径),现在按 man 页(`man/nbd-server.5.sgml.in` 第 618 行起)描述的行为补全了。
+
+## 改动内容
+
+**`treefiles.c`(新实现,接口按现成的 `treefiles.h`)**
+- 布局:exportname 是一个目录,数据按 4096 字节一块拆成 `FILE%04d` 文件;每个目录最多 1024 个条目,超出就按 `TREE%04d` 子目录分层,深度由 filesize 决定(≤4MiB 不分层,≤4GiB 一层,以此类推)
+- `construct_path()`:偏移 → 树中路径 + 块内偏移;`open_treefile()`:按需打开/创建目录和块文件(带 mutex 防多线程竞态);`delete_treefile()`、`mkdir_path()`
+
+**`nbd-server.c`**
+- `setupexport_treefiles()`:建根目录、用 filesize 定导出大小;块文件不预先打开,服务时按需开
+- `treeexpread()/treeexpwrite()`:读写按块边界切分后落到对应块文件;没写过的块读回全零(不建文件);沿用原有 F_SYNC/FUA 语义;`rawexpread/rawexpwrite/expflush` 里加 `F_TREEFILES` 分支
+- 配置校验:treefiles 必须配 filesize;与 splice、waitfile 互斥(解析期报错);与 multifile 同时给出时 treefiles 优先(man 页规定)
+- `CLIENT` 增加 `tree_lock`(nbdsrv.h/commit_client),`nbdsrv.c` 的 `exptrim` 增加树模式:整块 TRIM 直接删块文件,部分块打洞
+
+**其它**:`tests/run/simple_test`、`cwrap_test` 丢了执行位,automake 跑不了,补回 `+x`。
+
+## 验证
+
+- **`make check` 全绿**:parse 6/6、code 5/5、run 17 pass / 0 fail,其中 `tree`、`rotree` 通过;4 个 SKIP(inetd/tls×3)是构建本身没编 syslog/GnuTLS 的既有限制,与本改动无关
+- 另写了个端到端脚本(裸 NBD 协议)跑了 51 项检查,全过:跨块读写回环、首尾字节在盘上落点与偏移一一对应(含一层 TREE 目录的 4MiB 边界)、未写区域读零且盘上无文件、换连接数据仍在、trim/flush/FUA/write_zeroes、treefiles+multifile 时确实走树不出 `.0` 平文件、普通导出仍是单文件不变
+- 期间 e2e 抓到一个真实 bug:路径构造里 TREE 下标的除数少乘了一个 1024,会导致块 1 和块 1025 映射到同一文件(数据互相覆盖),已修复
+
+一个已知边界:导出大小不是 4096 整数倍时最后一块是短文件,读写按 filesize 截断,行为正确。

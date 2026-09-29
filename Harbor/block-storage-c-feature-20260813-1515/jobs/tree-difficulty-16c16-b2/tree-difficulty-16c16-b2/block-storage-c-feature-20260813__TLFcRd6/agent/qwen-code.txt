@@ -1,0 +1,32 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前只在配置解析里存了个 flag，读写路径完全没用它，所以表现跟普通单文件一样。现在按 man 文档描述的行为把它补全了。
+
+## 改了什么
+
+**`treefiles.c`**（原来只有一行注释）：实现了树存储后端。
+- `construct_path()`：按块号算出叶子文件路径。块大小固定 `TREEPAGESIZE=4096`，每层目录最多 `TREEDIRSIZE=1024` 项，目录深度按 `filesize` 自动推导，路径形如 `exportname/0001/0000/0001`。
+- `open_treefile()` / `mkdir_path()`：按需打开块文件，写入时逐级创建缺失目录（多线程用互斥锁串行化建目录）。
+- `delete_treefile()`：TRIM 时删除对应块文件。
+
+**`nbd-server.c`**：
+- `rawexpread`/`rawexpwrite` 增加 treefiles 分支，按块拆开落到树上不同文件；从没写过的块读出来是全 0。
+- `setupexport`：treefiles 导出不再预先开一个大文件，只记录大小（`filesize`），根目录按需建。
+- `parse_cfile` 配置校验：treefiles 必须配 `filesize`；与 `splice` 冲突直接报错；与 `multifile` 互斥时 treefiles 优先（均与 man 文档一致）。
+- `expflush`：树文件每次请求即写即关，无需额外 flush。
+
+**`nbdsrv.h` / `nbdsrv.c`**：`CLIENT` 加了一把 `treelock`；`exptrim` 增加 treefiles 分支——整块被 trim 才删文件，跨块的零星 trim 保留数据。
+
+**`man/nbd-server.5.sgml.in`**：补上 treefiles 与 splice 不兼容的说明。
+
+## 验证结果
+
+- **官方套件**：`make check` 17/17 通过，其中 `tree`、`rotree`（只读）通过；4 个 SKIP（inetd/tls*）是本构建未启用 syslog/GnuTLS 的既有跳过，与改动无关。普通导出回归测试（cfg1/write/flush/integrity/integrityhuge/unix 等）全绿，行为没变。
+- **自写 NBD 客户端深测**（新式协议直连）：
+  - 写后读、跨块写、非对齐写、尾部不足一块的写，全部读写一致；
+  - 掉电式验证：杀进程重启后数据仍在，且确实落在树的对应文件里（逐文件核对内容）；
+  - 5GiB 导出验证了 3 层深度的路径构造；越界写被正确拒绝；
+  - 两个并发连接同时写同一棵树，无竞争错误，回读一致；
+  - TRIM 整块后文件被删、读回 0；部分 trim 不误删；
+  - treefiles 未配 `filesize` 时服务端正确报错退出。
+
+一个小提醒：树文件是“写时才建、trim 才删”，读未写过的区域返回 0，这是预期语义。若导出路径之前是个同名普通文件（旧用法残留），现在会明确报“不是目录”而不是静默覆盖。

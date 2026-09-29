@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前只有个头文件和一行 "not implemented" 的桩,现在按 man 页(`nbd-server.5.sgml.in` 里 treefiles 一节)描述的行为补齐了:数据按 4KiB 块拆进 `<exportname>/TREEXXXX.../FILEXXXX` 文件树,每层目录最多 1024 项,层数由 `filesize` 决定。
+
+**改动的文件**
+
+1. **`treefiles.c`**(原来是空桩)——实现了头文件里声明的四个函数:
+   - `construct_path()`:把导出内偏移映射成树路径,块号按 1024 进制拆成 目录/文件名
+   - `open_treefile()`:按偏移开块文件;写模式下缺失时自动建目录、建文件并撑到 4096 字节;只读导出用匿名临时文件兜底,未写过的块读回全零;用 mutex 串行化创建
+   - `delete_treefile()`:删块文件(TRIM 用)
+   - `mkdir_path()`:逐级创建路径上的目录
+
+2. **`nbd-server.c`**:
+   - `get_filepos()`:F_TREEFILES 时按需打开对应块文件(块内偏移 `a % 4096`,单次 I/O 截断到块边界),不再走 FILE_INFO 数组二分(该模式下数组为 NULL)
+   - `rawexpread/rawexpwrite/rawexpsplice`:treefiles 时用完即关 fd(每次 I/O 独立开关文件)
+   - `expflush()`:treefiles 分支(没有固定 fd 可 fsync,非只读时 `sync()`)
+   - `setupexport()`:treefiles 与 waitfile 一样不预开文件,导出大小直接取 `filesize`
+
+3. **`nbdsrv.c`**:`exptrim()` 增加 treefiles 分支——TRIM 范围内被完整覆盖的块文件直接删除,搭边的部分块保留。
+
+**验证结果**
+
+- `make` 干净无警告;`make check` **17/17 通过**,其中包括 `tree` 和 `rotree`(4 个 SKIP 是环境缺 inetd/GnuTLS,与本改动无关)
+- 普通导出回归:cfg1/cfgmulti/cfgnew/cfgsize/write/flush/rowrite/unix/handshake/integrity 全过,未配 treefiles 的路径行为未变(`get_filepos` 只在置了 F_TREEFILES 时才走新分支)
+- 在 50MiB treefiles 导出上跑了 integrity 测试(68990 次带校验的读写/flush 操作):通过,落盘 7825 个块文件
+- 自己写的端到端脚本(8GiB 导出,两级目录树):4 个不同树位置的读写、跨块边界的非对齐写、越界读拒绝、flush、TRIM 后块文件确实被删且读回全零——27 项检查全过
+
+man 页本来就已描述了这套行为,无需改动。一个实现细节值得一提:读写模式下读未写过的块会顺手把该块文件建出来(全零),只读模式不会——这是 `open_treefile` 的既有设计,两种模式都验证过。

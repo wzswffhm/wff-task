@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前只被解析进配置(置了个 `F_TREEFILES` 标志位)就没有下文了——`treefiles.c` 整个是空的占位注释,server 一律按单文件导出。我对照 man 文档(`man/nbd-server.5.sgml.in` 里 `treefiles` 条目)把行为补齐了:
+
+## 改动
+
+**`treefiles.c`(原为空壳,现为实现)**
+- `construct_path`:把导出偏移映射成 `exportname/TREEXXXX/.../FILEXXXX` 路径。数据按 4096 字节块(`TREEPAGESIZE`)切分,每级目录最多 1024 个条目(`TREEDIRSIZE`),按 `filesize` 自动决定嵌套层数
+- `open_treefile`:按偏移打开对应块文件;不存在时写模式自动建目录+建文件(并扩到 4096 字节),只读模式用匿名临时文件兜底(读回全零);由互斥锁保护创建过程
+- `delete_treefile` / `mkdir_path`:删除块文件、逐级建目录
+
+**`nbd-server.c`(I/O 路径接线)**
+- `setupexport`:treefiles 导出不再打开单个文件(`export` 置 NULL),大小直接取 `filesize`
+- `get_filepos`:treefiles 时按偏移现开对应块文件,`maxbytes` 截到块边界,读写循环自然按块跨文件
+- `rawexpread` / `rawexpwrite` / `rawexpsplice`:treefiles 时用毕关闭 fd
+- `expflush`:treefiles 时改对整个文件系统 `sync()`(不再遍历 NULL 的文件数组)
+
+**`nbdsrv.c`**:`exptrim` 增加 treefiles 分支——TRIM 覆盖到的整块直接删除块文件(man 文档:"Files will be deleted if the corresponding block gets marked as unused")
+
+普通导出(不含 `treefiles = true`)的代码路径全部走原逻辑,未变。
+
+## 验证
+
+- `make check` 全绿:parse 6/6、code 5/5、run 17/17(仅 inetd/tls×3 因本构建无 GNUTLS/inetd 而 SKIP,与本改动无关)。其中 `tree`(读写回环)、`rotree`(只读导出写失败)是套件里现成的 treefiles 用例
+- 手工确认落盘形态:4MiB 导出 → `nbd.tree/TREE0000/FILE0000..FILE03FF`,共 1024 个 4096 字节块文件,不再是一个大文件;16MiB 导出 → `TREE0000`~`TREE0003` 四级目录共 4096 个块文件
+- 另写了个协议级脚本(`/tmp/tree_trim_test.py`)直接驱动 NBD 协议验证:写入后块文件内容与写入一致、读回一致;TRIM 后块文件被删除、再读回全零;不同偏移落到树的不同位置(8MiB 导出的第 1500 块落在 `TREE0001/FILE01DC` 且内容正确)
+
+顺带恢复了 `tests/run/simple_test`、`cwrap_test` 的执行位(快照里丢了,否则 `make check` 全部报 Permission denied)。

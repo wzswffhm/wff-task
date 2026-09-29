@@ -1,0 +1,25 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前是个空壳:`treefiles.c` 只有一行注释,头文件里声明的四个函数没有实现,server 读写路径完全不引用它,所以配不配都一样。现在按 man 页(`nbd-server.5`)描述的行为补齐了。
+
+## 改动
+
+**`treefiles.c`(新实现)**——四个基础函数:
+- `construct_path`:把导出偏移换算成树内路径。设备按 4096B(TREEPAGESIZE)分块,每块一个文件;目录扇出 1024(TREEDIRSIZE),层数按 `filesize` 自动推导,块号按 1024 进制拆成 `%04X` 命名的目录/文件名(如 4MB → `nbd.tree/0000`…`03FF`;5MB → `nbd.tree/0001/0000`)
+- `mkdir_path`:mkdir -p 式建目录
+- `open_treefile`:按偏移打开块文件,不存在时持锁建目录树并创建
+- `delete_treefile`:块标记为未用时删除对应文件
+
+**`nbd-server.c`(接入)**:
+- `setupexport_treefiles`:建根目录、`exportsize = filesize`,块文件按需开/关不预占 fd;清掉 `F_MULTIFILE`(man 页:treefiles 优先)和 `F_WAIT`
+- 读:整块缺失或部分缺失一律读作 0;写:按需创建块文件,跨块请求由原有 `rawexp*_fully` 循环按块边界拆分;两者都支持 FUA/sync
+- TRIM / WRITE_ZEROES:整块覆盖的文件直接删除(man 页:"Files will be deleted if the corresponding block gets marked as unused"),部分覆盖的块写零
+- FLUSH 对 treefiles 直接返回 0;`commit_client` 初始化每客户端的建树锁
+
+**配置校验**(`parse_cfile`):treefiles 必须配 `filesize`、不能与 `splice` 同用,否则启动时报错退出(和现有 copyonwrite+splice 的校验同款)。
+
+另外修了个环境小问题:`tests/run/simple_test` 和 `cwrap_test` 丢了可执行位,`make check` 因此全挂,已 `chmod +x`。
+
+## 验证
+
+- `make check` 全绿:`tree`、`rotree` 及 cfg1/write/integrity/integrityhuge 等全部通过,普通导出行为无回归(TLS 几项 SKIP 是构建未带 GnuTLS,与改动无关)
+- 用自写协议客户端逐字节核对过:4MB 平树(1024 个块文件、内容按偏移对上)、5MB 两层树、跨块/跨目录边界写、流水线并发写、TRIM/WRITE_ZEROES 后整块文件消失且读回 0、部分块数据保留、只读导出(已有树读到旧数据、树不存在读 0、写被 EPERM 拒)、filesize 非 4096 整数倍的尾块、越界读写被拒、普通导出仍是单一大文件

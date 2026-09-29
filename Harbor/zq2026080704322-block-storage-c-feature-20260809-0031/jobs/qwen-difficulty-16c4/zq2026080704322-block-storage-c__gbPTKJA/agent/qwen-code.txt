@@ -1,0 +1,30 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+netlink 路径的 `-persist` 长驻模式已实现完毕，全部测试通过。
+
+## 工作机制（对照内核行为设计）
+
+- **连接时带死链超时**：netlink CONNECT 现在会发送 `NBD_ATTR_DEAD_CONN_TIMEOUT`。新增 `-T/--dead-timeout` 可单独指定；未指定且处于 persist 模式时默认 **30 秒**。没有它，链路一断内核会立刻把在途 I/O 全部失败掉，重连就没意义了（内核靠它把排队请求保留到重连成功）。
+- **连完不退出**：`-p` 时 `netlink_configure()` 之后不再 `return 0`，而是进入 `netlink_persist()`：加入 `nbd_mc_group` 组播、注册 SIGINT/SIGTERM/SIGPIPE/SIGCHLD 处理，然后 `poll()` 挂住等事件。
+- **断链→退避重连→reconfigure**：内核在探测到连接死亡时会广播 `NBD_CMD_LINK_DEAD`（带 `NBD_ATTR_INDEX`）。回调匹配到本设备后：先查一次 STATUS（避免对已断开的设备做无用功）→ 重新 TCP/unix 连接 + negotiate（失败按 1s→2s→…→180s 指数退避无限重试）→ 校验导出大小未变 → 发 `NBD_CMD_RECONFIGURE` 把新 socket 塞回内核（带 `-i` 时附 `NBD_ATTR_BACKEND_IDENTIFIER`，否则内核会拒绝）→ 成功后关掉用户态副本（内核已持引用）。reconfigure 失败同样退避重试；期间若设备被外部断开则退出。
+- **兜底轮询**：每 30s 用现成的 `NBD_CMD_STATUS` 查一次——`nbd-client -d` 这类外部断开不发事件，查到 disconnected 就干净退出（SIGTERM 也是 0 退出）。
+- **ioctl 老路径原样保留**：`NBD_DO_IT` + `cont` 重连循环一行未动；只是 `-p` 和 nbdtab 的 `persist` 标志现在同时置上 `persist_mode`。
+
+## 顺手修的两个真问题
+
+- nbdtab 的 `persist` 标志此前完全没人读（死配置），现在两条路径都生效。
+- netlink 路径设备名解析只认 `/dev/nbdN`，而 `get_from_config()` 会把前缀剥掉，导致 nbdtab 方式根本走不通；现在 `main()` 和 `netlink_disconnect()` 都兼容两种写法。
+
+## 改动文件
+
+- `nbd-client.c`：persist 实现（约 280 行，位于 negotiate 之后的 `#if HAVE_NETLINK` 块）、`-T` 选项、超时属性、设备名解析
+- `nbdclt.h`：`CLIENT` 增加 `persist_mode`、`dead_conn_timeout`
+- `tests/run/libnl_mock.c`：新增组播模拟（`genl_ctrl_resolve_grp`/`nl_socket_add_membership`/`nl_socket_get_fd` 拦截、一次性 LINK_DEAD 事件注入、RECONFIGURE 消息校验）
+- `tests/run/simple_test` + `Makefile.am/.in/Makefile`：新测试 `nlpersist`
+- `man/nbd-client.8.sgml.in`：`-T` 文档、`-persist` 的 netlink 行为说明
+
+## 验证
+
+- `make check` 全绿：6 parse + 5 code + 18 run（新增 `PASS: nlpersist`，既有 `connstatus`/`nlconnect` 及全部 ioctl 回归不受影响；4 个跳过是 inetd/TLS 环境性跳过，与改动无关）
+- `nlpersist` 实测链路：常驻 ✓ → 收到 LINK_DEAD → 真连 nbd-server 重新协商 → RECONFIGURE 校验通过 → "Reconnected" ✓；`-T 99` 覆盖默认值 ✓；SIGTERM 干净退出码 0 ✓
+
+一个已知边界：重连耗时超过死链超时（默认 30s）时，排队 I/O 会先以 EIO 失败（内核语义如此），但设备配置仍在，重连成功后新 I/O 正常——想拉长窗口就用 `-T`。

@@ -1,0 +1,68 @@
+{
+  "benchmark": "deepSWE",
+  "candidate_title": "Leased task delivery with crash recovery for Huey",
+  "upstream_repo": "coleifer/huey",
+  "scenario_goal": "Huey currently removes a task from storage the moment a consumer reads it, so a consumer that crashes mid-execution loses the task forever and two consumers cannot coordinate ownership. The task is to add a leased-delivery protocol: a task taken for execution stays owned by the taking consumer for a bounded lease, is invisible to every other reader meanwhile, becomes visible again automatically once the lease expires, and is retired to a dead-letter set after a bounded number of failed deliveries. Success means the storage and public Huey API expose lease/ack/nack/renew/dead-letter semantics that hold across independent connections and processes on the SQLite backend, while every pre-existing queue, schedule and result behaviour is unchanged.",
+  "actors": [
+    "Producer code calling the Huey public API to enqueue tasks.",
+    "One or more consumer processes or threads pulling work from the same backend.",
+    "Operator or recovery tooling inspecting leased and dead-lettered work.",
+    "A new consumer process started after another one crashed."
+  ],
+  "domain_objects": [
+    "Pending queue entries (task rows) with queue name, priority and monotonic id.",
+    "Delivery leases binding a task row to a lease id, owner and expiry timestamp.",
+    "Delivery attempt counters per task.",
+    "Dead-letter entries holding tasks that exceeded their delivery budget.",
+    "Idempotency keys that pin a logical operation to at most one live task."
+  ],
+  "workflow": [
+    "Producer enqueues a task, optionally with a dedup key, a maximum delivery count and a priority.",
+    "A consumer leases one or more tasks with a timeout instead of destructively dequeuing them.",
+    "The consumer renews the lease while it works, then acks on success or nacks (with optional requeue delay) on failure.",
+    "Leases that are never renewed or acked expire and the task returns to the visible set with an incremented delivery count.",
+    "Once the delivery count reaches the configured maximum the task stops being deliverable and appears in the dead-letter set.",
+    "Operators can inspect and drain leased, pending and dead-letter views.",
+    "A consumer that crashed before acking is recovered simply by another consumer leasing the expired task."
+  ],
+  "state_and_lifecycle": [
+    "A task moves pending -> leased -> (acked and gone) or -> pending again or -> dead-letter.",
+    "Lease ownership is exclusive: at most one lease may reference a live task at any instant.",
+    "Lease expiry is evaluated against a caller-supplied or injected clock so expiry is deterministic under test.",
+    "Priority ordering applies to the visible set; ordering among equal priorities falls back to the original enqueue order.",
+    "A dedup key is released only when its task reaches a terminal state (acked or dead-lettered).",
+    "Lease and dead-letter state must survive process restart because it lives in the persistent backend."
+  ],
+  "conflicts_failures_recovery": [
+    "Two consumers racing to lease the last visible task: exactly one wins, the other observes an empty visible set.",
+    "A consumer that dies between lease and ack: the lease expires and the task is redelivered, not lost.",
+    "A consumer that acks after its lease already expired: the ack must be rejected so it cannot delete work that already moved on.",
+    "Simultaneous renew and expiry at the same timestamp boundary.",
+    "Duplicate enqueue with the same dedup key, including after the first task was leased but not yet terminal.",
+    "Requeue with a delay must not become visible before the delay elapses even though the lease is gone.",
+    "A failed delivery that reaches the maximum count must land in the dead-letter set instead of cycling forever."
+  ],
+  "observable_outcomes": [
+    "Public methods report the same leased/pending/dead-letter pictures to independent connections.",
+    "Counts and listings stay consistent with what was enqueued, leased, acked, nacked and expired.",
+    "Errors are raised for operations on foreign or expired leases instead of silently corrupting state.",
+    "Pre-existing dequeue, enqueue, queue_size, enqueued_items, schedule and result behaviour keeps working."
+  ],
+  "verifier_behaviors": [
+    "Distinguish leases that hide tasks from leases that merely mark them.",
+    "Distinguish expiry-driven redelivery from explicit requeue.",
+    "Distinguish a rejected foreign ack from an accepted owner ack.",
+    "Check ordering of redelivered and new tasks under priority and delay.",
+    "Check dedup key release timing at terminal states only.",
+    "Check dead-letter transition exactly at the delivery budget boundary.",
+    "Re-read through a second storage connection to prove durability rather than in-memory bookkeeping."
+  ],
+  "task_difficulties": [
+    "Choosing a durable representation for lease ownership that stays atomic under concurrent readers of the same SQLite file.",
+    "Making expiry lazy and correct without a background reaper, so a crashed consumer needs no cleanup call.",
+    "Keeping lease, requeue-with-delay and dead-letter transitions from double-counting or losing a delivery attempt.",
+    "Defining when a dedup key is released so concurrent duplicate producers converge on one live task.",
+    "Preserving the original visible-set ordering rules while introducing a second invisibility reason (lease vs. not-yet-due).",
+    "Keeping the in-memory backend semantically identical so behaviour does not depend on which backend is configured."
+  ]
+}

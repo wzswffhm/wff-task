@@ -1,0 +1,26 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。之前 `treefiles.c` 整个文件就是一句 "not implemented" 的桩，选项解析了但没有任何代码消费它，所以数据照旧落进单个文件。现在按 man 页（`nbd-server(5)` 的 treefiles 条目）描述的行为补上了。
+
+## 改动
+
+**`treefiles.c`（新实现，约 270 行）**
+- 布局：数据按 `TREEPAGESIZE`=4096 字节切块，块 n 存为 `<exportname>/TREExxxx/.../TREExxxx/FILExxxx`，xxxx 是 n 的 1024 进制各位数字（最低位是文件名，高位由外向内作目录名）。每层目录 ≤1024 个条目，超过 4GiB 的导出自动加深嵌套层级
+- 实现了头文件声明的 `construct_path` / `mkdir_path` / `open_treefile` / `delete_treefile`，外加 `trim_treefiles`、`tree_path_extra` 和共享互斥锁
+
+**`nbd-server.c`**
+- `setupexport`：treefiles 分支——校验 filesize 必填、创建/校验基础目录、`exportsize = filesize`；treefiles 与 multifile 同配时按 man 页由 treefiles 优先
+- `treeexpread`/`treeexpwrite`：读写按块文件分发，跨块请求在块边界截断由上层循环续接；块文件不存在或尾部未写过一律读作 0；支持 F_SYNC/FUA 落盘
+- `expflush`：treefiles 分支（块文件随用随关，flush 时 fsync 基础目录元数据）
+- `parse_cfile`：treefiles 缺 filesize、或同时配 waitfile/splice 时启动即报错（splice/waitfile 依赖单文件导出的数据结构，混用会崩）
+
+**`nbdsrv.c`**：`exptrim` 增加 treefiles 分支——整块被 trim 的直接删文件（对应 man 页 "Files will be deleted if the corresponding block gets marked as unused"），部分覆盖的块只把 trim 区间写零
+
+普通导出、multifile、copyonwrite 的路径一行未动。
+
+## 验证
+
+- 套件自带的 `tree`/`rotree` 通过；全量 run 套件 17 过 4 跳过（TLS/inetd，与本改动无关的环境跳过）；tests/code、tests/parse 全过
+- integrity 测试（约 6.9 万条写读校验事务）在 treefiles 导出上通过
+- 自写深度验证（`/tmp/tree_verify.py`）：5GiB 导出两层 TREE 目录、块 1050627 确实落在 `TREE0001/TREE0002/FILE0003`、跨块写/半块写/全零读/trim 删文件与部分清零/重启后数据仍在，全部对上
+- 并发压测（`/tmp/tree_stress.py`，4 客户端 × 800 随机写读 trim 对照内存模型）——过程中抓到一个真 bug：nbd-server 每连接 fork 一个子进程，多客户端同时连接时 `setupexport` 里 stat→mkdir 会竞态，后到的子进程因 EEXIST 直接拒绝服务。已改成先 mkdir 容忍 EEXIST、再校验是目录，复测通过
+- multifile 回归、treefiles+multifile 优先级、三种非法配置的拒绝信息均验证过

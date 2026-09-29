@@ -1,0 +1,25 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 选项原来是空壳(`treefiles.c` 只有一句 "not implemented",标志位被解析后没人用),现在按 man 文档描述的行为补齐了。
+
+## 改动
+
+**`treefiles.c`(新实现,原先是 stub)**
+- 导出被切成 4096 字节块(TREEPAGESIZE),块号以 1024(TREEDIRSIZE)为基数展开成多级路径:中间目录 `TREEXXXX`、叶子块文件 `FILEXXXX`。树深取恰好覆盖 `filesize` 的最小层数(4MB 一层 `FILE0000..1023`;50MB 两层 `TREE0000/FILEXXXX`…)
+- `open_treefile`:按需打开/创建块文件,目录用 `mkdir_path` 递归创建,创建路径有互斥保护
+- `delete_treefile`:删除块文件(TRIM 时用)
+
+**`nbd-server.c`**
+- `setupexport`:treefiles 分支强制要求 `filesize`(树的深度由它决定),size 直接取配置值;与 multifile 同时给时 treefiles 优先(符合 man 文档)并告警
+- 新增 `treeexpread`/`treeexpwrite`,在 `expread`/`expwrite` 入口分发:IO 按块边界切分落到对应块文件;读不存在的块返回全零,写时按需建文件;`expflush` 对 treefiles 直接成功(每请求开/写/关,无积压)
+- 配置解析阶段拒绝 treefiles 与 copyonwrite / waitfile / splice 混用(这些路径会直接操作 export 数组,混用会崩),错误信息风格沿用现有的 cow+splice 等校验
+
+**`nbdsrv.c` / `nbdsrv.h`**
+- `exptrim` 加 treefiles 分支:整块被 trim → 删文件;部分 trim → 只把 trim 区域写零,文件保留
+- CLIENT 增加 `treefiles_mutex`,新增错误码 `NBDS_ERR_CFILE_INVALID_TREEFILES`
+
+## 验证
+
+- **tests/run `make check`:17/17 通过**,`tree`/`rotree` 现在是真跑树布局(4MB 导出 → `nbd.tree/FILE0000..FILE1023` 各 4096 字节,不再落单文件);4 个 SKIP 是本机没编 TLS/syslog,改动前就不跑。tests/code(含 trim 单测)5/5、tests/parse 6/6 通过
+- 在 treefiles 导出上跑了 **integrity 完整性测试**(68990 次写+带校验的回读,含 flush/fua),通过
+- 另写了个协议级 Python 检查(25 项全过):两层树的偏移→路径映射、非对齐/跨界写读、未写块读零、TRIM 删文件后读零、部分 TRIM 只清对应区域、trim 后重写重建文件、设备末块
+- 配置校验:缺 `filesize` 连接被拒并有明确日志;`treefiles+copyonwrite` 启动即报配置错误;普通导出(不带 treefiles)全部既有测试行为不变

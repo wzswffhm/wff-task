@@ -1,0 +1,24 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 选项之前只有个空壳(`treefiles.c` 是一行注释,flag 解析了但没人用),现在按 man 文档(`nbd-server.5`)描述的行为补上了。
+
+## 改动内容
+
+**`treefiles.c`(原为 stub,现完整实现)**,用 `treefiles.h` 里已声明的接口:
+- `construct_path()`:把导出内偏移映射成路径。块大小固定 4096(`TREEPAGESIZE`),每层目录最多 1024 个条目(`TREEDIRSIZE`),按 filesize 算出需要的嵌套层数,块号按 1024 进制展开成 `exportname/TREEXXXX/.../FILEXXXX`(≤4MB 只有一层 `FILEXXXX`,更大则逐级 `TREEXXXX` 目录)
+- `mkdir_path()`:递归建目录;**`open_treefile()`**:按需打开/创建块文件(建目录用传入的 mutex 串行化,照顾 man 里提到的 fuse/davfs 这类网络文件系统);**`delete_treefile()`**:删除块文件
+
+**`nbd-server.c`**:
+- `setupexport()`:treefiles 导出不预先开文件(可能上千个),`client->export = NULL`、大小取 `filesize`(未指定则拒绝连接,对应 man 里 "filesize 必须指定");文件句柄在读写时按需开关
+- 新增 `rawexptreefile_read/write` + `expread_treefile/expwrite_treefile`,并在 `expread`/`expwrite` 开头按 `F_TREEFILES` 分派(放在 COW/普通路径之前,兼容 structured replies)
+- 没写过的块读回来是零;写时自动建目录建文件;`F_SYNC`/FUA 语义与普通导出一致
+- `parse_cfile()` 拒绝 treefiles 与 copyonwrite/splice/waitfile 混用(会崩的组合),multifile 混用时按 man 文档由 treefiles 优先
+
+**`nbdsrv.c`/`nbdsrv.h`**:`exptrim()` 对 treefiles 导出把完全被 TRIM 覆盖的块的块文件删掉(man:"块被标记 unused 时文件删除",之后读回零);新增配套错误码。不配 treefiles 的导出走的代码路径完全没动。
+
+## 验证
+
+- `make check` 全绿:**tree、rotree 两个 treefiles 测试通过**,其余 15 个运行测试(cfg1/write/flush/integrity/integrityhuge/rowrite 等)+ 6 个 parse + 5 个 code 测试全部通过(未跑的 4 个是环境缺 GnuTLS 的 TLS 测试和 inetd,与本改动无关)
+- 另写了个 NBD 协议客户端做了 21 项端到端检查,全过:跨块边界写、20MB 导出的嵌套目录(`TREE0000/FILE0256` 内容与导出偏移逐字节对上)、未写区域读零、断开重连数据还在、TRIM 后块文件确实被删且读回零、未 TRIM 数据不受影响
+- 错误路径:treefiles 不配 filesize → 连接被拒;treefiles+copyonwrite → 启动时报错退出
+
+另外把 `tests/run/simple_test`、`cwrap_test` 丢了的可执行位补了回来(否则 `make check` 跑不起来)。
