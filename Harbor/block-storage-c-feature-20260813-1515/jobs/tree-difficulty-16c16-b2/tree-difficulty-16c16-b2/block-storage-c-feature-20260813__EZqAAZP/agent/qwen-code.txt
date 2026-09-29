@@ -1,0 +1,25 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。原因很简单:`treefiles.c` 整个文件就是一句注释 "Tree files support is not implemented in this tree." —— 选项被解析成 `F_TREEFILES` 标志后,从来没有任何代码使用它,`treefiles.h` 里声明的四个函数也没有实现。
+
+## 实现内容(按 man 页 nbd-server(5) 描述的行为)
+
+**`treefiles.c`(核心实现)**
+- 导出按 4096 字节块(TREEPAGESIZE)切分,每个目录最多 1024 个条目(TREEDIRSIZE);块号按 1024 进制展开成路径:`exportname/TREEXXXX/.../FILEXXXX`,嵌套层数按 `filesize` 自动取最少层级(≤1024 块时块文件直接放在根目录)
+- `construct_path` / `mkdir_path` / `open_treefile` / `delete_treefile`:按头文件既有契约实现,块文件按需创建(含目录 `mkdir -p`),用传入的 mutex 串行化创建
+- `tree_read`:跨块读;块文件不存在读作全零(稀疏语义),尾块不足 4096 的部分补零
+- `tree_write`:跨块写、按需建文件,尊重 F_SYNC/FUA;整块写零会删除对应块文件(即"块标记为未使用")
+- `tree_trim`:TRIM 范围内整块覆盖的块文件直接删除
+
+**`nbd-server.c` / `nbdsrv.c` / `nbdsrv.h`(接线)**
+- `setupexport`:treefiles 导出不在连接时打开任何文件,`exportsize` 取自 `filesize`,块文件随读写按需打开;man 页规定 treefiles 优先于 multifile,已实现
+- `rawexpread`/`rawexpwrite` 开头拦截 F_TREEFILES 走树读写;`exptrim`、`expflush` 加了树模式分支,避免解引用空导出数组
+- CLIENT 增加 `tree_lock`(请求经线程池并发处理,保护块文件创建/删除)
+- 配置校验:treefiles 必须配 `filesize`,否则启动即报错;与 `waitfile`、`splice` 混用报错
+
+## 验证结果
+
+- 测试套件:`tests/run` 全套 17 项通过(含之前必挂的 `tree`、`rotree`),`tests/code` 5 项、`tests/parse` 6 项通过;4 项 SKIP 是 TLS/inetd 构建条件问题,与改动无关
+- 手工 NBD 客户端做了 35 项细查,全部通过:不同偏移数据落到树中对应位置(含两级嵌套)、跨块写、尾块部分写、读写回环、TRIM 后块文件删除且读回零、整块写零删除文件、越界请求被拒、重启后数据仍在、树目录外无杂散文件
+- 回归:普通导出、multifile、copyonwrite 等原有测试全过;普通导出的数据仍写入单一文件
+
+另外顺手修了个环境问题:`tests/run/simple_test` 丢了执行位,导致所有运行测试直接 FAIL,已 `chmod +x`。

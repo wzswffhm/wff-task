@@ -1,0 +1,34 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+# 完成:treefiles 选项已实现并通过全部验证
+
+## 根因
+
+配置解析、`F_TREEFILES` 标志位、man 文档、甚至 `treefiles.h` 的函数声明和 Makefile 编译项都在,但 `treefiles.c` 只有一行注释 *"Tree files support is not implemented"*,服务端 I/O 路径也从没引用过这个标志——所以配了等于没配,数据照常落进单个文件。
+
+## 改动(3 个文件)
+
+**`treefiles.c`** — 实现了头文件声明的 4 个函数:
+- `construct_path()`:按块的编号递归构造路径。块文件 4096 字节(`TREEPAGESIZE`),每个目录最多 1024 个条目(`TREEDIRSIZE`),目录名 `TREEXXXX`、文件名 `FILEXXXX`(十六进制),树的层数由 `filesize` 决定
+- `mkdir_path()`:按需逐级创建目录
+- `open_treefile()`:按需打开块文件;不存在且可写时创建(先建目录路径);只读导出读到缺失块时返回一个全零的临时哑文件
+- `delete_treefile()`:删除块文件(TRIM 用)
+
+**`nbd-server.c`** — 把标志接入 I/O 路径:
+- `setupexport()`:treefiles 导出不再打开单个后备文件,大小直接取 `filesize`(文档明确要求必须配),文件句柄按需打开
+- `get_filepos()`:偏移 `a` → `open_treefile()` 打开对应块文件,文件内偏移 `a % 4096`,单次操作上限到块边界
+- `rawexpread/rawexpwrite/rawexpsplice`:操作完成后关闭按请求打开的 fd
+- `expflush()`:treefiles 分支(只读直接返回,否则 `sync()`)
+
+**`nbdsrv.c`** — `exptrim()`:TRIM 覆盖的完整块直接删除对应文件(man 文档:"Files will be deleted if the corresponding block gets marked as unused")
+
+## 验证结果
+
+- **`make check` 全套:17 项全 PASS**(含 `tree`、`rotree` 两个 treefiles 测试,以及 cfg1/write/flush/integrity/integrityhuge 等回归项);4 项 SKIP 是环境缺 GnuTLS/inetd,与本改动无关
+- **自写协议级验证客户端**(Python,留在 `/tmp/treeverify.py` + `/tmp/run_treeverify.sh`)逐项确认:
+  - 块对齐/非对齐/跨 3 块/设备末尾写入全部读写一致;数据在磁盘上的位置逐字节对上——跨块写入确实拆进 3 个不同文件、文件内偏移正确
+  - 未写区域读回全零;从没被访问过的块不会凭空建文件
+  - FLUSH 正常;TRIM 删掉对应块文件、读回零、不伤及无关块;断开重连数据仍在
+  - 5 GiB 导出形成两层树,末尾块正确落在 `TREE0001/TREE00FF/FILE03FF`(块号 0x13FFFF 的 1024 进制分解)
+  - **普通导出行为不变**:仍是单文件、同偏移同样数据,回归测试全绿
+
+两个已知边界,均与上游 nbd 实现一致:配了 treefiles 但没配 `filesize` 时导出大小为 0(文档已声明 filesize 必配);可写导出上首次*读*缺失块也会顺手创建全零块文件。

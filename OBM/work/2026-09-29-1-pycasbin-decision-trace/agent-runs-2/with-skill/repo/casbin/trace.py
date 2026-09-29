@@ -1,0 +1,450 @@
+# Copyright 2021 The casbin Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Decision tracing and hypothetical policy-change analysis."""
+
+import copy
+
+from casbin.effect import Effector, effect_to_bool
+from casbin.model import FunctionMap
+from casbin.model.policy_op import PolicyOp
+
+
+ALLOW = "allow"
+DENY = "deny"
+INDETERMINATE = "indeterminate"
+
+
+class TracedRule:
+    """A policy rule whose matcher evaluated to true."""
+
+    __slots__ = ("ptype", "rule", "index", "effect")
+
+    def __init__(self, ptype, rule, index, effect):
+        self.ptype = ptype
+        self.rule = tuple(rule)
+        self.index = index
+        self.effect = effect
+
+    def __eq__(self, other):
+        if not isinstance(other, TracedRule):
+            return NotImplemented
+        return (
+            self.ptype == other.ptype
+            and self.rule == other.rule
+            and self.index == other.index
+            and self.effect == other.effect
+        )
+
+    def __hash__(self):
+        return hash((self.ptype, self.rule, self.index, self.effect))
+
+    def __repr__(self):
+        return "TracedRule(ptype={!r}, rule={!r}, index={!r}, effect={!r})".format(
+            self.ptype, list(self.rule), self.index, self.effect
+        )
+
+
+class TraceResult:
+    """The boolean decision and the policy rules used to reach that decision."""
+
+    __slots__ = ("allowed", "matched", "decisive", "disabled")
+
+    def __init__(self, allowed, matched, decisive, disabled):
+        self.allowed = allowed
+        self.matched = tuple(matched)
+        self.decisive = tuple(decisive)
+        self.disabled = disabled
+
+    def __iter__(self):
+        return iter((self.allowed, self.matched, self.decisive, self.disabled))
+
+    def __eq__(self, other):
+        if not isinstance(other, TraceResult):
+            return NotImplemented
+        return tuple(self) == tuple(other)
+
+    def __hash__(self):
+        return hash((self.allowed, self.matched, self.decisive, self.disabled))
+
+    def __repr__(self):
+        return "TraceResult(allowed={!r}, matched={!r}, decisive={!r}, disabled={!r})".format(
+            self.allowed, self.matched, self.decisive, self.disabled
+        )
+
+
+class Mutation:
+    """A hypothetical add/remove operation in the policy or role section."""
+
+    __slots__ = ("operation", "section", "ptype", "rule")
+
+    def __init__(self, operation, section, ptype, rule):
+        operation = operation.lower()
+        section = section.lower()
+        if operation not in ("add", "remove"):
+            raise ValueError("mutation operation must be 'add' or 'remove'")
+        if section not in ("p", "g"):
+            raise ValueError("mutation section must be 'p' or 'g'")
+
+        self.operation = operation
+        self.section = section
+        self.ptype = ptype
+        self.rule = tuple(rule)
+
+    def __iter__(self):
+        return iter((self.operation, self.section, self.ptype, list(self.rule)))
+
+    def __eq__(self, other):
+        if not isinstance(other, Mutation):
+            return NotImplemented
+        return tuple(self) == tuple(other)
+
+    def __hash__(self):
+        return hash((self.operation, self.section, self.ptype, self.rule))
+
+    def __repr__(self):
+        return "Mutation(operation={!r}, section={!r}, ptype={!r}, rule={!r})".format(
+            self.operation, self.section, self.ptype, list(self.rule)
+        )
+
+
+class ChangeResult:
+    """Original and hypothetical decisions for a mutation sequence."""
+
+    __slots__ = ("before", "after", "changed")
+
+    def __init__(self, before, after, changed):
+        self.before = before
+        self.after = after
+        self.changed = changed
+
+    def __iter__(self):
+        return iter((self.before, self.after, self.changed))
+
+    def __eq__(self, other):
+        if not isinstance(other, ChangeResult):
+            return NotImplemented
+        return tuple(self) == tuple(other)
+
+    def __hash__(self):
+        return hash((self.before, self.after, self.changed))
+
+    def __repr__(self):
+        return "ChangeResult(before={!r}, after={!r}, changed={!r})".format(
+            self.before, self.after, self.changed
+        )
+
+
+def normalize_mutations(mutations):
+    """Accept one mutation or an ordered collection of mutations."""
+    if mutations is None:
+        return []
+
+    if isinstance(mutations, str):
+        raise ValueError("mutations must be a mutation or collection of mutations")
+
+    if isinstance(mutations, Mutation):
+        return [mutations]
+
+    # A mutation is represented as four fields. Strings are iterable, but are
+    # not valid rule values here, so treating such input as invalid is correct.
+    if (
+        len(mutations) == 4
+        and isinstance(mutations[0], str)
+        and isinstance(mutations[1], str)
+        and isinstance(mutations[2], str)
+    ):
+        return [Mutation(*mutations)]
+
+    result = []
+    for mutation in mutations:
+        if isinstance(mutation, Mutation):
+            result.append(mutation)
+        else:
+            result.append(Mutation(*mutation))
+    return result
+
+
+def effect_from_rule(ptype, p_parameters):
+    key = ptype + "_eft"
+    if key in p_parameters:
+        value = p_parameters[key]
+        if value == "allow":
+            return ALLOW, Effector.ALLOW
+        if value == "deny":
+            return DENY, Effector.DENY
+        return INDETERMINATE, Effector.INDETERMINATE
+    return ALLOW, Effector.ALLOW
+
+
+def enforce_traced(enforcer, *rvals):
+    """Evaluate a request without changing the enforcer and trace matched rules."""
+    from casbin.core_enforcer import EnforceContext
+
+    request = rvals
+    rtype = "r"
+    ptype = "p"
+    etype = "e"
+    mtype = "m"
+
+    if not enforcer.enabled:
+        return TraceResult(True, (), (), True)
+
+    functions = enforcer.fm.get_functions()
+
+    if "g" in enforcer.model.keys():
+        for key, ast in enforcer.model["g"].items():
+            if len(enforcer.rm_map) != 0:
+                from casbin.util import generate_g_function
+
+                functions[key] = generate_g_function(ast.rm)
+            if len(enforcer.cond_rm_map) != 0:
+                from casbin.util import generate_conditional_g_function
+
+                functions[key] = generate_conditional_g_function(ast.cond_rm)
+
+    if len(request) != 0 and isinstance(request[0], EnforceContext):
+        context = request[0]
+        rtype = context.rtype
+        ptype = context.ptype
+        etype = context.etype
+        mtype = context.mtype
+        request = request[1:]
+
+    # Keep all validation and missing-section errors identical to enforce_ex.
+    if "m" not in enforcer.model.keys():
+        raise RuntimeError("model is undefined")
+    if "m" not in enforcer.model["m"].keys():
+        raise RuntimeError("model is undefined")
+
+    r_tokens = enforcer.model["r"][rtype].tokens
+    p_tokens = enforcer.model["p"][ptype].tokens
+
+    if len(r_tokens) != len(request):
+        raise RuntimeError("invalid request size")
+
+    exp_string = enforcer.model["m"][mtype].value
+    exp_has_eval = _has_eval(exp_string)
+    if not exp_has_eval:
+        expression = enforcer._get_expression(exp_string, functions)
+
+    policy_effects = set()
+    r_parameters = dict(zip(r_tokens, request))
+    policy = enforcer.model["p"][ptype].policy
+    matched = []
+    decisive = ()
+
+    if policy:
+        for i, pvals0 in enumerate(policy):
+            pvals = tuple(pvals0)
+            if len(p_tokens) != len(pvals):
+                raise RuntimeError("invalid policy size")
+
+            p_parameters = dict(zip(p_tokens, pvals))
+            parameters = dict(r_parameters, **p_parameters)
+
+            if exp_has_eval:
+                from casbin.util import util
+
+                rule_names = util.get_eval_value(exp_string)
+                rules = [util.escape_assertion(p_parameters[name]) for name in rule_names]
+                exp_with_rule = util.replace_eval(exp_string, rules)
+                expression = enforcer._get_expression(exp_with_rule, functions)
+
+            result = expression.eval(parameters)
+            if isinstance(result, bool):
+                if not result:
+                    policy_effects.add(Effector.INDETERMINATE)
+                    continue
+            elif isinstance(result, float):
+                if result == 0:
+                    policy_effects.add(Effector.INDETERMINATE)
+                    continue
+            else:
+                raise RuntimeError("matcher result should be bool, int or float")
+
+            effect_name, effect_value = effect_from_rule(ptype, p_parameters)
+            policy_effects.add(effect_value)
+            record = TracedRule(ptype, pvals, i, effect_name)
+            matched.append(record)
+
+            if enforcer.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
+                decisive = (record,)
+                break
+    else:
+        if exp_has_eval:
+            raise RuntimeError("please make sure rule exists in policy when using eval() in matcher")
+
+        parameters = r_parameters.copy()
+        for token in enforcer.model["p"][ptype].tokens:
+            parameters[token] = ""
+
+        result = expression.eval(parameters)
+        if result:
+            policy_effects.add(Effector.ALLOW)
+        else:
+            policy_effects.add(Effector.INDETERMINATE)
+
+    final_effect = enforcer.eft.final_effect(policy_effects)
+    allowed = effect_to_bool(final_effect)
+    return TraceResult(allowed, matched, decisive, False)
+
+
+def would_change(enforcer, *rvals, mutations):
+    """Apply mutations to an isolated copy and compare the resulting decision."""
+    before = enforcer.enforce(*rvals)
+    sandbox = _sandbox(enforcer)
+    for mutation in normalize_mutations(mutations):
+        _apply_mutation(sandbox, mutation)
+    after = sandbox.enforce(*rvals)
+    return ChangeResult(before, after, before != after)
+
+
+def _has_eval(expr):
+    return "eval(" in expr.replace(" ", "")
+
+
+def _copy_role_manager(rm):
+    """Best practical in-memory clone for the role managers used by this package."""
+    from casbin.rbac.default_role_manager import role_manager as defaults
+
+    if isinstance(rm, defaults.ConditionalDomainManager):
+        clone = defaults.ConditionalDomainManager(rm.max_hierarchy_level)
+    elif isinstance(rm, defaults.DomainManager):
+        clone = defaults.DomainManager(rm.max_hierarchy_level)
+    elif isinstance(rm, defaults.ConditionalRoleManager):
+        clone = defaults.ConditionalRoleManager(rm.max_hierarchy_level)
+    elif isinstance(rm, defaults.RoleManager):
+        clone = defaults.RoleManager(rm.max_hierarchy_level)
+    else:
+        clone = copy.deepcopy(rm)
+        return clone
+
+    clone.matching_func = rm.matching_func
+    clone.domain_matching_func = rm.domain_matching_func
+    clone.max_hierarchy_level = rm.max_hierarchy_level
+
+    # Rebuild the graph from stored links, preserving all ordinary and
+    # conditional role links without serialization.
+    if isinstance(rm, defaults.DomainManagerBase):
+        for domain, links in rm.all_links.items():
+            for link in links:
+                clone.add_link(link.user, link.role, domain)
+        if isinstance(rm, defaults.ConditionalDomainManager):
+            _copy_domain_condition_functions(rm, clone)
+    else:
+        for link in rm.all_links:
+            clone.add_link(link.user, link.role)
+        if isinstance(rm, defaults.ConditionalRoleManager):
+            _copy_condition_functions(rm, clone)
+
+    return clone
+
+
+def _copy_condition_functions(source, target):
+    # The public Role graph contains exactly the registered user/role edge pairs.
+    for user_name, user in source.all_roles.items():
+        for role in user.roles:
+            fn = user.get_link_condition_func(role, "")
+            if fn is not None:
+                target.add_link_condition_func(user_name, role.name, fn)
+            params = user.get_link_condition_func_params(role, "")
+            if params:
+                target.set_link_condition_func_params(user_name, role.name, *params)
+
+
+def _copy_domain_condition_functions(source, target):
+    for domain, domain_rm in source.rm_map.items():
+        for user_name, user in domain_rm.all_roles.items():
+            for role in user.roles:
+                fn = user.get_link_condition_func(role, domain)
+                if fn is not None:
+                    target.add_domain_link_condition_func(user_name, role.name, domain, fn)
+                params = user.get_link_condition_func_params(role, domain)
+                if params:
+                    target.set_domain_link_condition_func_params(user_name, role.name, domain, *params)
+
+
+def _sandbox(enforcer):
+    """Create an isolated enforcer while retaining all in-memory functions."""
+    cls = enforcer.__class__
+    obj = cls.__new__(cls)
+    obj.__dict__.update(copy.deepcopy(enforcer.__dict__))
+
+    # Assertion.__deepcopy__ deliberately shares role managers. Replace those
+    # shared graphs and reconnect every assertion to the cloned managers.
+    new_rm_map = {ptype: _copy_role_manager(rm) for ptype, rm in enforcer.rm_map.items()}
+    new_cond_rm_map = {
+        ptype: _copy_role_manager(rm) for ptype, rm in enforcer.cond_rm_map.items()
+    }
+
+    # Existing grouping APIs look up the ordinary rm_map even when a role type is
+    # represented solely by a conditional manager. Keep an independent reference in
+    # that map, while using cond_rm_map to choose the manager during enforcement.
+    for ptype, rm in new_cond_rm_map.items():
+        new_rm_map.setdefault(ptype, rm)
+
+    for ptype, rm in new_rm_map.items():
+        if ptype in obj.model["g"]:
+            obj.model["g"][ptype].rm = rm
+    for ptype, rm in new_cond_rm_map.items():
+        if ptype in obj.model["g"]:
+            obj.model["g"][ptype].cond_rm = rm
+
+    obj.rm_map = new_rm_map
+    obj.cond_rm_map = new_cond_rm_map
+
+    # The hypothetical enforcer must calculate locally but must not persist,
+    # notify watchers, or begin any subclass-specific background mechanisms.
+    obj.adapter = None
+    obj.watcher = None
+    obj.auto_save = False
+    obj.auto_notify_watcher = False
+    obj.auto_build_role_links = True
+
+    # Function maps are normally stateless dictionaries; make an independent one
+    # while preserving any user-registered custom functions.
+    obj.fm = FunctionMap.load_function_map()
+    for name, fn in enforcer.fm.get_functions().items():
+        if name not in obj.fm.get_functions():
+            obj.fm.add_function(name, fn)
+
+    return obj
+
+
+def _apply_mutation(enforcer, mutation):
+    rule = list(mutation.rule)
+    section = mutation.section
+    ptype = mutation.ptype
+
+    if section == "p":
+        if mutation.operation == "add":
+            enforcer.add_named_policy(ptype, rule)
+        else:
+            enforcer.remove_named_policy(ptype, rule)
+        return
+
+    if mutation.operation == "add":
+        enforcer.add_named_grouping_policy(ptype, rule)
+    else:
+        existed = enforcer.has_named_grouping_policy(ptype, rule)
+        enforcer.remove_named_grouping_policy(ptype, rule)
+
+        # Existing upstream named grouping API does not incrementally update a
+        # conditional role manager on removal. Remove it explicitly in the
+        # sandbox so the operation has the complete side effect required here.
+        if existed and ptype in enforcer.cond_rm_map:
+            enforcer.model.build_incremental_conditional_role_links(
+                enforcer.cond_rm_map[ptype], PolicyOp.Policy_remove, "g", ptype, [rule]
+            )

@@ -1,0 +1,23 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前只解析了配置、打印了选项,`treefiles.c` 整个文件就是一句 "not implemented" 的 stub——所以配不配一个样。现在按 man 页(`nbd-server(5)`)描述的行为把它补全了。
+
+## 改动
+
+**`treefiles.c`(核心实现,原来是空的)**
+- 偏移 → 块文件路径:块号按 1024 进制拆位,高位是 `TREEXXXX` 目录、低位是 `FILEXXXX` 文件,嵌套层数随 `filesize` 增长(≤4MiB 一层、≤4GiB 两层……),每层目录 ≤1024 个条目,块文件固定 4096 字节——与 man 页一致
+- `construct_path` / `mkdir_path` / `open_treefile` / `delete_treefile`(沿用 `treefiles.h` 里已有的接口签名),目录按需懒创建
+
+**`nbd-server.c`**
+- `setupexport()`:treefiles 分支——强制要求 `filesize`(无法自动探测大小)、创建根目录、若导出名已被普通文件占用则明确报错;块文件按请求开/关,不长期占 fd
+- `treeexpread/treeexpwrite`:读写按块边界切分后落到对应块文件;没写过的块读回全零(不会凭空建文件);写入时自动建目录/文件,末块不足 4096 时按实际长度截断;支持 FUA/sync
+- `expflush` 对 treefiles 直接成功(数据写入时已同步);配置解析阶段拒绝 treefiles+copyonwrite/waitfile/splice 组合,treefiles 优先于 multifile(man 页要求)
+
+**`nbdsrv.c`** — `exptrim`:整块被 TRIM 时删除对应块文件(man 页:"block 标记 unused 时删除文件");部分 TRIM 则对块文件打洞
+
+## 验证
+
+- **`make check` 17/17 通过**(含 `tree`、`rotree`;tls/inetd 4 个 SKIP 是环境缺 GnuTLS,改动前同样跳过);全量重建无警告
+- 另写了个 NBD 协议客户端做了端到端检查:8389608 字节导出 → 两层树(`TREE0000..0002/FILEXXXX`),逐字节核对"不同偏移落在不同文件"、跨界读写、末尾不足块、未写块不存在且读零、整块 TRIM 删文件、部分 TRIM 打洞、WRITE_ZEROES、**重启后数据仍在**;4GiB+ 导出的三层树也验证了(懒创建,只落 3 个文件)
+- 普通导出(不配 treefiles)行为未变:仍是单个文件,原有 cfg1/write/integrity 等用例全部照常通过
+
+一个注意点:已存在的同名**普通文件**不能再当 treefiles 导出根(服务器会在连接时报 "exists but is not a directory"),这是有意为之,避免把旧的扁平文件误当目录树处理。

@@ -1,0 +1,26 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+全部完成。`treefiles` 选项的行为已按 man 文档补齐并验证通过。
+
+## 改动内容
+
+**`treefiles.c`**(原来只有一行 "not implemented" 的桩)——完整实现:
+- 树布局:导出名成为树根目录,按 `TREEPAGESIZE=4096` 字节切块,每块一个文件;每级目录最多 `TREEDIRSIZE=1024` 个条目,按 filesize 自动算嵌套层数,块号按 1024 进制映射到 `根/TRE%04d/.../FIL%04d`
+- `construct_path` / `mkdir_path` / `open_treefile` / `delete_treefile`(即 `treefiles.h` 里原本声明的四个函数),另加三个 I/O 辅助函数:
+  - `treeexpread`:按块打开文件读取;没写过的块(无文件)读回全 0,短文件/末尾不完整块自动补 0
+  - `treeexpwrite`:按块按需创建目录和文件写入,遵守 `F_SYNC`/FUA/`F_FLUSH`(文件写完即关,关前同步),写超出 filesize 的部分自动截断
+  - `treetrim`:整块被 trim → 删除块文件;部分 trim → 在块文件上打洞
+
+**`nbd-server.c` / `nbdsrv.c` / `nbdsrv.h`** 接线:
+- 配置校验:treefiles 必须配 `filesize`(否则启动时报错退出);与 splice/waitfile 组合报错;与 multifile 同时给出时 treefiles 优先(man 文档要求)
+- `setupexport`:treefiles 导出不打开单一文件,exportsize 取 filesize,根目录不存在则创建;块文件在读写时按需打开
+- `rawexpread`/`rawexpwrite`/`exptrim`/`expflush` 各加一个 `F_TREEFILES` 分支;`CLIENT` 增加一把保护树文件创建/删除的互斥锁
+- 普通导出(单文件/多文件/COW)的代码路径未动
+
+另外修了一个环境问题:`tests/run/simple_test` 和 `cwrap_test` 丢了可执行位,已 `chmod +x`。
+
+## 验证结果
+
+- **自带测试套件全过**:tests/code 6/6、tests/parse 5/5、tests/run 17/17(含 `tree`、`rotree`);4 个 SKIP 是构建未开 GnuTLS/syslog 所致,与本改动无关
+- **协议级功能验证(28 项全过)**:不同偏移落到树中正确位置(含两层嵌套的导出)、跨块读写、未写区域读回 0、整块 trim 后文件被删且读回 0、部分 trim 只打洞不丢未 trim 数据、末尾不足 4096 字节的块正确处理、越界写被拒、**重启后数据仍在**
+- **多连接并发**:3 个客户端同时写同一导出的不同区段,768 个块文件全部正确落盘、交叉读回一致
+- 配置了 treefiles 但没配 filesize 时明确报错;新代码 `-Wall -Wextra` 无告警

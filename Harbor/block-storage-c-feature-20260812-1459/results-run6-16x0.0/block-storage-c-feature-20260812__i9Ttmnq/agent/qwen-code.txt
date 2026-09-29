@@ -1,0 +1,23 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+写时复制（copy-on-write）导出的行为已经补全。改动如下：
+
+## 改动内容
+
+**`nbdsrv.h`** — 恢复 `CLIENT` 结构体里被拿掉的 CoW 状态字段（`tests/code/trim.c` 一直引用它们）：`difffilename`、`difffile`、`difffilelen`、`difmap`、以及保护并发访问的 `diff_lock`。
+
+**`nbd-server.c`** — 实现完整的 CoW 路径：
+- **写入**（`cow_write`，挂在 `rawexpwrite`）：数据不进主文件，改写进每连接一个的 diff 文件。按 4096 字节页管理；首次写某页时若没覆盖整页，先从主文件把该页原内容垫进去，保证页内未写的部分不丢。`sparse_cow` 时 diff 是稀疏文件、页按原偏移存放；否则新写的页依次追加到 diff 末尾（`difmap` 记录页号→偏移）。
+- **读取**（`cow_read`，挂在 `rawexpread`）：逐页判断，`difmap` 里有的（本连接写过的）从 diff 读，其余回落主文件。
+- **断开清理**（`cleanup_diff`，在 `finalize_client` 调用）：关闭并 `unlink` 本次会话的 diff 文件、释放映射表，主文件保持原样。DISC 和连接掉线两条路径都会走到。
+- **配套**：`expflush` 对 CoW 刷的是 diff 文件；diff 文件放在 `cowdir`（没配就放主文件所在目录），名字带 PID，遇到残留的旧文件会复用。
+
+配置项 `copyonwrite`/`cowdir`/`sparse_cow` 和命令行 `-c` 原本就解析好了，现在按语义真正生效；已有的 copyonwrite+splice、copyonwrite+waitfile 互斥校验不动。
+
+## 验证
+
+- 单元测试 `tests/code`：5 个全过（含之前编译不过的 `trim`）。
+- 集成测试 `tests/run`：18 个全过，其中 **`cow` 通过**——`cowplain`/`cowsparse`/`cowcowdir` 三种都验证了「写入立即读回正确、主文件不变、断开后 diff 清掉、重连只读到原始数据」。
+- 另做了 CoW + flush/fua/sync 的写入测试，以及整块主文件内容比对，均正常。
+- 全量重编译无警告；未跑的几个是 TLS/netlink 用例（`HAVE_GNUTLS=0`，环境本身没编 TLS），与本改动无关。
+
+一个已知的既有行为我保留了：TRIM 在 CoW 导出上仍是 no-op（`nbdsrv.c` 里 `exptrim` 原本就注释了「未实现」并直接返回成功），按 NBD 协议 trim 后内容本就未定义，不影响正确性。

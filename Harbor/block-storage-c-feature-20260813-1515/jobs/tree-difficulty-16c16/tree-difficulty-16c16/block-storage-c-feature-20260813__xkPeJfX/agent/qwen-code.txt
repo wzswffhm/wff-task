@@ -1,0 +1,28 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+treefiles 选项的行为已按 man 文档补齐。
+
+## 改动内容
+
+**`treefiles.c`(原本是 "not implemented" 的空壳)** — 实现树布局原语:
+- `construct_path()`:把导出内偏移映射成 `exportname/TREEXXXX/.../FILEXXXX` 路径。每块固定 4096 字节(TREEPAGESIZE),每目录最多 1024 项(TREEDIRSIZE),子目录层数按 filesize 自动计算(≤4MB 0 层、≤4GB 1 层、≤4TB 2 层……)
+- `mkdir_path()`:递归创建父目录(容忍并发 EEXIST)
+- `open_treefile()` / `delete_treefile()`:按需打开/创建块文件;删除块文件(TRIM 用)
+
+**`nbd-server.c`** — 接入服务器:
+- `setupexport`:F_TREEFILES 分支——校验 filesize 必须配置、创建(或只读时容忍缺失)根目录、以 filesize 作为导出大小;块文件按需打开,不再落到单文件
+- 读路径 `treeexpread`:块文件不存在读作全零,文件比块短的部分补零,跨块读自动分块续读
+- 写路径 `treeexpwrite`:按需建目录建文件,支持 F_SYNC/FUA 语义
+- `expflush`:递归 fsync 整棵文件树
+- 配置校验:treefiles 必须配 filesize;与 splice、waitfile 互斥(启动时报错)
+
+**`nbdsrv.c`** — `exptrim`:treefiles 导出的 TRIM 直接删除被 trim 块的块文件,之后读回为零。`nbdsrv.h` 给 CLIENT 加了目录创建锁。
+
+**`tests/code/treefiles.c`** — 新增单元测试,覆盖 0/1/2 层树的路径映射、按需创建、删除、mkdir_path。
+
+## 验证结果
+
+- **`make check` 全绿**:tests/parse 6/6、tests/code 6/6(含新测试)、tests/run 17 过 4 跳过(跳过的是环境缺 GNUTLS/inetd,与改动无关);其中 `tree`/`rotree` 现在是真跑通(之前 rotree 是靠"导出打开失败"碰运气过的)
+- **端到端验证**(自写 NBD 客户端):8MB(1 层树)和 5GB(2 层树)导出下,不同偏移数据落到正确的 TREE/FILE 位置;跨块写、块内部分写(前后空洞读零)、TRIM 后文件消失且读零、FLUSH、WRITE_ZEROES、重启后数据仍在、只读导出拒写且能读旧数据、树目录缺失的只读导出全零可读、结构化回复读、dontfork 8 线程并发写(1024 个文件布局无误)
+- **普通导出不受影响**:cfg1/write/flush/integrity/rowrite 等既有用例全部照旧通过
+
+过程中修掉一个布局算法 off-by-one:目录索引少除了一级 TREEDIRSIZE,导致块 N 错落到 `TREEN/FILEN`,已修正并经 2 层树用例验证。

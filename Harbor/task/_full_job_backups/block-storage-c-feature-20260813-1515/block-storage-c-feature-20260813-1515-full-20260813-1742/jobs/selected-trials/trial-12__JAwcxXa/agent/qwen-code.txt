@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 选项现在按 man 文档描述的方式真正生效了。
+
+## 改动
+
+**核心实现 — `treefiles.c`（原来是空壳）**
+- 数据布局:导出名变成一棵文件树的根目录,每个叶子文件存一个 4096 字节块(`TREEPAGESIZE`),每个目录最多 1024 个条目(`TREEDIRSIZE`)。树的层数由 `filesize` 决定(≤4MiB 单层,≤4GiB 两层,以此类推),偏移量按块号映射到 `根/目录/.../文件`,读写路径一一对应
+- 实现了头文件里声明的 `construct_path`、`mkdir_path`、`open_treefile`、`delete_treefile`,另加 `trim_treefiles` 供 TRIM/WRITE_ZEROES 用
+
+**服务端的接线 — `nbd-server.c` / `nbdsrv.c` / `nbdsrv.h`**
+- 配置校验:treefiles 必须给 `filesize`(树没法自动探测大小);与 multifile 同时给时 treefiles 优先(man 文档规定);与 copyonwrite/waitfile/splice/temporary 组合直接在配置解析时报错
+- `setupexport` 增加 treefiles 分支:校验/创建根目录,大小取 `filesize`;块文件按需打开(写时 `O_CREAT` 连同目录一起建)
+- 读写路径:块文件按需 open/pread|pwrite/close;不存在的块读回全零;跨块请求由原有循环自然分片;F_SYNC/FUA 语义保留
+- TRIM/WRITE_ZEROES:整块被覆盖就删文件(man 文档说的 "marked as unused 就删"),部分覆盖只把对应区间写零
+- CLIENT 增加 `tree_lock`,多线程(dontfork)模式下串行化文件/目录创建
+
+## 验证
+
+- `make check` 全绿:parse 6/6、code 5/5(含 exptrim 单测)、run 18/18。4 个 SKIP(inetd/tls×3)是环境问题(未编 syslog/GnuTLS),改动前后一致
+- 普通导出回归:cfg1、write、flush、integrity、integrityhuge、rowrite 等全部通过,行为不变
+- treefiles 导出:integrity 测试(6.9 万笔读写、内容逐一校验)在两层树上通过;重启服务后数据仍在(块文件落盘持久);非 4096 整数倍大小、跨块读写、未写区域读零、TRIM 删文件、readonly 拒绝写、dontfork 多线程模式均单独验证过
+
+## 测试固化
+
+- `simple_test` 的 `tree` 用例加了内容 integrity 一遍;新增 `treecontent` 用例(读零/回环/跨块/第二层)
+- 新增 `tests/run/treeverify.c`(专用内容校验客户端,已编入 `make check`)及三个补充脚本(`treeverify_test`/`_edge_test`/`_odssize_test`,覆盖持久化、TRIM、奇异大小),均加入 `EXTRA_DIST`
+- 因改了 `Makefile.am`,用 `autoreconf` 重新生成了构建文件;`config.h` 无变化,构建配置与原有一致

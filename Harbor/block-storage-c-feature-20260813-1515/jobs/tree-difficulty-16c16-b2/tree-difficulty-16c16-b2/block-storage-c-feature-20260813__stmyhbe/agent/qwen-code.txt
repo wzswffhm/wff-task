@@ -1,0 +1,26 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前只在配置解析里存在(`F_TREEFILES` 标志位被读进来就再没人用),`treefiles.c` 是一句 "not implemented" 的注释。现在按 man 文档(`nbd-server.5`)描述的行为补齐了,实现参照上游 nbd 的同名功能。
+
+## 改动
+
+**`treefiles.c`(新实现,此前是空壳)** — 四个树结构辅助函数:
+- `construct_path`:把导出内偏移递归映射成 `导出名/TREEXXXX/.../FILEXXXX` 路径;树深度由 filesize 决定,每层最多 1024 项,叶子文件固定 4096 字节
+- `open_treefile`:按需打开块文件;不存在时(读写模式)自动建目录并创建、扩展到 4KB;(只读模式)用匿名临时文件补零返回
+- `mkdir_path` / `delete_treefile`:建路径 / 删块文件
+
+**`nbd-server.c`**
+- `get_filepos`:treefiles 时不再查 export 数组,而是算出块内偏移、按需 `open_treefile`,单次 I/O 限制在单个块文件内
+- `rawexpread` / `rawexpwrite` / `rawexpsplice`:用完即关块文件 fd(跨块请求由 `_fully` 循环逐块进行)
+- `expflush`:treefiles 时不能遍历空数组,改为 `sync()`
+- `setupexport`:treefiles 导出不再打开单一文件(`export=NULL`、大小取 filesize),并校验 man 文档要求的 filesize 必填;treefiles 与 multifile 同时给出时 treefiles 优先
+
+**`nbdsrv.c`** — `exptrim`:treefiles 时把 TRIM 范围里被完整覆盖的块文件直接删除(半块不删),此后读回为全零。
+
+## 验证
+
+- 仓库自带测试:`tree`、`rotree` 通过;回归 `cfg1/cfgmulti/cfgnew/cfgsize/write/flush/dirconfig/rowrite/unix/handshake/integrity` 全部通过(普通导出行为未变);`tests/parse`、`tests/code`(含 trim 单测)全过
+- 端到端自测(临时客户端在 `/tmp/treeclient.c`、`/tmp/trimcheck.c`):跨块边界写读、未写块读零、64KB 跨多块写、TRIM 后读零且磁盘文件确实被删、非对齐 TRIM 只删完整覆盖块、部分块残留数据保留、跨连接重连读回一致 — 全过
+- 树布局核验:4MiB 导出下 offset 1MiB → `TREE0000/FILE0100`、末块 → `FILE03FF`,每文件恰 4KB;4GiB 导出正确产生两层嵌套 `TREE0000/TREE03FF/FILE03FF`
+- 大树压测:50MB 完整性 trace(约 6.9 万请求)在 treefiles 导出上回放,数据一致性全部通过
+
+一个已知语义(与上游一致):读写导出上 TRIM 后再**读**该块,会重建一个全零块文件;只读导出不受影响。

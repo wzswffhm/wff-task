@@ -1,0 +1,320 @@
+diff --git a/marshmallow/schema.py b/marshmallow/schema.py
+index 8024dfe..da26ded 100644
+--- a/marshmallow/schema.py
++++ b/marshmallow/schema.py
+@@ -837,6 +837,57 @@ class Schema(metaclass=SchemaMeta):
+             return typing.cast("dict[str, list[str]]", exc.messages)
+         return {}
+ 
++    ##### Document diff #####
++
++    def document_diff(
++        self,
++        left: typing.Any,
++        right: typing.Any,
++        *,
++        include_unknown: bool = False,
++        ignore_fields: types.StrSequenceOrSet = (),
++    ) -> list[dict[str, typing.Any]]:
++        """Compare two documents field by field following this schema's
++        declared fields and return an ordered list of change records.
++
++        Each record is a dictionary with the keys ``op``, ``path``, ``left``
++        and ``right``:
++
++        - ``"add"``: the field only exists in ``right`` (``left`` is ``None``)
++        - ``"remove"``: the field only exists in ``left`` (``right`` is ``None``)
++        - ``"change"``: the field exists in both documents but differs
++
++        Fields are visited in the order they are declared on the schema, not
++        in the insertion order of the input documents. ``Nested`` fields are
++        compared recursively with their nested schema (paths are joined with
++        dots, e.g. ``address.street``); ``Nested(many=True)`` and ``List``
++        fields are compared element by position (paths use bracketed indexes,
++        e.g. ``members[0].age`` or ``tags[1]``).
++
++        :param left: The first document. A mapping is compared as-is; any
++            other object is first serialized with :meth:`dump`.
++        :param right: The other document. A mapping is compared as-is; any
++            other object is first serialized with :meth:`dump`.
++        :param include_unknown: If `True`, keys that are not declared on the
++            schema are also compared. They are ignored by default.
++        :param ignore_fields: Field names to skip for the whole comparison,
++            at every nesting level.
++        :return: Ordered list of change records; an empty list if the
++            documents are equal.
++        """
++        if not isinstance(left, Mapping):
++            left = self.dump(left)
++        if not isinstance(right, Mapping):
++            right = self.dump(right)
++        return _diff_documents(
++            self,
++            left,
++            right,
++            path="",
++            include_unknown=include_unknown,
++            ignore_fields=set(ignore_fields),
++        )
++
+     ##### Private Helpers #####
+ 
+     def _do_load(
+@@ -1251,3 +1302,257 @@ class Schema(metaclass=SchemaMeta):
+ 
+ 
+ BaseSchema = Schema  # for backwards compatibility
++
++
++##### Schema-aware document diff helpers #####
++
++_diff_missing: typing.Any = object()
++
++
++def _diff_join(path: str, name: str) -> str:
++    return f"{path}.{name}" if path else name
++
++
++def _diff_record(
++    op: str, path: str, left: typing.Any, right: typing.Any
++) -> dict[str, typing.Any]:
++    return {"op": op, "path": path, "left": left, "right": right}
++
++
++def _diff_is_list(value: typing.Any) -> bool:
++    return isinstance(value, (list, tuple))
++
++
++def _diff_documents(
++    schema: Schema,
++    left: Mapping[str, typing.Any],
++    right: Mapping[str, typing.Any],
++    *,
++    path: str,
++    include_unknown: bool,
++    ignore_fields: set[str],
++) -> list[dict[str, typing.Any]]:
++    """Compare two mappings against ``schema``'s declared fields."""
++    records: list[dict[str, typing.Any]] = []
++    known_keys: set[typing.Any] = set()
++    for field_name, field_obj in schema.fields.items():
++        data_key = field_obj.data_key if field_obj.data_key is not None else field_name
++        known_keys.add(data_key)
++        if field_name in ignore_fields:
++            continue
++        in_left = data_key in left
++        in_right = data_key in right
++        if not in_left and not in_right:
++            continue
++        field_path = _diff_join(path, field_name)
++        if not in_left:
++            records.append(
++                _diff_record("add", field_path, None, right[data_key])
++            )
++            continue
++        if not in_right:
++            records.append(
++                _diff_record("remove", field_path, left[data_key], None)
++            )
++            continue
++        records.extend(
++            _diff_field(
++                field_obj,
++                left[data_key],
++                right[data_key],
++                field_path,
++                include_unknown=include_unknown,
++                ignore_fields=ignore_fields,
++            )
++        )
++    if include_unknown:
++        # Unknown keys have no schema definition; compare them as whole
++        # values after all declared fields, in document insertion order.
++        for key in dict.fromkeys([*left, *right]):
++            if key in known_keys or key in ignore_fields:
++                continue
++            key_path = _diff_join(path, str(key))
++            in_left = key in left
++            in_right = key in right
++            if in_left and in_right:
++                left_value = left[key]
++                right_value = right[key]
++                if left_value != right_value:
++                    records.append(
++                        _diff_record(
++                            "change", key_path, left_value, right_value
++                        )
++                    )
++            elif in_right:
++                records.append(
++                    _diff_record("add", key_path, None, right[key])
++                )
++            else:
++                records.append(
++                    _diff_record("remove", key_path, left[key], None)
++                )
++    return records
++
++
++def _diff_field(
++    field_obj: Field,
++    left: typing.Any,
++    right: typing.Any,
++    path: str,
++    *,
++    include_unknown: bool,
++    ignore_fields: set[str],
++) -> list[dict[str, typing.Any]]:
++    """Compare two present values according to ``field_obj``'s type."""
++    if isinstance(field_obj, ma_fields.Nested) and not isinstance(
++        field_obj, ma_fields.Pluck
++    ):
++        nested_schema = field_obj.schema
++        if bool(nested_schema.many or field_obj.many):
++            return _diff_document_collection(
++                nested_schema,
++                left,
++                right,
++                path,
++                include_unknown=include_unknown,
++                ignore_fields=ignore_fields,
++            )
++        return _diff_single_document(
++            nested_schema,
++            left,
++            right,
++            path,
++            include_unknown=include_unknown,
++            ignore_fields=ignore_fields,
++        )
++    if isinstance(field_obj, ma_fields.List):
++        return _diff_list(
++            field_obj,
++            left,
++            right,
++            path,
++            include_unknown=include_unknown,
++            ignore_fields=ignore_fields,
++        )
++    if left != right:
++        return [_diff_record("change", path, left, right)]
++    return []
++
++
++def _diff_single_document(
++    schema: Schema,
++    left: typing.Any,
++    right: typing.Any,
++    path: str,
++    *,
++    include_unknown: bool,
++    ignore_fields: set[str],
++) -> list[dict[str, typing.Any]]:
++    """Compare two nested document values for a single ``Nested`` field."""
++    if isinstance(left, Mapping) and isinstance(right, Mapping):
++        return _diff_documents(
++            schema,
++            left,
++            right,
++            path=path,
++            include_unknown=include_unknown,
++            ignore_fields=ignore_fields,
++        )
++    if left != right:
++        return [_diff_record("change", path, left, right)]
++    return []
++
++
++def _diff_document_collection(
++    schema: Schema,
++    left: typing.Any,
++    right: typing.Any,
++    path: str,
++    *,
++    include_unknown: bool,
++    ignore_fields: set[str],
++) -> list[dict[str, typing.Any]]:
++    """Compare two collections of documents for a ``Nested(many=True)`` field."""
++    if not _diff_is_list(left) or not _diff_is_list(right):
++        if left != right:
++            return [_diff_record("change", path, left, right)]
++        return []
++    records: list[dict[str, typing.Any]] = []
++    for index, (left_item, right_item) in enumerate(
++        zip_longest(left, right, fillvalue=_diff_missing)
++    ):
++        item_path = f"{path}[{index}]"
++        if left_item is _diff_missing:
++            records.append(_diff_record("add", item_path, None, right_item))
++        elif right_item is _diff_missing:
++            records.append(_diff_record("remove", item_path, left_item, None))
++        else:
++            records.extend(
++                _diff_single_document(
++                    schema,
++                    left_item,
++                    right_item,
++                    item_path,
++                    include_unknown=include_unknown,
++                    ignore_fields=ignore_fields,
++                )
++            )
++    return records
++
++
++def _diff_list(
++    field_obj: ma_fields.List,
++    left: typing.Any,
++    right: typing.Any,
++    path: str,
++    *,
++    include_unknown: bool,
++    ignore_fields: set[str],
++) -> list[dict[str, typing.Any]]:
++    """Compare two values of a ``List`` field position by position."""
++    if not _diff_is_list(left) or not _diff_is_list(right):
++        if left != right:
++            return [_diff_record("change", path, left, right)]
++        return []
++    inner = field_obj.inner
++    records: list[dict[str, typing.Any]] = []
++    for index, (left_item, right_item) in enumerate(
++        zip_longest(left, right, fillvalue=_diff_missing)
++    ):
++        item_path = f"{path}[{index}]"
++        if left_item is _diff_missing:
++            records.append(_diff_record("add", item_path, None, right_item))
++            continue
++        if right_item is _diff_missing:
++            records.append(_diff_record("remove", item_path, left_item, None))
++            continue
++        if isinstance(inner, ma_fields.Nested) and not isinstance(
++            inner, ma_fields.Pluck
++        ):
++            if bool(inner.schema.many or inner.many):
++                records.extend(
++                    _diff_document_collection(
++                        inner.schema,
++                        left_item,
++                        right_item,
++                        item_path,
++                        include_unknown=include_unknown,
++                        ignore_fields=ignore_fields,
++                    )
++                )
++            else:
++                records.extend(
++                    _diff_single_document(
++                        inner.schema,
++                        left_item,
++                        right_item,
++                        item_path,
++                        include_unknown=include_unknown,
++                        ignore_fields=ignore_fields,
++                    )
++                )
++        elif left_item != right_item:
++            records.append(
++                _diff_record("change", item_path, left_item, right_item)
++            )
++    return records

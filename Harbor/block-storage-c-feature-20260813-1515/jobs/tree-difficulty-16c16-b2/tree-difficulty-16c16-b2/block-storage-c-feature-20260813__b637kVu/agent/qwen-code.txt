@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。原因:`treefiles.c` 整个文件就是一句注释("not implemented"),配置项虽然被解析成 `F_TREEFILES` 标志,但数据通路里从来没人用它,所以数据照旧落进单个文件。
+
+## 改动
+
+**`treefiles.c`** — 实现了 `treefiles.h` 里声明的四个函数(man 页语义):
+- `construct_path`:按导出总大小递归计算嵌套层级,把偏移映射成 `exportname/TREEXXXX/.../FILEXXXX` 路径;叶子块文件固定 4096 字节(TREEPAGESIZE),每层目录最多 1024 项(TREEDIRSIZE)
+- `open_treefile`:按需打开块文件;不存在时写模式自动建目录+建文件(并撑到 4 KiB),只读模式返回全零的临时文件;用 mutex 防并发创建竞争
+- `delete_treefile` / `mkdir_path`:删除块文件、逐级建目录
+
+**`nbd-server.c`** — 把标志接进数据通路:
+- `get_filepos`:treefiles 导出按块现算路径、现开文件,偏移 = 块内偏移,读写边界钳制到块尾
+- `rawexpread` / `rawexpwrite` / `rawexpsplice`:操作完关掉按需打开的 fd(跨块的大读写由外层循环逐块推进)
+- `expflush`:treefiles 不长期持有 fd,flush 改为 `sync()`
+- `setupexport`:treefiles 时不打开任何文件(`export = NULL`),导出大小直接取 `filesize`,按需开句柄
+
+**`nbdsrv.c`** — `exptrim` 增加 treefiles 分支:TRIM 覆盖到的整块直接删文件(man 页:"Files will be deleted if the corresponding block gets marked as unused")
+
+**`tests/run/simple_test`、`cwrap_test`** — 补回丢失的可执行位,否则 `make check` 全部 Permission denied(与功能无关,纯环境修复)
+
+## 验证
+
+- `make check`(tests/run)全绿:17 PASS,0 FAIL;`tree`/`rotree` 通过;tls/inetd 的 SKIP 是构建未开 GnuTLS/syslog 所致,与本改动无关;tests/parse、tests/code 也全过
+- 用自写的最小 NBD 客户端做了深度验证:1 GiB treefiles 导出上,跨块边界、跨 TREE 目录边界、设备尾部、多块连续写等 6 种写入 → 杀掉 server 重启 → 全部原样读回,未写块读回全零;落盘布局与偏移一一对应(如偏移 0 → `TREE0000/TREE0000/FILE0000`,块 262142 → `TREE00FF/FILE03FE`)
+- TRIM:整块 trim 后对应文件被删除、读回全零;部分覆盖的 trim 不删文件、邻块数据不受影响
+- 50 MB 的 integrity 事务日志回放(68992 次带校验的随机读写)在 treefiles 导出上通过,生成 7825 个块文件、13 个目录
+- 回归:普通文件导出(cfg1/write/flush/integrity/rowrite/cfgmulti)、multifile(逐字节比对)、只读导出行为均未变

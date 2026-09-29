@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成了。问题根源:`treefiles.c` 本身是个空壳(只有一句 "not implemented" 注释),配置里的 `treefiles = true` 虽然被解析成 `F_TREEFILES` 标志,但整个数据通路从来没人看这个标志,所以退化成普通单文件导出。我按 man 文档(`man/nbd-server.5.sgml.in`)描述的行为把它补上了,实现参照了上游 nbd-3.15 的 treefiles 设计。
+
+## 改动
+
+**`treefiles.c`(新实现,原先是空壳)**
+- `construct_path`:按导出总大小决定树的嵌套深度,把偏移映射成 `exportname/TREEXXXX/.../FILEXXXX` 路径;每个块文件固定 4096 字节(TREEPAGESIZE),每个目录最多 1024 个条目(TREEDIRSIZE)
+- `open_treefile`:按需打开/创建块文件(含逐级建目录),创建时扩到 4096 字节;只读导出遇到不存在的块时返回匿名临时文件,读出全零
+- `mkdir_path`、`delete_treefile`:建目录、删块文件
+
+**`nbd-server.c`**
+- `get_filepos`:treefiles 导出每次按偏移打开对应块文件,偏移取模 4096,maxbytes 截到块边界
+- `rawexpread`/`rawexpwrite`/`rawexpsplice`:用完后关闭块文件 fd(可能有上万个文件,不缓存句柄)
+- `expflush`:treefiles 走 `sync()`
+- `setupexport`:treefiles 时不再打开单个文件,`exportsize` 取配置的 `filesize`(与 F_WAIT 同一分支处理,与上游一致;multifile 同时配置时 treefiles 优先,符合 man 文档)
+- `parse_cfile`:按 man 文档要求强制 treefiles 必须配 `filesize`,否则启动时报错拒绝
+
+**`nbdsrv.c`**
+- `exptrim`:treefiles 导出收到 TRIM 时,删除被完全覆盖的块的块文件(man 文档:"Files will be deleted if the corresponding block gets marked as unused");边缘部分覆盖的块保留
+
+## 验证
+
+- `make check` 全绿:tests/run 17 PASS + 4 SKIP(inetd/tls 因本构建未开 syslog/GNUTLS 而跳过,与改动无关),tests/code 5/5,tests/parse 6/6,其中 `tree`、`rotree` 通过
+- 另写了端到端脚本(53 项检查,普通与 splice 两种模式各跑一遍):跨块边界写、部分块写、FUA/flush、未写块读零、磁盘上文件布局与内容逐一核对(8 MiB→TREE0000/0001、50 MiB→TREE0000~TREE000C)、TRIM 删文件、重启后数据仍在、双客户端并发读写、只读导出(含从未写过的树)、缺 filesize 被拒
+- 回归:普通导出仍是单文件、数据落在正确偏移;68990 次操作的 integrity 测试在普通导出和 treefiles 导出上都通过
+
+顺带修了一个环境问题:`tests/run/simple_test`(和 `cwrap_test`)丢了可执行位,导致 `make check` 21 个用例全部 "Permission denied",已 chmod +x。

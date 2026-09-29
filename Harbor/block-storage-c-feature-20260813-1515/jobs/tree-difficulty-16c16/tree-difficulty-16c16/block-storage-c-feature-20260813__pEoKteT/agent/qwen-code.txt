@@ -1,0 +1,25 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+`treefiles` 补完了。之前 `treefiles.c` 是个空壳(只有一句 "not implemented" 注释),配置项解析了但服务端完全没用它,所以数据照样落单文件。
+
+## 实现
+
+**树的布局**(按 man 文档语义):`exportname/TREEXXXX/.../FILEXXXX`,每个块文件固定 4096 字节,每个目录最多 1024 个条目,子目录层数由 `filesize` 算出(≤4 MiB 无子目录,≤4 GiB 一层,以此类推)。偏移 `pos` 的块号按 1024 进制拆成各级目录号 + 文件名。
+
+**改动:**
+- `treefiles.c` — 实现头文件里声明的四个函数:`construct_path`(偏移→块文件路径)、`mkdir_path`(按需建目录)、`open_treefile`(带 O_CREAT 时建目录和文件,否则缺文件返回 ENOENT)、`delete_treefile`
+- `nbd-server.c` — `rawexpread`/`rawexpwrite` 遇 F_TREEFILES 改走树文件路径(每次 I/O 开/关块文件,无状态;未写过的块读回全零,天然稀疏);`setupexport` 里 treefiles 分支用 `filesize` 作导出大小;`expflush`、配置校验(treefiles 必须配 `filesize`;与 `multifile` 互斥且 treefiles 优先;与 `splice`/`waitfile` 组合直接报错)
+- `nbdsrv.c` — `exptrim` 的 treefiles 分支:整块被 trim → 删块文件;部分 trim → 对块文件打洞
+- `nbdsrv.h` — CLIENT 加 `tree_lock`(多线程建文件串行化)
+
+**新增测试:**
+- `tests/code/treefiles.c` — 单元测试:各尺寸下路径构造(0/1/2 层目录)、按需建目录建文件、读写往返、缺块 ENOENT、删除
+- `tests/run/tree-e2e-client.c` + simple_test 的 `treee2e` 用例 — 协议层端到端:8 GiB+8 MiB 导出(两层目录),非对齐写、跨块写、深层偏移写,断开重连读回校验,未写区域读零,TRIM 后整块文件删除/部分块打洞保留数据,还核对磁盘上真实文件路径和内容
+
+## 验证结果
+
+- 单元 6/6、parse 6/6、run 套件 18/18 可执行项全过(含原有 `tree`/`rotree` 和全部回归项;inetd/tls×3 是环境性 SKIP,改动前就不跑)
+- 杀掉 server 进程再重启,数据从树里完整读回
+- 配置校验:缺 `filesize` 报 "The filesize option is required...";treefiles+multifile 提示后按 treefiles 走;根路径是普通文件时干净拒绝
+- 不配 treefiles 的导出行为不变(write/rowrite/flush/integrity 等全过;显式 `treefiles = false` 走普通单文件路径)
+
+途中修掉一个自己引入的 bug:部分块 trim 时打洞长度算错(用了绝对偏移当长度),e2e 测试当场抓了出来。

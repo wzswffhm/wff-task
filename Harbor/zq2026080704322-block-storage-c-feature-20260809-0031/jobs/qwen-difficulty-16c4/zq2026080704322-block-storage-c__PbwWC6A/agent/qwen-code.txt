@@ -1,0 +1,28 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。以下是改动摘要：
+
+## 实现内容（`nbd-client.c` + `nbdclt.h`）
+
+**netlink 路径的 `-persist` 长驻模式**，按要求的三段式工作：
+
+1. **连接时带死链超时**：`netlink_configure` 在 CONNECT 消息里加 `NBD_ATTR_DEAD_CONN_TIMEOUT`——`-dead-timeout|-T` 单独指定时用指定值，未指定且处于 persist 模式时默认 **30 秒**（内核据此在链路死掉后挂起 I/O 等待重连，而不是立刻断开设备）。新增 nbdtab 属性 `dead-timeout=`。
+2. **连完不退出，监听链路事件**：配置完成后进入 `persist_mode_main`：加入 `nbd_mc_group` 多播组，用 `ppoll` 循环监听内核事件；收到 `NBD_CMD_LINK_DEAD`（按设备 index 过滤，index 取自命令行设备或 CONNECT 应答）后触发重连。SIGINT/SIGTERM 干净退出。
+3. **退避重连 + reconfigure 换连接**：指数退避（1s 起、上限 3 分钟）重开全部 `nconn` 条连接并重新协商（校验设备大小未变），成功后发 `NBD_CMD_RECONFIGURE` 把新 socket 换进内核；若 reconfigure 失败（设备已被断开，内核返回 -EINVAL）则回退为重新 CONNECT。
+
+**ioctl 老逻辑原样保留**，只是把循环开关从局部变量 `cont` 统一到 `cur_client->persist_mode`（顺带修复了 nbdtab 里 `persist` 标志此前在 ioctl 路径不生效的问题）。
+
+## 过程中发现并修掉的坑
+
+- 上游对应提交（5b2d384）本身是半成品：`-p` 只设置了 `persist` 字段而所有判断用 `persist_mode`（永不为真），且重连/reconfigure 函数定义了却没接线——本实现补全了这两处。
+- 多播消息无序列号，libnl 默认 seq check 会丢弃 → 需要 `nl_socket_disable_seq_check`。
+- 信号处理：只 block INT/TERM 而不装 handler，信号会在 `sleep`/ppoll 快路径里永远投递不出去 → 改为 handler 置标志位、循环每圈检查。
+- 容器 ulimit 为 1M，fd 可能超过 `FD_SETSIZE`，且 mock 下 fd 为 -1 → 用 `ppoll` 替代 `select` 并妥善处理 `POLLNVAL`。
+- nbdtab 解析后设备名无 `/dev/` 前缀导致 netlink 分支报 "Invalid nbd device target"（上游后来也修了）→ 剥前缀后按 `nbd%d` 解析。
+
+## 验证
+
+- 全量 `make` 零告警；`HAVE_NETLINK=0` 编译路径语法检查通过。
+- 仓库自带 `connstatus`、`nlconnect` 测试通过。
+- 用 LD_PRELOAD libnl mock + 真实 nbd-server 做了 8 组端到端场景（测试件在 `/tmp/persist-test/`，未动仓库 `tests/`）：默认/显式死链超时、无 `-p` 时行为不变、链路事件→重连→reconfigure 消息校验、server 宕机期间指数退避重试且恢复后自动换连接、SIGTERM 干净退出、坏 fd 容错、nbdtab 配置驱动——**全部通过**。
+
+真机内核行为（多播事件触发时机、reconfigure 语义）已对照当前内核 `drivers/block/nbd.c` 源码核实；文档（nbd-client.8、nbdtab.5）已同步更新。

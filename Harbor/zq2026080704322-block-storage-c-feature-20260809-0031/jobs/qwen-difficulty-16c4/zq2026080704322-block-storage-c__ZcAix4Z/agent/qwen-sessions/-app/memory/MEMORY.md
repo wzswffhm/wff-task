@@ -1,0 +1,1 @@
+- [nbd tree quirks](project/nbd-tree-quirks.md) — /app/nbd build/test gotchas: no-GnuTLS config, min-nbd-client stub, simple_test ./name invocation, mock fd 42

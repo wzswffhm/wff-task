@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成了。`treefiles` 选项现在按 man 文档描述的方式真正工作了——之前 `treefiles.c` 只有一行 "not implemented" 的桩,服务端也完全没有接入这个标志,所以配不配都一样落到单个文件里。
+
+## 改动内容
+
+**核心实现** — `treefiles.c`(原来是空桩):
+- `construct_path`:把导出内偏移映射成 `exportname/TREEXXXX/.../FILEXXXX` 路径,目录嵌套深度由 `filesize` 推导;每个目录最多 1024 项,叶子是 4096 字节的块文件
+- `open_treefile`:按需打开/创建块文件(含缺失目录);只读导出读未写块时返回匿名零填充文件,保证空洞读零
+- `delete_treefile`:删除块文件(TRIM 用)
+- `mkdir_path`:递归建目录
+
+**服务端接入** — `nbd-server.c`:
+- `get_filepos`:`F_TREEFILES` 时按 `TREEPAGESIZE` 算块内偏移,`open_treefile` 取 fd
+- `rawexpread/rawexpwrite/rawexpsplice`:操作完成后关闭临时 fd
+- `expflush`:treefiles 走 `sync()`(只读直接返回)
+- `setupexport`:treefiles 时 `export=NULL`(按需开句柄)、大小取 `filesize`;并强制要求必须设置 `filesize`(man 文档的硬要求,之前没校验)
+- `parse_cfile`:拒绝 `treefiles + waitfile` 这种自相矛盾的组合
+
+**TRIM** — `nbdsrv.c`:`exptrim` 对 treefiles 删除覆盖到的整块文件,块随后读回为零。
+
+## 验证结果
+
+- 新增单元测试 `tests/code/treefiles_test`(路径构造、读写往返、空洞读零、TRIM 删除),全部通过
+- 功能测试:`tree`/`rotree` 通过,并加了一个 `treecontent` 测试(写不同图案→读回比对→未写块读零);50MB 导出下确认数据分散到 13 个目录、每目录 ≤1024 个 4096 字节文件;重启后数据仍在
+- **普通导出无回归**:`cfg1/cfgmulti/write/flush/integrity/integrityhuge/rowrite/unix` 等全部通过;`tls*`/`inetd` 的 SKIP 是本构建未开 GnuTLS/syslog 的既有原因,与改动无关
+
+一个设计上的已知行为(与上游一致):可读写导出上"读"一个空洞会顺带创建该块的零填充文件;只有只读导出读空洞才完全不落盘。

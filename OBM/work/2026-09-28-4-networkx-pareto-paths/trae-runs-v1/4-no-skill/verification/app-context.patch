@@ -1,0 +1,659 @@
+diff --git a/networkx/algorithms/shortest_paths/__init__.py b/networkx/algorithms/shortest_paths/__init__.py
+index eb0d91c..18a6116 100644
+--- a/networkx/algorithms/shortest_paths/__init__.py
++++ b/networkx/algorithms/shortest_paths/__init__.py
+@@ -1,5 +1,6 @@
+ from networkx.algorithms.shortest_paths.generic import *
+ from networkx.algorithms.shortest_paths.unweighted import *
+ from networkx.algorithms.shortest_paths.weighted import *
++from networkx.algorithms.shortest_paths.multiobjective import *
+ from networkx.algorithms.shortest_paths.astar import *
+ from networkx.algorithms.shortest_paths.dense import *
+diff --git a/networkx/algorithms/shortest_paths/multiobjective.py b/networkx/algorithms/shortest_paths/multiobjective.py
+new file mode 100644
+index 0000000..b4ee347
+--- /dev/null
++++ b/networkx/algorithms/shortest_paths/multiobjective.py
+@@ -0,0 +1,282 @@
++"""
++Multiobjective (Pareto) shortest path algorithms.
++"""
++
++from bisect import bisect_left
++from heapq import heappop, heappush
++from itertools import count
++
++import networkx as nx
++
++__all__ = ["pareto_paths"]
++
++
++@nx._dispatchable(edge_attrs={"weight": 0, "cost": 0})
++def pareto_paths(
++    G,
++    source,
++    target,
++    weight="weight",
++    cost="cost",
++    *,
++    max_cost=None,
++    max_weight=None,
++):
++    """Find all non-dominated (Pareto optimal) paths from source to target.
++
++    Each edge carries two additive attributes: ``cost`` and ``weight``
++    (the attribute names are configurable). A ``(cost, weight)`` pair
++    *dominates* another pair if both components are no larger and at least
++    one is strictly smaller. This function returns every reachable
++    non-dominated pair together with a simple path realizing exactly that
++    pair.
++
++    Parameters
++    ----------
++    G : NetworkX graph
++        A (possibly directed) graph. Every edge may carry the two numeric
++        attributes ``cost`` and ``weight``; a missing attribute counts as
++        zero. MultiGraph and MultiDiGraph are not supported.
++
++    source : node
++        Starting node.
++
++    target : node
++        Ending node.
++
++    weight : string (default: "weight")
++        Name of the edge attribute holding the first additive metric.
++
++    cost : string (default: "cost")
++        Name of the edge attribute holding the second additive metric.
++
++    max_cost : number, optional
++        If given, only paths with total cost at most ``max_cost`` are
++        considered.
++
++    max_weight : number, optional
++        If given, only paths with total weight at most ``max_weight`` are
++        considered.
++
++    Returns
++    -------
++    records : list of dicts
++        A list of ``{"cost": c, "weight": w, "path": path}`` records, one
++        per reachable non-dominated pair. ``path`` is a simple path (a list
++        of nodes starting with `source` and ending with `target`) whose edge
++        attributes sum to exactly ``(c, w)``. Records are sorted by cost in
++        ascending order, and by weight in ascending order for equal costs
++        (so weights strictly decrease as costs increase along the frontier).
++        If `source` equals `target`, the single record
++        ``{"cost": 0, "weight": 0, "path": [source]}`` is returned. If the
++        target is reachable but no path respects the given bounds, an empty
++        list is returned.
++
++    Raises
++    ------
++    NodeNotFound
++        If `source` or `target` is not in `G`.
++
++    NetworkXNoPath
++        If `target` is in `G` but no path exists from `source` to `target`.
++
++    NetworkXNotImplemented
++        If `G` is a MultiGraph or MultiDiGraph.
++
++    ValueError
++        If an edge reached during the search has a negative value for one of
++        the two attributes.
++
++    Examples
++    --------
++    >>> G = nx.DiGraph()
++    >>> G.add_edge("a", "b", cost=1, weight=4)
++    >>> G.add_edge("a", "c", cost=3, weight=2)
++    >>> G.add_edge("b", "d", cost=2, weight=2)
++    >>> G.add_edge("c", "d", cost=1, weight=2)
++    >>> result = nx.pareto_paths(G, "a", "d")
++    >>> for record in result:
++    ...     print(record["cost"], record["weight"], record["path"])
++    3 6 ['a', 'b', 'd']
++    4 4 ['a', 'c', 'd']
++
++    Notes
++    -----
++    The algorithm is a label-setting multiobjective extension of Dijkstra's
++    algorithm (Martins' algorithm). Each node keeps the sorted Pareto
++    frontier of labels found so far; labels are finalized in lexicographic
++    ``(cost, weight)`` order, which is valid because both metrics are
++    non-negative. Each label stores a parent pointer; stripping the
++    necessarily zero-cost/zero-weight cycles from the parent chain yields a
++    simple witness path with identical totals. The function does not modify
++    ``G`` and repeated calls return identical results.
++    """
++    if G.is_multigraph():
++        raise nx.NetworkXNotImplemented(
++            "pareto_paths not implemented for MultiGraph or MultiDiGraph."
++        )
++    if source not in G:
++        raise nx.NodeNotFound(f"Node {source} not found in graph")
++    if target not in G:
++        raise nx.NodeNotFound(f"Node {target} not found in graph")
++
++    if source == target:
++        return [{"cost": 0, "weight": 0, "path": [source]}]
++
++    # Per-node Pareto frontier kept in three parallel lists, sorted by cost
++    # in ascending order. Along a frontier weights are strictly decreasing:
++    # a later label with a weight no smaller than an earlier label would be
++    # dominated. A label is the list ``[c, w, pred_node, parent, status]``
++    # where status is 0 (queued), 1 (settled) or 2 (pruned as dominated).
++    frontiers = {}
++    src_label = [0, 0, None, None, 0]
++    frontiers[source] = ([0], [0], [src_label])
++
++    adj = G._adj
++    cost_attr = cost
++    weight_attr = weight
++    _heappop = heappop
++    _heappush = heappush
++    _bisect_left = bisect_left
++    _next_tie = count(1).__next__
++    check_cost_bound = max_cost is not None
++    check_weight_bound = max_weight is not None
++
++    # Heap entries carry their label; status marking makes any re-lookup
++    # (and bisect) at pop time unnecessary.
++    heap = [(0, 0, 0, source, src_label)]
++
++    while heap:
++        c, w, _, v, lab = _heappop(heap)
++        if lab[4]:
++            # Already settled, or pruned from its frontier as dominated.
++            continue
++        lab[4] = 1
++
++        # Labels at the target never need to be expanded: any walk that
++        # reaches the target, leaves it and comes back to it is either
++        # dominated by (or equal to) its target prefix.
++        if v == target:
++            continue
++
++        for u, edgedata in adj[v].items():
++            ec = edgedata.get(cost_attr, 0)
++            ew = edgedata.get(weight_attr, 0)
++            if ec < 0 or ew < 0:
++                raise ValueError(
++                    "pareto_paths requires non-negative edge attributes, "
++                    f"got cost={ec!r}, weight={ew!r} on edge ({v!r}, {u!r})"
++                )
++            nc = c + ec
++            nw = w + ew
++            if check_cost_bound and nc > max_cost:
++                continue
++            if check_weight_bound and nw > max_weight:
++                continue
++
++            fentry = frontiers.get(u)
++            if fentry is None:
++                new_label = [nc, nw, v, lab, 0]
++                frontiers[u] = ([nc], [nw], [new_label])
++                _heappush(heap, (nc, nw, _next_tie(), u, new_label))
++                continue
++
++            costs, weights, labels = fentry
++            # A single bisect locates the candidate cost. Frontier weights
++            # are strictly decreasing with increasing cost, so the
++            # candidate is dominated (or is a duplicate) when the weight of
++            # the last label with cost <= nc is no larger than nw.
++            k = _bisect_left(costs, nc)
++            if k < len(costs) and costs[k] == nc:
++                if weights[k] <= nw:
++                    continue
++            elif k > 0 and weights[k - 1] <= nw:
++                continue
++            # Prune frontier labels dominated by the candidate: labels with
++            # cost >= nc and weight >= nw form a prefix of the tail. They
++            # cannot have been settled yet (the candidate precedes them in
++            # lexicographic order), so simply mark them pruned.
++            stop = k
++            n_front = len(weights)
++            while stop < n_front and weights[stop] >= nw:
++                labels[stop][4] = 2
++                stop += 1
++            if stop > k:
++                del costs[k:stop]
++                del weights[k:stop]
++                del labels[k:stop]
++            new_label = [nc, nw, v, lab, 0]
++            costs.insert(k, nc)
++            weights.insert(k, nw)
++            labels.insert(k, new_label)
++            _heappush(heap, (nc, nw, _next_tie(), u, new_label))
++
++    target_entry = frontiers.get(target)
++    if target_entry is None or not target_entry[0]:
++        # No feasible label at the target: either genuinely unreachable or
++        # reachable but every path exceeds a bound.
++        if not _unweighted_reachable(adj, source, target):
++            raise nx.NetworkXNoPath(f"No path to {target}.")
++        return []
++
++    result = []
++    for tlab in target_entry[2]:
++        path = _witness_path(target, tlab)
++        pc, pw = _path_totals(G, path, cost_attr, weight_attr)
++        result.append({"cost": pc, "weight": pw, "path": path})
++    return result
++
++
++def _unweighted_reachable(adj, source, target):
++    """Return True if target is reachable from source ignoring edge metrics."""
++    seen = {source}
++    stack = [source]
++    while stack:
++        v = stack.pop()
++        for u in adj[v]:
++            if u == target:
++                return True
++            if u not in seen:
++                seen.add(u)
++                stack.append(u)
++    return False
++
++
++def _witness_path(target_node, label):
++    """Reconstruct a simple witness path for a settled target label.
++
++    Following parent pointers gives a walk from the source to the target.
++    For a non-dominated (settled) label every cycle in that walk must have
++    zero total cost and zero weight (removing a positive cycle would yield
++    a strictly dominating walk), so deleting repeated-node segments
++    produces a simple path with exactly the same attribute totals.
++    """
++    walk = [target_node]
++    while label[2] is not None:
++        walk.append(label[2])
++        label = label[3]
++    walk.reverse()
++
++    path = []
++    positions = {}
++    for node in walk:
++        if node in positions:
++            p = positions[node]
++            for repeated in path[p + 1 :]:
++                del positions[repeated]
++            del path[p + 1 :]
++        else:
++            positions[node] = len(path)
++            path.append(node)
++    return path
++
++
++def _path_totals(G, path, cost_attr, weight_attr):
++    total_cost = 0
++    total_weight = 0
++    edges = G._adj
++    for a, b in zip(path, path[1:]):
++        data = edges[a][b]
++        total_cost += data.get(cost_attr, 0)
++        total_weight += data.get(weight_attr, 0)
++    return total_cost, total_weight
+diff --git a/networkx/algorithms/shortest_paths/tests/test_multiobjective.py b/networkx/algorithms/shortest_paths/tests/test_multiobjective.py
+new file mode 100644
+index 0000000..a3e2e54
+--- /dev/null
++++ b/networkx/algorithms/shortest_paths/tests/test_multiobjective.py
+@@ -0,0 +1,354 @@
++"""Tests for the multiobjective (Pareto) shortest path API."""
++
++import random
++
++import pytest
++
++import networkx as nx
++from networkx.utils import pairwise
++
++
++# ---------------------------------------------------------------------------
++# Validation helpers and a brute-force oracle
++# ---------------------------------------------------------------------------
++
++
++def path_totals(G, path, cost_attr="cost", weight_attr="weight"):
++    total_cost = 0
++    total_weight = 0
++    for u, v in pairwise(path):
++        data = G[u][v]
++        total_cost += data.get(cost_attr, 0)
++        total_weight += data.get(weight_attr, 0)
++    return total_cost, total_weight
++
++
++def validate_record(G, record, source, target):
++    assert set(record) == {"cost", "weight", "path"}
++    path = record["path"]
++    assert path[0] == source
++    assert path[-1] == target
++    # The witness must be a simple path.
++    assert len(path) == len(set(path))
++    # Every consecutive pair must be an edge of G.
++    for u, v in pairwise(path):
++        assert v in G[u]
++    # Declared totals must match the path exactly.
++    total_cost, total_weight = path_totals(G, path)
++    assert total_cost == record["cost"]
++    assert total_weight == record["weight"]
++
++
++def brute_force_pareto(G, source, target, max_cost=None, max_weight=None):
++    """Reference answer via exhaustive enumeration of simple paths."""
++    pairs = set()
++    for path in nx.all_simple_paths(G, source, target):
++        c, w = path_totals(G, path)
++        if max_cost is not None and c > max_cost:
++            continue
++        if max_weight is not None and w > max_weight:
++            continue
++        pairs.add((c, w))
++    front = []
++    for pair in pairs:
++        c, w = pair
++        if any(
++            (c2, w2) != pair and c2 <= c and w2 <= w
++            for c2, w2 in pairs
++        ):
++            continue
++        front.append(pair)
++    return sorted(front)
++
++
++def check_against_oracle(
++    G, source, target, max_cost=None, max_weight=None
++):
++    result = nx.pareto_paths(
++        G,
++        source,
++        target,
++        max_cost=max_cost,
++        max_weight=max_weight,
++    )
++    expected = brute_force_pareto(
++        G, source, target, max_cost=max_cost, max_weight=max_weight
++    )
++    assert [(r["cost"], r["weight"]) for r in result] == expected
++    for record in result:
++        validate_record(G, record, source, target)
++    # Ordering contract: cost ascending, then weight ascending; weights
++    # strictly decrease as costs increase.
++    for r1, r2 in pairwise(result):
++        assert (r1["cost"], r1["weight"]) < (r2["cost"], r2["weight"])
++    return result
++
++
++# ---------------------------------------------------------------------------
++# Deterministic hand-built cases
++# ---------------------------------------------------------------------------
++
++
++def test_basic_two_object_tradeoff():
++    G = nx.DiGraph()
++    G.add_edge("a", "b", cost=1, weight=4)
++    G.add_edge("a", "c", cost=3, weight=2)
++    G.add_edge("b", "d", cost=2, weight=2)
++    G.add_edge("c", "d", cost=1, weight=2)
++    result = nx.pareto_paths(G, "a", "d")
++    assert [(r["cost"], r["weight"]) for r in result] == [(3, 6), (4, 4)]
++    for record in result:
++        validate_record(G, record, "a", "d")
++
++
++def test_dominated_route_absent():
++    G = nx.DiGraph()
++    # Cheap-light direct route dominates the long detour in both metrics.
++    G.add_edge(0, 1, cost=1, weight=1)
++    G.add_edge(1, 3, cost=1, weight=1)
++    G.add_edge(0, 2, cost=5, weight=5)
++    G.add_edge(2, 3, cost=5, weight=5)
++    result = nx.pareto_paths(G, 0, 3)
++    assert [(r["cost"], r["weight"]) for r in result] == [(2, 2)]
++    assert result[0]["path"] == [0, 1, 3]
++
++
++def test_equal_pair_from_distinct_paths_appears_once():
++    G = nx.DiGraph()
++    G.add_edge("s", "a", cost=1, weight=4)
++    G.add_edge("s", "b", cost=2, weight=2)
++    G.add_edge("a", "t", cost=2, weight=2)
++    G.add_edge("b", "t", cost=1, weight=4)
++    result = nx.pareto_paths(G, "s", "t")
++    assert [(r["cost"], r["weight"]) for r in result] == [(3, 6)]
++    assert len(result) == 1
++    validate_record(G, result[0], "s", "t")
++
++
++def test_missing_attributes_count_as_zero():
++    G = nx.DiGraph()
++    G.add_edge(0, 1, cost=2)  # weight missing -> 0
++    G.add_edge(1, 2, weight=3)  # cost missing -> 0
++    G.add_edge(0, 2)  # both missing -> (0, 0), dominates
++    result = nx.pareto_paths(G, 0, 2)
++    assert [(r["cost"], r["weight"]) for r in result] == [(0, 0)]
++    assert result[0]["path"] == [0, 2]
++
++    # All edges without attributes give a single zero pair.
++    H = nx.path_graph(4, create_using=nx.DiGraph())
++    result = nx.pareto_paths(H, 0, 3)
++    assert result == [{"cost": 0, "weight": 0, "path": [0, 1, 2, 3]}]
++
++
++def test_custom_attribute_names():
++    G = nx.DiGraph()
++    G.add_edge("s", "a", price=1, time=4)
++    G.add_edge("s", "b", price=3, time=2)
++    G.add_edge("a", "t", price=2, time=2)
++    G.add_edge("b", "t", price=1, time=2)
++    result = nx.pareto_paths(G, "s", "t", weight="time", cost="price")
++    assert [(r["cost"], r["weight"]) for r in result] == [(3, 6), (4, 4)]
++
++
++def test_source_equals_target():
++    G = nx.cycle_graph(5, create_using=nx.DiGraph())
++    G.add_edge(0, 0, cost=1, weight=1)
++    result = nx.pareto_paths(G, 0, 0)
++    assert result == [{"cost": 0, "weight": 0, "path": [0]}]
++    # Bounds do not change the source == target contract.
++    result = nx.pareto_paths(G, 0, 0, max_cost=10, max_weight=10)
++    assert result == [{"cost": 0, "weight": 0, "path": [0]}]
++
++
++def test_node_not_found():
++    G = nx.path_graph(3)
++    with pytest.raises(nx.NodeNotFound):
++        nx.pareto_paths(G, 99, 0)
++    with pytest.raises(nx.NodeNotFound):
++        nx.pareto_paths(G, 0, 99)
++
++
++def test_no_path_directed():
++    G = nx.DiGraph()
++    G.add_edge(0, 1, cost=1, weight=1)
++    G.add_edge(2, 3, cost=1, weight=1)
++    with pytest.raises(nx.NetworkXNoPath):
++        nx.pareto_paths(G, 0, 3)
++    # Bounds must not turn an unreachable target into an empty list.
++    with pytest.raises(nx.NetworkXNoPath):
++        nx.pareto_paths(G, 0, 3, max_cost=100, max_weight=100)
++
++
++def test_no_path_undirected():
++    G = nx.Graph()
++    G.add_edge(0, 1)
++    G.add_edge(2, 3)
++    with pytest.raises(nx.NetworkXNoPath):
++        nx.pareto_paths(G, 0, 3)
++
++
++def test_bounds_filter_when_reachable():
++    G = nx.DiGraph()
++    G.add_edge("s", "a", cost=1, weight=8)
++    G.add_edge("s", "b", cost=8, weight=1)
++    G.add_edge("a", "t", cost=1, weight=8)
++    G.add_edge("b", "t", cost=8, weight=1)
++    # Front without bounds: (2, 16) and (16, 2).
++    assert [(r["cost"], r["weight"]) for r in nx.pareto_paths(G, "s", "t")] == [
++        (2, 16),
++        (16, 2),
++    ]
++    # Only the cheap-in-cost route fits max_cost.
++    result = nx.pareto_paths(G, "s", "t", max_cost=2)
++    assert [(r["cost"], r["weight"]) for r in result] == [(2, 16)]
++    # Only the cheap-in-weight route fits max_weight.
++    result = nx.pareto_paths(G, "s", "t", max_weight=2)
++    assert [(r["cost"], r["weight"]) for r in result] == [(16, 2)]
++    # Reachable but nothing fits both bounds: empty list, no exception.
++    assert nx.pareto_paths(G, "s", "t", max_cost=1) == []
++    assert nx.pareto_paths(G, "s", "t", max_weight=1) == []
++    assert nx.pareto_paths(G, "s", "t", max_cost=10, max_weight=10) == []
++
++
++def test_negative_attributes_raise_value_error():
++    G = nx.DiGraph()
++    G.add_edge(0, 1, cost=-1, weight=1)
++    G.add_edge(1, 2, cost=1, weight=1)
++    with pytest.raises(ValueError):
++        nx.pareto_paths(G, 0, 2)
++
++    G = nx.DiGraph()
++    G.add_edge(0, 1, cost=1, weight=-1)
++    G.add_edge(1, 2, cost=1, weight=1)
++    with pytest.raises(ValueError):
++        nx.pareto_paths(G, 0, 2)
++
++
++def test_multigraph_raises_not_implemented():
++    G = nx.MultiDiGraph()
++    G.add_edge(0, 1, cost=1, weight=1)
++    G.add_edge(1, 2, cost=1, weight=1)
++    with pytest.raises(nx.NetworkXNotImplemented):
++        nx.pareto_paths(G, 0, 2)
++
++    G = nx.MultiGraph()
++    G.add_edge(0, 1, cost=1, weight=1)
++    with pytest.raises(nx.NetworkXNotImplemented):
++        nx.pareto_paths(G, 0, 1)
++
++
++def test_zero_cost_zero_weight_cycles_terminate():
++    # A zero/zero 2-cycle on the way to t can be walked arbitrarily many
++    # times; the search must still terminate with a single pair.
++    G = nx.DiGraph()
++    G.add_edge("s", "a", cost=1, weight=1)
++    G.add_edge("a", "b", cost=0, weight=0)
++    G.add_edge("b", "a", cost=0, weight=0)
++    G.add_edge("b", "t", cost=2, weight=3)
++    result = nx.pareto_paths(G, "s", "t")
++    assert [(r["cost"], r["weight"]) for r in result] == [(3, 4)]
++    validate_record(G, result[0], "s", "t")
++    assert result[0]["path"].count("a") == 1
++    assert result[0]["path"].count("b") == 1
++
++
++def test_self_loop_zero_zero():
++    G = nx.DiGraph()
++    G.add_edge(0, 0, cost=0, weight=0)
++    G.add_edge(0, 1, cost=1, weight=2)
++    result = nx.pareto_paths(G, 0, 1)
++    assert [(r["cost"], r["weight"]) for r in result] == [(1, 2)]
++    assert result[0]["path"] == [0, 1]
++
++
++def test_undirected_graph():
++    G = nx.Graph()
++    G.add_edge(0, 1, cost=1, weight=4)
++    G.add_edge(0, 2, cost=4, weight=1)
++    G.add_edge(1, 3, cost=4, weight=1)
++    G.add_edge(2, 3, cost=1, weight=4)
++    result = nx.pareto_paths(G, 0, 3)
++    assert [(r["cost"], r["weight"]) for r in result] == [(5, 5)]
++    assert len(result) == 1
++
++
++def test_floating_point_attributes():
++    G = nx.DiGraph()
++    G.add_edge(0, 1, cost=0.5, weight=1.5)
++    G.add_edge(1, 3, cost=1.5, weight=0.5)
++    G.add_edge(0, 2, cost=1.0, weight=1.0)
++    G.add_edge(2, 3, cost=1.0, weight=1.0)
++    result = nx.pareto_paths(G, 0, 3)
++    # (2, 2) via either route; one record.
++    assert [(r["cost"], r["weight"]) for r in result] == [(2.0, 2.0)]
++    validate_record(G, result[0], 0, 3)
++
++
++def test_pure_function_and_determinism():
++    G = nx.DiGraph()
++    G.add_edge(0, 1, cost=1, weight=4)
++    G.add_edge(0, 2, cost=3, weight=2)
++    G.add_edge(1, 3, cost=2, weight=2)
++    G.add_edge(2, 3, cost=1, weight=2)
++    snapshot_nodes = set(G.nodes)
++    snapshot_edges = [(u, v, dict(d)) for u, v, d in G.edges(data=True)]
++
++    first = nx.pareto_paths(G, 0, 3)
++    second = nx.pareto_paths(G, 0, 3)
++    third = nx.pareto_paths(G, 0, 3, max_cost=100, max_weight=100)
++    assert first == second == third
++
++    assert set(G.nodes) == snapshot_nodes
++    assert [(u, v, dict(d)) for u, v, d in G.edges(data=True)] == snapshot_edges
++
++
++# ---------------------------------------------------------------------------
++# Randomized differential tests against the brute-force oracle
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("directed", [True, False])
++@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
++def test_random_graphs_match_oracle(directed, seed):
++    rng = random.Random(seed)
++    G = nx.gnp_random_graph(
++        14, 0.25, seed=seed * 7 + 13, directed=directed
++    )
++    # Remove self loops for clarity of the random suite.
++    G.remove_edges_from(nx.selfloop_edges(G))
++    for u, v, data in G.edges(data=True):
++        # Includes plenty of zeros to stress equal / zero-cycle handling.
++        data["cost"] = rng.randrange(0, 4)
++        data["weight"] = rng.randrange(0, 4)
++        if rng.random() < 0.1:
++            del data["cost"]
++        if rng.random() < 0.1:
++            del data["weight"]
++
++    nodes = list(G.nodes)
++    for _ in range(12):
++        s = rng.choice(nodes)
++        t = rng.choice(nodes)
++        if s == t:
++            assert nx.pareto_paths(G, s, t) == [
++                {"cost": 0, "weight": 0, "path": [s]}
++            ]
++            continue
++        try:
++            result = check_against_oracle(G, s, t)
++        except nx.NetworkXNoPath:
++            assert not nx.has_path(G, s, t)
++            continue
++        if result:
++            # Exercise bounds: tighten them to a frontier record's totals.
++            mid = result[len(result) // 2]
++            check_against_oracle(
++                G, s, t, max_cost=mid["cost"], max_weight=mid["weight"]
++            )
++            # A bound below every feasible pair gives [] when reachable.
++            min_c = result[0]["cost"]
++            min_w = result[-1]["weight"]
++            if min_c > 0:
++                assert nx.pareto_paths(G, s, t, max_cost=min_c - 1) == []
++            if min_w > 0:
++                assert nx.pareto_paths(G, s, t, max_weight=min_w - 1) == []

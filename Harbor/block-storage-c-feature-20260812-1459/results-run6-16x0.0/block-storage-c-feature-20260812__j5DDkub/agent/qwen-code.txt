@@ -1,0 +1,31 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+写时复制导出已修复并验证通过。原来 CoW 的数据路径整个缺失(`F_COPYONWRITE` 只在配置解析、协商标志和 `exptrim` 里被引用,实际读写仍直接走主文件),`tests/code/trim.c` 里引用的 `difffile/difffilename/difffilelen/difmap` 字段也不存在。
+
+## 改动
+
+**`nbd/nbdsrv.h`** — 给 `CLIENT` 补上 CoW 状态字段(与单元测试预期的命名一致):`difffile`、`difffilename`、`difffilelen`、`difmap`(按 4096 字节页索引,记录每页在 diff 文件里的位置,`(off_t)-1` 表示不在 diff 里)、`diff_lock`(线程池多线程处理请求时的保护锁)。
+
+**`nbd/nbd-server.c`** — 新增 CoW 层并接入读写路径:
+- `master_read()`:绕过 CoW 直读主文件(原 `rawexpread` 的主体)。
+- `cow_ensure_page()`:某页第一次被写时,先从主文件把整页拷进 diff 文件(read-modify-write),整页被覆盖时跳过这次读。
+- `cow_write()`:写入全部落到 diff 文件,**不碰主文件**。
+- `cow_read_chunk()`:读时先查 `difmap`,页在 diff 里就从 diff 读,否则回落主文件。
+- `setup_cow()`/`cleanup_cow()`:连接建立时创建 diff 文件,断开时 `unlink` 掉。
+
+接入点:`rawexpread`/`expwrite`/`expflush` 按 `difmap` 是否建立分流;`setupexport` 里 CoW 导出**以只读方式打开主文件**(避免 O_RDWR 失败后被降级成 readonly,也符合 cowdir "主文件目录不可写" 的用途),并在末尾调 `setup_cow`;`finalize_client`(NBD_CMD_DISC 和连接意外断开两条路径都会走)调 `cleanup_cow`。
+
+## 配置语义对应
+
+- **copyonwrite**:写不进主文件,进 diff;断开时 diff 被删、写入丢失(`send_export_info` 里 CoW 不发 `CAN_MULTI_CONN` 原本就在)。
+- **cowdir**:diff 文件放到该目录,文件名取导出名的 basename + `.diff`;未设置时与主文件同目录。
+- **sparse_cow**(`F_SPARSE`):diff 文件是 ftruncate 到导出大小的稀疏文件,页按原偏移存放;关闭时新写的页追加到 diff 末尾、用 `difmap`/`difffilelen` 索引(即 man page 描述的两种模式)。
+
+## 验证
+
+- `tests/run/simple_test ./cow`(cow-client 三个导出:plain / sparse / cowdir):写后立即可读回、断开后 `*.diff` 无残留、主文件逐字节未变、重连后只读到原始数据 —— **通过**。
+- 命令行 `-c` 路径也手动验证通过。
+- `tests/code` 5 个单元测试(含之前编译不过的 `trim`、`dup`)全部通过。
+- `tests/run` 全套:18 通过、0 失败(未跑的 4 个是缺 gnutls/syslog 的环境性跳过,与改动无关);`cfgmulti`(含 copyonwrite 导出)、`write`、`flush`、`integrity` 等无回归。
+- 干净重编译无警告。
+
+一个已知边界:同一导出的多个并发 CoW 连接会用同一个 diff 文件名(fork 模型下各子进程会互相覆盖);现有测试与文档场景均为每连接独立,未做额外处理。

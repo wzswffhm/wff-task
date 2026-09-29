@@ -1,0 +1,15 @@
+import networkx as nx
+
+print("  pareto_paths    :", hasattr(nx, "pareto_paths"))
+print("  pareto_frontier :", hasattr(nx, "pareto_frontier"))
+print("  ParetoIndex     :", hasattr(nx, "ParetoIndex"))
+G = nx.DiGraph()
+G.add_edge("s", "a", cost=1, weight=4)
+G.add_edge("a", "t", cost=1, weight=0)
+G.add_edge("s", "b", cost=3, weight=1)
+G.add_edge("b", "t", cost=0, weight=0)
+print("  frontier        :", nx.pareto_frontier(G, "s", "t"))
+idx = nx.ParetoIndex(G, "s")
+idx.update_edge("s", "t", cost=0, weight=9)
+print("  index.frontier  :", idx.frontier("t"))
+print("  index.pareto    :", [(r["cost"], r["weight"]) for r in idx.pareto("t")])

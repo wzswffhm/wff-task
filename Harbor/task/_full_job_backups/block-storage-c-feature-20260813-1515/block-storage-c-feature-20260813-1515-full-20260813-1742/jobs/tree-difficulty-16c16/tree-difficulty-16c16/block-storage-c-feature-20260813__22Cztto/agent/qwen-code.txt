@@ -1,0 +1,27 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成了。原因:`treefiles.c` 原本是个空 stub("not implemented in this tree"),`treefiles = true` 只被解析进 flag、服务端读写路径从未用过它,所以数据照旧落单文件。
+
+## 改动
+
+**`treefiles.c`(新实现,对应 `treefiles.h` 声明的 4 个函数)**
+- `construct_path`:树的布局只由导出大小和偏移决定——按 4096 字节(TREEPAGESIZE)分块,每级目录最多 1024(TREEDIRSIZE)个条目,大小决定嵌套深度;偏移映射为 `exportname/TREEXXXX/.../FILEXXXX`
+- `open_treefile`:按需打开/创建对应块文件(互斥锁保护创建竞争);新建文件扩到 4096 字节(稀疏);只读打开不存在的块时用已 unlink 的零填充临时文件,读不会凭空造文件
+- `delete_treefile` / `mkdir_path`:删块文件、递归建目录
+
+**`nbd-server.c`**
+- `get_filepos`:treefiles 分支——按块打开文件,I/O 钳制在块边界内,交错的请求由外层 `_fully` 循环逐块推进
+- `rawexpread`/`rawexpwrite`/`rawexpsplice`:treefiles 时每次操作后关闭 fd(句柄全按需,不预开)
+- `setupexport`:treefiles 导出 `export=NULL`、大小取 `filesize`;文件/目录首次写入时自动创建
+- `expflush`:treefiles 分支(无持久句柄,非只读时 `sync()`)
+- `parse_cfile`:按 man 文档要求,`treefiles` 未配 `filesize` 时启动即报错
+
+**`nbdsrv.c`**
+- `exptrim`:TRIM 范围内被完整覆盖的块,其文件直接删除(man 所述 "marked as unused 即删文件");部分覆盖的边缘块保留
+
+普通导出路径未动(所有分支都以 `F_TREEFILES` 前置判断)。另外补回了 `tests/run/simple_test`、`cwrap_test` 丢失的可执行位,否则测试框架跑不起来。
+
+## 验证
+
+- **自带测试**:`tests/run` 全套 17/17 通过(含 `tree`、`rotree`;4 个未跑的是 TLS/inetd,本构建无 GnuTLS,属环境预存跳过);`tests/parse` 6/6、`tests/code` 5/5
+- **手工协议级验证**(自写 NBD client):对齐/非对齐/跨块写入读回一致;断开重连后数据仍在;未写区域读为零;TRIM 整块后文件确实被删、读回零,部分覆盖的块文件保留;只读导出读正常且不产生任何文件;3 级深树(4GiB+ 导出)路径正确,如偏移 4GiB → `TREE0001/TREE0000/FILE0000`
+- 无编译告警

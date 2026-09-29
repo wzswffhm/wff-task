@@ -1,0 +1,21 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 之前只有配置解析、没有任何实现(`treefiles.c` 是个 "not implemented" 空壳),所以数据全落进一个普通文件。现在按 man 页(`nbd-server(5)`)描述的语义补齐了。
+
+## 实现
+
+**存储布局**(与 man 页一致):`exportname` 变成树的根目录,导出空间按 4096 字节(TREEPAGESIZE)一块,每块对应树里一个文件;每个目录最多 1024(TREEDIRSIZE)个条目,块数超过就自动加深一层 `TREEXXXX` 子目录。块号按 1024 进制拆成路径,如 8MB 导出:偏移 0 → `TREE0000/FILE0000`,偏移 4MB → `TREE0001/FILE0000`。文件/目录按需创建;没写过的块没有文件,读回来是全零。
+
+**改动**:
+- `treefiles.c` — 实现了头文件里声明的四个函数:`construct_path`(偏移→路径+块内偏移)、`mkdir_path`(mkdir -p)、`open_treefile`(建目录、开块文件)、`delete_treefile`;全局 `tree_lock` 保护路径构造/建目录(`treefiles.h` 里加了 extern 声明)。
+- `nbd-server.c` — `setupexport` 增加 treefiles 分支(根目录自动创建,exportsize=filesize);`expread`/`expwrite` 各增加按块走树文件的路径(读:缺文件补零、短文件补零;写:按需建文件,支持 F_SYNC/fua);`expwrite_zeroes` 对 treefiles 转为 trim;配置校验:treefiles 必须配 `filesize`,与 `multifile` 同配时 treefiles 优先(man 页规定),与 `splice`/`copyonwrite`/`waitfile` 互斥并报清晰错误。
+- `nbdsrv.c` — `exptrim` 增加 treefiles 分支:整块被 trim 就删掉块文件(该块重新读作全零),部分覆盖的块只把覆盖部分写零。
+
+普通导出(不带 treefiles)的所有路径未动。
+
+## 测试与验证
+
+- 新增单元测试 `tests/code/treefiles.c`(挂进 `make check`):各嵌套边界的路径构造、按需创建、未写块 ENOENT、删除幂等、mkdir_path 幂等。
+- 新增端到端脚本 `tests/run/treefiles_e2e.py`(自带 NBD 协议客户端,手动可跑):真实连 server 验证写入/读回一致、非对齐与跨目录边界写入、盘上树布局逐文件比对、未写块读零、TRIM/WRITE_ZEROES 删文件、FLUSH、普通导出仍是单文件且数据在正确偏移、非法配置被拒。
+- 顺手修了 `tests/run/simple_test`、`cwrap_test` 丢失的执行位(之前整个 run 套件因此全挂)。
+
+结果:`make check` parse 6/6、code 6/6、run 17/17 全过(inetd 和 3 个 TLS 用例是环境性跳过——构建未含 GnuTLS、inetd 模式在该沙箱本来就不通,与本改动无关);e2e 脚本全部断言通过。

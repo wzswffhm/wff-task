@@ -1,0 +1,30 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+完成。`treefiles` 选项现在按 man 页描述的行为工作了。
+
+## 问题根源
+
+`treefiles = true` 只被解析成 `F_TREEFILES` 标志位,`treefiles.c` 是一行占位注释("not implemented in this tree"),数据读写路径完全没有分支处理它——所以一切照旧落进单一大文件。
+
+## 实现(按 man/nbd-server.5 的语义)
+
+设备按 **4096 字节块**切分,每个块一个文件,放在以 exportname 命名的目录树下;每层目录最多 **1024 个条目**,按 `filesize` 自动计算嵌套深度(`≤4MiB` 时块文件直接放根目录,更大则逐级 `TREExxxx/` 嵌套);从未写入(或被 TRIM)的块没有文件,读回全零。
+
+- **treefiles.c**:实现了头文件声明的 4 个函数——`construct_path`(偏移→`TREExxxx/…/FILExxxx` 路径)、`mkdir_path`、`open_treefile`(按需建目录建文件)、`delete_treefile`(删块文件并自下而上清理空目录,保留树根)
+- **nbd-server.c**:`setupexport` 加 treefiles 分支(校验 filesize、建根目录、优先于 multifile);`rawexpread/rawexpwrite` 经 `treeexpread/treexpwrite` 按块分发(跨块请求由原有 `_fully` 循环自然衔接;支持 F_SYNC/FUA);`expflush` 加 treefiles 分支;`parse_cfile` 校验:treefiles 必须配 filesize,禁止与 splice/waitfile 混用;`commit_client` 初始化新增的 `treefile_lock`(CLIENT 结构,见 nbdsrv.h)
+- **nbdsrv.c**:`exptrim` 加 treefiles 分支——整块覆盖的直接删文件(man 页"块标记 unused 即删文件"),部分覆盖的块写零,保证 trim 后读回为零
+
+## 顺带修掉的一个隐患
+
+`copyonwrite_prepare` 直接把 `client->exportname` 传给 `dirname()/basename()`——glibc 会**就地截断实参**,exportname 被改成父目录。普通导出用已打开的 fd 读写不受影响,但 treefiles 每次 IO 都要按名字重建路径,COW 组合下必炸;diff 文件名也因此取错过 basename。改为先 `g_strdup` 再传给 dirname/basename。
+
+## 验证结果
+
+| 项目 | 结果 |
+|---|---|
+| tests/parse | 6/6 通过 |
+| tests/code | 6/6 通过(含新增 `treefiles` 单测:38 项断言,覆盖深度 0/1/2 路径构造、建/读/删、TRIM 语义) |
+| tests/run | **17/17 通过**,含 `tree`、`rotree`;4 个 SKIP(inetd/tls×3)是构建未开 syslog/GnuTLS 的既有限制 |
+| 自写 NBD 客户端端到端 | 8MiB 嵌套布局、非对齐/跨块/1MiB 批量写、断开重连读回、未写区读零、整块 TRIM 删文件、部分 TRIM 置零——22 项全过 |
+| 组合场景 | copyonwrite+treefiles(树上已有数据可读、写入进 diff、树不被污染)与普通 COW 各循环 10~15 次全过;multifile+treefiles 时 treefiles 优先;缺 filesize 时配置解析即报错拒绝启动 |
+
+另外恢复了 `tests/run/simple_test`、`cwrap_test` 丢失的可执行位(否则 `make check` 起不来),并重新生成了 `tests/code/Makefile.in/Makefile`。普通导出(单文件/多文件/COW/flush/integrity 等)行为未变,全部回归通过。

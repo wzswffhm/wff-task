@@ -1,0 +1,238 @@
+diff --git a/nbd-server.c b/nbd-server.c
+--- a/nbd-server.c
++++ b/nbd-server.c
+@@ -122,6 +122,7 @@
+ #include "nbd-debug.h"
+ #include "netdb-compat.h"
+ #include "backend.h"
++#include "treefiles.h"
+ #include "nbd-helper.h"
+ 
+ #ifdef WITH_SDP
+@@ -1145,6 +1146,14 @@
+ 	if(a < 0)
+ 		return -1;
+ 
++	/* Open separate file for treefiles */
++        if (client->server->flags & F_TREEFILES) {
++		*foffset = a % TREEPAGESIZE;
++		*maxbytes = (( 1 + (a/TREEPAGESIZE) ) * TREEPAGESIZE) - a; // start position of next block
++		*fhandle = open_treefile(client->exportname, ((client->server->flags & F_READONLY) ? O_RDONLY : O_RDWR), client->exportsize,a, &client->lock);
++		return 0;
++	}
++
+ 	/* Binary search for last file with starting offset <= a */
+ 	FILE_INFO fi;
+ 	int start = 0;
+@@ -1244,6 +1253,10 @@
+ 		fdatasync(fhandle);
+ #endif
+ 	}
++	/* close file pointer in case of treefiles */
++        if (client->server->flags & F_TREEFILES) {
++		close(fhandle);
++	}
+ 	return retval;
+ }
+ 
+@@ -1442,6 +1455,9 @@
+ 	DEBUG("(READ from fd %d offset %llu len %u), ", fhandle, (long long unsigned int)foffset, (unsigned int)len);
+ 
+ 	retval = pread(fhandle, buf, len, foffset);
++        if (client->server->flags & F_TREEFILES) {
++		close(fhandle);
++	}
+ 	return retval;
+ }
+ 
+@@ -1499,6 +1515,8 @@
+ 		else if (fua)
+ 			fdatasync(fhandle);
+ 	}
++	if (client->server->flags & F_TREEFILES)
++		close(fhandle);
+ 	return retval;
+ }
+ 
+@@ -1723,6 +1741,14 @@
+ 		return fsync(client->difffile);
+ 	}
+ 
++        if (client->server->flags & F_TREEFILES ) {
++		// all we can do is force sync the entire filesystem containing the tree
++		if (client->server->flags & F_READONLY)
++			return 0;
++		sync();
++		return 0;
++	}
++
+ 	for (i = 0; i < client->export->len; i++) {
+ 		FILE_INFO fi = g_array_index(client->export, FILE_INFO, i);
+ 		if (fsync(fi.fhandle) < 0)
+@@ -1994,10 +2020,11 @@
+ 	int i = 0;
+ 	off_t laststartoff = 0, lastsize = 0;
+ 	int multifile = (client->server->flags & F_MULTIFILE);
++	int treefile = (client->server->flags & F_TREEFILES);
+ 	int temporary = (client->server->flags & F_TEMPORARY) && !multifile;
+ 	int cancreate = (client->server->expected_size) && !multifile;
+ 
+-	if (client->server->flags & F_WAIT) {
++	if (treefile || (client->server->flags & F_WAIT)) {
+ 		client->export = NULL; // this could be thousands of files so we open handles on demand although its slower
+ 		client->exportsize = client->server->expected_size; // available space is not checked, as it could change during runtime anyway
+ 
+@@ -2107,6 +2134,9 @@
+ 	if(multifile) {
+ 		msg(LOG_INFO, "Total number of files: %d", i);
+ 	}
++	if(treefile) {
++		msg(LOG_INFO, "Total number of (potential) files: %" PRId64, (client->exportsize+TREEPAGESIZE-1)/TREEPAGESIZE);
++	}
+ 	return true;
+ }
+ 
+diff --git a/treefiles.c b/treefiles.c
+--- a/treefiles.c
++++ b/treefiles.c
+@@ -1,3 +1,108 @@
+-/*
+- * Tree files support is not implemented in this tree.
++#include <fcntl.h>
++#include <limits.h> // for PATH_MAX
++#include <inttypes.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#include "config.h"
++#include "cliserv.h"
++#include "treefiles.h"
++#include "nbd-debug.h"
++
++/**
++ * Tree structure helper functions
+  */
++void construct_path(char* name, int lenmax, off_t size, off_t pos, off_t* ppos) {
++	if (lenmax<10)
++		err("Char buffer overflow. This is likely a bug.");
++
++	if (size<TREEDIRSIZE*TREEPAGESIZE) {
++		// we are done, add filename
++		snprintf(name,lenmax,"/FILE%04" PRIX64,(pos/TREEPAGESIZE) % TREEDIRSIZE);
++		*ppos = pos / (TREEPAGESIZE*TREEDIRSIZE);
++	} else {
++		construct_path(name+9,lenmax-9,size/TREEDIRSIZE,pos,ppos);
++		char buffer[10];
++		snprintf(buffer,sizeof(buffer),"/TREE%04jX",(intmax_t)(*ppos % TREEDIRSIZE));
++		memcpy(name,buffer,9); // copy into string without trailing zero
++		*ppos/=TREEDIRSIZE;
++	}
++}
++
++void delete_treefile(char* name, off_t size, off_t pos) {
++	char filename[PATH_MAX];
++	off_t ppos;
++
++	strncpy(filename,name,PATH_MAX-1);
++	filename[PATH_MAX-1] = '\0';
++	construct_path(filename+strlen(name),PATH_MAX-strlen(name)-1,size,pos,&ppos);
++
++	DEBUG("Deleting treefile: %s",filename);
++
++	if (unlink(filename)==-1)
++		DEBUG("Deleting failed : %s",strerror(errno));
++}
++
++void mkdir_path(char* path) {
++	char *subpath=path+1;
++	while ((subpath=strchr(subpath,'/'))) {
++		*subpath='\0'; // path is modified in place with terminating null char instead of slash
++		if (mkdir(path,0700)==-1) {
++			if (errno!=EEXIST)
++				err("Path access error! %m");
++		}
++		*subpath='/';
++		subpath++;
++	}
++}
++
++int open_treefile(char* name, mode_t mode, off_t size, off_t pos, pthread_mutex_t* mutex) {
++	char filename[PATH_MAX];
++	off_t ppos;
++
++	strncpy(filename,name,PATH_MAX-1);
++	filename[PATH_MAX - 1] = '\0';
++	construct_path(filename+strlen(name),PATH_MAX-strlen(name)-1,size,pos,&ppos);
++
++	DEBUG("Accessing treefile %s (offset %llu of %llu)",filename,(unsigned long long)pos,(unsigned long long)size);
++
++	pthread_mutex_lock(mutex);
++	int handle=open(filename, mode, 0600);
++	if (handle<0 && errno==ENOENT) {
++		if (mode & O_RDWR) {
++
++			DEBUG("Creating new treepath");
++
++			mkdir_path(filename);
++			handle=open(filename, O_RDWR|O_CREAT, 0600);
++			if (handle<0) {
++				err("Error opening tree block file %m");
++			}
++		} else {
++
++			DEBUG("Creating a dummy tempfile for reading");
++			char tmpname[] = "dummy-XXXXXX";
++			mode_t oldmode = umask(077);
++			handle = mkstemp(tmpname);
++			umask(oldmode);
++			if (handle>0) {
++				unlink(tmpname); /* File will stick around whilst FD open */
++			} else {
++				err("Error opening tree block file %m");
++			}
++		}
++		char* n = "\0";
++		if(lseek(handle,TREEPAGESIZE-1, SEEK_SET) < 0) {
++			err("Could not create tree file!\n");
++		}
++		ssize_t c = write(handle,n,1);
++		if (c<1) {
++			err("Error setting tree block file size %m");
++		}
++	}
++	pthread_mutex_unlock(mutex);
++	return handle;
++}
++
+diff --git a/nbdsrv.c b/nbdsrv.c
+--- a/nbdsrv.c
++++ b/nbdsrv.c
+@@ -16,6 +16,7 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
++#include <treefiles.h>
+ #include "backend.h"
+ #ifdef HAVE_SYS_IOCTL_H
+ #include <sys/ioctl.h>
+@@ -276,6 +277,18 @@
+ 		DEBUG("TRIM not supported yet on copy-on-write exports");
+ 		return 0;
+ 	}
++	if (client->server->flags & F_TREEFILES) {
++		/* start address of first block to be trimmed */
++		off_t min = ( ( req->from + TREEPAGESIZE - 1 ) / TREEPAGESIZE) * TREEPAGESIZE;
++		/* start address of first block NOT to be trimmed */
++		off_t max = ( ( req->from + req->len ) / TREEPAGESIZE) * TREEPAGESIZE;
++		while (min<max) {
++			delete_treefile(client->exportname,client->exportsize,min);
++			min+=TREEPAGESIZE;
++		}
++		DEBUG("Performed TRIM request on TREE structure from %llu to %llu", (unsigned long long) req->from, (unsigned long long) req->len);
++		return 0;
++	}
+ 	FILE_INFO cur = g_array_index(client->export, FILE_INFO, 0);
+ 	FILE_INFO next;
+ 	int i = 1;

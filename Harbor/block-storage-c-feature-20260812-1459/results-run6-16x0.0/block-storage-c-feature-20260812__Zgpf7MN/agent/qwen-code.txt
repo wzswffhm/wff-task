@@ -1,0 +1,31 @@
+Warning: running headless with --yolo / approval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.
+写时复制(COW)导出的完整行为已实现并验证通过。改动集中在两个文件:
+
+## 改动内容
+
+**`nbdsrv.h`** — `CLIENT` 结构体补齐 COW 状态字段(`tests/code/trim.c` 对字段名有硬性要求):
+- `difffile` / `difffilename`:本次会话的 diff 文件描述符与文件名
+- `difffilelen`:非 sparse 模式下 diff 文件当前长度(追加写位置)
+- `difmap`:页号 → diff 文件内位置的哈希表(记录哪些 4K 页已被写过)
+- `diff_lock`:保护 `difmap`/`difffilelen`(请求由线程池并发处理)
+
+**`nbd-server.c`** — 新增 COW 支持段并接入现有读写路径:
+
+| 路径 | 行为 |
+|---|---|
+| `setupexport`(连接建立) | COW 导出时主文件以**只读**打开、不自动创建(对应 cowdir 文档"从无写权限的目录导出"的场景);末尾调 `setup_cow` 创建 `<主文件名>.<客户端>.<pid>.diff`,位置取 `cowdir` 或主文件所在目录;`sparse_cow` 时 `ftruncate` 成与导出等大的稀疏文件,页按原偏移存放;否则新写页追加到 diff 末尾并由 `difmap` 记录位置 |
+| `rawexpwrite`(写) | COW 时重定向到 `cow_write`,只写 diff、不碰主文件;部分页写入先读-改-写补齐全页再入 diff;`F_SYNC`/FUA 语义同步作用于 diff 文件 |
+| `rawexpread`(读) | COW 时走 `cow_read`:diff 中已有的页优先从 diff 返回(连续页合并成大块 pread),其余从主文件读 |
+| `finalize_client`(断开) | `cleanup_cow`:unlink diff 文件、关闭 fd、释放映射;另注册 `atexit` 兜底异常退出路径。正常 DISC 与连接被强断(EOF/reset)都会触发 |
+| `expflush` | 同时 fsync diff 文件 |
+| `dump_section` | `-o` 输出补上 `sparse_cow`/`cowdir` |
+
+命令行 `-c` 与配置项 `copyonwrite`/`sparse_cow`/`cowdir` 原本就解析到 `F_COPYONWRITE`/`F_SPARSE`/`cowdir`,本次让它们的语义真正生效;`copyonwrite` 与 `splice`/`waitfile` 的互斥校验、TRIM 在 COW 下的处理均为树中已有行为,未改动。
+
+## 验证结果
+
+- **`tests/code`**:5/5 通过(`make check`,包括依赖新字段的 `trim`、`dup`)
+- **`tests/run`**:`cow` 测试通过——`cowplain`/`cowsparse`/`cowcowdir` 三种导出下,写入阶段本连接内可回读、断开后 `*.diff` 被清理、主文件逐字节未变(`checkfile`)、重连只读到原始数据;另跑通 17 个回归测试(cfg1/cfgmulti/write/flush/tree/integrity 等)
+- **手动补充验证**:命令行 `-c` 路径全流程;并发连接时每连接独立 diff 文件、互不可见(写者自见其写,并行读者始终见原始数据);客户端被 `kill -9` 的异常断开也能清理;`nbd-tester-client -w` 写压力在两种 COW 模式下通过
+
+无编译警告。仅 `inetd` 与 TLS 相关用例因该构建未开 syslog/GnuTLS 而按既有逻辑跳过,与本改动无关。

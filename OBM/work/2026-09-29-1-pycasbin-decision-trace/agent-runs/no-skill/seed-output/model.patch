@@ -1,0 +1,493 @@
+diff --git a/casbin/__init__.py b/casbin/__init__.py
+index 9c2719e..5dcf993 100644
+--- a/casbin/__init__.py
++++ b/casbin/__init__.py
+@@ -26,3 +26,4 @@ from .persist import *
+ from .effect import *
+ from .model import *
+ from .frontend import *
++from .trace import TraceResult, MatchedRule, Mutation, ChangeResult
+diff --git a/casbin/core_enforcer.py b/casbin/core_enforcer.py
+index a80744b..a6c0514 100644
+--- a/casbin/core_enforcer.py
++++ b/casbin/core_enforcer.py
+@@ -390,6 +390,18 @@ class CoreEnforcer:
+         result, _ = self.enforce_ex(*rvals)
+         return result
+ 
++    def enforce_traced(self, *rvals):
++        """decides whether access is allowed and explains matched/decisive policies."""
++        from casbin.trace import enforce_traced
++
++        return enforce_traced(self, *rvals)
++
++    def would_change(self, *rvals, mutations):
++        """evaluates a request in a sandbox after applying policy/role mutations."""
++        from casbin.trace import would_change
++
++        return would_change(self, *rvals, mutations=mutations)
++
+     def enforce_ex(self, *rvals):
+         """decides whether a "subject" can access a "object" with the operation "action",
+         input parameters are usually: (sub, obj, act).
+diff --git a/casbin/management_enforcer.py b/casbin/management_enforcer.py
+index a96ec05..734d8d8 100644
+--- a/casbin/management_enforcer.py
++++ b/casbin/management_enforcer.py
+@@ -319,7 +319,7 @@ class ManagementEnforcer(InternalEnforcer):
+             rule_removed = self._remove_policy("g", ptype, list(params))
+             rules.append(list(params))
+ 
+-        if self.auto_build_role_links and rule_removed:
++        if self.auto_build_role_links and rule_removed and ptype in self.rm_map:
+             self.model.build_incremental_role_links(self.rm_map[ptype], PolicyOp.Policy_remove, "g", ptype, rules)
+         return rule_removed
+ 
+diff --git a/casbin/synced_enforcer.py b/casbin/synced_enforcer.py
+index a10a57f..21289f5 100644
+--- a/casbin/synced_enforcer.py
++++ b/casbin/synced_enforcer.py
+@@ -281,6 +281,16 @@ class SyncedEnforcer:
+         with self._rl:
+             return self._e.enforce_ex(*rvals)
+ 
++    def enforce_traced(self, *rvals):
++        """tracks an enforcement decision under the read lock."""
++        with self._rl:
++            return self._e.enforce_traced(*rvals)
++
++    def would_change(self, *rvals, mutations):
++        """evaluates hypothetical policy changes under the read lock."""
++        with self._rl:
++            return self._e.would_change(*rvals, mutations=mutations)
++
+     def batch_enforce(self, rvals):
+         """batch_enforce enforce in batches,
+         input parameters are usually: [(sub, obj, act), (sub, obj, act), ...].
+diff --git a/casbin/trace.py b/casbin/trace.py
+new file mode 100644
+index 0000000..4e07e0b
+--- /dev/null
++++ b/casbin/trace.py
+@@ -0,0 +1,421 @@
++# Copyright 2024 The casbin Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Public helpers for explainable enforcement and sandboxed change analysis."""
++
++import copy
++
++from casbin.effect import Effector
++from casbin.effect.default_effectors import (
++    AllowAndDenyEffector,
++    AllowOverrideEffector,
++    DenyOverrideEffector,
++    PriorityEffector,
++)
++from casbin.model.policy_op import PolicyOp
++from casbin.util import util
++
++
++MatchedRule = tuple
++
++
++class TraceResult:
++    """Immutable result returned by :meth:`CoreEnforcer.enforce_traced`."""
++
++    __slots__ = ("allowed", "matched", "decisive", "disabled")
++
++    def __init__(self, allowed, matched=(), decisive=(), disabled=False):
++        matched = tuple(matched)
++        decisive = tuple(decisive)
++        if len(decisive) > 1:
++            raise ValueError("at most one rule can be decisive")
++
++        object.__setattr__(self, "allowed", bool(allowed))
++        object.__setattr__(self, "matched", matched)
++        object.__setattr__(self, "decisive", decisive)
++        object.__setattr__(self, "disabled", bool(disabled))
++
++    def __setattr__(self, name, value):
++        raise AttributeError("TraceResult is immutable")
++
++    def __delattr__(self, name):
++        raise AttributeError("TraceResult is immutable")
++
++    def __iter__(self):
++        return iter((self.allowed, self.matched, self.decisive, self.disabled))
++
++    def __eq__(self, other):
++        if not isinstance(other, TraceResult):
++            return NotImplemented
++        return (
++            self.allowed == other.allowed
++            and self.matched == other.matched
++            and self.decisive == other.decisive
++            and self.disabled == other.disabled
++        )
++
++    def __repr__(self):
++        return (
++            f"TraceResult(allowed={self.allowed!r}, matched={self.matched!r}, "
++            f"decisive={self.decisive!r}, disabled={self.disabled!r})"
++        )
++
++
++class Mutation:
++    """Description of one policy or role-link change to test in a sandbox."""
++
++    __slots__ = ("operation", "section", "ptype", "rule")
++
++    def __init__(self, operation, section, ptype, rule):
++        operation = operation.lower()
++        section = section.lower()
++        if operation not in ("add", "remove"):
++            raise ValueError('mutation operation must be "add" or "remove"')
++        if section not in ("p", "g"):
++            raise ValueError('mutation section must be "p" or "g"')
++        if not isinstance(rule, (list, tuple)):
++            raise TypeError("mutation rule must be a list or tuple")
++
++        object.__setattr__(self, "operation", operation)
++        object.__setattr__(self, "section", section)
++        object.__setattr__(self, "ptype", ptype)
++        object.__setattr__(self, "rule", list(rule))
++
++    def __setattr__(self, name, value):
++        raise AttributeError("Mutation is immutable")
++
++    def __delattr__(self, name):
++        raise AttributeError("Mutation is immutable")
++
++    def __iter__(self):
++        return iter((self.operation, self.section, self.ptype, self.rule))
++
++    def __len__(self):
++        return 4
++
++    def __getitem__(self, index):
++        return (self.operation, self.section, self.ptype, self.rule)[index]
++
++    def __eq__(self, other):
++        if isinstance(other, Mutation):
++            other = tuple(other)
++        if not isinstance(other, tuple) or len(other) != 4:
++            return NotImplemented
++        return tuple(self) == other
++
++    def __repr__(self):
++        return f"Mutation({self.operation!r}, {self.section!r}, {self.ptype!r}, {self.rule!r})"
++
++
++class ChangeResult:
++    """Immutable before/after result returned by :meth:`CoreEnforcer.would_change`."""
++
++    __slots__ = ("before", "after", "changed")
++
++    def __init__(self, before, after):
++        object.__setattr__(self, "before", bool(before))
++        object.__setattr__(self, "after", bool(after))
++        object.__setattr__(self, "changed", bool(before) != bool(after))
++
++    def __setattr__(self, name, value):
++        raise AttributeError("ChangeResult is immutable")
++
++    def __delattr__(self, name):
++        raise AttributeError("ChangeResult is immutable")
++
++    def __iter__(self):
++        return iter((self.before, self.after, self.changed))
++
++    def __eq__(self, other):
++        if isinstance(other, ChangeResult):
++            other = tuple(other)
++        if not isinstance(other, tuple) or len(other) != 3:
++            return NotImplemented
++        return tuple(self) == other
++
++    def __repr__(self):
++        return f"ChangeResult(before={self.before!r}, after={self.after!r}, changed={self.changed!r})"
++
++
++def normalize_mutations(mutations):
++    """Normalizes one mutation or a sequence of mutations."""
++    if mutations is None:
++        return ()
++
++    # A mutation can be represented by the public Mutation type, any compatible
++    # four-element sequence, or a plain rule-looking tuple. A bare rule is not a
++    # mutation because it has no operation/section/ptype.
++    if isinstance(mutations, Mutation):
++        return (mutations,)
++
++    if isinstance(mutations, tuple) and len(mutations) == 4:
++        try:
++            return (Mutation(*mutations),)
++        except (TypeError, ValueError):
++            pass
++
++    normalized = []
++    for mutation in mutations:
++        if isinstance(mutation, Mutation):
++            normalized.append(mutation)
++        else:
++            normalized.append(Mutation(*mutation))
++    return tuple(normalized)
++
++
++def resolve_enforce_context(enforcer, rvals):
++    """Resolves an optional leading EnforceContext in the same way as enforce_ex."""
++    rtype = "r"
++    ptype = "p"
++    etype = "e"
++    mtype = "m"
++
++    request_values = rvals
++    if len(request_values) != 0 and hasattr(request_values[0], "rtype"):
++        # Duck typing keeps this compatible with the public EnforceContext class.
++        enforce_context = request_values[0]
++        rtype = enforce_context.rtype
++        ptype = enforce_context.ptype
++        etype = enforce_context.etype
++        mtype = enforce_context.mtype
++        request_values = request_values[1:]
++
++    return rtype, ptype, etype, mtype, request_values
++
++
++def _effect_value(ptype, parameters):
++    p_eft_key = ptype + "_eft"
++    if p_eft_key in parameters:
++        value = parameters[p_eft_key]
++        if value == "allow":
++            return "allow", Effector.ALLOW
++        if value == "deny":
++            return "deny", Effector.DENY
++        return "indeterminate", Effector.INDETERMINATE
++    return "allow", Effector.ALLOW
++
++
++def _matched_record(ptype, rule, index, effect_name):
++    return MatchedRule((ptype, list(rule), index, effect_name))
++
++
++def enforce_traced(enforcer, *rvals):
++    """Tracks policy matches and the early-stop point without mutating ``enforcer``."""
++    if not enforcer.enabled:
++        return TraceResult(True, (), (), True)
++
++    rtype, ptype, _, mtype, request_values = resolve_enforce_context(enforcer, rvals)
++
++    functions = enforcer.fm.get_functions()
++    if "g" in enforcer.model.keys():
++        for key, ast in enforcer.model["g"].items():
++            if len(enforcer.rm_map) != 0 and ast.rm is not None:
++                from casbin.util import generate_g_function
++
++                functions[key] = generate_g_function(ast.rm)
++            if len(enforcer.cond_rm_map) != 0 and ast.cond_rm is not None:
++                from casbin.util import generate_conditional_g_function
++
++                functions[key] = generate_conditional_g_function(ast.cond_rm)
++
++    if "m" not in enforcer.model.keys() or "m" not in enforcer.model["m"].keys():
++        raise RuntimeError("model is undefined")
++
++    r_tokens = enforcer.model["r"][rtype].tokens
++    p_tokens = enforcer.model["p"][ptype].tokens
++
++    if len(r_tokens) != len(request_values):
++        raise RuntimeError("invalid request size")
++
++    exp_string = enforcer.model["m"][mtype].value
++    exp_has_eval = util.has_eval(exp_string)
++    if not exp_has_eval:
++        expression = enforcer._get_expression(exp_string, functions)
++
++    policy_effects = set()
++    matched = []
++    decisive = ()
++    r_parameters = dict(zip(r_tokens, request_values))
++    policies = enforcer.model["p"][ptype].policy
++
++    if len(policies) != 0:
++        for index, pvals in enumerate(policies):
++            if len(p_tokens) != len(pvals):
++                raise RuntimeError("invalid policy size")
++
++            p_parameters = dict(zip(p_tokens, pvals))
++            parameters = dict(r_parameters, **p_parameters)
++
++            if exp_has_eval:
++                rule_names = util.get_eval_value(exp_string)
++                rules = [util.escape_assertion(p_parameters[rule_name]) for rule_name in rule_names]
++                exp_with_rule = util.replace_eval(exp_string, rules)
++                expression = enforcer._get_expression(exp_with_rule, functions)
++
++            result = expression.eval(parameters)
++
++            if isinstance(result, bool):
++                if not result:
++                    policy_effects.add(Effector.INDETERMINATE)
++                    continue
++            elif isinstance(result, float):
++                if result == 0:
++                    policy_effects.add(Effector.INDETERMINATE)
++                    continue
++            else:
++                raise RuntimeError("matcher result should be bool, int or float")
++
++            effect_name, numeric_effect = _effect_value(ptype, parameters)
++            policy_effects.add(numeric_effect)
++
++            record = _matched_record(ptype, pvals, index, effect_name)
++            matched.append(record)
++
++            if enforcer.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
++                decisive = (record,)
++                break
++    else:
++        if exp_has_eval:
++            raise RuntimeError("please make sure rule exists in policy when using eval() in matcher")
++
++        parameters = r_parameters.copy()
++        for token in enforcer.model["p"][ptype].tokens:
++            parameters[token] = ""
++
++        result = expression.eval(parameters)
++        if result:
++            policy_effects.add(Effector.ALLOW)
++        else:
++            policy_effects.add(Effector.INDETERMINATE)
++
++    final_effect = enforcer.eft.final_effect(policy_effects)
++    from casbin.effect import effect_to_bool
++
++    allowed = effect_to_bool(final_effect)
++
++    # Deny override and allow-and-deny have no decisive positive rule when their
++    # answer is allow; the result is caused by absence of a matched deny.
++    if allowed and isinstance(enforcer.eft, (DenyOverrideEffector, AllowAndDenyEffector)):
++        decisive = ()
++
++    return TraceResult(allowed, tuple(matched), decisive, False)
++
++
++def _clone_role_manager(rm):
++    """Creates an isolated role-manager copy while preserving registered functions."""
++    return copy.deepcopy(rm)
++
++
++def make_sandbox(enforcer):
++    """Builds an isolated enforcer-like sandbox with copied policies and role graphs."""
++    # Replace the live role managers with independent clones before the model is
++    # deep-copied. Assertion.__deepcopy__ shares whatever managers it finds, so
++    # this maps the copied assertions onto cloned graphs rather than real graphs.
++    original_rm = dict(enforcer.rm_map)
++    original_cond_rm = dict(enforcer.cond_rm_map)
++    try:
++        for key, rm in original_rm.items():
++            enforcer.rm_map[key] = _clone_role_manager(rm)
++        for key, rm in original_cond_rm.items():
++            enforcer.cond_rm_map[key] = _clone_role_manager(rm)
++
++        sandbox = copy.deepcopy(enforcer)
++    finally:
++        enforcer.rm_map.clear()
++        enforcer.rm_map.update(original_rm)
++        enforcer.cond_rm_map.clear()
++        enforcer.cond_rm_map.update(original_cond_rm)
++
++    # Keep the sandbox maps independent in case a caller mutates a manager later.
++    sandbox.rm_map = {key: copy.deepcopy(value) for key, value in sandbox.rm_map.items()}
++    sandbox.cond_rm_map = {key: copy.deepcopy(value) for key, value in sandbox.cond_rm_map.items()}
++    for key, rm in sandbox.rm_map.items():
++        if key in sandbox.model["g"]:
++            sandbox.model["g"][key].rm = rm
++    for key, rm in sandbox.cond_rm_map.items():
++        if key in sandbox.model["g"]:
++            sandbox.model["g"][key].cond_rm = rm
++
++    # The trial must not persist, notify watchers, or rebuild links separately.
++    sandbox.adapter = None
++    sandbox.watcher = None
++    sandbox.auto_save = False
++    sandbox.auto_notify_watcher = False
++    sandbox.auto_build_role_links = True
++
++    return sandbox
++
++
++def _conditional_delete_link(ast, rule):
++    """Deletes a conditional role link while preserving registered predicates.
++
++    The normal non-conditional remove path intentionally never deletes entries
++    from conditional managers (its Assertion call would receive an unexpected
++    number of arguments).  For speculative role changes, however, the link must
++    actually disappear.  Remove exactly the graph edge; do not touch the
++    condition-function maps because those registrations are model metadata.
++    """
++    cond_rm = ast.cond_rm
++    count = ast.value.count("_")
++    graph_rule = rule[:count]
++    if hasattr(cond_rm, "rm_map"):
++        # Domain managers lazily build per-domain conditional role managers.
++        cond_rm.delete_link(graph_rule[0], graph_rule[1], *graph_rule[2:])
++    else:
++        cond_rm.delete_link(graph_rule[0], graph_rule[1], *graph_rule[2:])
++
++def apply_mutation(sandbox, mutation):
++    """Applies one mutation using the normal model/role-manager side effects."""
++    operation, section, ptype, rule = mutation
++    rule = list(rule)
++
++    if section == "p":
++        if operation == "add":
++            return sandbox.add_named_policy(ptype, rule)
++        return sandbox.remove_named_policy(ptype, rule)
++
++    if operation == "add":
++        return sandbox.add_named_grouping_policy(ptype, rule)
++
++    removed = sandbox.remove_named_grouping_policy(ptype, rule)
++    ast = sandbox.model["g"][ptype]
++    if ast.cond_rm is not None:
++        _conditional_delete_link(ast, rule)
++    return removed
++
++
++def would_change(enforcer, *rvals, mutations):
++    """Evaluates a request before and after mutations in an isolated sandbox."""
++    before = enforcer.enforce(*rvals)
++    mutation_list = normalize_mutations(mutations)
++
++    if not mutation_list:
++        return ChangeResult(before, before)
++
++    sandbox = make_sandbox(enforcer)
++    for mutation in mutation_list:
++        apply_mutation(sandbox, mutation)
++
++    after = sandbox.enforce(*rvals)
++    return ChangeResult(before, after)
++
++
++__all__ = [
++    "TraceResult",
++    "MatchedRule",
++    "Mutation",
++    "ChangeResult",
++    "enforce_traced",
++    "would_change",
++]

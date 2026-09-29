@@ -1,0 +1,230 @@
+diff --git a/networkx/algorithms/shortest_paths/__init__.py b/networkx/algorithms/shortest_paths/__init__.py
+index eb0d91c..2339fca 100755
+--- a/networkx/algorithms/shortest_paths/__init__.py
++++ b/networkx/algorithms/shortest_paths/__init__.py
+@@ -3,3 +3,5 @@ from networkx.algorithms.shortest_paths.unweighted import *
+ from networkx.algorithms.shortest_paths.weighted import *
+ from networkx.algorithms.shortest_paths.astar import *
+ from networkx.algorithms.shortest_paths.dense import *
++
++from networkx.algorithms.shortest_paths.pareto import *
+diff --git a/networkx/algorithms/shortest_paths/pareto.py b/networkx/algorithms/shortest_paths/pareto.py
+new file mode 100644
+index 0000000..d7baed8
+--- /dev/null
++++ b/networkx/algorithms/shortest_paths/pareto.py
+@@ -0,0 +1,214 @@
++"""参考实现：多目标帕累托最优路径（v2 契约）。
++
++对外提供三个入口，**语义必须完全一致**：
++
++1. ``pareto_paths(G, source, target, weight="weight", cost="cost", *,
++   max_cost=None, max_weight=None)``
++   返回 source→target 的**全部非支配** (cost, weight) 对，每对附一条
++   **简单见证路径**，其两条属性之和**恰好等于**该对。
++
++2. ``pareto_frontier(...)``  —— 只返回排序后的 ``(cost, weight)`` 列表，
++   必须恒等于 ``[(r["cost"], r["weight"]) for r in pareto_paths(...)]``。
++
++3. ``ParetoIndex(G, source, weight=..., cost=...)`` —— 可变图上的索引：
++   ``.pareto(target, *, max_cost, max_weight)`` / ``.frontier(...)`` /
++   ``.update_edge(u, v, **attrs)`` / ``.remove_edge(u, v)`` / ``.reset()`` /
++   ``.graph``。任意变更序列之后，查询结果必须等于「对当前图直接调用函数式入口」。
++
++公共契约：
++- 两条可加属性；值缺失或为 None 按 0；搜索中遇到负值 → ValueError。
++- 结果按 cost 升序、cost 相同按 weight 升序；**前沿集合与图的构造顺序无关**。
++- source == target → 单条 (0, 0) / 路径 [source]；target 不可达 → NetworkXNoPath；
++  可达但被上界全部挡掉 → 空结果。
++- 纯函数：不修改传入的 G；同一图重复查询结果一致。
++- weight / cost 可以是属性名字符串，也可以是 ``f(u, v, data) -> number`` 可调用对象。
++- MultiGraph / MultiDiGraph → NetworkXNotImplemented。
++"""
++
++from __future__ import annotations
++
++import heapq
++import itertools
++
++from networkx.algorithms.shortest_paths.generic import has_path
++from networkx.exception import (
++    NetworkXError,
++    NetworkXNoPath,
++    NetworkXNotImplemented,
++    NodeNotFound,
++)
++
++
++__all__ = ["pareto_paths", "pareto_frontier", "ParetoIndex"]
++
++
++# --------------------------------------------------------------------------- #
++# 参数解析
++# --------------------------------------------------------------------------- #
++def _make_reader(spec):
++    """把属性名或可调用对象统一成 ``f(u, v, data) -> number``。"""
++    if callable(spec):
++        def reader(u, v, data):
++            value = spec(u, v, data)
++            return 0 if value is None else value
++        return reader
++
++    name = spec
++
++    def reader(u, v, data):
++        value = data.get(name, 0)
++        return 0 if value is None else value
++
++    return reader
++
++
++def _out_edges(G, node):
++    if G.is_multigraph():
++        for _, nbr, _, data in G.edges(node, keys=True, data=True):
++            yield nbr, data
++    else:
++        for _, nbr, data in G.edges(node, data=True):
++            yield nbr, data
++
++
++def _dominates(c1, w1, c2, w2):
++    return c1 <= c2 and w1 <= w2 and (c1 < c2 or w1 < w2)
++
++
++def _strip_cycles(path):
++    """去掉重复节点构成的环，保持首尾不变（对非支配解不改变属性之和）。"""
++    out = []
++    seen = {}
++    for node in path:
++        if node in seen:
++            del out[seen[node] + 1 :]
++            for key in [k for k, v in seen.items() if v > seen[node]]:
++                del seen[key]
++        else:
++            seen[node] = len(out)
++            out.append(node)
++    return out
++
++
++# --------------------------------------------------------------------------- #
++# 核心：标号法（共享给三个入口，保证语义一致）
++# --------------------------------------------------------------------------- #
++def _validate(G, source, target):
++    if G.is_multigraph():
++        raise NetworkXNotImplemented(
++            "pareto_paths is not implemented for MultiGraph or MultiDiGraph."
++        )
++    if source not in G or target not in G:
++        raise NodeNotFound(f"source or target not in G: {source!r}, {target!r}")
++
++
++def _solve(G, source, target, weight, cost, max_cost, max_weight, want_paths):
++    _validate(G, source, target)
++    read_w = _make_reader(weight)
++    read_c = _make_reader(cost)
++
++    counter = itertools.count()
++    pareto: dict = {v: [] for v in G}   # node -> 非支配 (c, w)
++    pred: dict = {}                     # (node, c, w) -> (prev_node, prev_c, prev_w)
++    heap: list = []
++
++    def push(node, c, w, parent):
++        if max_cost is not None and c > max_cost:
++            return
++        if max_weight is not None and w > max_weight:
++            return
++        labels = pareto[node]
++        for c2, w2 in labels:
++            if c2 <= c and w2 <= w:
++                return                  # 已被支配或与已有标号等价
++        pareto[node] = [p for p in labels if not (c <= p[0] and w <= p[1])]
++        pareto[node].append((c, w))
++        pred[(node, c, w)] = parent
++        heapq.heappush(heap, (c, w, next(counter), node))
++
++    push(source, 0, 0, None)
++    while heap:
++        c, w, _, node = heapq.heappop(heap)
++        if (c, w) not in pareto[node]:
++            continue                    # 入队后被支配剪掉
++        for nbr, data in _out_edges(G, node):
++            dc = read_c(node, nbr, data)
++            dw = read_w(node, nbr, data)
++            if dc < 0 or dw < 0:
++                raise ValueError("negative cost/weight is not supported")
++            push(nbr, c + dc, w + dw, (node, c, w))
++
++    del counter, heap
++    frontier = sorted(pareto[target])
++    if not frontier:
++        if not has_path(G, source, target):
++            raise NetworkXNoPath(f"no path between {source!r} and {target!r}")
++        return []
++    if not want_paths:
++        return list(frontier)
++
++    results = []
++    for c, w in frontier:
++        node_path = []
++        cur = (target, c, w)
++        while cur is not None:
++            node_path.append(cur[0])
++            cur = pred.get(cur)
++        node_path.reverse()
++        results.append({"cost": c, "weight": w, "path": _strip_cycles(node_path)})
++    return results
++
++
++# --------------------------------------------------------------------------- #
++# 三个公开入口
++# --------------------------------------------------------------------------- #
++def pareto_paths(G, source, target, weight="weight", cost="cost", *,
++                 max_cost=None, max_weight=None):
++    return _solve(G, source, target, weight, cost, max_cost, max_weight, True)
++
++
++def pareto_frontier(G, source, target, weight="weight", cost="cost", *,
++                    max_cost=None, max_weight=None):
++    return _solve(G, source, target, weight, cost, max_cost, max_weight, False)
++
++
++class ParetoIndex:
++    """可变图上的帕累托路径索引；查询语义与函数式入口**完全一致**。
++
++    构造时对传入图做快照（**不修改**调用方的 G）。任意 ``update_edge`` /
++    ``remove_edge`` 之后，``pareto`` / ``frontier`` 的结果必须等于对
++    ``self.graph`` 直接调用同名函数式入口的结果。
++    """
++
++    def __init__(self, G, source, weight="weight", cost="cost"):
++        _validate(G, source, source)
++        self.source = source
++        self.weight = weight
++        self.cost = cost
++        self._orig = G.copy()
++        self._G = G.copy()
++
++    # ---- 视图 / 变更 ----
++    @property
++    def graph(self):
++        return self._G
++
++    def update_edge(self, u, v, **attrs):
++        self._G.add_edge(u, v, **attrs)
++
++    def remove_edge(self, u, v):
++        if not self._G.has_edge(u, v):
++            raise NetworkXError(f"edge {u!r}-{v!r} is not in the index graph")
++        self._G.remove_edge(u, v)
++
++    def reset(self):
++        self._G = self._orig.copy()
++
++    # ---- 查询 ----
++    def pareto(self, target, *, max_cost=None, max_weight=None):
++        return pareto_paths(self._G, self.source, target, self.weight, self.cost,
++                            max_cost=max_cost, max_weight=max_weight)
++
++    def frontier(self, target, *, max_cost=None, max_weight=None):
++        return pareto_frontier(self._G, self.source, target, self.weight, self.cost,
++                               max_cost=max_cost, max_weight=max_weight)
