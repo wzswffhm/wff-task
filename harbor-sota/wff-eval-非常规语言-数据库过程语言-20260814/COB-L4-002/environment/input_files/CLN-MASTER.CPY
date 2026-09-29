@@ -1,0 +1,12 @@
+       05  ACCT-NO            PIC X(10).
+       05  ACCT-NAME          PIC X(24).
+       05  ACCT-PRODUCT       PIC X(04).
+       05  ACCT-CURRENCY      PIC X(04).
+       05  ACCT-OPEN-DATE     PIC 9(08).
+       05  ACCT-PRINCIPAL     PIC 9(12)V99.
+       05  ACCT-ANNUAL-RATE   PIC 9(02)V9(4).
+       05  ACCT-BASIS         PIC X(04).
+       05  ACCT-GRACE-DAYS    PIC 9(03).
+       05  ACCT-MATURITY-DATE PIC 9(08).
+       05  ACCT-STATUS        PIC X(01).
+       05  ACCT-STATUS-DATE   PIC 9(08).
