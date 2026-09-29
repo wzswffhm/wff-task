@@ -1,7 +1,10 @@
 ---
-name: obm-run-qc-bundle
+name: OBM-run-qc
 description: 用于 OBM 题目的本地跑题和质检。用户说“质检”时调用最新本地质检工具；用户说“跑题 N 个”时按冻结候选、Docker Linux、Doubao-Seed-Evolving 和独立 verifier 执行 N 个题。仅处理本地文件，不自动上传飞书或把密钥写进日志。
 ---
+
+> **子流程：本地跑题与质检**
+> 本目录是 OBM skill 的子流程之一，由主目录 `../../SKILL.md` 路由进入。
 
 # OBM 跑题与质检
 
