@@ -1,5 +1,5 @@
 ---
-name: Harbor SOTA
+name: harbor-sota
 description: 按《外发版-评测题包交付规范 v4》与《Coding 交叉长尾领域数据生产规范》自动化生产符合交付标准的 Harbor 格式评测题包。覆盖五件套结构（instruction.md/task.toml/environment/solution/tests）、task.toml schema 1.4 全字段、judge.toml + gating.toml Rubric 编写（条数/权重 3|7|10/维度/锚点≥30%/负向≥20%）、双向预检（Oracle≥0.7 且 gating=1.0、空产物≤0.10、verifier_error=0）、SOTA 三家均分通过率验证（L2≤65%/L3-L4≤55%/L5≤50%）、打包命名与无残留自检。当用户要求生产/生成/交付外发评测题包、五件套、judge.toml、gating.toml、golden_output，或按评测集外发规范/龙猫数据提交标准出题时使用。
 description_zh: 评测题包外发生产
 description_en: Eval bundle delivery production
