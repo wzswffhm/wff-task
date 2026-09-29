@@ -1,7 +1,10 @@
 ---
-name: obm-review-skills
+name: OBM-review
 description: Validate and review OBM proposal folders for format, relevance, source reuse, and public change derivation. Use for OBM review, re-audit, or publishing opinions to Feishu.
 ---
+
+> **子流程：proposal 内容审查**
+> 本目录是 OBM skill 的子流程之一，由主目录 `../../SKILL.md` 路由进入。
 
 # OBM 内容审查
 

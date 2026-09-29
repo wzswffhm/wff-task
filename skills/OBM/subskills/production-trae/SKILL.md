@@ -1,9 +1,12 @@
 ---
-name: obm-task-production
-description: 制作和交付 OBM Source benchmark 题包。用户说“生成题包”“生成新的仓库包”“继续生产”“继续返修”“检查最新结果”“准备 no-skill/with-skill”“打包”或“上传”时自动接续当前 OBM 任务；负责场景去重、proposal、中文专家 skill、verifier、手动 Trae 工作区、最终质检和交付。Trae 由用户自行执行，本 skill 不启动或操作 Trae。
+name: OBM-production-trae
+description: 制作和交付 OBM Source benchmark 题包（Trae 手动版）。用户说“生成题包”“生成新的仓库包”“继续生产”“继续返修”“检查最新结果”“准备 no-skill/with-skill”“打包”或“上传”时自动接续当前 OBM 任务；负责场景去重、proposal、中文专家 skill、verifier、手动 Trae 工作区、最终质检和交付。Trae 由用户自行执行，本 skill 不启动或操作 Trae。仅在用户明确要求手动 Trae 流程或环境无法调用 API 时使用；默认生产流程是 OBM 主目录的 production（OpenAI 兼容接口版）。
 ---
 
-# OBM题目生产
+> **子流程：Trae 手动版生产（备选）**
+> 本目录是 OBM skill 的备选生产流程。默认应使用主目录的 OpenAI 兼容接口版（`../../SKILL.md`）。本版与主版 `references/` 内容不同，**不可混用**。
+
+# OBM题目生产（Trae 手动版）
 
 本 skill 现在采用“用户执行 Trae，Codex 制作和交付”的流程。先判断请求是分析、生产、验证、返修、打包还是上传。分析只读；生产、返修和打包可以写文件。不要把 OBM 与 Harbor、Pair-wise GSB 或其他标注项目混用。
 

@@ -1,13 +1,60 @@
 ---
-name: obm-task-production-openai
-description: 通过 OpenAI 兼容接口生产、验证、复核或返修 OBM Source benchmark 题目。适用于场景去重、proposal、中文专家 skill、Seed API 对照实验、verifier、离线环境、最终截图和飞书提交；当前完整支持 deepSWE，其他 benchmark 必须先读取对应规范，不能套用 deepSWE 的目录和评分规则。
+name: OBM
+description: OBM Source benchmark 题目生产与交付的统一入口，覆盖从选题生产到质检交付的全流程。用户说“生成题包”“生成 OBM 题目”“继续生产”“继续返修”“检查最新结果”“质检”“跑题 N 个”“审查 proposal”“打包”“上传”时调用。内含四套子流程：production（OpenAI 兼容接口版生产，主流程）、production-trae（Trae 手动版生产，备选）、review（proposal 内容审查）、run-qc（本地跑题与质检）。当前完整支持 deepSWE，其他 benchmark 必须先读取对应规范，不能套用 deepSWE 的目录和评分规则。
+disable: false
+agent_created: true
 ---
 
-# OBM 题目生产
+# OBM 题目生产与交付（统一入口）
+
+本 skill 整合 OBM 全流程，供任意 Agentic 环境直接加载使用。先按用户意图路由到对应子流程，再进入该子流程的 SKILL.md 执行。
+
+## 意图路由
+
+| 用户意图 | 子流程 | 入口 |
+|---|---|---|
+| 生产题包、生成新题、返修、继续生产、打包、上传飞书 | **production**（主流程，OpenAI 兼容接口） | 本文档 |
+| 生产题包且必须由用户在 Trae 中手动跑题 | **production-trae**（备选） | `subskills/production-trae/SKILL.md` |
+| 审查 proposal、复核交付内容、审计 source 复用 | **review** | `subskills/review/SKILL.md` |
+| 质检某个包/目录、跑题 N 个 | **run-qc** | `subskills/run-qc/SKILL.md` |
+
+默认使用 **production**（OpenAI 兼容接口版）。仅当用户明确要求"用 Trae 手动跑"或环境无法调用 API 时，才切换到 `production-trae`。
+
+**两套生产流程互斥**：`production` 与 `production-trae` 的 `references/` 内容不同，不可混用。禁止把另一版的脚本、提示词或流程套进来。两版各自的规范以各自目录内的 `references/` 为准。
+
+## 子流程目录说明
+
+```text
+OBM/
+├── SKILL.md                    # 本文件：统一入口与路由
+├── scripts/                    # production 主流程脚本
+├── references/                 # production 主流程规范
+├── agents/                     # production 主流程 agent 定义
+├── proposal_validator/         # production 主流程 proposal 校验器
+└── subskills/
+    ├── production-trae/        # Trae 手动版生产（备选）
+    ├── review/                 # proposal 内容审查
+    └── run-qc/                 # 本地跑题与质检
+```
+
+各子流程自带完整的 `scripts/`、`references/`、`SKILL.md`，可独立运行。引用子流程脚本时使用 `OBM_SKILL_DIR/subskills/<名称>/scripts/...`。
+
+## 全局边界
+
+- 不要把 OBM 与 Harbor 生产、Pair-wise GSB 或其他标注项目混用。
+- 分析请求只读材料，不修改题包；生产、返修和打包请求才写文件。
+- 密钥只从环境变量或配置文件读取，绝不写入命令行、日志、截图或交付 ZIP。
+- 独立 verifier 才能决定 solved，模型自报成功或退出码为 0 不能代替 verifier 结果。
+
+以下为 production 主流程正文。使用其他子流程时，转至对应 `SKILL.md`。
+
+---
+
+# OBM 题目生产（production：OpenAI 兼容接口版）
 
 先确认用户要做的是分析、生产、验证、返修还是打包。分析请求只读材料，不修改题包；生产或返修请求才写文件。不要把 OBM 与 Harbor 生产、Pair-wise GSB 或其他标注项目混用。
 
-本 skill 是 OpenAI 兼容接口版，Seed 实验只能调用 `prepare_agent_runs.py`、`launch_seed_background.py`、`monitor_seed_experiment.py` 和 `inspect_seed_status.py` 这套后台流程。禁止打开或操作 Trae，禁止调用 Trae 执行题目，禁止把同目录的 `obm-task-production`（非 OpenAI 版）流程套进来；看到 Trae、手动 Trae 工作区或前台 Trae 运行要求时，应立即停用该步骤并回到本 skill 的 Seed API 流程。
+本 skill 是 OpenAI 兼容接口版，Seed 实验只能调用 `prepare_agent_runs.py`、`launch_seed_background.py`、`monitor_seed_experiment.py` 和 `inspect_seed_status.py` 这套后台流程。禁止打开或操作 Trae，禁止调用 Trae 执行题目，禁止把 `subskills/production-trae`（非 OpenAI 版）流程套进来；看到 Trae、手动 Trae 工作区或前台 Trae 运行要求时，应立即停用该步骤并回到本 skill 的 Seed API 流程。
 
 执行边界：本 skill 只使用本地文件、终端命令、skill 自带脚本、Docker 和 OpenAI 兼容接口。禁止调用 MCP、Computer Use、浏览器自动化、桌面软件、IDE、Trae、飞书网页或其他图形界面。飞书读写只能通过配置核对过的本地 `lark-cli` 命令完成；Seed 定时监听只能由本地后台监控脚本完成，不创建客户端 heartbeat、automation 或其他对话定时任务。
 
