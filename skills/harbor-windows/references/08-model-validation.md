@@ -184,7 +184,116 @@ opus_pass_sum = 15               # 条件 2：15 > 12 → 通过区分度
 
 ---
 
-## 七、多模型自检
+## 七、自动化执行（`scripts/run_model_validation.py`）
+
+规范要求 4 个模型、共 8 次调用（Qwen 3 + Opus 3 + GLM 1 + Kimi 1）并计算区分度。
+手工执行易漏、易算错，统一用脚本完成。
+
+### 7.1 端点与模型
+
+协议均为 **Anthropic Messages**：`POST {base_url}/v1/messages`，
+header `x-api-key` + `anthropic-version: 2023-06-01`。
+
+| key | label | base_url | model | 次数 | 角色 |
+|---|---|---|---|---|---|
+| `qwen3.8-max` | Qwen3.8-Max-0902 | `https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic` | `qwen3.8-max` | 3 | primary |
+| `opus-5` | Opus 5 | `https://api.blvr.top` | `claude-opus-5` | 3 | primary |
+| `glm-5.3` | GLM-5.3 | 同 aliyun | `GLM-5.3` | 1 | auxiliary |
+| `kimi-k3` | Kimi K3 | 同 aliyun | `Kimi K3` | 1 | auxiliary |
+
+> ⚠️ aliyun 的 base_url **必须带 `/apps/anthropic` 后缀**；去掉后 `/v1/messages` 返回 404。
+> 三个 aliyun 模型共用一个 Key（`HARBOR_WINDOWS_ALIYUN_KEY`），Opus 单独用 `HARBOR_WINDOWS_BLVR_KEY`。
+
+### 7.2 命令
+
+```bash
+pip install httpx
+export HARBOR_WINDOWS_ALIYUN_KEY=<key>
+export HARBOR_WINDOWS_BLVR_KEY=<key>
+
+# 全量
+python scripts/run_model_validation.py --tasks <assets> --out delivery-extras/tasks
+
+# 冒烟（每模型 1 次，仅验证连通性）
+python scripts/run_model_validation.py --tasks <assets> --out delivery-extras/tasks --smoke
+
+# 平台回填分数后只算区分度
+python scripts/run_model_validation.py --score-only --out delivery-extras/tasks
+```
+
+可调项：`HARBOR_WINDOWS_MAX_TOKENS` / `TIMEOUT_SEC` / `MAX_RETRIES` / `ENDPOINTS_JSON`。
+
+### 7.3 脚本职责边界（重要）
+
+| 脚本负责 | 脚本**不**负责 |
+|---|---|
+| 发起 4 模型调用、重试 | 在真实 Windows Runtime 执行 F2P/P2P |
+| 保存轨迹、补丁、token、耗时 | 产出正式分（`score`） |
+| 区分 VALID / INVALID 并归因 | 判定 Golden / no-change |
+| 计算 `model_score_sum` / `testcase_pass_sum` | |
+| 给出条件 1 / 条件 2 准入结论 | |
+
+因此 `per_testcase.json` 初值为 `NOT_RUN`、`report.json.score` 初值为 `null`，
+**必须由平台 harness（`test.ps1` + `grade.py`）执行后回填**，再跑 `--score-only`。
+
+> 这条分工是刻意设计：规范禁止用 Linux Mock 替代真实 Windows Runtime，
+> 故模型调用层与评测执行层必须分离，不能由本脚本伪造分数。
+
+### 7.4 VALID / INVALID 判定
+
+脚本按响应内容自动分类：
+
+| 分类 | 触发 | 结果 | 是否重试 |
+|---|---|---|---|
+| `credential_rejected` | `API-key is blocked` / `Invalid token` | **INVALID** | 否（重试无意义） |
+| `auth_failed` | HTTP 401 / 403 | **INVALID** | 否 |
+| `rate_limited` | 429 / `rate limit` | **INVALID** | 是 |
+| `quota_exhausted` | `insufficient` / `balance` | **INVALID** | 是 |
+| `network_timeout` / `network_error` | 超时 / DNS / SSL | **INVALID** | 是 |
+| `model_unavailable` | `model not found` | **INVALID** | 否 |
+| `upstream_5xx` | HTTP ≥ 500 | **INVALID** | 是 |
+| `model_overloaded` / `context_overflow` | 显式过载/超长 | VALID（按真实结果记录） | 是 |
+| 成功 | HTTP 200 | VALID | — |
+
+失效运行会写 `error.json` 与 `badcase_attribution.md`，并在 `meta.json` 标 `retest_required: true`。
+
+### 7.5 准入判定状态机
+
+```
+有效运行 < 3            → 待定（blocking: insufficient_valid_runs）
+存在 INVALID 未补跑      → 待定（blocking: invalid_runs_not_retested）
+3 次有效但分数未回填     → 待定（blocking: scores_not_filled）
+─────────────────────────────────────────────
+否则按条件 1 / 条件 2 判定 → True / False
+```
+
+> `--score-only` 退出码：`0` 无明确失败（含"待定"）／`1` 存在明确"不通过"。
+> 把"待定"与"不通过"分开，是为了避免"分数还没回填"被误报成"区分度不合格"。
+
+### 7.6 输出
+
+```
+delivery-extras/
+├── model_summary.csv                # 各模型 runs/valid/invalid/score_sum
+├── model_validation_report.md       # 区分度准入表 + 逐模型状态
+├── model_validation_summary.json    # 机器可读
+└── tasks/<task-id>/model_runs/<model>/run-N/
+    ├── meta.json                    # 状态/耗时/token/归因/retest_required
+    ├── response.md                  # 原始回复
+    ├── patch.diff                   # 提取的补丁
+    ├── per_testcase.json            # 逐 testcase（待平台回填）
+    ├── report.json                  # 正式分（待平台回填）
+    └── badcase_attribution.md       # 失败归因
+```
+
+### 7.7 权限配置模板
+
+`scripts/model_endpoints.template.json` 提供端点和凭据字段模板。
+复制为 `model_endpoints.local.json` 并填 Key（该名已在 `.gitignore` 中，不会入库）。
+
+---
+
+## 八、多模型自检
 
 ```
 [ ] Qwen3.8-Max-0902 独立运行 3 次（全 VALID）
@@ -199,4 +308,5 @@ opus_pass_sum = 15               # 条件 2：15 > 12 → 通过区分度
 [ ] no-change 3×0，P2P 全过 + 核心 F2P 失败
 [ ] 至少 1 次干净重建/恢复复验
 [ ] 运行记录与证据字段齐全
+[ ] 正式分已由平台 harness 回填（非脚本伪造）
 ```

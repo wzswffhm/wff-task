@@ -1,15 +1,15 @@
 ---
-name: windows-coding-bench
+name: harbor-windows
 description: >
-  Windows 专项 Coding Bench 题包生产与交付全流程。按《Windows 专项 Coding Bench 数据采购》（windwos-第二版，替代 v1.0.2）
+  Windows 专项 Coding Bench（Harbor Windows）题包生产、交付与自动化模型验证全流程。按《Windows 专项 Coding Bench 数据采购》（windwos-第二版，替代 v1.0.2）
   生成符合冻结 Harbor Schema（默认 1.3）的标准题包，覆盖 Windows 价值反事实判定、标准 Harbor 五件套构题、F2P/P2P 二值判分、
-  Golden/no-change 对照、Qwen/Opus 各 3 次模型区分度门槛、身份三元组一致性与 delivery-extras 伴随材料交付。
+  Golden/no-change 对照、Qwen3.8-Max-0902 / Opus 5 各 3 次 + GLM-5.3 / Kimi K3 各 ≥1 次的自动化模型区分度验证、身份三元组一致性与 delivery-extras 伴随材料交付。
   Use when the user asks to 出题/产题/构题/生产题包/交付题包 for Windows coding benchmark, mentions
-  Windows 专项 Coding Bench、Harbor Task、Harbor 题包、SWE-bench-Live、swelive_spec、F2P/P2P、Golden 验证、
-  no-change、模型区分度, or wants to convert/整改旧题包到本规范。Also use when reviewing whether an existing
+  Windows 专项 Coding Bench、Harbor Windows、Harbor Task、Harbor 题包、SWE-bench-Live、swelive_spec、F2P/P2P、Golden 验证、
+  no-change、模型区分度、多模型验证, or wants to convert/整改旧题包到本规范。Also use when reviewing whether an existing
   Windows 题包 meets the 验收标准, or when building delivery-extras 伴随交付材料.
-  Keywords: Windows bench, Harbor schema 1.3, task.toml, instruction.md, environment, solution, tests,
-  test_patch, oracle patch, task_id + task_version + task_hash, ExternalImages, 脱敏, 供应商交付.
+  Keywords: Harbor Windows, harbor-windows, Windows bench, Harbor schema 1.3, task.toml, instruction.md, environment, solution, tests,
+  test_patch, oracle patch, task_id + task_version + task_hash, ExternalImages, 脱敏, 供应商交付, model_runs 自动化验证.
 ---
 
 # Windows 专项 Coding Bench 题包生产
@@ -162,6 +162,29 @@ testcase → 题面要求/公开契约 → 预期行为
 
 不满足 → 整改或替换。只统计 **VALID** 运行；INVALID 必须查明原因并补跑。
 
+**自动化执行**（一条命令跑完 4 个模型并算区分度）：
+
+```bash
+# 1) 填凭据（推荐环境变量，避免明文入库）
+export HARBOR_WINDOWS_ALIYUN_KEY=<aliyun key>   # qwen / glm / kimi 共用
+export HARBOR_WINDOWS_BLVR_KEY=<blvr key>       # opus
+
+# 2) 全量验证（Qwen 3 + Opus 3 + GLM 1 + Kimi 1）
+python scripts/run_model_validation.py \
+    --tasks outside_harbor-assets --out delivery-extras/tasks
+
+# 3) 平台 harness 跑完 F2P/P2P 并回填 report.json 分数后，只算区分度
+python scripts/run_model_validation.py --score-only --out delivery-extras/tasks
+```
+
+前提：`pip install httpx`。端点与模型名见 `scripts/model_endpoints.template.json`。
+
+> **⚠️ 分工边界**：该脚本是**模型调用与记录层**，只负责发起调用、保存轨迹与补丁、
+> 区分 VALID/INVALID、计算区分度；**不负责**在真实 Windows Runtime 中执行 F2P/P2P。
+> 因此 `per_testcase.json` 初值为 `NOT_RUN`、`report.json.score` 初值为 `null`，
+> **正式分必须由平台 harness（`test.ps1` + `grade.py`）执行后回填**，再跑 `--score-only`。
+> 这条分工是为守住"不得用 Linux Mock 替代真实 Windows Runtime 验证"的红线。
+
 > **模型门槛不能覆盖数据质量门槛**，不得为造分差增加未声明要求或冷门陷阱。
 > 运行记录 → `delivery-extras/tasks/<task-id>/model_runs/<model>/`
 
@@ -259,24 +282,37 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `references/09-gz-package-analysis.md` | 对 `Windows_SWE_d70d30df` 27 题现包的实测分析 |
 | `scripts/validate_package.py` | 题包结构与身份一致性校验（实测 27 题包可用） |
 | `scripts/build_delivery_extras.py` | 批量生成 delivery-extras 骨架 |
+| `scripts/run_model_validation.py` | **4 模型自动化验证 + 区分度准入计算** |
+| `scripts/model_endpoints.template.json` | 模型端点与凭据配置模板 |
+| `scripts/README.md` | 三个脚本的完整用法说明 |
 | `assets/harbor-skeleton/` | 标准 Harbor 五件套骨架（含可直接复用的 grade.py / test.ps1 / Dockerfile） |
 | `assets/metadata-templates/` | 伴随材料 JSON 模板（source_and_license / labels / lineage / manifest） |
 
-## 快速上手（三条命令）
+## 快速上手（四条命令）
 
 ```bash
 SKILL=<skill目录>
 
-# 1) 从骨架起一题
-bash "$SKILL/assets/harbor-skeleton/README.md"   # 按 README 的 cp 清单操作
+# 0) 依赖（多模型验证需要 httpx）
+pip install httpx
+
+# 1) 从骨架起一题（按该 README 的 cp 清单操作）
+cat "$SKILL/assets/harbor-skeleton/README.md"
 
 # 2) 批量生成伴随材料骨架
 python "$SKILL/scripts/build_delivery_extras.py" \
     --assets outside_harbor-assets --out delivery-extras
 
-# 3) 出包前校验（PASS/FAIL/FLAG）
+# 3) 多模型自动化验证（Qwen 3 + Opus 3 + GLM 1 + Kimi 1）
+export HARBOR_WINDOWS_ALIYUN_KEY=<key>
+export HARBOR_WINDOWS_BLVR_KEY=<key>
+python "$SKILL/scripts/run_model_validation.py" \
+    --tasks outside_harbor-assets --out delivery-extras/tasks
+
+# 4) 出包前校验（PASS/FAIL/FLAG）
 python "$SKILL/scripts/validate_package.py" \
     --package <题包根目录> --schema-version 1.3 --json validate-report.json
 ```
 
 > 校验退出码：`0` 全过（可能含 FLAG）／`1` 存在 FAIL（不满足验收）／`2` 参数错误。
+> 模型验证退出码：`0` 无明确失败／`1` 存在 INVALID 或区分度不通过。
