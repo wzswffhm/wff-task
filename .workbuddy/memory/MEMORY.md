@@ -8,12 +8,25 @@
 
 | 目录 | 内容 |
 |---|---|
-| `Harbor/` | 共享基础设施：`.dsh/skills/`（skill 快照）、`scripts/`、环境文档、`分类说明.md` |
 | `harbor-16/` | **harbor-16** skill 产物：内部 RL 题包（`zq*` 批次、`block-storage-*`） |
 | `harbor-sota/` | **harbor-sota** skill 产物：外发供应商题包（`wff-eval-*`，含 gating/graded/golden_output） |
 | `OBM/` | `Benchmark/`（第三方数据集）、`work/`（实验产物）、`output/`（结果） |
-| `skills/` | skill 集合：`OBM`（统一 OBM skill）、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman` |
+| `skills/` | **★ 唯一的 skill 目录**：`OBM`、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman` |
 | `.workbuddy/` | 会话记忆 |
+
+**注意**：原 `Harbor/` 文件夹已于 2026-09-29 删除（其中的 skill 副本、脚本、文档已归档至 `skills/harbor-16/workspace/`）。skill 只保留在 `skills/` 一处，**不要再从其他位置放置 skill 副本**。
+
+## skills/ 目录中的 skill
+
+| skill | 说明 |
+|---|---|
+| `OBM` | 统一 OBM skill（含 subskills：production-trae、review、run-qc） |
+| `harbor-16` | Harbor 内部 RL 出题全流程（+ `workspace/` 归档的脚本与文档） |
+| `harbor-sota` | 外发评测题包生产（规范 v4） |
+| `harbor-work` | 龙猫-阿里 A/B 标注 |
+| `caveman` | 精简输出模式 |
+
+**skill `name` 字段规范**：必须用小写连字符形式（如 `harbor-16`），**不可含空格**（如 `Harbor 16` 会导致调用失败）。
 
 ## skills/OBM 统一 skill
 
