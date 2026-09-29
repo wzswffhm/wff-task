@@ -30,7 +30,7 @@ wff-task/
     ├── harbor-work/       # 龙猫-阿里 A/B 标注
     ├── caveman/           # 精简输出模式
     ├── wff-workspace-discipline/  # 落盘纪律（约束产物位置）
-    └── windows-coding-bench/      # ★ Windows 专项 Coding Bench 题包生产（windwos-第二版）
+    └── harbor-windows/            # ★ Windows 专项 Coding Bench 题包生产（windwos-第二版）
 ```
 
 ## 目录职责约定
@@ -93,7 +93,7 @@ git add -A && git commit -m "描述改动" && git push
 - `skills/OBM/README.md` — OBM 全流程安装与使用
 - `skills/harbor-16/SKILL.md` — Harbor 内部 RL 出题规范
 - `skills/harbor-sota/SKILL.md` — 外发题包生产规范
-- `skills/windows-coding-bench/SKILL.md` — Windows 专项 Coding Bench 题包生产（含校验与骨架脚本）
+- `skills/harbor-windows/SKILL.md` — Windows 专项 Coding Bench 题包生产（含校验、骨架与自动化模型验证脚本）
 - `skills/wff-workspace-discipline/SKILL.md` — 落盘纪律
 
 ## 查看题包交付状态
@@ -101,5 +101,6 @@ git add -A && git commit -m "描述改动" && git push
 - **harbor-16 题包**：看 `jobs/` 是否含 baseline/nop + oracle + 难度门（16 条 trial，`<1`≥13、`=1`≥1）
 - **harbor-sota 题包**：看是否含完整五件套 + `tests/gating/` + `tests/graded/` + `tests/golden_output/`
 - **OBM 题包**：看 `output/` 下是否含 `proposal.json` 与 `sources/`
-- **windows-coding-bench 题包**：跑 `python skills/windows-coding-bench/scripts/validate_package.py --package <题包根>`，
-  须满足五件套齐全 + required F2P/P2P 二值判分 + `delivery-extras/` 齐全 + 镜像 Digest 另存
+- **harbor-windows 题包**：跑 `python skills/harbor-windows/scripts/validate_package.py --package <题包根>`，
+  须满足五件套齐全 + required F2P/P2P 二值判分 + `delivery-extras/` 齐全 + 镜像 Digest 另存；
+  模型区分度用 `python skills/harbor-windows/scripts/run_model_validation.py` 自动化验证

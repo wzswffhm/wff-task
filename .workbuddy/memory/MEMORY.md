@@ -12,10 +12,10 @@
 | `harbor-sota/` | **题包类型目录**：**harbor-sota** skill 产物（外发供应商题包 `wff-eval-*`） |
 | `OBM/` | **题包类型目录**：`Benchmark/`、`work/`、`output/`；根部只放公用配置/脚本 |
 | `deliverables/` | **★ 解析材料产出区**：`<YYYY-MM-DD>_<材料名>/`，材料名保持原拼写 |
-| `skills/` | **★ 唯一的 skill 目录**：`OBM`、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman`、`wff-workspace-discipline`、`windows-coding-bench` |
+| `skills/` | **★ 唯一的 skill 目录**：`OBM`、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman`、`wff-workspace-discipline`、`harbor-windows` |
 | `.workbuddy/` | 会话记忆 |
 
-> **待登记**：`windows-coding-bench` 对应的题包类型目录（建议 `windows-harbor/`）尚未创建，生产时再建并登记于根 `README.md`。
+> **待登记**：`harbor-windows` 对应的题包类型目录（建议 `windows-harbor/`）尚未创建，生产时再建并登记于根 `README.md`。
 
 ## 目录纪律（强制，由 skill `wff-workspace-discipline` 约束）
 
@@ -46,20 +46,24 @@
 | `harbor-work` | 龙猫-阿里 A/B 标注 |
 | `caveman` | 精简输出模式 |
 | `wff-workspace-discipline` | 落盘纪律（根目录洁净 + 题包类型目录 + deliverables 命名） |
-| `windows-coding-bench` | **Windows 专项 Coding Bench 题包生产**（规范 `windwos-第二版`）+ 校验/脚手架脚本 |
+| `harbor-windows` | **Windows 专项 Coding Bench 题包生产**（规范 `windwos-第二版`）+ 校验/脚手架/多模型验证脚本 |
 
 **skill `name` 字段规范**：必须用小写连字符形式（如 `harbor-16`），**不可含空格**（如 `Harbor 16` 会导致调用失败）。
 
-## skills/windows-coding-bench（Windows 专项 Coding Bench）
+## skills/harbor-windows（Windows 专项 Coding Bench）
 
+原名 `windows-coding-bench`，2026-09-29 改名为 `harbor-windows`（与 `harbor-16`/`harbor-sota` 命名风格统一）。
 按《Windows 专项 Coding Bench 数据采购》（`windwos-第二版`，替代 v1.0.2）生产标准 Harbor Task。
 
 ```
-skills/windows-coding-bench/
+skills/harbor-windows/
 ├── SKILL.md                          # 主入口：10 步生产流程 + 交付物清单 + 10 陷阱 + 14 否决
 ├── references/01-spec-requirements.md ~ 09-gz-package-analysis.md
 ├── scripts/validate_package.py       # 题包结构与身份一致性校验（PASS/FAIL/FLAG）
 ├── scripts/build_delivery_extras.py  # 批量生成 delivery-extras 骨架
+├── scripts/run_model_validation.py   # ★ 4 模型自动化验证 + 区分度准入计算
+├── scripts/model_endpoints.template.json  # 端点/凭据配置模板
+├── scripts/README.md                 # 三脚本完整用法
 ├── assets/harbor-skeleton/           # 五件套骨架（可复用 grade.py / test.ps1 / Dockerfile）
 └── assets/metadata-templates/        # 伴随材料 JSON 模板
 ```
@@ -67,6 +71,22 @@ skills/windows-coding-bench/
 **三条底线**：① Windows 价值反事实判定（换 Linux 后实现/根因/Evaluator 若不变 → 淘汰）；② 二值判分（required F2P+P2P 全过=1，否则=0；异常=INVALID，**不得伪装成 0 分**）；③ 身份唯一（`task_id + task_version + task_hash`；镜像 tag 不是身份，须另存 Digest）。
 
 **可复用模式（来自实测 27 题供应商包）**：`===SWELIVE_INVALID <reason>===` 标记、reward 三件套完整性校验、`parser(log)->{test:status}` 契约、`verification_evidence` 3+3 声明块、`run_evidence` 六字段、`UV_OFFLINE=1` 离线镜像、非 wall-clock 基线 commit。
+
+### 多模型验证端点（`run_model_validation.py`）
+
+| key | label | base_url | model | 次数 |
+|---|---|---|---|---|
+| `qwen3.8-max` | Qwen3.8-Max-0902 | `https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic` | `qwen3.8-max` | 3 |
+| `opus-5` | Opus 5 | `https://api.blvr.top` | `claude-opus-5` | 3 |
+| `glm-5.3` | GLM-5.3 | 同 aliyun | `GLM-5.3` | 1 |
+| `kimi-k3` | Kimi K3 | 同 aliyun | `Kimi K3` | 1 |
+
+- 协议 Anthropic Messages（`POST {base_url}/v1/messages`，`x-api-key` + `anthropic-version: 2023-06-01`）
+- **aliyun base_url 必须带 `/apps/anthropic` 后缀**，否则 404
+- 凭据环境变量：`HARBOR_WINDOWS_ALIYUN_KEY`（3 个 aliyun 模型共用）、`HARBOR_WINDOWS_BLVR_KEY`
+- **脚本是"模型调用层"，不是评测沙箱**：只发起调用/存轨迹/区分 VALID-INVALID/算区分度；
+  `per_testcase.json` 初值 `NOT_RUN`、`report.json.score` 初值 `null`，**正式分须由平台 harness 回填**
+- 依赖 `httpx`，已装于 `C:\Users\Administrator\.workbuddy\binaries\python\envs\default`
 
 ## skills/OBM 统一 skill
 
@@ -93,11 +113,29 @@ skills/windows-coding-bench/
 
 详见 `Harbor/分类说明.md`。
 
-## ⚠️ 安全
+## ⚠️ 安全：真实明文密钥的 5 个位置（2026-09-29 全库扫描）
 
-`Harbor/check.md` 含**明文 API Key**（阿里云 MaaS OPENAI_API_KEY），已随仓库推送至 GitHub 私有仓库。用户当时选择不处理，**建议轮换该 Key**。
+**已推送至 GitHub 私有仓库 `wzswffhm/wff-task`**：
 
-**重要**：`Harbor/` 与 `skills/` 原本是独立 git 仓库，其内层 `.git` 已按需求移除，**现为普通目录**。原远程 `wzswffhm/harbor` 与 `wzswffhm/wff-skills` 已不再由本地同步。
+| # | 位置 | 密钥前缀 | 类型 |
+|---|---|---|---|
+| 1 | `skills/harbor-windows/scripts/run_model_validation.py`（第 63/89/102 行） | `sk-ws-H.PIDYYYX` | aliyun MaaS（3 模型共用） |
+| 2 | 同上（第 76 行） | `sk-l8hraN17` | blvr（Opus） |
+| 3 | `skills/harbor-16/workspace/docs/check.md`（第 3 行） | `sk-ws-H.ERLPMXH` | aliyun MaaS（旧） |
+| 4 | `OBM/model.env`（`key=`） | `ark-9bd32e64` | 火山方舟 |
+| 5 | `OBM/feishu-gsb.toml` | `cli_aaf0…` / `ou_35041…` | 飞书应用凭据 |
+
+**仅为端点（无 Key，低风险）**：`skills/harbor-16/references/notes-22.md`、`ops-notes.md`
+（`llm-sn32yenb08wvkx41…compatible-mode/v1`）、`skills/OBM/subskills/run-qc/config/obm.paths.json`（`ark…/api/plan/v3/`）。
+
+**合规做法（不是泄漏）**：`skills/harbor-sota/` 全程用 `${OPENAI_API_KEY}` / `${OPENAI_BASE_URL}` / `${JUDGE_GATEWAY}` 占位符，规范明令逐字保留。
+
+详见 `skills/harbor-windows/references/10-api-keys-and-endpoints.md`（含扫描命令与轮换建议）。
+
+> 排除项：`OBM/.venv/` 下 `openai` 包源码含大量 `api_key` 字样，是库代码非凭据，扫描时须 `grep -v "\.venv/"`。
+
+**历史**：原 `Harbor/check.md` 含明文 Key，已随 `Harbor/` 删除并归档至 `skills/harbor-16/workspace/docs/check.md`（即上表第 3 项）。
+`Harbor/` 与 `skills/` 原本是独立 git 仓库，内层 `.git` 已移除，**现为普通目录**；原远程 `wzswffhm/harbor` 与 `wzswffhm/wff-skills` 已不再由本地同步。
 
 ## Git 约定
 
@@ -105,6 +143,7 @@ skills/windows-coding-bench/
 - **必须开启 `core.longpaths=true`**：`Harbor/` 内存在超过 260 字符的深层路径，否则 checkout 失败。
 - `core.autocrlf=false`（避免 CRLF 批量改写）。
 - 工作流：`git add -A && git commit -m "..." && git push`。
+  - **⚠️ 仅在用户明确要求提交时才执行**；否则改动只留在工作区（见「用户偏好」）。
 - **新增内容时必须先确认无内层 `.git`**：内层仓库会被记录为 gitlink 占位符（模式 `160000`），内容不会入库。清理后需 `git rm -r --cached . -f` 再重新 `git add`。
 
 ## 大文件约束
@@ -134,3 +173,7 @@ skills/windows-coding-bench/
 - 中文交流，偏好结构化表格与结论先行。
 - 涉及全局配置或破坏性操作时，希望先了解影响面再决定。
 - 倾向"全部推送、不做额外处理"的直给风格，但接受必要的技术约束说明。
+- **不要自动提交代码**：改完文件后**只本地落盘**，**必须等用户明确说"提交/推送"才 commit + push**。
+  （2026-09-29 用户明确要求；此前默认改完即提交的行为需纠正。）
+- **删除/清理操作不必逐次确认**：用户已明确授权直接执行（2026-09-29）。
+- 遇到能力/凭据受限时，倾向"先把工具链做完、待条件就绪即可跑通"，而非阻塞等待。
