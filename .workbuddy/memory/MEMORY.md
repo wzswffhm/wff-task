@@ -50,6 +50,40 @@
 
 **skill `name` 字段规范**：必须用小写连字符形式（如 `harbor-16`），**不可含空格**（如 `Harbor 16` 会导致调用失败）。
 
+### ★ skill 注册机制（2026-09-29 建立，重要）
+
+**`skills/` 目录本身不是 WorkBuddy 的 skill 扫描路径**——它只是仓库内的普通文件夹（名巧合叫 skills）。
+Agent 能自动发现的只有两处：`~/.workbuddy/skills/`（用户级，全项目）和 `{项目}/.workbuddy/skills/`（项目级）。
+
+**现行方案：目录联结（junction），单一事实源在仓库。**
+
+`~/.workbuddy/skills/` 下 7 个条目**全部是指向 `wff-task/skills/<name>` 的 junction**：
+
+```
+~/.workbuddy/skills/
+├── OBM                      -> Desktop/wff-task/skills/OBM
+├── caveman                  -> .../caveman
+├── harbor-16                -> .../harbor-16
+├── harbor-sota              -> .../harbor-sota
+├── harbor-windows           -> .../harbor-windows
+├── harbor-work              -> .../harbor-work
+└── wff-workspace-discipline -> .../wff-workspace-discipline
+```
+
+- **创建命令**：`cmd /c mklink /J "<链接>" "<目标>"`（目录联接，**不需管理员权限**；`/D` 符号链接才需要开发者模式）。
+  - ⚠️ 必须在 **PowerShell** 里执行；Git Bash 会把 `/J` 当路径转换掉（报 `无效开关 - "C:"`）。
+- **好处**：改仓库文件即改用户级 skill，零同步、零漂移；`git status` 保持干净（链接在仓库外，不污染）。
+- **禁止再复制**：历史上 `skills/harbor-16/workspace/sync-skills.ps1` 用 **copy** 做三向同步（repo→Codex→DSH），复制必然漂移，已弃用。
+
+**已清理的重复项（2026-09-29 精确比对后删除）**：
+
+| 已删除（用户级） | 保留（项目级，更新/更全） | 判定依据 |
+|---|---|---|
+| `harbor-skill`（587 行单体，8-12） | `harbor-16`（188 行 + 19 references，9-29） | harbor-16 把单体拆成「主文件 + 按需加载 references」，harbor-skill 全部 19 个章节均已被覆盖，另有 `workspace/` 21 脚本 |
+| `harbor-eval-bundle`（158 行，8-14） | `harbor-sota`（189 行，9-29） | harbor-sota 是**严格超集**，仅多出领域分类表，无一行反向独有 |
+
+`agent-created-skills.json` 已重置为空数组（原登记已删除的 `harbor-eval-bundle`）。
+
 ## skills/harbor-windows（Windows 专项 Coding Bench）
 
 原名 `windows-coding-bench`，2026-09-29 改名为 `harbor-windows`（与 `harbor-16`/`harbor-sota` 命名风格统一）。
