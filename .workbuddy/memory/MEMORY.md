@@ -8,11 +8,31 @@
 
 | 目录 | 内容 |
 |---|---|
-| `harbor-16/` | **harbor-16** skill 产物：内部 RL 题包（`zq*` 批次、`block-storage-*`） |
-| `harbor-sota/` | **harbor-sota** skill 产物：外发供应商题包（`wff-eval-*`，含 gating/graded/golden_output） |
-| `OBM/` | `Benchmark/`（第三方数据集）、`work/`（实验产物）、`output/`（结果） |
-| `skills/` | **★ 唯一的 skill 目录**：`OBM`、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman` |
+| `harbor-16/` | **题包类型目录**：**harbor-16** skill 产物（内部 RL 题包，`zq*` 批次、`block-storage-*`） |
+| `harbor-sota/` | **题包类型目录**：**harbor-sota** skill 产物（外发供应商题包 `wff-eval-*`） |
+| `OBM/` | **题包类型目录**：`Benchmark/`、`work/`、`output/`；根部只放公用配置/脚本 |
+| `deliverables/` | **★ 解析材料产出区**：`<YYYY-MM-DD>_<材料名>/`，材料名保持原拼写 |
+| `skills/` | **★ 唯一的 skill 目录**：`OBM`、`harbor-16`、`harbor-sota`、`harbor-work`、`caveman`、`wff-workspace-discipline`、`windows-coding-bench` |
 | `.workbuddy/` | 会话记忆 |
+
+> **待登记**：`windows-coding-bench` 对应的题包类型目录（建议 `windows-harbor/`）尚未创建，生产时再建并登记于根 `README.md`。
+
+## 目录纪律（强制，由 skill `wff-workspace-discipline` 约束）
+
+**铁律一 · 根目录单一制**：`README.md`、`.gitignore`、`deliverables/`、`skills/` **各只允许一个**。禁止根级备份/临时目录（`X.backup-*`、`X-2/`、`tmp/`）。
+
+**铁律二 · 题包类型目录**：`OBM/`、`harbor-16/`、`harbor-sota/` 是**题包类型目录**（代表某 skill 的题包集合），**可扩展**（如 Windows-Harbor 作业需新建自己的类型目录）。规则：
+- 单包 = 类型目录下**独立子目录**，一题一目录
+- 类型目录**根部只放公用**配置/脚本/缓存（参考 `OBM/model.env`、`OBM/tools/`）
+- 题目专属内容**禁止上浮**到类型目录根部，避免污染其他题包
+
+**铁律三 · deliverables 命名规则**：解析材料产出放 `deliverables/<YYYY-MM-DD>_<材料名>/`：
+- 目录名 = **产出日期** + 材料文件名（去扩展名）
+- 日期用 `date +%F` 取真实值，不凭记忆推算
+- 材料名**保持原拼写**（不改错别字，`windwos` 不纠正成 `windows`）
+- 一材料一目录；目录内产物按内容命名，**不强制**与材料同名
+
+**已登记题包类型目录**：`OBM/`、`harbor-16/`、`harbor-sota/`。新增须经确认并登记于根 `README.md`。
 
 **注意**：原 `Harbor/` 文件夹已于 2026-09-29 删除（其中的 skill 副本、脚本、文档已归档至 `skills/harbor-16/workspace/`）。skill 只保留在 `skills/` 一处，**不要再从其他位置放置 skill 副本**。
 
@@ -25,8 +45,28 @@
 | `harbor-sota` | 外发评测题包生产（规范 v4） |
 | `harbor-work` | 龙猫-阿里 A/B 标注 |
 | `caveman` | 精简输出模式 |
+| `wff-workspace-discipline` | 落盘纪律（根目录洁净 + 题包类型目录 + deliverables 命名） |
+| `windows-coding-bench` | **Windows 专项 Coding Bench 题包生产**（规范 `windwos-第二版`）+ 校验/脚手架脚本 |
 
 **skill `name` 字段规范**：必须用小写连字符形式（如 `harbor-16`），**不可含空格**（如 `Harbor 16` 会导致调用失败）。
+
+## skills/windows-coding-bench（Windows 专项 Coding Bench）
+
+按《Windows 专项 Coding Bench 数据采购》（`windwos-第二版`，替代 v1.0.2）生产标准 Harbor Task。
+
+```
+skills/windows-coding-bench/
+├── SKILL.md                          # 主入口：10 步生产流程 + 交付物清单 + 10 陷阱 + 14 否决
+├── references/01-spec-requirements.md ~ 09-gz-package-analysis.md
+├── scripts/validate_package.py       # 题包结构与身份一致性校验（PASS/FAIL/FLAG）
+├── scripts/build_delivery_extras.py  # 批量生成 delivery-extras 骨架
+├── assets/harbor-skeleton/           # 五件套骨架（可复用 grade.py / test.ps1 / Dockerfile）
+└── assets/metadata-templates/        # 伴随材料 JSON 模板
+```
+
+**三条底线**：① Windows 价值反事实判定（换 Linux 后实现/根因/Evaluator 若不变 → 淘汰）；② 二值判分（required F2P+P2P 全过=1，否则=0；异常=INVALID，**不得伪装成 0 分**）；③ 身份唯一（`task_id + task_version + task_hash`；镜像 tag 不是身份，须另存 Digest）。
+
+**可复用模式（来自实测 27 题供应商包）**：`===SWELIVE_INVALID <reason>===` 标记、reward 三件套完整性校验、`parser(log)->{test:status}` 契约、`verification_evidence` 3+3 声明块、`run_evidence` 六字段、`UV_OFFLINE=1` 离线镜像、非 wall-clock 基线 commit。
 
 ## skills/OBM 统一 skill
 
