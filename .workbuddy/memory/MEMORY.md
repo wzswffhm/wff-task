@@ -15,7 +15,7 @@
 | `.workbuddy/` | 会话记忆 |
 
 **待登记**的题包类型目录（生产时再建，并登记于根 `README.md`）：
-`harbor-windows` → `windows-harbor/`；`harbor-legal` → `legal/`；`harbor-finance` → `finance/`。
+`harbor-windows` → `windows-harbor/`；`harbor-rl` → `legal/`；`harbor-weakness` → `finance/`。
 
 ## 2. 目录纪律（由 skill `wff-workspace-discipline` 约束）
 
@@ -34,8 +34,8 @@ skill **只保留在 `skills/` 一处**，不要再从其他地方放副本。
 | `harbor-16` | Harbor 内部 RL 出题（`zq*` 批次，pytest 程序化评分） |
 | `harbor-sota` | 外发供应商题包（**旧版规范 v4**，`judge.toml`+`gating.toml`） |
 | `harbor-windows` | Windows 专项 Coding Bench（二值判分） |
-| `harbor-legal` | **法律领域出题**（Law1–Law6）+ 内联交付标准 |
-| `harbor-finance` | **金融领域出题**（专项 1000 + Weakness 1000）+ 内联交付标准 |
+| `harbor-rl` | **法律领域出题**（Law1–Law6）+ 内联交付标准 ｜原名 `harbor-legal`，2026-09-30 改名 |
+| `harbor-weakness` | **金融领域出题**（专项 1000 + Weakness 1000）+ 内联交付标准 ｜原名 `harbor-finance`，2026-09-30 改名 |
 | `harbor-work` | 龙猫-阿里 A/B 标注 |
 | `caveman` | 精简输出模式 |
 | `wff-workspace-discipline` | 落盘纪律 |
@@ -48,7 +48,7 @@ skill **只保留在 `skills/` 一处**，不要再从其他地方放副本。
 
 `~/.workbuddy/skills/` 下 9 个条目**全部是指向 `wff-task/skills/<name>` 的 junction**：
 `OBM`、`caveman`、`harbor-16`、`harbor-sota`、`harbor-windows`、`harbor-work`、
-`wff-workspace-discipline`、`harbor-legal`、`harbor-finance`。
+`wff-workspace-discipline`、`harbor-rl`、`harbor-weakness`。
 
 - **创建**：`New-Item -ItemType Junction -Path "<链接>" -Target "<目标>"`（无需管理员权限，2026-09-30 实测可用）
   - ⚠️ `cmd /c mklink /J` **已被安全策略阻断**；Git Bash 也不可用（`/J` 被当路径转换，报 `无效开关 - "C:"`）。
@@ -67,10 +67,10 @@ skill **只保留在 `skills/` 一处**，不要再从其他地方放副本。
 
 | skill | 规范来源 | 结构 |
 |---|---|---|
-| `harbor-legal` | 《RL0-1 数据生产规范（法律）》 | `references/01–03`（出题设计）+ `delivery/00–08`+`templates/`+`assets/`（交付标准，内联） |
-| `harbor-finance` | 《基于 weakness 和 skill 的数据构造方案（金融）》 | `references/01–08`（总纲/5 类专项/weakness/C 级/埋点 rubric）+ 同上 `delivery/` |
+| `harbor-rl` | 《RL0-1 数据生产规范（法律）》 | `references/01–03`（出题设计）+ `delivery/00–08`+`templates/`+`assets/`（交付标准，内联） |
+| `harbor-weakness` | 《基于 weakness 和 skill 的数据构造方案（金融）》 | `references/01–08`（总纲/5 类专项/weakness/C 级/埋点 rubric）+ 同上 `delivery/` |
 
-- **`delivery/` 在两 skill 下各存一份且必须逐字一致**（校验：`diff -r skills/harbor-legal/delivery skills/harbor-finance/delivery`）。
+- **`delivery/` 在两 skill 下各存一份且必须逐字一致**（校验：`diff -r skills/harbor-rl/delivery skills/harbor-weakness/delivery`）。
 - 原独立 skill `harbor-rewardkit` 已内联并删除（不再存在于 `skills/` 与 junction 列表）。
 - **法律口径映射（高频返修点）**：法律规范的 `weight = -3/-7/-10` 交付时须改写为 `weight = 3.0/7.0/10.0` + `negate = true`（交付态**严禁负 weight**）；`type=Gradient`+`levels{1,.75,.5,.25,0}` → `type=likert`+`points=5`（judge 1–5 归一化 `(raw−1)/4` 恰对应）。两式数学等价。
 - **金融配额**：专项 1000（5 类 × 200）+ Weakness 1000；每类 weakness ∈[50,250]；C1–C5 配比 120/250/350/180/100；同一知识点出题 <3 道。

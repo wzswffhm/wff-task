@@ -209,24 +209,24 @@
 
 | # | skill | 对应规范 | 定位 |
 |---|---|---|---|
-| 1 | `harbor-legal` | 文件1《RL0-1 数据生产规范（法律）》 | **题型 skill ①**：法律领域常规办公题。Law1–Law6 分布、三/四级标签、法律专业维度打分项 |
-| 2 | `harbor-finance` | 文件2《基于 weakness 和 skill 的数据构造方案（金融）》 | **题型 skill ②**：金融领域。内含两块共 2000 条——专项数据 1000 条（Skill Discovery / Skill Generation·Editing / Skill Dependency / Dependency-aware Workflow / Subagent Workflow / MCP Scaling）+ Weakness-driven 1000 条（W1–W14 × C1–C5） |
+| 1 | `harbor-rl` | 文件1《RL0-1 数据生产规范（法律）》 | **题型 skill ①**：法律领域常规办公题。Law1–Law6 分布、三/四级标签、法律专业维度打分项 |
+| 2 | `harbor-weakness` | 文件2《基于 weakness 和 skill 的数据构造方案（金融）》 | **题型 skill ②**：金融领域。内含两块共 2000 条——专项数据 1000 条（Skill Discovery / Skill Generation·Editing / Skill Dependency / Dependency-aware Workflow / Subagent Workflow / MCP Scaling）+ Weakness-driven 1000 条（W1–W14 × C1–C5） |
 
 ### 8.1 题型 → skill 的承载映射
 
 | 题型（§二） | 承载 skill | 参考文件 |
 |---|---|---|
-| 1 常规办公题（法律） | `harbor-legal` | `references/01`–`03` |
-| 2 Skill Discovery | `harbor-finance` | `references/02-skill-discovery.md` |
-| 3 Skill Generation / Editing | `harbor-finance` | `references/03-skill-authoring.md` |
-| 4 Skill Dependency | `harbor-finance` | `references/04-skill-dependency.md` |
-| 5 Workflow Execution（Dependency-aware + Subagent） | `harbor-finance` | `references/05-workflow.md` |
-| 6 Weakness-driven（W1–W14） | `harbor-finance` | `references/06`–`08` |
-| 7 MCP Scaling（低优） | `harbor-finance` | `references/05-workflow.md` §MCP |
+| 1 常规办公题（法律） | `harbor-rl` | `references/01`–`03` |
+| 2 Skill Discovery | `harbor-weakness` | `references/02-skill-discovery.md` |
+| 3 Skill Generation / Editing | `harbor-weakness` | `references/03-skill-authoring.md` |
+| 4 Skill Dependency | `harbor-weakness` | `references/04-skill-dependency.md` |
+| 5 Workflow Execution（Dependency-aware + Subagent） | `harbor-weakness` | `references/05-workflow.md` |
+| 6 Weakness-driven（W1–W14） | `harbor-weakness` | `references/06`–`08` |
+| 7 MCP Scaling（低优） | `harbor-weakness` | `references/05-workflow.md` §MCP |
 
 ### 8.2 交付标准的内联（不单设 skill）
 
-`delivery/` 在两个 skill 下**各存一份、内容完全一致**（校验：`diff -r skills/harbor-legal/delivery skills/harbor-finance/delivery`）：
+`delivery/` 在两个 skill 下**各存一份、内容完全一致**（校验：`diff -r skills/harbor-rl/delivery skills/harbor-weakness/delivery`）：
 
 | 文件 | 内容 |
 |---|---|

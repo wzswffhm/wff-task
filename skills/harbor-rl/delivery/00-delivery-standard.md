@@ -1,6 +1,6 @@
 # 交付标准总纲（rewardkit 20260913）
 > **内联说明**：本文件原为独立 skill `harbor-rewardkit`，现并入本 skill 的 `delivery/`，使技能包**自包含**。
-> 同一内容在 `harbor-legal/delivery/` 与 `harbor-finance/delivery/` **各存一份，须逐字一致**；规范更新时须同步两处（校验 `diff -r skills/harbor-legal/delivery skills/harbor-finance/delivery`）。
+> 同一内容在 `harbor-rl/delivery/` 与 `harbor-weakness/delivery/` **各存一份，须逐字一致**；规范更新时须同步两处（校验 `diff -r skills/harbor-rl/delivery skills/harbor-weakness/delivery`）。
 
 
 按《外发版-评测题包交付规范（rewardkit）20260913》生产与交付外发评测题包。
@@ -270,8 +270,8 @@ S_max（满分基准） = Σ 全部正向条目的 weight        ← 负向条�
 
 | skill | 关系 |
 |---|---|
-| `harbor-legal` | 题型 skill ①：法律领域常规办公题，交付环节依赖本 skill |
-| `harbor-finance` | 题型 skill ②：金融领域（专项 1000 条 + Weakness 1000 条），交付环节依赖本 skill |
+| `harbor-rl` | 题型 skill ①：法律领域常规办公题，交付环节依赖本 skill |
+| `harbor-weakness` | 题型 skill ②：金融领域（专项 1000 条 + Weakness 1000 条），交付环节依赖本 skill |
 | `harbor-sota` | 旧版外发规范（v4 / judge.toml + gating.toml），**口径不同，不得混用** |
 | `harbor-windows` | Windows 专项 Coding Bench（二值判分），**口径不同，不得混用** |
 | `wff-workspace-discipline` | 产物落盘位置约束（题包放类型目录，解析产出放 `deliverables/`） |

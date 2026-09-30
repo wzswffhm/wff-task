@@ -1,5 +1,5 @@
 ---
-name: harbor-legal
+name: harbor-rl
 description: >
   按《RL0-1-数据生产规范 Guideline for 外部供应商（法律）》生产法律领域常规办公场景评测题。
   覆盖法律二级标签 Law1–Law6（诉讼律师/非诉律师/企业法务与合规/法官与法院辅助/检察官与检察辅助/立法与政策研究）的

@@ -379,6 +379,6 @@ if __name__ == "__main__":
 | 交付格式、task.toml / rubrics.toml / prompt.md 硬约束 | `../delivery/` |
 | W2 冲突选边 / W9 形式化调用 / W11 无据自造的构造细则 | `04-skill-dependency.md` |
 | W8 派发即完成 / 长链路任务的构造细则 | `05-workflow.md` |
-| W14 脱敏规则 | `harbor-legal/references/02-input-files.md` |
+| W14 脱敏规则 | `harbor-rl/references/02-input-files.md` |
 | W1–W14 全量观测证据与构造建议 | `06-weakness-catalog.md` |
 | C1–C5 指标与题量配比 | `07-complexity-scales.md` |
