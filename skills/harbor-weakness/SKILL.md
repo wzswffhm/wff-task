@@ -1,5 +1,5 @@
 ---
-name: harbor-finance
+name: harbor-weakness
 description: >
   生产金融（FIN）领域 Harbor 评测题包，覆盖两大块共 2000 条：① 专项数据 1000 条——
   Skill Discovery（该不该用/用哪个 skill，含干扰技能）、Skill Generation/Editing（创建/修改/
@@ -39,7 +39,7 @@ agent_created: true
 
 触发词：金融题 / 金融题包 / skill 专项题 / workflow 题 / weakness 题 / W1–W14 / C1–C5 / 定向构造。
 
-**不适用**：法律领域题（→ `../../harbor-legal/SKILL.md`）、Windows Coding 题（→ `harbor-windows`）、
+**不适用**：法律领域题（→ `../../harbor-rl/SKILL.md`）、Windows Coding 题（→ `harbor-windows`）、
 内部 RL 题包（→ `harbor-16`）。
 
 ---
@@ -114,7 +114,7 @@ Evidence Chain / 执行步数 / 工具种类。**六项大多同档 → 取该�
 - 专项题：`environment/skills/<name>/` 装入功能型 skill（`SKILL.md` + `scripts/` + `references/`），
   Dockerfile 中 `COPY skills/ /skills/`；skill 须与 `skill_set` **逐一对应**；
 - weakness 题：埋点落在数据 / 目录结构 / 跨源冲突上，须满足**可发现 · 稳定复现 · 不可提示**三要素；
-- 脱敏规则同法律领域 → `../../harbor-legal/references/02-input-files.md`。
+- 脱敏规则同法律领域 → `../../harbor-rl/references/02-input-files.md`。
 
 ### ⑥ 写 instruction.md
 
@@ -244,4 +244,4 @@ weakness_tag                = ["W07-长表格数据覆盖"]
 | `delivery/03-rubrics-and-prompt.md` | rubrics.toml / prompt.md 通用规则与评分机制 |
 | `delivery/06-model-validation.md` | 三模型难度验证流程与等级区间 |
 | `delivery/08-skill-packaging.md` | skill 打包进 `environment/skills/` 的目录规范与自检 |
-| `../../harbor-legal/references/02-input-files.md` | 脱敏规则（W14 与全部金融题共用） |
+| `../../harbor-rl/references/02-input-files.md` | 脱敏规则（W14 与全部金融题共用） |
