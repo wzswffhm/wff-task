@@ -42,6 +42,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -150,8 +151,16 @@ def classify_failure(status_code, body_text):
 
 # ------------------------------------------------------------------ HTTP 调用
 
-def call_anthropic(base_url, api_key, model, prompt, auth="x-api-key"):
-    """用 Anthropic Messages 协议调用，返回 (ok, status, text, meta)。"""
+def call_anthropic(base_url, api_key, model, prompt, auth="x-api-key",
+                   max_tokens=None, extra_body=None):
+    """用 Anthropic Messages 协议调用，返回 (ok, status, text, meta)。
+
+    max_tokens  该端点专用输出预算（默认 MAX_TOKENS）。
+    extra_body  合并进请求体的附加字段，用于供应商差异，例如
+                火山方舟的 {"thinking": {"type": "disabled"}}。
+                注意：部分模型（如 GLM-5.3）不支持关闭 thinking，且 thinking 块
+                会计入 max_tokens，预算不足会导致 text 块为空 —— 此时必须调大预算。
+    """
     try:
         import httpx
     except ImportError:
@@ -166,9 +175,11 @@ def call_anthropic(base_url, api_key, model, prompt, auth="x-api-key"):
     headers["content-type"] = "application/json"
     payload = {
         "model": model,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens or MAX_TOKENS,
         "messages": [{"role": "user", "content": prompt}],
     }
+    if extra_body:
+        payload.update(extra_body)
 
     last = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -184,6 +195,10 @@ def call_anthropic(base_url, api_key, model, prompt, auth="x-api-key"):
                 text = "".join(
                     b.get("text", "") for b in (doc.get("content") or []) if b.get("type") == "text"
                 )
+                thinking_chars = sum(
+                    len(b.get("thinking") or "")
+                    for b in (doc.get("content") or []) if b.get("type") == "thinking"
+                )
                 usage = doc.get("usage") or {}
                 return True, 200, text, {
                     "elapsed": round(elapsed, 2),
@@ -191,6 +206,10 @@ def call_anthropic(base_url, api_key, model, prompt, auth="x-api-key"):
                     "output_tokens": usage.get("output_tokens"),
                     "stop_reason": doc.get("stop_reason"),
                     "model_returned": doc.get("model"),
+                    "thinking_chars": thinking_chars,
+                    # 预算被 thinking 吃光 → text 为空。这是**可诊断的配置问题**，
+                    # 不是模型无输出，须调大 max_tokens 或关闭 thinking 后重跑。
+                    "empty_text_with_thinking": (not text.strip()) and thinking_chars > 0,
                 }
             last = (r.status_code, r.text[:1000], elapsed)
             kind, _, _ = classify_failure(r.status_code, r.text)
@@ -246,8 +265,28 @@ def discover_tasks(tasks_arg):
 
 # ------------------------------------------------------------------ 结果读写
 
+# 伴随材料布局：
+#   batch —— 批次布局，题外材料在 <out>/<tid>/（model_runs 等）
+#   flat  —— 平铺布局，题外材料在 <out>/<tid>/extras/（harbor-windows 型目录）
+LAYOUT = "batch"
+
+
+def task_base(out_root, tid):
+    """题的伴随材料根目录（model_runs 的父目录）。"""
+    if LAYOUT == "flat":
+        return os.path.join(out_root, tid, "extras")
+    return os.path.join(out_root, tid)
+
+
+def summary_dir(out_root):
+    """目录级汇总（model_summary.csv 等）的输出位置。"""
+    if LAYOUT == "flat":
+        return os.path.join(out_root, "_index")
+    return os.path.join(out_root, "..")
+
+
 def run_dir(out_root, tid, ep_dir, n):
-    return os.path.join(out_root, tid, "model_runs", ep_dir, f"run-{n}")
+    return os.path.join(task_base(out_root, tid), "model_runs", ep_dir, f"run-{n}")
 
 
 def write_json(path, obj):
@@ -272,7 +311,8 @@ def classify_run(validation_kind, meta):
 
 # ------------------------------------------------------------------ 单次运行
 
-def run_once(task_dir, tid, ep, n, out_root, prompt, dry_run=False):
+def run_once(task_dir, tid, ep, n, out_root, prompt, dry_run=False,
+             agent=True, instruction=None):
     rd = run_dir(out_root, tid, ep["dir"], n)
     os.makedirs(rd, exist_ok=True)
 
@@ -293,8 +333,71 @@ def run_once(task_dir, tid, ep, n, out_root, prompt, dry_run=False):
         write_json(os.path.join(rd, "meta.json"), meta)
         return {"status": "PENDING", "meta": meta}
 
+    # ---------------- Agent 模式：给模型沙箱与工具，自行读写工作区 ----------------
+    if agent:
+        try:
+            import agent_harness
+        except ImportError as e:
+            meta["status"] = "INVALID"
+            meta["invalid_reason"] = "agent_harness import failed: %s" % e
+            write_json(os.path.join(rd, "meta.json"), meta)
+            return {"status": "INVALID", "meta": meta}
+
+        res = agent_harness.run_agent(
+            task_dir, ep, n, instruction or prompt, get_api_key(ep))
+
+        meta["mode"] = "agent"
+        meta["completed_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for k in ("elapsed", "steps", "submitted", "submit_summary", "last_stop_reason",
+                  "input_tokens", "output_tokens", "patch_bytes", "sandbox", "base_commit",
+                  "agent_max_steps", "tools"):
+            if k in res:
+                meta[k] = res[k]
+        meta["status"] = res.get("status", "INVALID")
+        if meta["status"] != "VALID":
+            meta["invalid_reason"] = res.get("invalid_reason")
+            meta["http_status"] = res.get("http_status")
+
+        write_json(os.path.join(rd, "meta.json"), meta)
+        write_json(os.path.join(rd, "agent_result.json"), {
+            k: v for k, v in res.items() if k not in ("patch",)
+        })
+        if res.get("trajectory") and os.path.isfile(res["trajectory"]):
+            shutil.copy2(res["trajectory"], os.path.join(rd, "trajectory.jsonl"))
+
+        patch = (res.get("patch") or "").strip()
+        if patch:
+            write_text(os.path.join(rd, "patch.diff"), res["patch"])
+            meta["patch_extracted"] = True
+        else:
+            meta["patch_extracted"] = False
+        write_text(os.path.join(rd, "response.md"),
+                   res.get("submit_summary") or
+                   "(agent 未给出 submit 摘要；详见 trajectory.jsonl)")
+        write_json(os.path.join(rd, "meta.json"), meta)
+
+        spec = load_spec(task_dir)
+        per_test = {}
+        for t in spec.get("FAIL_TO_PASS", []):
+            per_test[t] = "NOT_RUN"
+        for t in spec.get("PASS_TO_PASS", []):
+            per_test[t] = "NOT_RUN"
+        write_json(os.path.join(rd, "per_testcase.json"), {
+            "task_id": tid, "run_index": n,
+            "_note": "逐 testcase 结果由判分层（test.ps1/grade.py 或 l2_runner.py）执行后回填",
+            "results": per_test,
+        })
+        write_json(os.path.join(rd, "report.json"), {
+            "task_id": tid, "run_index": n, "status": meta["status"],
+            "score": None, "model_score_sum": None,
+            "_note": "需由判分层执行 F2P/P2P 后回填 score",
+        })
+        return {"status": meta["status"], "meta": meta}
+
+    # ---------------- 单轮模式（无工具）：仅把题面作为 prompt 发出 ----------------
     ok, status, text, call_meta = call_anthropic(
-        ep["base_url"], get_api_key(ep), ep["model"], prompt, ep.get("auth", "x-api-key")
+        ep["base_url"], get_api_key(ep), ep["model"], prompt, ep.get("auth", "x-api-key"),
+        max_tokens=ep.get("max_tokens"), extra_body=ep.get("extra_body"),
     )
     meta["completed_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     meta.update(call_meta)
@@ -372,7 +475,7 @@ def score_task(out_root, tid, endpoints):
     """读取已有 model_runs 结果，计算 model_score_sum / testcase_pass_sum 与准入结论。"""
     result = {"task_id": tid, "models": {}, "validity": {}, "admission": None}
     for ep in endpoints:
-        d = os.path.join(out_root, tid, "model_runs", ep["dir"])
+        d = os.path.join(task_base(out_root, tid), "model_runs", ep["dir"])
         score_sum = 0
         pass_sum = 0
         valid = 0
@@ -481,7 +584,7 @@ def write_score_report(out_root, results, schema_ver="1.3"):
                 m["testcase_pass_sum"], r["validity"].get(k, ""),
                 (r["admission"].get("reason") or "").replace(",", "；"),
             ]))
-    write_text(os.path.join(out_root, "..", "model_summary.csv"), "\n".join(rows) + "\n")
+    write_text(os.path.join(summary_dir(out_root), "model_summary.csv"), "\n".join(rows) + "\n")
 
     md = [f"# 多模型验证报告\n", f"生成时间：{today}", "",
           "## 1. 区分度准入汇总", "",
@@ -509,24 +612,48 @@ def write_score_report(out_root, results, schema_ver="1.3"):
            "> 只统计 VALID 运行；INVALID 必须查明原因并补跑，不得计入难度统计。",
            "> 模型门槛不能覆盖数据质量门槛：题面歧义、错误测试、环境故障、答案泄漏、Windows 价值不足时仍不得验收。",
            "> 不得为制造分差而增加题面未声明要求或冷门陷阱。", ""]
-    write_text(os.path.join(out_root, "..", "model_validation_report.md"), "\n".join(md) + "\n")
+    write_text(os.path.join(summary_dir(out_root), "model_validation_report.md"), "\n".join(md) + "\n")
 
     summary = {"generated_at": today, "harbor_schema": schema_ver, "tasks": results}
-    write_json(os.path.join(out_root, "..", "model_validation_summary.json"), summary)
+    write_json(os.path.join(summary_dir(out_root), "model_validation_summary.json"), summary)
 
 
 # ------------------------------------------------------------------ 主流程
 
 def main():
+    global LAYOUT
     ap = argparse.ArgumentParser(description="Harbor Windows 多模型自动化验证")
     ap.add_argument("--tasks", help="题目目录（单题）或包含多题的目录")
-    ap.add_argument("--out", required=True, help="delivery-extras/tasks 输出目录")
+    ap.add_argument("--out", required=True,
+                    help="伴随材料输出根：batch=<delivery-extras/tasks>；flat=<题包类型目录>")
+    ap.add_argument("--layout", choices=["batch", "flat"], default="batch",
+                    help="伴随材料布局：batch → <out>/<tid>/model_runs；"
+                         "flat → <out>/<tid>/extras/model_runs（默认 batch）")
     ap.add_argument("--config", help="模型配置 JSON（默认用内置）")
     ap.add_argument("--smoke", action="store_true", help="冒烟：每模型只跑 1 次")
     ap.add_argument("--dry-run", action="store_true", help="不实际调用，只建骨架")
     ap.add_argument("--score-only", action="store_true", help="只计算区分度，不调模型")
     ap.add_argument("--prompt-file", help="自定义题面 prompt 模板（{instruction} 占位）")
+    ap.add_argument("--no-agent", action="store_true",
+                    help="关闭 agent 模式，退回单轮 prompt（模型看不到源码，仅用于对照/排障）")
+    ap.add_argument("--agent-max-steps", type=int,
+                    help="agent 模式单次运行的最大工具轮次（默认 40，也可用环境变量 "
+                         "HARBOR_WINDOWS_AGENT_MAX_STEPS 设置）")
+    ap.add_argument("--only", help="只跑指定端点的 key（逗号分隔，如 qwen3.8-max,opus-5）。"
+                                  "用于把各模型拆成独立进程并行执行；不传 = 全部端点。"
+                                  "注意：--score-only 时忽略此参数（区分度需要全部端点）。")
+    ap.add_argument("--run-index", type=int,
+                    help="只执行指定序号的重复运行（1-based）。配合 --only 可把同一模型的 "
+                         "多次独立运行拆成多个并行进程，用于缩短长耗时模型的墙钟时间。")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="断点续跑：某 run 的 meta.json 已存在且状态为 VALID/INVALID 时跳过。"
+                         "被中断的运行（process 被外部终止）不会写 meta.json，因此会被自动重跑。")
     args = ap.parse_args()
+
+    if args.agent_max_steps:
+        os.environ["HARBOR_WINDOWS_AGENT_MAX_STEPS"] = str(args.agent_max_steps)
+
+    LAYOUT = args.layout
 
     endpoints = DEFAULT_ENDPOINTS
     env_cfg = os.environ.get("HARBOR_WINDOWS_ENDPOINTS_JSON")
@@ -548,12 +675,28 @@ def main():
     if args.smoke:
         endpoints = [dict(e, runs=1) for e in endpoints]
 
+    if args.only:
+        want = [s.strip() for s in args.only.split(",") if s.strip()]
+        picked, missing = [], []
+        for w in want:
+            hit = [e for e in endpoints if e.get("key") == w or e.get("dir") == w]
+            if hit:
+                picked.append(hit[0])
+            else:
+                missing.append(w)
+        if missing:
+            print("错误: --only 指定的端点不存在: %s（可选: %s）"
+                  % (", ".join(missing), ", ".join(str(e.get("key")) for e in endpoints)),
+                  file=sys.stderr)
+            return 2
+        endpoints = picked
+        print(f"[分片] 仅执行端点: {', '.join(str(e.get('key')) for e in endpoints)}")
+
     out_root = os.path.abspath(args.out)
     os.makedirs(out_root, exist_ok=True)
 
     if args.score_only:
-        tids = discover_tasks(args.tasks) if args.tasks else [
-            d for d in sorted(os.listdir(out_root)) if os.path.isdir(os.path.join(out_root, d))]
+        tids = discover_tasks(args.tasks) if args.tasks else discover_tasks(out_root)
         if not tids:
             print("错误: 未找到题目", file=sys.stderr)
             return 2
@@ -599,7 +742,9 @@ def main():
             continue
         ok, status, text, meta = call_anthropic(
             ep["base_url"], key, ep["model"], "Reply with exactly: OK",
-            ep.get("auth", "x-api-key"))
+            ep.get("auth", "x-api-key"),
+            max_tokens=ep.get("precheck_max_tokens") or ep.get("max_tokens"),
+            extra_body=ep.get("extra_body"))
         if ok:
             print(f"  [OK]      {ep['label']} ({ep['model']}) -> {text.strip()[:40]!r}")
         else:
@@ -634,9 +779,27 @@ def main():
         print("=" * 66)
         for ep in endpoints:
             print(f"  · {ep['label']}  x{ep['runs']}  [{ep['role']}]")
-            for n in range(1, ep["runs"] + 1):
+            run_list = ([args.run_index] if args.run_index
+                        else list(range(1, ep["runs"] + 1)))
+            for n in run_list:
+                if args.skip_existing:
+                    mp = os.path.join(run_dir(out_root, tid, ep["dir"], n), "meta.json")
+                    if os.path.isfile(mp):
+                        try:
+                            prev = json.load(open(mp, encoding="utf-8")).get("status")
+                        except Exception:
+                            prev = None
+                        if prev in ("VALID", "INVALID"):
+                            print(f"    run-{n}: 跳过（已存在 {prev}）")
+                            if prev == "VALID":
+                                total_ok += 1
+                            else:
+                                total_invalid += 1
+                            continue
                 try:
-                    res = run_once(task_dir, tid, ep, n, out_root, prompt, dry_run=args.dry_run)
+                    res = run_once(task_dir, tid, ep, n, out_root, prompt,
+                                   dry_run=args.dry_run,
+                                   agent=not args.no_agent, instruction=instr)
                 except Exception:
                     res = {"status": "INVALID", "meta": {}}
                     print(f"    run-{n}: EXCEPTION\n{traceback.format_exc()}")

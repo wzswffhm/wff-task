@@ -1,0 +1,523 @@
+diff --git a/wsync/fsops.py b/wsync/fsops.py
+index d466d2a..07ab1a2 100644
+--- a/wsync/fsops.py
++++ b/wsync/fsops.py
+@@ -6,19 +6,25 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import os
+ import shutil
+ import stat
+-from typing import Dict, Optional, Tuple
++from typing import Callable, Dict, Optional, Tuple
+ 
+ __all__ = [
+     "join",
+     "path_key",
+     "list_entries",
++    "list_dirs",
+     "stat_signature",
++    "content_signature",
++    "same_content",
+     "is_readonly",
++    "ensure_writable",
+     "remove_file",
+     "remove_tree",
++    "remove_entry",
+     "copy_file",
+     "prune_empty_dirs",
+ ]
+@@ -33,9 +39,28 @@ def path_key(relpath: str) -> str:
+     """把相对路径规整成用于比较的键。
+ 
+     目标平台的文件系统如何认定“两个路径写的是同一个东西”，由本函数
+-    决定；调用方不应自己再做字符串拼比较。
++    决定；调用方不应自己再做字符串拼比较。在不区分大小写的文件系统
++    （如 Windows 的 NTFS 默认配置）上，仅大小写不同的两个路径会得到
++    相同的键。
+     """
+-    return relpath.replace("/", os.sep)
++    return os.path.normcase(os.path.normpath(relpath.replace("/", os.sep)))
++
++
++def _scan(root: str) -> Tuple[Dict[str, str], Dict[str, str]]:
++    """遍历目录树，返回 ``(文件, 目录)`` 两张 ``{相对路径: 绝对路径}`` 表。
++
++    相对路径使用 ``os.sep`` 分隔；``root`` 自身不出现在目录表里。
++    """
++    files: Dict[str, str] = {}
++    dirs: Dict[str, str] = {}
++    for dirpath, dirnames, filenames in os.walk(root):
++        for name in filenames:
++            full = os.path.join(dirpath, name)
++            files[os.path.relpath(full, root)] = full
++        for name in dirnames:
++            full = os.path.join(dirpath, name)
++            dirs[os.path.relpath(full, root)] = full
++    return files, dirs
+ 
+ 
+ def list_entries(root: str) -> Dict[str, str]:
+@@ -43,18 +68,25 @@ def list_entries(root: str) -> Dict[str, str]:
+ 
+     返回 ``{相对路径: 绝对路径}``；``root`` 不存在时返回空字典。
+     """
+-    entries: Dict[str, str] = {}
+     if not os.path.isdir(root):
+-        return entries
+-    for dirpath, _dirnames, filenames in os.walk(root):
+-        for name in filenames:
+-            full = os.path.join(dirpath, name)
+-            entries[os.path.relpath(full, root)] = full
+-    return entries
++        return {}
++    files, _dirs = _scan(root)
++    return files
++
++
++def list_dirs(root: str) -> Dict[str, str]:
++    """列出目录树中的所有目录（不含 ``root`` 自身）。
++
++    返回 ``{相对路径: 绝对路径}``；``root`` 不存在时返回空字典。
++    """
++    if not os.path.isdir(root):
++        return {}
++    _files, dirs = _scan(root)
++    return dirs
+ 
+ 
+ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+-    """返回用于“内容是否变化”判定的签名。
++    """返回用于“内容是否变化”快速判定的签名。
+ 
+     签名由大小与修改时间共同构成；读取失败时返回 ``None``。
+     """
+@@ -65,6 +97,30 @@ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+     return (info.st_size, info.st_mtime_ns)
+ 
+ 
++def content_signature(path: str) -> Optional[Tuple[int, str]]:
++    """返回基于文件内容的签名 ``(大小, SHA-256 摘要)``。
++
++    读取失败时返回 ``None``。只读文件同样可以读取。
++    """
++    try:
++        size = os.path.getsize(path)
++        digest = hashlib.sha256()
++        with open(path, "rb") as handle:
++            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++                digest.update(chunk)
++    except OSError:
++        return None
++    return (size, digest.hexdigest())
++
++
++def same_content(source_path: str, target_path: str) -> bool:
++    """两个文件的内容是否一致（依据内容本身，而非大小或时间戳）。"""
++    source_sig = content_signature(source_path)
++    if source_sig is None:
++        return False
++    return source_sig == content_signature(target_path)
++
++
+ def is_readonly(path: str) -> bool:
+     """路径是否带有只读属性。"""
+     try:
+@@ -74,33 +130,77 @@ def is_readonly(path: str) -> bool:
+     return not bool(info.st_mode & stat.S_IWRITE)
+ 
+ 
++def ensure_writable(path: str) -> None:
++    """去掉路径上的只读属性（不存在或本就可写时什么都不做）。"""
++    try:
++        info = os.stat(path)
++    except OSError:
++        return
++    if not info.st_mode & stat.S_IWRITE:
++        os.chmod(path, stat.S_IWRITE)
++
++
++def _on_rm_error(func: Callable, path: str, _exc_info: object) -> None:
++    """``shutil.rmtree`` 的错误回调：去掉只读属性后重试一次。"""
++    ensure_writable(path)
++    func(path)
++
++
+ def remove_file(path: str) -> None:
+-    """删除单个文件。"""
+-    os.remove(path)
++    """删除单个文件；只读文件先去掉只读属性再删。"""
++    try:
++        os.remove(path)
++    except PermissionError:
++        ensure_writable(path)
++        os.remove(path)
+ 
+ 
+ def remove_tree(path: str) -> None:
+-    """递归删除一棵目录树。"""
+-    shutil.rmtree(path)
++    """递归删除一棵目录树，途中遇到的只读条目自动去掉只读属性。"""
++    ensure_writable(path)
++    shutil.rmtree(path, onerror=_on_rm_error)
++
++
++def remove_entry(path: str) -> None:
++    """删除一条路径：是目录则递归删除整棵子树，否则删除文件。"""
++    if os.path.isdir(path):
++        remove_tree(path)
++    else:
++        remove_file(path)
+ 
+ 
+ def copy_file(source: str, target: str) -> None:
+-    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。"""
++    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。
++
++    目标已存在且只读时先去掉只读属性再覆盖；写完后把源的修改时间
++    同步到目标上，使后续同步可以依据时间戳快速判定“没有变化”。
++    """
+     parent = os.path.dirname(target)
+     if parent:
+         os.makedirs(parent, exist_ok=True)
++    if os.path.exists(target):
++        ensure_writable(target)
+     with open(source, "rb") as src_handle, open(target, "wb") as dst_handle:
+         shutil.copyfileobj(src_handle, dst_handle, length=1024 * 1024)
++    shutil.copystat(source, target)
+ 
+ 
+ def prune_empty_dirs(root: str) -> None:
+-    """自底向上删除目标树中的空目录（不含 ``root`` 自身）。"""
++    """自底向上删除目标树中的空目录（不含 ``root`` 自身）。
++
++    只读的空目录先去掉只读属性再删除；仍然删不掉的（例如被其它进程
++    占用）跳过，由调用方决定是否记入失败清单。
++    """
+     root = os.path.abspath(root)
+     for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+         if os.path.abspath(dirpath) == root:
+             continue
+         try:
+             if not os.listdir(dirpath):
+-                os.rmdir(dirpath)
++                try:
++                    os.rmdir(dirpath)
++                except PermissionError:
++                    ensure_writable(dirpath)
++                    os.rmdir(dirpath)
+         except OSError:
+             pass
+diff --git a/wsync/mirror.py b/wsync/mirror.py
+index f6b81ed..b5a5a9e 100644
+--- a/wsync/mirror.py
++++ b/wsync/mirror.py
+@@ -32,11 +32,55 @@ class SyncResult:
+         return not self.failed
+ 
+ 
+-def _apply(entry: PlanEntry) -> None:
++def _clear_conflicting_target(target_root: str, target: str) -> None:
++    """清掉占住 ``target`` 及其上级分量的异类型条目。
++
++    只在目标路径当前无法按预期类型使用时才动手：要落地文件的位置被
++    一棵目录占住，或者它的某个上级分量被一个文件占住。清理只影响
++    构成冲突的那条路径本身，不波及其它条目；不存在的上级分量交给
++    ``copy_file`` 按需创建。
++    """
++    # 从目标根目录逐级向下走，遇到“是文件”的上级分量即构成冲突，
++    # 删除之；更深层此时必然不存在，无需继续。在不区分大小写的文件
++    # 系统上，实际名字可能与预期只有大小写不同，按平台归一键比较。
++    root = os.path.abspath(target_root)
++    relpath = os.path.relpath(target, root)
++    if relpath == os.pardir or relpath.startswith(os.pardir + os.sep):
++        return
++    parts = relpath.split(os.sep)
++
++    cursor = root
++    for part in parts[:-1]:
++        if not os.path.isdir(cursor):
++            break
++        wanted = fsops.path_key(part)
++        child = None
++        try:
++            names = os.listdir(cursor)
++        except OSError:
++            break
++        for name in names:
++            if fsops.path_key(name) == wanted:
++                child = os.path.join(cursor, name)
++                break
++        if child is None:
++            break  # 这一层不存在，更深层交给 makedirs
++        if not os.path.isdir(child):
++            fsops.remove_entry(child)  # 文件占住了目录的位置
++            break
++        cursor = child
++
++    # 目标位置本身被一棵目录占住（源里是文件）。
++    if os.path.isdir(target):
++        fsops.remove_tree(target)
++
++
++def _apply(target_root: str, entry: PlanEntry) -> None:
+     if entry.action in (CREATE, UPDATE):
++        _clear_conflicting_target(target_root, entry.target)
+         fsops.copy_file(entry.source, entry.target)
+     elif entry.action == DELETE:
+-        fsops.remove_file(entry.target)
++        fsops.remove_entry(entry.target)
+ 
+ 
+ def _record(result: SyncResult, action: str, relpath: str) -> None:
+@@ -48,8 +92,41 @@ def _record(result: SyncResult, action: str, relpath: str) -> None:
+         result.deleted.append(relpath)
+ 
+ 
++def _prune_empty_dirs(target_root: str, result: SyncResult) -> None:
++    """自底向上删除目标树中的空目录（不含 ``target_root`` 自身）。
++
++    只读的空目录先去掉只读属性再删；仍然删不掉的记入失败清单，
++    不影响本次同步的其余部分。
++    """
++    root = os.path.abspath(target_root)
++    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
++        if os.path.abspath(dirpath) == root:
++            continue
++        relpath = os.path.relpath(dirpath, root)
++        try:
++            if os.listdir(dirpath):
++                continue
++        except OSError:
++            continue
++        try:
++            try:
++                os.rmdir(dirpath)
++            except PermissionError:
++                fsops.ensure_writable(dirpath)
++                os.rmdir(dirpath)
++        except OSError as exc:
++            result.failed.append(
++                {"action": DELETE, "relpath": relpath, "error": str(exc)}
++            )
++
++
+ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> SyncResult:
+-    """把 ``source_root`` 镜像同步到 ``target_root``。"""
++    """把 ``source_root`` 镜像同步到 ``target_root``。
++
++    单个条目处理失败（例如被其它进程占用）不会中断整次同步：该条目
++    记入返回结果的 ``failed``，其余条目继续完成。只读条目会先自动
++    去掉只读属性再处理，属于可以自动修复的情况，不会记成失败。
++    """
+     source_root = os.path.abspath(source_root)
+     target_root = os.path.abspath(target_root)
+ 
+@@ -66,10 +143,16 @@ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> Sync
+         if dry_run:
+             _record(result, entry.action, entry.relpath)
+             continue
+-        _apply(entry)
++        try:
++            _apply(target_root, entry)
++        except OSError as exc:
++            result.failed.append(
++                {"action": entry.action, "relpath": entry.relpath, "error": str(exc)}
++            )
++            continue
+         _record(result, entry.action, entry.relpath)
+ 
+     if not dry_run:
+-        fsops.prune_empty_dirs(target_root)
++        _prune_empty_dirs(target_root, result)
+ 
+     return result
+diff --git a/wsync/planner.py b/wsync/planner.py
+index f42cb36..7044025 100644
+--- a/wsync/planner.py
++++ b/wsync/planner.py
+@@ -2,8 +2,9 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass, field
+-from typing import List, Optional
++from typing import Dict, List, Optional, Set, Tuple
+ 
+ from . import fsops
+ 
+@@ -36,23 +37,136 @@ class Plan:
+         return [entry for entry in self.entries if entry.action == action]
+ 
+ 
++def _index_by_key(relpaths) -> Dict[str, str]:
++    """把相对路径列表按 :func:`fsops.path_key` 归一键索引。
++
++    归一键冲突（同一目录下出现仅大小写不同的两个名字）时保留排序后
++    的第一个，保证结果是确定性的。
++    """
++    indexed: Dict[str, str] = {}
++    for relpath in sorted(relpaths):
++        indexed.setdefault(fsops.path_key(relpath), relpath)
++    return indexed
++
++
+ def needs_update(source_path: str, target_path: str) -> bool:
+-    """目标文件是否需要被源文件覆盖。"""
++    """目标文件是否需要被源文件覆盖。
++
++    判定依据内容本身：大小或修改时间不同可以直接认定需要更新；两者
++    都相同（上游工具可能就地改写并保留时间戳）时再比较内容。
++    """
+     signature = fsops.stat_signature(source_path)
+     if signature is None:
+         return False
+-    return signature != fsops.stat_signature(target_path)
++    if signature != fsops.stat_signature(target_path):
++        return True
++    return not fsops.same_content(source_path, target_path)
++
++
++def _parent_keys(relpath: str) -> List[str]:
++    """返回 ``relpath`` 全部上级分量的归一键（由浅到深）。"""
++    parts = relpath.replace("/", os.sep).split(os.sep)
++    keys = []
++    for i in range(1, len(parts)):
++        keys.append(fsops.path_key(os.sep.join(parts[:i])))
++    return keys
++
++
++def _resolve_conflicts(
++    source_files: Dict[str, str],
++    source_dirs: Dict[str, str],
++    target_files: Dict[str, str],
++    target_dirs: Dict[str, str],
++) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
++    """消解源与目标在同一路径上的类型冲突。
++
++    返回过滤后的四张表。凡是被认定构成冲突的目标条目，都从常规差异
++    计算中剔除——它们会由执行阶段在落地源条目之前单独清理，清理只
++    影响构成冲突的那条路径本身。
++    """
++    source_file_keys = _index_by_key(source_files)
++    source_dir_keys = _index_by_key(source_dirs)
++    target_file_keys = _index_by_key(target_files)
++    target_dir_keys = _index_by_key(target_dirs)
++
++    # 目标侧构成冲突的条目（归一键集合）：
++    #  - 目标文件占住了源中某个目录的位置；
++    #  - 目标目录占住了源中某个文件的位置；
++    #  - 目标文件占住了源中某个文件/目录的上级分量（目录的位置）。
++    # 注意：源的上级分量落在目标“目录”里是正常情况，不构成冲突。
++    conflict_target_files: Set[str] = set()
++    conflict_target_dirs: Set[str] = set()
++
++    for key in target_file_keys:
++        if key in source_dir_keys:
++            conflict_target_files.add(key)
++
++    for key in target_dir_keys:
++        if key in source_file_keys:
++            conflict_target_dirs.add(key)
++
++    # 上级分量冲突：源里 ``a/b/c.txt`` 而目标里 ``a/b`` 是一个文件，
++    # 这个文件占住了本该是目录的位置。只有“上级分量是文件”才冲突；
++    # 上级分量是目录恰好是期望状态。
++    for relpath in source_files:
++        for key in _parent_keys(relpath):
++            if key in target_file_keys:
++                conflict_target_files.add(key)
++    for relpath in source_dirs:
++        for key in _parent_keys(relpath):
++            if key in target_file_keys:
++                conflict_target_files.add(key)
++
++    def _drop(table: Dict[str, str], doomed: Set[str]) -> Dict[str, str]:
++        return {
++            relpath: full
++            for relpath, full in table.items()
++            if fsops.path_key(relpath) not in doomed
++        }
++
++    # 冲突的目标目录会被整体清理，它里面的文件与子目录不再单独生成
++    # 删除动作，避免重复清理误伤清理后新落地的内容。
++    doomed_dir_keys = conflict_target_dirs
++
++    def _under_doomed_dir(relpath: str) -> bool:
++        return any(key in doomed_dir_keys for key in _parent_keys(relpath))
++
++    new_target_files = {
++        relpath: full
++        for relpath, full in _drop(target_files, conflict_target_files).items()
++        if not _under_doomed_dir(relpath)
++    }
++    new_target_dirs = {
++        relpath: full
++        for relpath, full in _drop(target_dirs, conflict_target_dirs).items()
++        if not _under_doomed_dir(relpath)
++    }
++
++    return source_files, source_dirs, new_target_files, new_target_dirs
+ 
+ 
+ def build_plan(source_root: str, target_root: str) -> Plan:
+     """计算从 ``source_root`` 到 ``target_root`` 的镜像同步计划。"""
+     source_files = fsops.list_entries(source_root)
++    source_dirs = fsops.list_dirs(source_root)
+     target_files = fsops.list_entries(target_root)
++    target_dirs = fsops.list_dirs(target_root)
++
++    source_files, source_dirs, target_files, target_dirs = _resolve_conflicts(
++        source_files, source_dirs, target_files, target_dirs
++    )
++
++    # 以平台归一键匹配源与目标：不区分大小写的文件系统上，仅大小写
++    # 不同的两个路径被认定为同一个文件。
++    target_file_keys = _index_by_key(target_files)
++    source_file_keys = _index_by_key(source_files)
+ 
+     entries: List[PlanEntry] = []
+ 
+     for relpath in sorted(source_files):
+-        if relpath not in target_files:
++        key = fsops.path_key(relpath)
++        target_relpath = target_file_keys.get(key)
++        if target_relpath is None:
+             entries.append(
+                 PlanEntry(
+                     CREATE,
+@@ -61,17 +175,27 @@ def build_plan(source_root: str, target_root: str) -> Plan:
+                     fsops.join(target_root, relpath),
+                 )
+             )
+-        elif needs_update(source_files[relpath], target_files[relpath]):
++        elif needs_update(source_files[relpath], target_files[target_relpath]):
+             entries.append(
+-                PlanEntry(UPDATE, relpath, source_files[relpath], target_files[relpath])
++                PlanEntry(
++                    UPDATE,
++                    relpath,
++                    source_files[relpath],
++                    target_files[target_relpath],
++                )
+             )
+         else:
+             entries.append(
+-                PlanEntry(KEEP, relpath, source_files[relpath], target_files[relpath])
++                PlanEntry(
++                    KEEP,
++                    relpath,
++                    source_files[relpath],
++                    target_files[target_relpath],
++                )
+             )
+ 
+     for relpath in sorted(target_files):
+-        if relpath not in source_files:
++        if fsops.path_key(relpath) not in source_file_keys:
+             entries.append(PlanEntry(DELETE, relpath, None, target_files[relpath]))
+ 
+     return Plan(entries)

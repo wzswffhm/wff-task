@@ -196,7 +196,7 @@ score = 1.0 if resolved else 0.0
 
 若本轮任务是解析/生产 **Windows-Harbor** 类题包，应：
 
-1. **新建自己的题包类型目录**（如 `windows-harbor/`），不与 `OBM/`、`harbor-16/`、`harbor-sota/` 混放
+1. **新建自己的题包类型目录**（如 `harbor-windows/`），不与 `OBM/`、`harbor-16/`、`harbor-sota/` 混放
 2. 参照本包已有的 `grade.py` / `test.ps1` / `swelive_spec.json` 模式，但**必须补齐**：
    - `solution/` 五件套
    - `delivery-extras/` 伴随材料

@@ -1,0 +1,39 @@
+FROM python:3.12-slim
+RUN useradd -m -u 1000 agent
+
+# ① node/npm 是 claude CLI 的运行依赖；中文字体 + libreoffice 供交付物渲染/校验
+#    全部走官方源（Debian / registry.npmjs.org / pypi.org），禁止任何国内镜像源
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git bash jq ripgrep unzip nodejs npm \
+        libreoffice-calc libreoffice-writer fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+# ② 预装 claude-code（钉死版本 2.1.114）：judge 在 verifier 判分容器内运行，
+#    harbor 安装器不负责该容器，claude 必须镜像内预装。
+#    版本必须钉死：评分行为随 CLI 版本漂移，不锁版本则跨批次分数不可比。
+#    若基础镜像/上层环境已自带 claude，不覆盖 —— 只在缺失时安装。
+#    ln 到 /root/.local/bin 的软链给 test.sh 的 PATH 前缀用（$HOME/.local/bin）。
+RUN command -v claude >/dev/null 2>&1 \
+      || npm install -g @anthropic-ai/claude-code@2.1.114; \
+    command -v claude >/dev/null 2>&1 \
+    && mkdir -p /root/.local/bin \
+    && ln -sf "$(which claude)" /root/.local/bin/claude \
+    && claude --version
+
+# ③ pip 依赖：rewardkit + 基本的解析库（官方 pypi.org）
+#    缺装解析库会导致判官读不了二进制交付物、大面积判负
+RUN pip install --no-cache-dir \
+        "harbor-rewardkit[all]==0.1.7" markitdown \
+        openpyxl pandas python-docx pypdf python-pptx PyYAML chardet matplotlib
+
+# ④ 本题执行侧依赖（无依赖交空 requirements.txt）
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ⑤ 输入材料（只读）与输出目录（agent 可写）
+COPY input_files/ /app/input_files/
+RUN chown -R root:root /app/input_files && chmod -R a-w /app/input_files
+RUN mkdir -p /app/output && chown -R agent:agent /app/output
+WORKDIR /app
+
+# ⑥ 本题 skill_set = []（无 Skill），不复制 skills 目录；执行侧依赖见 requirements.txt

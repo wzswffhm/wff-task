@@ -1,0 +1,109 @@
+diff --git a/tests/test_windows_name_rules.py b/tests/test_windows_name_rules.py
+new file mode 100644
+index 0000000..dadd4d8
+--- /dev/null
++++ b/tests/test_windows_name_rules.py
+@@ -0,0 +1,103 @@
++"""Windows 名称规则的行为验证。
++
++覆盖三类只在 Windows 目标文件系统上成立的语义：
++保留设备名（含带扩展名的形式）、尾随点/空格的规范化、以及规范化后为空的名称。
++"""
++
++import os
++
++import pytest
++
++from wsafename import FileStore, InvalidNameError, sanitize
++
++RESERVED_NAMES = (
++    ["CON", "PRN", "AUX", "NUL"]
++    + ["COM%d" % i for i in range(1, 10)]
++    + ["LPT%d" % i for i in range(1, 10)]
++)
++
++
++@pytest.fixture()
++def store(tmp_path):
++    return FileStore(str(tmp_path / "uploads"))
++
++
++# --- 核心回归（base 上失败） ------------------------------------------------
++
++
++def test_reserved_device_name_with_extension_is_rejected(store):
++    with pytest.raises(InvalidNameError):
++        store.save("CON.txt", b"x")
++
++
++def test_reserved_device_name_with_dotted_extension_is_rejected(store):
++    with pytest.raises(InvalidNameError):
++        store.save("lpt1.tar.gz", b"x")
++
++
++def test_reserved_device_names_never_reach_the_directory(store):
++    for base in RESERVED_NAMES:
++        for candidate in (base, base.lower(), "%s.log" % base.title()):
++            with pytest.raises(InvalidNameError):
++                store.save(candidate, b"x")
++    assert store.list_names() == []
++    assert os.listdir(store.root) == []
++
++
++def test_trailing_dot_is_stripped(store):
++    assert sanitize("report.") == "report"
++
++
++def test_trailing_dots_and_spaces_are_stripped(store):
++    assert sanitize("report. . ") == "report"
++
++
++def test_name_made_only_of_dots_is_rejected(store):
++    with pytest.raises(InvalidNameError):
++        store.save("...", b"x")
++
++
++def test_trailing_dot_does_not_create_a_second_entry(store):
++    store.save("report", b"A")
++    assert store.save("report.", b"B") == "report"
++    assert store.list_names() == ["report"]
++    assert len(os.listdir(store.root)) == 1
++
++
++# --- 回归保护（base 与参考解上都必须通过） ----------------------------------
++
++
++def test_name_containing_reserved_word_is_allowed(store):
++    assert store.save("console.txt", b"x") == "console.txt"
++    assert store.save("mycon", b"x") == "mycon"
++
++
++def test_reserved_word_beyond_nine_is_allowed(store):
++    assert store.save("com10.log", b"x") == "com10.log"
++
++
++def test_inner_dot_is_preserved(store):
++    assert sanitize("archive.tar.gz") == "archive.tar.gz"
++
++
++def test_leading_dot_is_preserved(store):
++    assert sanitize(".gitignore") == ".gitignore"
++
++
++def test_overlong_name_is_truncated(store):
++    assert len(store.save("x" * 400 + ".txt", b"x")) == 255
++
++
++def test_unicode_name_is_untouched(store):
++    assert store.save("报告-最终.docx", b"x") == "报告-最终.docx"
++
++
++def test_plain_name_roundtrip(store):
++    store.save("plain.txt", b"data")
++    assert store.load("plain.txt") == b"data"
++
++
++def test_delete_removes_entry(store):
++    store.save("gone.txt", b"x")
++    assert store.delete("gone.txt") is True
++    assert store.list_names() == []

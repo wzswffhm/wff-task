@@ -1,0 +1,579 @@
+diff --git a/test_type_conflict.py b/test_type_conflict.py
+new file mode 100644
+index 0000000..7c0f3b1
+--- /dev/null
++++ b/test_type_conflict.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python
++"""Test type conflict handling."""
++
++import tempfile
++from pathlib import Path
++import shutil
++
++tmp = Path(tempfile.mkdtemp())
++try:
++    src = tmp / 'src'
++    tgt = tmp / 'tgt'
++    src.mkdir()
++    tgt.mkdir()
++
++    # Source has a directory
++    data_dir = src / 'data'
++    data_dir.mkdir()
++    (data_dir / 'file.txt').write_text('nested file')
++
++    # Target has a file with the same name
++    (tgt / 'data').write_text('plain file')
++
++    print('Before sync:')
++    print(f'  Source data is dir: {data_dir.is_dir()}')
++    print(f'  Target data is file: {(tgt / "data").is_file()}')
++
++    from wsync.planner import build_plan
++    plan = build_plan(str(src), str(tgt))
++
++    print(f'\nPlan has {len(plan.entries)} entries:')
++    for entry in plan.entries:
++        print(f'  {entry.action}: {entry.relpath}')
++
++    from wsync import sync_tree
++    result = sync_tree(str(src), str(tgt))
++
++    print('\nAfter sync:')
++    print(f'  Created: {result.created}')
++    print(f'  Updated: {result.updated}')
++    print(f'  Deleted: {result.deleted}')
++    print(f'  Failed: {result.failed}')
++    print(f'  Target data is dir: {(tgt / "data").is_dir()}')
++    print(f'  Target data is file: {(tgt / "data").is_file()}')
++    
++    if (tgt / 'data').is_dir():
++        print(f'  Target data/file.txt exists: {(tgt / "data" / "file.txt").exists()}')
++        if (tgt / 'data' / 'file.txt').exists():
++            print(f'  Content: {(tgt / "data" / "file.txt").read_text()}')
++
++finally:
++    shutil.rmtree(tmp)
+diff --git a/wsync/fsops.py b/wsync/fsops.py
+index d466d2a..4e818a4 100644
+--- a/wsync/fsops.py
++++ b/wsync/fsops.py
+@@ -9,18 +9,22 @@ from __future__ import annotations
+ import os
+ import shutil
+ import stat
++import sys
+ from typing import Dict, Optional, Tuple
+ 
+ __all__ = [
+     "join",
+     "path_key",
+     "list_entries",
++    "list_all_entries",
+     "stat_signature",
+     "is_readonly",
++    "clear_readonly",
+     "remove_file",
+     "remove_tree",
+     "copy_file",
+     "prune_empty_dirs",
++    "files_equal",
+ ]
+ 
+ 
+@@ -32,10 +36,14 @@ def join(root: str, relpath: str) -> str:
+ def path_key(relpath: str) -> str:
+     """把相对路径规整成用于比较的键。
+ 
+-    目标平台的文件系统如何认定“两个路径写的是同一个东西”，由本函数
++    目标平台的文件系统如何认定"两个路径写的是同一个东西"，由本函数
+     决定；调用方不应自己再做字符串拼比较。
+     """
+-    return relpath.replace("/", os.sep)
++    normalized = relpath.replace("/", os.sep)
++    # Windows 文件系统不区分大小写
++    if sys.platform == "win32":
++        normalized = normalized.lower()
++    return normalized
+ 
+ 
+ def list_entries(root: str) -> Dict[str, str]:
+@@ -53,8 +61,33 @@ def list_entries(root: str) -> Dict[str, str]:
+     return entries
+ 
+ 
++def list_all_entries(root: str) -> Dict[str, Tuple[str, str]]:
++    """列出目录树中的所有文件和目录。
++
++    返回 ``{相对路径: (绝对路径, 类型)}``，类型为 'file' 或 'dir'。
++    ``root`` 不存在时返回空字典。
++    """
++    entries: Dict[str, Tuple[str, str]] = {}
++    if not os.path.isdir(root):
++        return entries
++    
++    for dirpath, dirnames, filenames in os.walk(root):
++        # 记录目录
++        for name in dirnames:
++            full = os.path.join(dirpath, name)
++            relpath = os.path.relpath(full, root)
++            entries[relpath] = (full, "dir")
++        # 记录文件
++        for name in filenames:
++            full = os.path.join(dirpath, name)
++            relpath = os.path.relpath(full, root)
++            entries[relpath] = (full, "file")
++    
++    return entries
++
++
+ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+-    """返回用于“内容是否变化”判定的签名。
++    """返回用于"内容是否变化"判定的签名。
+ 
+     签名由大小与修改时间共同构成；读取失败时返回 ``None``。
+     """
+@@ -65,6 +98,30 @@ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+     return (info.st_size, info.st_mtime_ns)
+ 
+ 
++def files_equal(path1: str, path2: str) -> bool:
++    """比较两个文件的内容是否完全相同。"""
++    try:
++        # 先比较大小，不同则直接返回
++        stat1 = os.stat(path1)
++        stat2 = os.stat(path2)
++        if stat1.st_size != stat2.st_size:
++            return False
++        
++        # 逐块比较内容
++        chunk_size = 1024 * 1024  # 1MB
++        with open(path1, "rb") as f1, open(path2, "rb") as f2:
++            while True:
++                chunk1 = f1.read(chunk_size)
++                chunk2 = f2.read(chunk_size)
++                if chunk1 != chunk2:
++                    return False
++                if not chunk1:  # 都读完了
++                    break
++        return True
++    except OSError:
++        return False
++
++
+ def is_readonly(path: str) -> bool:
+     """路径是否带有只读属性。"""
+     try:
+@@ -74,23 +131,75 @@ def is_readonly(path: str) -> bool:
+     return not bool(info.st_mode & stat.S_IWRITE)
+ 
+ 
++def clear_readonly(path: str) -> None:
++    """清除路径的只读属性（包括目录及其内容）。"""
++    try:
++        if os.path.isdir(path):
++            # 递归清除目录及其所有内容的只读属性
++            for root, dirs, files in os.walk(path):
++                for name in files:
++                    full = os.path.join(root, name)
++                    try:
++                        if is_readonly(full):
++                            os.chmod(full, stat.S_IWRITE | stat.S_IREAD)
++                    except OSError:
++                        pass
++                for name in dirs:
++                    full = os.path.join(root, name)
++                    try:
++                        if is_readonly(full):
++                            os.chmod(full, stat.S_IWRITE | stat.S_IREAD)
++                    except OSError:
++                        pass
++            # 清除目录自身
++            if is_readonly(path):
++                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
++        else:
++            # 单个文件
++            if is_readonly(path):
++                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
++    except OSError:
++        pass
++
++
+ def remove_file(path: str) -> None:
+     """删除单个文件。"""
++    # 尝试清除只读属性
++    if is_readonly(path):
++        clear_readonly(path)
+     os.remove(path)
+ 
+ 
+ def remove_tree(path: str) -> None:
+     """递归删除一棵目录树。"""
++    # 尝试清除只读属性
++    if os.path.exists(path):
++        clear_readonly(path)
+     shutil.rmtree(path)
+ 
+ 
+ def copy_file(source: str, target: str) -> None:
+-    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。"""
++    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。
++    
++    复制完成后保留源文件的修改时间。
++    """
+     parent = os.path.dirname(target)
+     if parent:
+         os.makedirs(parent, exist_ok=True)
++    
++    # 如果目标已存在且只读，先清除只读属性
++    if os.path.exists(target) and is_readonly(target):
++        clear_readonly(target)
++    
+     with open(source, "rb") as src_handle, open(target, "wb") as dst_handle:
+         shutil.copyfileobj(src_handle, dst_handle, length=1024 * 1024)
++    
++    # 保留源文件的修改时间
++    try:
++        stat_info = os.stat(source)
++        os.utime(target, (stat_info.st_atime, stat_info.st_mtime))
++    except OSError:
++        pass
+ 
+ 
+ def prune_empty_dirs(root: str) -> None:
+@@ -101,6 +210,9 @@ def prune_empty_dirs(root: str) -> None:
+             continue
+         try:
+             if not os.listdir(dirpath):
++                # 如果是只读目录，先清除只读属性
++                if is_readonly(dirpath):
++                    clear_readonly(dirpath)
+                 os.rmdir(dirpath)
+         except OSError:
+             pass
+diff --git a/wsync/mirror.py b/wsync/mirror.py
+index f6b81ed..44651c4 100644
+--- a/wsync/mirror.py
++++ b/wsync/mirror.py
+@@ -3,10 +3,14 @@
+ from __future__ import annotations
+ 
+ import os
++import sys
++import traceback
++import uuid
+ from dataclasses import dataclass, field
+ from typing import Dict, List
+ 
+ from . import fsops
++from .errors import TargetInUseError
+ from .planner import CREATE, DELETE, KEEP, UPDATE, PlanEntry, build_plan
+ 
+ 
+@@ -32,14 +36,127 @@ class SyncResult:
+         return not self.failed
+ 
+ 
+-def _apply(entry: PlanEntry) -> None:
++def _ensure_parent_is_dir(path: str, target_root: str) -> None:
++    """确保路径的所有父目录都存在且是目录。
++    
++    如果任何父路径被文件占据，删除该文件并创建目录。
++    从根向下处理，避免递归。
++    """
++    parent = os.path.dirname(path)
++    if not parent or parent == target_root:
++        return
++    
++    # 获取从 target_root 到 parent 的所有路径段
++    rel_parent = os.path.relpath(parent, target_root)
++    if rel_parent == '.':
++        return
++    
++    # 按层级处理
++    parts = rel_parent.split(os.sep)
++    current = target_root
++    
++    for part in parts:
++        current = os.path.join(current, part)
++        
++        # 如果当前路径是文件，删除它
++        if os.path.exists(current) and os.path.isfile(current):
++            fsops.remove_file(current)
++        
++        # 确保当前路径是目录
++        if not os.path.exists(current):
++            os.makedirs(current, exist_ok=True)
++
++
++def _clear_path_for_file(target_path: str, target_root: str) -> None:
++    """清除目标路径上的障碍，为写入文件做准备。
++    
++    如果目标路径被目录占据，递归删除该目录。
++    确保父路径是目录（如果被文件占据，删除该文件）。
++    """
++    # 如果目标是目录，删除它
++    if os.path.exists(target_path) and os.path.isdir(target_path):
++        fsops.remove_tree(target_path)
++    
++    # 确保父路径是目录
++    _ensure_parent_is_dir(target_path, target_root)
++
++
++def _normalize_filename_case(source_path: str, target_path: str) -> None:
++    """确保目标文件名的大小写与源文件一致。
++    
++    在 Windows 上，文件系统不区分大小写但保留大小写。
++    如果目标文件已存在但大小写不同，需要重命名。
++    """
++    if sys.platform != "win32":
++        return
++    
++    # 检查目标是否存在
++    if not os.path.exists(target_path):
++        return
++    
++    # 获取目标目录中实际的文件名
++    target_dir = os.path.dirname(target_path)
++    target_basename = os.path.basename(target_path)
++    
++    if not target_dir:
++        return
++    
++    try:
++        actual_files = os.listdir(target_dir)
++    except OSError:
++        return
++    
++    # 找到实际的文件名（可能大小写不同）
++    actual_basename = None
++    for f in actual_files:
++        if f.lower() == target_basename.lower():
++            actual_basename = f
++            break
++    
++    # 如果大小写不同，需要重命名
++    if actual_basename and actual_basename != target_basename:
++        actual_path = os.path.join(target_dir, actual_basename)
++        # Windows 上不能直接重命名为只有大小写不同的名字
++        # 需要先重命名到临时名，再重命名到目标名
++        temp_name = f"~tmp_{uuid.uuid4().hex[:8]}_{target_basename}"
++        temp_path = os.path.join(target_dir, temp_name)
++        try:
++            os.rename(actual_path, temp_path)
++            os.rename(temp_path, target_path)
++        except OSError:
++            # 如果重命名失败，尝试清理临时文件
++            if os.path.exists(temp_path):
++                try:
++                    os.remove(temp_path)
++                except OSError:
++                    pass
++
++
++def _apply(entry: PlanEntry, target_root: str) -> None:
++    """执行一条同步计划条目。"""
+     if entry.action in (CREATE, UPDATE):
++        # 清除目标路径上的障碍
++        _clear_path_for_file(entry.target, target_root)
++        
++        # 如果是更新操作，先规范化文件名大小写
++        if entry.action == UPDATE:
++            _normalize_filename_case(entry.source, entry.target)
++        
++        # 复制文件
+         fsops.copy_file(entry.source, entry.target)
++        
++        # 再次确保文件名大小写正确（复制后）
++        _normalize_filename_case(entry.source, entry.target)
++        
+     elif entry.action == DELETE:
+-        fsops.remove_file(entry.target)
++        if os.path.isdir(entry.target):
++            fsops.remove_tree(entry.target)
++        else:
++            fsops.remove_file(entry.target)
+ 
+ 
+ def _record(result: SyncResult, action: str, relpath: str) -> None:
++    """记录已完成的操作。"""
+     if action == CREATE:
+         result.created.append(relpath)
+     elif action == UPDATE:
+@@ -48,8 +165,23 @@ def _record(result: SyncResult, action: str, relpath: str) -> None:
+         result.deleted.append(relpath)
+ 
+ 
++def _record_failure(result: SyncResult, action: str, relpath: str, error: str) -> None:
++    """记录失败的操作。"""
++    result.failed.append({"action": action, "relpath": relpath, "error": error})
++
++
+ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> SyncResult:
+-    """把 ``source_root`` 镜像同步到 ``target_root``。"""
++    """把 ``source_root`` 镜像同步到 ``target_root``。
++    
++    在 Windows 上正确处理：
++    - 只读文件和目录
++    - 大小写不敏感的文件系统
++    - 被占用的文件
++    - 文件与目录的类型冲突
++    - 基于内容的更新判断
++    
++    单个条目失败不会中断整次同步，失败的条目会记录在结果的 failed 列表中。
++    """
+     source_root = os.path.abspath(source_root)
+     target_root = os.path.abspath(target_root)
+ 
+@@ -63,11 +195,27 @@ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> Sync
+         if entry.action == KEEP:
+             result.kept.append(entry.relpath)
+             continue
++        
+         if dry_run:
+             _record(result, entry.action, entry.relpath)
+             continue
+-        _apply(entry)
+-        _record(result, entry.action, entry.relpath)
++        
++        # 执行操作，捕获异常以确保单个失败不影响整体
++        try:
++            _apply(entry, target_root)
++            _record(result, entry.action, entry.relpath)
++        except PermissionError as e:
++            # 被占用或权限不足
++            error_msg = f"Permission denied: {str(e)}"
++            _record_failure(result, entry.action, entry.relpath, error_msg)
++        except OSError as e:
++            # 其他文件系统错误
++            error_msg = f"OS error: {str(e)}"
++            _record_failure(result, entry.action, entry.relpath, error_msg)
++        except Exception as e:
++            # 其他未预期的错误
++            error_msg = f"Unexpected error: {str(e)}"
++            _record_failure(result, entry.action, entry.relpath, error_msg)
+ 
+     if not dry_run:
+         fsops.prune_empty_dirs(target_root)
+diff --git a/wsync/planner.py b/wsync/planner.py
+index f42cb36..5767c45 100644
+--- a/wsync/planner.py
++++ b/wsync/planner.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass, field
+ from typing import List, Optional
+ 
+@@ -37,41 +38,85 @@ class Plan:
+ 
+ 
+ def needs_update(source_path: str, target_path: str) -> bool:
+-    """目标文件是否需要被源文件覆盖。"""
+-    signature = fsops.stat_signature(source_path)
+-    if signature is None:
+-        return False
+-    return signature != fsops.stat_signature(target_path)
++    """目标文件是否需要被源文件覆盖。
++    
++    必须基于内容比较，不能仅凭修改时间和大小判断。
++    """
++    # 目标不存在，需要创建
++    if not os.path.exists(target_path):
++        return True
++    
++    # 目标存在但是目录，需要先清理
++    if os.path.isdir(target_path):
++        return True
++    
++    # 比较内容是否相同
++    return not fsops.files_equal(source_path, target_path)
+ 
+ 
+ def build_plan(source_root: str, target_root: str) -> Plan:
+-    """计算从 ``source_root`` 到 ``target_root`` 的镜像同步计划。"""
++    """计算从 ``source_root`` 到 ``target_root`` 的镜像同步计划。
++    
++    在 Windows 上正确处理大小写不敏感的文件系统。
++    """
+     source_files = fsops.list_entries(source_root)
+     target_files = fsops.list_entries(target_root)
+-
++    
++    # 构建目标文件的规范化键映射（用于大小写不敏感匹配）
++    target_keys = {}
++    for relpath, abspath in target_files.items():
++        key = fsops.path_key(relpath)
++        target_keys[key] = (relpath, abspath)
++    
+     entries: List[PlanEntry] = []
+-
+-    for relpath in sorted(source_files):
+-        if relpath not in target_files:
++    processed_target_keys = set()
++
++    # 处理源文件
++    for source_relpath in sorted(source_files):
++        source_abspath = source_files[source_relpath]
++        source_key = fsops.path_key(source_relpath)
++        
++        if source_key in target_keys:
++            # 目标中存在（可能大小写不同）
++            target_relpath, target_abspath = target_keys[source_key]
++            processed_target_keys.add(source_key)
++            
++            if needs_update(source_abspath, target_abspath):
++                # 使用源的路径形式作为 relpath（保持源的大小写）
++                entries.append(
++                    PlanEntry(
++                        UPDATE,
++                        source_relpath,
++                        source_abspath,
++                        fsops.join(target_root, source_relpath),
++                    )
++                )
++            else:
++                entries.append(
++                    PlanEntry(
++                        KEEP,
++                        source_relpath,
++                        source_abspath,
++                        target_abspath,
++                    )
++                )
++        else:
++            # 目标中不存在
+             entries.append(
+                 PlanEntry(
+                     CREATE,
+-                    relpath,
+-                    source_files[relpath],
+-                    fsops.join(target_root, relpath),
++                    source_relpath,
++                    source_abspath,
++                    fsops.join(target_root, source_relpath),
+                 )
+             )
+-        elif needs_update(source_files[relpath], target_files[relpath]):
+-            entries.append(
+-                PlanEntry(UPDATE, relpath, source_files[relpath], target_files[relpath])
+-            )
+-        else:
++
++    # 处理目标中多余的文件
++    for target_relpath in sorted(target_files):
++        target_key = fsops.path_key(target_relpath)
++        if target_key not in processed_target_keys:
+             entries.append(
+-                PlanEntry(KEEP, relpath, source_files[relpath], target_files[relpath])
++                PlanEntry(DELETE, target_relpath, None, target_files[target_relpath])
+             )
+ 
+-    for relpath in sorted(target_files):
+-        if relpath not in source_files:
+-            entries.append(PlanEntry(DELETE, relpath, None, target_files[relpath]))
+-
+     return Plan(entries)

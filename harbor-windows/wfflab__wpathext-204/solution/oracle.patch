@@ -1,0 +1,85 @@
+diff --git a/wexec/resolve.py b/wexec/resolve.py
+index e01bd19..b8a82ad 100644
+--- a/wexec/resolve.py
++++ b/wexec/resolve.py
+@@ -24,9 +24,25 @@ def executable_extensions():
+ 
+     优先使用环境变量 :envvar:`PATHEXT`；它缺失时才退回内置兜底值。
+     """
++    raw = os.environ.get("PATHEXT", "")
++    extensions = tuple(e.strip() for e in raw.split(os.pathsep) if e.strip())
++    if extensions:
++        return extensions
+     return EXECUTABLE_EXTENSIONS
+ 
+ 
++def candidates_for(name):
++    """按 PATHEXT 顺序给出候选文件名。
++
++    名字本身已经带扩展名时不再叠加，否则 ``tool.exe`` 会被误拼成
++    ``tool.exe.exe``。
++    """
++    _root, ext = os.path.splitext(name)
++    if ext:
++        return [name]
++    return [name + extension for extension in executable_extensions()]
++
++
+ def resolve(name):
+     """把 ``name`` 解析成磁盘上的绝对路径。
+ 
+@@ -35,9 +51,11 @@ def resolve(name):
+     if not name:
+         raise CommandNotFound(name)
+ 
++    candidates = candidates_for(name)
+     for directory in search_dirs():
+-        candidate = os.path.join(directory, "%s.exe" % name)
+-        if os.path.isfile(candidate):
+-            return os.path.abspath(candidate)
++        for candidate in candidates:
++            path = os.path.join(directory, candidate)
++            if os.path.isfile(path):
++                return os.path.abspath(path)
+ 
+     raise CommandNotFound(name)
+diff --git a/wexec/runner.py b/wexec/runner.py
+index db6ba24..36e3362 100644
+--- a/wexec/runner.py
++++ b/wexec/runner.py
+@@ -1,18 +1,33 @@
+ """运行已经解析出来的命令。"""
+ 
++import os
+ import subprocess
+ 
+ from .resolve import resolve
+ 
++#: 必须交给命令解释器执行的脚本类型。
++SCRIPT_EXTENSIONS = frozenset({".cmd", ".bat"})
++
+ 
+ def run(argv, timeout=None):
+-    """解析 ``argv[0]`` 并执行，返回 ``subprocess.CompletedProcess``。"""
++    """解析 ``argv[0]`` 并执行，返回 ``subprocess.CompletedProcess``。
++
++    Windows 的 ``CreateProcess`` 不能直接执行批处理脚本（``.cmd`` / ``.bat``），
++    必须通过命令解释器启动。
++    """
+     if not argv:
+         raise ValueError("argv must not be empty")
+ 
+     path = resolve(argv[0])
++    _root, ext = os.path.splitext(path)
++    if ext.lower() in SCRIPT_EXTENSIONS:
++        shell = os.environ.get("COMSPEC") or "cmd.exe"
++        command = [shell, "/c", path] + [str(a) for a in argv[1:]]
++    else:
++        command = [path] + [str(a) for a in argv[1:]]
++
+     return subprocess.run(
+-        [path] + [str(a) for a in argv[1:]],
++        command,
+         capture_output=True,
+         text=True,
+         timeout=timeout,

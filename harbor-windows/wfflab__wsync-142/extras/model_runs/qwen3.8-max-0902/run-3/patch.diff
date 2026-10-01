@@ -1,0 +1,570 @@
+diff --git a/wsync/fsops.py b/wsync/fsops.py
+index d466d2a..debbfeb 100644
+--- a/wsync/fsops.py
++++ b/wsync/fsops.py
+@@ -2,27 +2,58 @@
+ 
+ 所有直接接触磁盘的调用都集中在本模块，这样文件属性、路径形式和共享
+ 冲突的处理就只有一个地方需要关心。
++
++企业 Windows 目标环境里有四件事必须在这里一次做对：
++
++* **文件名大小写**：NTFS 不区分大小写，``Report.PDF`` 与 ``report.pdf``
++  是同一个条目；比较路径必须经过 :func:`path_key`，不能直接比字符串。
++* **只读属性**：带 ``FILE_ATTRIBUTE_READONLY`` 的文件既不能覆盖也不能删除，
++  目录带上该属性时连 ``rmdir`` 都会失败；动手之前先解锁。
++* **共享冲突**：被其它进程打开着的条目删不掉也写不进，这类错误统一翻译成
++  :class:`~wsync.errors.TargetInUseError`，由上层记进失败清单而不是中断同步。
++* **时间戳**：镜像写完一个文件之后，目标的修改时间必须与源一致，否则下一次
++  同步会把刚写好的文件再次判定为"变了"。
+ """
+ 
+ from __future__ import annotations
+ 
++import errno
+ import os
+ import shutil
+ import stat
+-from typing import Dict, Optional, Tuple
++from typing import Dict, List, Optional, Tuple
++
++from .errors import SourceTargetCollisionError, TargetInUseError
+ 
+ __all__ = [
+     "join",
+     "path_key",
++    "same_path",
+     "list_entries",
+     "stat_signature",
++    "same_content",
+     "is_readonly",
++    "clear_readonly",
++    "ensure_dir",
+     "remove_file",
+     "remove_tree",
+     "copy_file",
++    "copy_times",
+     "prune_empty_dirs",
+ ]
+ 
++_CHUNK = 1024 * 1024
++
++# Windows：文件正被其它进程使用（ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION）
++_SHARING_VIOLATIONS = (32, 33)
++
++# POSIX 上语义最接近"被占用"的错误码
++_IN_USE_ERRNOS = tuple(
++    value
++    for value in (getattr(errno, "EBUSY", None), getattr(errno, "ETXTBSY", None))
++    if value is not None
++)
++
+ 
+ def join(root: str, relpath: str) -> str:
+     """把目标根目录和一个相对路径拼成绝对路径。"""
+@@ -34,8 +65,19 @@ def path_key(relpath: str) -> str:
+ 
+     目标平台的文件系统如何认定“两个路径写的是同一个东西”，由本函数
+     决定；调用方不应自己再做字符串拼比较。
++
++    Windows 的 NTFS 不区分文件名大小写，:func:`os.path.normcase` 在 Windows
++    上会统一分隔符并折叠大小写，于是 ``Report.PDF`` 与 ``report.pdf`` 得到
++    同一个键；在区分大小写的平台上它保持原样，行为与过去一致。
+     """
+-    return relpath.replace("/", os.sep)
++    return os.path.normcase(relpath.replace("/", os.sep))
++
++
++def same_path(left: str, right: str) -> bool:
++    """两个写法可能不同的路径是否指向同一个条目。"""
++    if not left or not right:
++        return bool(left) == bool(right)
++    return path_key(os.path.abspath(left)) == path_key(os.path.abspath(right))
+ 
+ 
+ def list_entries(root: str) -> Dict[str, str]:
+@@ -54,9 +96,11 @@ def list_entries(root: str) -> Dict[str, str]:
+ 
+ 
+ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+-    """返回用于“内容是否变化”判定的签名。
++    """返回条目的 ``(大小, 修改时间)`` 签名；读取失败时返回 ``None``。
+ 
+-    签名由大小与修改时间共同构成；读取失败时返回 ``None``。
++    注意：这个签名**不能**单独用来判断内容是否变化——上游工具就地改写文件
++    并把时间戳原样保留时，大小与修改时间都一样而内容已经不同。内容比较请用
++    :func:`same_content`。
+     """
+     try:
+         info = os.stat(path)
+@@ -65,6 +109,32 @@ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+     return (info.st_size, info.st_mtime_ns)
+ 
+ 
++def same_content(source_path: str, target_path: str) -> bool:
++    """两个文件的内容是否完全一致。
++
++    判定依据只有内容本身：先比大小（不同则内容必然不同），再逐块比对字节。
++    仅仅是修改时间不同不算“内容不同”；任何一侧读不出来时按“不一致”处理，
++    让上层去尝试覆盖。
++    """
++    source_signature = stat_signature(source_path)
++    target_signature = stat_signature(target_path)
++    if source_signature is None or target_signature is None:
++        return False
++    if source_signature[0] != target_signature[0]:
++        return False
++    try:
++        with open(source_path, "rb") as src_handle, open(target_path, "rb") as dst_handle:
++            while True:
++                source_chunk = src_handle.read(_CHUNK)
++                target_chunk = dst_handle.read(_CHUNK)
++                if source_chunk != target_chunk:
++                    return False
++                if not source_chunk:
++                    return True
++    except OSError:
++        return False
++
++
+ def is_readonly(path: str) -> bool:
+     """路径是否带有只读属性。"""
+     try:
+@@ -74,33 +144,218 @@ def is_readonly(path: str) -> bool:
+     return not bool(info.st_mode & stat.S_IWRITE)
+ 
+ 
++def clear_readonly(path: str) -> None:
++    """去掉条目上的只读属性（尽力而为，失败时静默返回）。
++
++    从旧备份盘整盘拷过来的目标树里经常残留只读文件和只读目录，覆盖、删除、
++    ``rmdir`` 都会被它挡住，所以每一次动手失败之后都先解锁再重试一次。
++    """
++    try:
++        mode = os.stat(path).st_mode
++    except OSError:
++        mode = stat.S_IREAD
++    try:
++        os.chmod(path, mode | stat.S_IREAD | stat.S_IWRITE)
++    except OSError:
++        pass
++
++
++def _translate_in_use(exc: OSError, path: str, action: str) -> OSError:
++    """把“被其它进程占用”的底层错误翻译成 :class:`TargetInUseError`。"""
++    winerror = getattr(exc, "winerror", None)
++    if winerror in _SHARING_VIOLATIONS or exc.errno in _IN_USE_ERRNOS:
++        return TargetInUseError(f"无法{action} {path}：该条目正被其它进程占用（{exc}）")
++    return exc
++
++
++def _retry_after_unlock(path: str, operation, action: str) -> None:
++    """执行 ``operation``；失败时去掉只读属性再试一次。"""
++    try:
++        operation()
++    except OSError as first:
++        clear_readonly(path)
++        try:
++            operation()
++        except OSError as second:
++            raise _translate_in_use(second, path, action) from first
++
++
+ def remove_file(path: str) -> None:
+-    """删除单个文件。"""
+-    os.remove(path)
++    """删除单个文件。
++
++    文件带只读属性时先解锁再删；删不掉（例如正被业务进程打开）时抛出
++    :class:`~wsync.errors.TargetInUseError` 或原始的 :class:`OSError`，
++    由调用方决定如何记账。
++    """
++    _retry_after_unlock(path, lambda: os.remove(path), "删除")
++
++
++def _remove_dir(path: str) -> None:
++    """删除一个空目录；只读目录先解锁。"""
++    _retry_after_unlock(path, lambda: os.rmdir(path), "删除")
+ 
+ 
+ def remove_tree(path: str) -> None:
+-    """递归删除一棵目录树。"""
+-    shutil.rmtree(path)
++    """递归删除一棵目录树。
++
++    树里的只读文件与只读目录都会被自动解锁，旧备份盘上常见的“只读残留”
++    不会让删除半途而废。``path`` 本来就是普通文件时退化为 :func:`remove_file`。
++    """
++    if not os.path.lexists(path):
++        return
++    if os.path.islink(path) or not os.path.isdir(path):
++        remove_file(path)
++        return
++    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
++        for name in filenames:
++            remove_file(os.path.join(dirpath, name))
++        for name in dirnames:
++            child = os.path.join(dirpath, name)
++            if os.path.islink(child):
++                remove_file(child)
++        _remove_dir(dirpath)
++
++
++def _chain_below(path: str, boundary: Optional[str]) -> List[str]:
++    """返回 ``boundary`` 之下、直到 ``path`` 为止的各层路径（自顶向下）。
++
++    ``boundary`` 自身及其上层不会出现在结果里，因此清理绝不会波及目标根
++    目录以外的东西。
++    """
++    current = os.path.abspath(path)
++    chain: List[str] = []
++    while True:
++        if boundary is not None and same_path(current, boundary):
++            break
++        chain.append(current)
++        parent = os.path.dirname(current)
++        if parent == current:
++            break
++        current = parent
++    chain.reverse()
++    return chain
++
++
++def ensure_dir(path: str, boundary: Optional[str] = None) -> None:
++    """确保 ``path`` 是一个已经存在的目录，必要时创建。
+ 
++    路径的某一层分量上如果躺着同名的普通文件（源里 ``bundle/`` 是目录、
++    目标里 ``bundle`` 是文件就是这种情况），先把这个挡路的文件删掉再建目录。
++    清理只针对真正构成冲突的那些分量，且不会越过 ``boundary``。
++    """
++    if not path:
++        return
++    if os.path.isdir(path):
++        return
++    chain = _chain_below(path, boundary)
++    for candidate in chain:
++        if os.path.lexists(candidate) and not os.path.isdir(candidate):
++            remove_file(candidate)
++    try:
++        os.makedirs(path, exist_ok=True)
++    except OSError:
++        for candidate in chain:
++            clear_readonly(candidate)
++        os.makedirs(path, exist_ok=True)
++
++
++def _is_same_file(left: str, right: str) -> bool:
++    """两个路径是否指向磁盘上的同一个文件。"""
++    if not left or not right:
++        return False
++    if same_path(left, right):
++        return True
++    try:
++        return os.path.samefile(left, right)
++    except OSError:
++        return False
++
++
++def _write_stream(source: str, target: str) -> None:
++    with open(source, "rb") as src_handle, open(target, "wb") as dst_handle:
++        shutil.copyfileobj(src_handle, dst_handle, length=_CHUNK)
++
++
++def copy_file(source: str, target: str, boundary: Optional[str] = None) -> None:
++    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。
++
++    * 父路径上挡着同名文件时先清掉，再建目录；
++    * ``target`` 位置上原本是一棵目录时（源里是文件、目标里是同名目录），
++      先把这棵旧目录树删干净，避免残留旧内容；
++    * ``target`` 已存在且带只读属性时先解锁，否则 Windows 上无法覆盖；
++    * 写完之后 ``target`` 的修改时间与 ``source`` 一致；
++    * 源与目标指向同一个文件时抛 :class:`SourceTargetCollisionError`，
++      以免把数据清空。
++    """
++    if _is_same_file(source, target):
++        raise SourceTargetCollisionError(f"源与目标是同一个文件：{source}")
+ 
+-def copy_file(source: str, target: str) -> None:
+-    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。"""
+     parent = os.path.dirname(target)
+     if parent:
+-        os.makedirs(parent, exist_ok=True)
+-    with open(source, "rb") as src_handle, open(target, "wb") as dst_handle:
+-        shutil.copyfileobj(src_handle, dst_handle, length=1024 * 1024)
++        ensure_dir(parent, boundary)
++
++    if os.path.isdir(target) and not os.path.islink(target):
++        remove_tree(target)
++    elif os.path.lexists(target):
++        clear_readonly(target)
++
++    try:
++        _write_stream(source, target)
++    except OSError:
++        # 只读的父目录、或者刚刚才变成只读的目标，都再解锁一次重试。
++        if parent:
++            for candidate in _chain_below(parent, boundary):
++                clear_readonly(candidate)
++        clear_readonly(target)
++        try:
++            _write_stream(source, target)
++        except OSError as exc:
++            raise _translate_in_use(exc, target, "写入") from None
++
++    copy_times(source, target)
++
++
++def copy_times(source: str, target: str) -> None:
++    """把 ``source`` 的访问时间/修改时间复制到 ``target``。
++
++    镜像同步必须保留时间戳：否则刚写完的文件在下一次同步里又会被认为
++    “和源不一样”，一遍遍重复做无谓的动作。
++    """
++    try:
++        info = os.stat(source)
++    except OSError:
++        return
++    stamp = (info.st_atime_ns, info.st_mtime_ns)
++    try:
++        os.utime(target, ns=stamp)
++    except OSError:
++        clear_readonly(target)
++        os.utime(target, ns=stamp)
+ 
+ 
+ def prune_empty_dirs(root: str) -> None:
+-    """自底向上删除目标树中的空目录（不含 ``root`` 自身）。"""
++    """自底向上删除目标树中的空目录（不含 ``root`` 自身）。
++
++    多余文件删干净之后，只剩只读属性的空目录在 Windows 上是 ``rmdir`` 不掉
++    的，这里先清掉只读属性再删；实在删不掉的（例如仍被占用）保持原样，
++    不影响本次同步的其余部分。
++    """
+     root = os.path.abspath(root)
++    if not os.path.isdir(root):
++        return
+     for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+-        if os.path.abspath(dirpath) == root:
++        if same_path(dirpath, root):
+             continue
+         try:
+-            if not os.listdir(dirpath):
+-                os.rmdir(dirpath)
++            if os.listdir(dirpath):
++                continue
+         except OSError:
+-            pass
++            continue
++        try:
++            os.rmdir(dirpath)
++        except OSError:
++            clear_readonly(dirpath)
++            try:
++                os.rmdir(dirpath)
++            except OSError:
++                pass
+diff --git a/wsync/mirror.py b/wsync/mirror.py
+index f6b81ed..9bc2598 100644
+--- a/wsync/mirror.py
++++ b/wsync/mirror.py
+@@ -1,4 +1,15 @@
+-"""执行同步计划。"""
++"""执行同步计划。
++
++执行阶段要顶住真实目标树的三种"脏"状态：
++
++* 条目带只读属性——解锁后继续，不算失败；
++* 条目被其它进程占用——记进 ``failed``，其余条目照常处理，绝不中断整次同步；
++* 同一条路径上源与目标的类型不同（一边文件、一边目录）——先清掉目标侧的旧
++  条目，再按源的类型落地。
++
++因此删除动作排在写入动作之前：挡路的旧文件必须先让位，源里的目录结构才建得
++起来；而清理只针对计划里确实要删的那条路径，不碰其它条目。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -32,11 +43,21 @@ class SyncResult:
+         return not self.failed
+ 
+ 
+-def _apply(entry: PlanEntry) -> None:
++def _remove(path: str) -> None:
++    """删掉目标侧的一个条目（普通文件或整棵目录树）。"""
++    if not os.path.lexists(path):
++        return  # 已经不在了，目标状态已符合要求
++    if os.path.isdir(path) and not os.path.islink(path):
++        fsops.remove_tree(path)
++    else:
++        fsops.remove_file(path)
++
++
++def _apply(entry: PlanEntry, target_root: str) -> None:
+     if entry.action in (CREATE, UPDATE):
+-        fsops.copy_file(entry.source, entry.target)
++        fsops.copy_file(entry.source, entry.target, boundary=target_root)
+     elif entry.action == DELETE:
+-        fsops.remove_file(entry.target)
++        _remove(entry.target)
+ 
+ 
+ def _record(result: SyncResult, action: str, relpath: str) -> None:
+@@ -48,8 +69,36 @@ def _record(result: SyncResult, action: str, relpath: str) -> None:
+         result.deleted.append(relpath)
+ 
+ 
++def _record_failure(result: SyncResult, entry: PlanEntry, error: BaseException) -> None:
++    """把没能完成的条目记进失败清单，而不是让它掀掉整次同步。"""
++    text = str(error).strip()
++    result.failed.append(
++        {
++            "action": entry.action,
++            "relpath": entry.relpath,
++            "error": text or error.__class__.__name__,
++        }
++    )
++
++
++def _execution_order(entries: List[PlanEntry]) -> List[PlanEntry]:
++    """先删除、后写入；同一种动作内部保持计划给出的顺序。
++
++    目标里"该让位"的旧条目（包括与源类型冲突的文件/目录）先清掉，源里的
++    结构才建得起来。
++    """
++    return [entry for entry in entries if entry.action == DELETE] + [
++        entry for entry in entries if entry.action != DELETE
++    ]
++
++
+ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> SyncResult:
+-    """把 ``source_root`` 镜像同步到 ``target_root``。"""
++    """把 ``source_root`` 镜像同步到 ``target_root``。
++
++    单个条目处理失败（例如被其它进程占用）不会中断整次同步：该条目会出现在
++    返回结果的 ``failed`` 里，其余条目照常完成。纯粹只读的条目会被自动解锁
++    后真正处理掉，不算失败。
++    """
+     source_root = os.path.abspath(source_root)
+     target_root = os.path.abspath(target_root)
+ 
+@@ -59,14 +108,18 @@ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> Sync
+     plan = build_plan(source_root, target_root)
+     result = SyncResult()
+ 
+-    for entry in plan.entries:
++    for entry in _execution_order(plan.entries):
+         if entry.action == KEEP:
+             result.kept.append(entry.relpath)
+             continue
+         if dry_run:
+             _record(result, entry.action, entry.relpath)
+             continue
+-        _apply(entry)
++        try:
++            _apply(entry, target_root)
++        except Exception as error:  # noqa: BLE001 - 单条目失败必须继续同步
++            _record_failure(result, entry, error)
++            continue
+         _record(result, entry.action, entry.relpath)
+ 
+     if not dry_run:
+diff --git a/wsync/planner.py b/wsync/planner.py
+index f42cb36..2238a27 100644
+--- a/wsync/planner.py
++++ b/wsync/planner.py
+@@ -1,9 +1,15 @@
+-"""把源树与目标树的差异计算成一份可执行的同步计划。"""
++"""把源树与目标树的差异计算成一份可执行的同步计划。
++
++计划里的条目一律用 :func:`wsync.fsops.path_key` 生成的键来配对源与目标，
++这样在不区分大小写的文件系统（Windows/NTFS）上，源里的 ``Report.PDF`` 与
++目标里的 ``report.pdf`` 会被认成同一个条目：该更新的走 UPDATE，内容一致的
++走 KEEP，绝不会被拆成"新建一个 + 删掉另一个"而把文件弄丢。
++"""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+-from typing import List, Optional
++from typing import Dict, List, Optional, Tuple
+ 
+ from . import fsops
+ 
+@@ -37,41 +43,58 @@ class Plan:
+ 
+ 
+ def needs_update(source_path: str, target_path: str) -> bool:
+-    """目标文件是否需要被源文件覆盖。"""
+-    signature = fsops.stat_signature(source_path)
+-    if signature is None:
++    """目标文件是否需要被源文件覆盖。
++
++    判定依据是**内容本身**：大小或字节不同就要覆盖；仅仅是修改时间不同不算
++    变化。上游工具就地改写文件却把时间戳保留成原样时，只看大小与修改时间会
++    漏掉这次变化，目标上留下的还是旧内容。
++
++    源文件自己读不出来时保持既有行为——不动目标。
++    """
++    if fsops.stat_signature(source_path) is None:
+         return False
+-    return signature != fsops.stat_signature(target_path)
++    return not fsops.same_content(source_path, target_path)
++
++
++def _index(files: Dict[str, str]) -> Dict[str, Tuple[str, str]]:
++    """把 ``{相对路径: 绝对路径}`` 换成 ``{路径键: (相对路径, 绝对路径)}``。"""
++    indexed: Dict[str, Tuple[str, str]] = {}
++    for relpath in sorted(files):
++        indexed[fsops.path_key(relpath)] = (relpath, files[relpath])
++    return indexed
+ 
+ 
+ def build_plan(source_root: str, target_root: str) -> Plan:
+     """计算从 ``source_root`` 到 ``target_root`` 的镜像同步计划。"""
+-    source_files = fsops.list_entries(source_root)
+-    target_files = fsops.list_entries(target_root)
++    source_files = _index(fsops.list_entries(source_root))
++    target_files = _index(fsops.list_entries(target_root))
+ 
+     entries: List[PlanEntry] = []
+ 
+-    for relpath in sorted(source_files):
+-        if relpath not in target_files:
++    for key in sorted(source_files, key=lambda item: source_files[item][0]):
++        source_relpath, source_path = source_files[key]
++        if key not in target_files:
+             entries.append(
+                 PlanEntry(
+                     CREATE,
+-                    relpath,
+-                    source_files[relpath],
+-                    fsops.join(target_root, relpath),
++                    source_relpath,
++                    source_path,
++                    fsops.join(target_root, source_relpath),
+                 )
+             )
+-        elif needs_update(source_files[relpath], target_files[relpath]):
++            continue
++        target_relpath, target_path = target_files[key]
++        if needs_update(source_path, target_path):
+             entries.append(
+-                PlanEntry(UPDATE, relpath, source_files[relpath], target_files[relpath])
++                PlanEntry(UPDATE, source_relpath, source_path, target_path)
+             )
+         else:
+-            entries.append(
+-                PlanEntry(KEEP, relpath, source_files[relpath], target_files[relpath])
+-            )
++            entries.append(PlanEntry(KEEP, source_relpath, source_path, target_path))
+ 
+-    for relpath in sorted(target_files):
+-        if relpath not in source_files:
+-            entries.append(PlanEntry(DELETE, relpath, None, target_files[relpath]))
++    for key in sorted(target_files, key=lambda item: target_files[item][0]):
++        if key in source_files:
++            continue
++        target_relpath, target_path = target_files[key]
++        entries.append(PlanEntry(DELETE, target_relpath, None, target_path))
+ 
+     return Plan(entries)

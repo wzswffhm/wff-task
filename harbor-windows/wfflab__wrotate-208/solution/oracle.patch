@@ -1,0 +1,99 @@
+diff --git a/wrotate/fsutil.py b/wrotate/fsutil.py
+index 4322090..55d8e84 100644
+--- a/wrotate/fsutil.py
++++ b/wrotate/fsutil.py
+@@ -11,8 +11,11 @@ def move(src, dst):
+     """把 ``src`` 移动到 ``dst``。
+ 
+     目标已存在时也应当成功（覆盖它），返回 ``dst``。
++
++    ``os.rename`` 在 Windows 上遇到已存在的目标会抛 ``FileExistsError``，
++    只有 ``os.replace`` 才有「原子地覆盖」的语义，且两个平台一致。
+     """
+-    os.rename(src, dst)
++    os.replace(src, dst)
+     return dst
+ 
+ 
+@@ -26,7 +29,7 @@ def remove(path):
+ 
+ 
+ def rotation_names(directory, stem):
+-    """返回 ``directory`` 中形如 ``stem.<n>`` 的名字列表（升序）。"""
++    """返回 ``directory`` 中形如 ``stem.<n>`` 的名字列表（按序号升序）。"""
+     names = []
+     for name in os.listdir(directory):
+         if not name.startswith(stem + "."):
+@@ -34,7 +37,7 @@ def rotation_names(directory, stem):
+         suffix = name[len(stem) + 1:]
+         if suffix.isdigit():
+             names.append(name)
+-    return sorted(names)
++    return sorted(names, key=lambda n: int(n.rsplit(".", 1)[1]))
+ 
+ 
+ def rotation_index(name):
+diff --git a/wrotate/rotator.py b/wrotate/rotator.py
+index 3a31f7d..de98bde 100644
+--- a/wrotate/rotator.py
++++ b/wrotate/rotator.py
+@@ -32,28 +32,45 @@ class Rotator(object):
+     def rotate(self):
+         """把当前日志滚成 ``.1``，并把已有轮转依次后移。
+ 
+-        返回本次被写入的新路径列表。
++        返回本次被写入的新路径列表。中途失败时回滚已完成的搬移，
++        避免留下半截状态。
+         """
+         if not os.path.exists(self.path):
+             return []
+ 
+-        moved = []
++        planned = []
+         for name in self.rotations():
+-            index = fsutil.rotation_index(name)
+-            src = os.path.join(self.directory, name)
+-            dst = "%s.%d" % (self.path, index + 1)
+-            fsutil.move(src, dst)
+-            moved.append(dst)
+-
+-        dst = "%s.1" % self.path
+-        fsutil.move(self.path, dst)
+-        moved.append(dst)
+-        return moved
++            planned.append(
++                (
++                    os.path.join(self.directory, name),
++                    "%s.%d" % (self.path, fsutil.rotation_index(name) + 1),
++                )
++            )
++        planned.append((self.path, "%s.1" % self.path))
++
++        done = []
++        try:
++            for src, dst in planned:
++                fsutil.move(src, dst)
++                done.append((src, dst))
++        except OSError:
++            for src, dst in reversed(done):
++                try:
++                    fsutil.move(dst, src)
++                except OSError:
++                    pass
++            raise RotationError("failed to rotate %s" % self.path)
++
++        return [dst for _src, dst in done]
+ 
+     def prune(self):
+-        """删除超出保留份数的轮转文件，返回被删除的名字列表。"""
++        """删除超出保留份数的轮转文件，返回被删除的名字列表。
++
++        保留份数按**序号**计算，不能按文件名的字典序 ——
++        ``app.log.10`` 在字典序里排在 ``app.log.9`` 前面。
++        """
+         names = self.rotations()
+-        ordered = sorted(names, reverse=True)
++        ordered = sorted(names, key=fsutil.rotation_index, reverse=True)
+         removed = []
+         for name in ordered[self.keep:]:
+             if fsutil.remove(os.path.join(self.directory, name)):

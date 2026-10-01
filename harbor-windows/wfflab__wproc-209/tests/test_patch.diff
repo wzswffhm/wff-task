@@ -1,0 +1,326 @@
+diff --git a/tests/test_windows_process_tree.py b/tests/test_windows_process_tree.py
+new file mode 100644
+index 0000000..419812a
+--- /dev/null
++++ b/tests/test_windows_process_tree.py
+@@ -0,0 +1,320 @@
++"""wproc 的 Windows 进程树与时间预算验收测试（隐藏）。
++
++题面依据：`instruction.md`「五类故障 / 目标 / 验收标准」。
++只断言题面已经声明的可观察行为：
++  * 超时后整棵进程树（含后代）必须停止
++  * 截止前已产生的输出必须保留
++  * 直接子进程已经结束时不得判为超时
++  * 不得波及其它无关进程
++
++判活手段刻意避开「删掉文件再看是否重建」这类会撞 WinError 32 的写法：
++统一用「pid 是否还在进程表里」+「心跳文件 mtime 是否冻结」两个独立观测。
++"""
++
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from wproc import run
++
++pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows 进程语义")
++
++PY = sys.executable
++
++# ------------------------------------------------------------------ 测试辅助脚本
++
++GRANDCHILD = """
++import os, sys, time
++hb = sys.argv[1]
++with open(hb + ".pid", "w", encoding="utf-8") as fh:
++    fh.write(str(os.getpid()))
++while True:
++    with open(hb, "w", encoding="utf-8") as fh:
++        fh.write(str(time.time()))
++    time.sleep(0.12)
++"""
++
++TREE = """
++import subprocess, sys, time
++hb, gc, depth = sys.argv[1], sys.argv[2], int(sys.argv[3])
++sys.stdout.write("tree-started\\n")
++sys.stdout.flush()
++if depth > 0:
++    subprocess.Popen([sys.executable, __file__, hb, gc, str(depth - 1)])
++else:
++    subprocess.Popen([sys.executable, gc, hb])
++time.sleep(3600)
++"""
++
++FINISHER = """
++import subprocess, sys
++hb, gc, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
++sys.stdout.write("finisher-out\\n")
++sys.stderr.write("finisher-err\\n")
++sys.stdout.flush()
++subprocess.Popen([sys.executable, gc, hb])
++sys.exit(rc)
++"""
++
++CHATTY = """
++import sys, time
++sys.stdout.write("chatty-out\\n")
++sys.stderr.write("chatty-err\\n")
++sys.stdout.flush()
++time.sleep(3600)
++"""
++
++WRITER = """
++import sys, time
++sys.stdout.write("writer-started\\n")
++sys.stdout.write("y" * (512 * 1024))
++sys.stdout.flush()
++time.sleep(3600)
++"""
++
++
++def _write(tmp_path: Path, name: str, source: str) -> Path:
++    path = tmp_path / name
++    path.write_text(source, encoding="utf-8")
++    return path
++
++
++def _helpers(tmp_path: Path) -> dict:
++    return {
++        "grandchild": _write(tmp_path, "grandchild.py", GRANDCHILD),
++        "tree": _write(tmp_path, "tree.py", TREE),
++        "finisher": _write(tmp_path, "finisher.py", FINISHER),
++        "chatty": _write(tmp_path, "chatty.py", CHATTY),
++        "writer": _write(tmp_path, "writer.py", WRITER),
++    }
++
++
++# ------------------------------------------------------------------ 观测原语
++
++
++def _wait_for(path: Path, wait: float = 5.0) -> bool:
++    deadline = time.time() + wait
++    while time.time() < deadline:
++        if path.exists():
++            return True
++        time.sleep(0.1)
++    return path.exists()
++
++
++def _pid_of(hb: Path):
++    """后代进程自己在启动时写下的 pid。"""
++    pid_file = Path(str(hb) + ".pid")
++    if not _wait_for(pid_file, 5.0):
++        return None
++    try:
++        return int(pid_file.read_text(encoding="utf-8").strip())
++    except (OSError, ValueError):
++        return None
++
++
++def _alive(pid) -> bool:
++    """pid 是否仍然在 Windows 进程表里。"""
++    if pid is None:
++        return False
++    result = subprocess.run(
++        ["tasklist", "/FI", "PID eq %d" % int(pid), "/NH"],
++        capture_output=True, text=True, errors="replace",
++    )
++    return "python" in result.stdout.lower()
++
++
++def _heartbeat_frozen(hb: Path, wait: float = 2.0) -> bool:
++    """等一会儿后心跳文件的 mtime 是否不再变化（不再变化 = 进程已停）。"""
++    if not hb.exists():
++        return True
++    before = hb.stat().st_mtime_ns
++    time.sleep(wait)
++    if not hb.exists():
++        return True
++    return hb.stat().st_mtime_ns == before
++
++
++def _kill_leftovers(hb: Path) -> None:
++    """只按记录下来的 pid 清理，不做宽泛匹配。"""
++    pid_file = Path(str(hb) + ".pid")
++    if not pid_file.exists():
++        return
++    try:
++        pid = int(pid_file.read_text(encoding="utf-8").strip())
++    except (OSError, ValueError):
++        return
++    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
++                   capture_output=True, timeout=30)
++
++
++# ================================================================== F2P：进程树终止
++
++
++def test_timeout_terminates_the_whole_process_tree(tmp_path):
++    """超时后，直接子进程启动的后代也必须一起停止。"""
++    helpers = _helpers(tmp_path)
++    hb = tmp_path / "hb_root.txt"
++    try:
++        result = run([PY, str(helpers["tree"]), str(hb), str(helpers["grandchild"]), "1"],
++                     timeout=6)
++        assert result.timed_out is True
++        assert _wait_for(hb), "后代进程从未启动，本用例无法判定"
++        assert _heartbeat_frozen(hb, 2.0) is True, "超时返回后后代进程仍在写心跳"
++        assert _alive(_pid_of(hb)) is False, "超时返回后后代进程仍在进程表里"
++    finally:
++        _kill_leftovers(hb)
++
++
++def test_timeout_terminates_a_deep_tree(tmp_path):
++    """四层深的进程链同样必须在超时后全部停止。"""
++    helpers = _helpers(tmp_path)
++    hb = tmp_path / "hb_deep.txt"
++    try:
++        result = run([PY, str(helpers["tree"]), str(hb), str(helpers["grandchild"]), "2"],
++                     timeout=10)
++        assert result.timed_out is True
++        assert _wait_for(hb), "后代进程从未启动，本用例无法判定"
++        assert _heartbeat_frozen(hb, 2.0) is True, "深层后代进程仍在写心跳"
++        assert _alive(_pid_of(hb)) is False, "深层后代进程仍在进程表里"
++    finally:
++        _kill_leftovers(hb)
++
++
++# ================================================================== F2P：输出保留
++
++
++def test_timeout_preserves_output_emitted_before_the_deadline(tmp_path):
++    """超时前已经写到 stdout 的内容必须出现在结果里。"""
++    helpers = _helpers(tmp_path)
++    hb = tmp_path / "hb_out.txt"
++    try:
++        result = run([PY, str(helpers["tree"]), str(hb), str(helpers["grandchild"]), "0"],
++                     timeout=6)
++        assert result.timed_out is True
++        assert "tree-started" in result.text(), "超时结果丢失了截止前产生的输出"
++    finally:
++        _kill_leftovers(hb)
++
++
++def test_timeout_preserves_large_output_emitted_before_the_deadline(tmp_path):
++    """超时前产生的大输出（512 KiB）同样不得丢失，也不得让运行时挂住。"""
++    helpers = _helpers(tmp_path)
++    started = time.time()
++    result = run([PY, str(helpers["writer"])], timeout=8)
++    elapsed = time.time() - started
++    assert result.timed_out is True
++    got = result.output.count(b"y")
++    assert got == 512 * 1024, "超时结果丢失了截止前产生的大输出，实际 %d 字节" % got
++    assert "writer-started" in result.text()
++    assert elapsed < 20, "超时后没有及时返回（耗时 %.1fs）" % elapsed
++
++
++def test_timeout_result_keeps_both_stdout_and_stderr(tmp_path):
++    """截止前分别写到 stdout 与 stderr 的内容都要保留。"""
++    helpers = _helpers(tmp_path)
++    result = run([PY, str(helpers["chatty"])], timeout=6)
++    assert result.timed_out is True
++    text = result.text()
++    assert "chatty-out" in text, "超时结果丢失了截止前写往 stdout 的内容"
++    assert "chatty-err" in text, "超时结果丢失了截止前写往 stderr 的内容"
++
++
++# ============================================================ F2P：已结束的子进程
++
++
++def test_finished_child_with_a_live_descendant_is_not_a_timeout(tmp_path):
++    """直接子进程已经正常退出，即使后代仍持有输出管道，也不得判为超时。"""
++    helpers = _helpers(tmp_path)
++    hb = tmp_path / "hb_fin.txt"
++    started = time.time()
++    try:
++        result = run([PY, str(helpers["finisher"]), str(hb), str(helpers["grandchild"]), "0"],
++                     timeout=25)
++        elapsed = time.time() - started
++        assert result.timed_out is False, "明明已经结束了，却被判成超时"
++        assert result.returncode == 0
++        assert "finisher-out" in result.text()
++        assert elapsed < 12, (
++            "等待一个早已结束的子进程用了 %.1fs，说明还在等后代释放输出管道" % elapsed)
++    finally:
++        _kill_leftovers(hb)
++
++
++# ================================================================== P2P：既有行为
++
++
++def test_success_still_reports_exit_code_and_output():
++    result = run([PY, "-c", "print('p2p-ok')"], timeout=60)
++    assert result.returncode == 0
++    assert result.ok
++    assert "p2p-ok" in result.text()
++
++
++def test_nonzero_exit_code_is_still_preserved():
++    result = run([PY, "-c", "import sys; sys.exit(5)"], timeout=60)
++    assert result.returncode == 5
++    assert result.timed_out is False
++
++
++def test_merged_streams_are_still_collected_for_finished_children():
++    result = run(
++        [PY, "-c", "import sys; sys.stderr.write('e\\n'); print('o')"],
++        timeout=60,
++    )
++    assert "e" in result.text() and "o" in result.text()
++
++
++def test_cwd_is_still_honoured(tmp_path):
++    workdir = tmp_path / "cwd_probe"
++    workdir.mkdir()
++    result = run([PY, "-c", "import os; print(os.getcwd())"], cwd=str(workdir), timeout=60)
++    assert str(workdir) in result.text()
++
++
++def test_large_output_of_a_finished_child_is_still_collected():
++    code = "import sys; sys.stdout.write('z' * (256 * 1024))"
++    result = run([PY, "-c", code], timeout=120)
++    assert result.returncode == 0
++    assert result.output.count(b"z") == 256 * 1024
++
++
++def test_unrelated_processes_are_not_touched(tmp_path):
++    """终止一次运行不得波及其它进程（例如同一台机器上的另一个构建任务）。"""
++    helpers = _helpers(tmp_path)
++    bystander_hb = tmp_path / "hb_bystander.txt"
++    bystander = subprocess.Popen(
++        [PY, str(helpers["tree"]), str(bystander_hb), str(helpers["grandchild"]), "0"],
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++    )
++    try:
++        assert _wait_for(bystander_hb), "旁观进程未启动，本用例无法判定"
++        bystander_pid = _pid_of(bystander_hb)
++        assert _alive(bystander_pid), "旁观进程未进入进程表，本用例无法判定"
++
++        victim_hb = tmp_path / "hb_victim.txt"
++        try:
++            run([PY, str(helpers["tree"]), str(victim_hb), str(helpers["grandchild"]), "0"],
++                timeout=6)
++            assert _alive(bystander_pid), "无关进程被这次终止误杀了"
++            assert _heartbeat_frozen(bystander_hb, 2.0) is False, (
++                "无关进程的心跳停了")
++        finally:
++            _kill_leftovers(victim_hb)
++    finally:
++        subprocess.run(["taskkill", "/F", "/T", "/PID", str(bystander.pid)],
++                       capture_output=True, timeout=30)
++        _kill_leftovers(bystander_hb)
++
++
++def test_timeout_returns_promptly_when_there_are_no_descendants():
++    started = time.time()
++    result = run([PY, "-c", "import time; time.sleep(300)"], timeout=4)
++    elapsed = time.time() - started
++    assert result.timed_out is True
++    assert elapsed < 15, "简单的超时用例耗时 %.1fs" % elapsed

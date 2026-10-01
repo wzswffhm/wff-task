@@ -23,6 +23,7 @@ wff-task/
 ├── deliverables/          # ★ 解析材料产出区（<日期>_<材料名>/，材料名保持原拼写）
 ├── harbor-16/             # 题包类型目录：harbor-16 skill 产物（内部 RL 题包）
 ├── harbor-sota/           # 题包类型目录：harbor-sota skill 产物（外发供应商题包）
+├── harbor-windows/        # 题包类型目录：harbor-windows skill 产物（Windows 专项 Coding Bench，9 题平铺）
 └── skills/                # ★ 唯一的 skill 目录
     ├── OBM/               # OBM 生产全流程（含 subskills）
     ├── harbor-16/         # Harbor 内部 RL 出题
@@ -54,13 +55,13 @@ wff-task/
 | 候选题（尚未立项） | `work/candidates/` | 仅有 `scene-profile.json` 的题目 |
 | 解析材料的产出 | `deliverables/<日期>_<材料名>/` | `deliverables/2026-09-29_windwos-第二版/` |
 
-`harbor-16/`、`harbor-sota/`、`OBM/` 均为**题包类型目录**：类型目录根部**只放公用**配置/脚本/缓存，单个题包各自独立子目录，互不污染。后续新增题包类型（如 Windows-Harbor）时同此组织，并在此登记。
+`harbor-16/`、`harbor-sota/`、`harbor-windows/`、`OBM/` 均为**题包类型目录**：类型目录根部**只放公用**配置/脚本/缓存，单个题包各自独立子目录，互不污染。后续新增题包类型时同此组织，并在此登记。
 
 ### 根目录洁净规则（强制）
 
 **以下条目只允许存在一个**：`README.md`、`.gitignore`、`deliverables/`、`skills/`。
 
-**题包类型目录可扩展**，当前已有：`OBM/`、`harbor-16/`、`harbor-sota/`。新增类型目录须先经确认并登记于本节与上方目录树。
+**题包类型目录可扩展**，当前已有：`OBM/`、`harbor-16/`、`harbor-sota/`、`harbor-windows/`。新增类型目录须先经确认并登记于本节与上方目录树。
 
 - **禁止**在根目录直接创建任何文件（报告、脚本、临时文件）。
 - **禁止**根级备份/临时目录（`X.backup-*`、`X-2/`、`tmp/`）。
@@ -101,6 +102,7 @@ git add -A && git commit -m "描述改动" && git push
 - **harbor-16 题包**：看 `jobs/` 是否含 baseline/nop + oracle + 难度门（16 条 trial，`<1`≥13、`=1`≥1）
 - **harbor-sota 题包**：看是否含完整五件套 + `tests/gating/` + `tests/graded/` + `tests/golden_output/`
 - **OBM 题包**：看 `output/` 下是否含 `proposal.json` 与 `sources/`
-- **harbor-windows 题包**：跑 `python skills/harbor-windows/scripts/validate_package.py --package <题包根>`，
-  须满足五件套齐全 + required F2P/P2P 二值判分 + `delivery-extras/` 齐全 + 镜像 Digest 另存；
-  模型区分度用 `python skills/harbor-windows/scripts/run_model_validation.py` 自动化验证
+- **harbor-windows 题包**：跑 `python skills/harbor-windows/scripts/validate_package.py --package harbor-windows`，
+  须满足五件套齐全 + required F2P/P2P 二值判分 + `<task-id>/extras/` 与 `_index/` 齐全 + 镜像 Digest 另存；
+  模型区分度用 `python skills/harbor-windows/scripts/run_model_validation.py --layout flat` 自动化验证
+  （**9 个题包平铺于 `harbor-windows/` 下，无批次层**）

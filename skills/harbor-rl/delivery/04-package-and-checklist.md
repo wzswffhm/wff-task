@@ -1,5 +1,17 @@
 # 打包、提交前自检与交付文档
 
+## 0. 静态自检脚本（先跑脚本，再做人工复核）
+
+`scripts/` 下提供两个可直接运行的校验器，覆盖 §3 中所有**可静态验证**的项：
+
+```bash
+python3 scripts/check_rubrics.py   <题目目录>/tests/rubrics.toml   # #4 #5 #11（G3 评分器门禁）
+python3 scripts/check_package.py   <题目目录>                       # #1 #2 #3 #7 #8 #9 #10 #12 #14 #15
+```
+
+两者均以退出码表示结果（0 = 通过），可直接串进打包流水线。
+**未能静态验证、必须实机执行的项**：`#6` golden 预检、`#13` 镜像自检、`#16` 本地跑分、`#17` 交付文档。
+
 ## 1. 打包命名
 
 | 场景 | 命名规则 | 示例 |
@@ -92,6 +104,10 @@
 ```bash
 # 解压后复核层级
 unzip -l <batch>.zip | head -50
+
+# 静态自检（脚本，见 §0）
+python3 scripts/check_rubrics.py <题目目录>/tests/rubrics.toml
+python3 scripts/check_package.py <题目目录>
 
 # 残留扫描
 find . -name ".git" -o -name "__pycache__" -o -name ".venv" -o -name "__MACOSX" \

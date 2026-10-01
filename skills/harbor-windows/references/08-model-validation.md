@@ -191,37 +191,63 @@ opus_pass_sum = 15               # 条件 2：15 > 12 → 通过区分度
 
 ### 7.1 端点与模型
 
-协议均为 **Anthropic Messages**：`POST {base_url}/v1/messages`，
-header `x-api-key` + `anthropic-version: 2023-06-01`。
+协议均为 **Anthropic Messages**：`POST {base_url}/v1/messages`。
+凭据存放在**仓库外**的用户级文件 `~/.workbuddy/harbor-windows-endpoints.json`（不入库），
+交由 `--config` 传入；下表的 `base_url` 均**不含 `/v1`**（脚本会自行拼接 `/v1/messages`）。
 
-| key | label | base_url | model | 次数 | 角色 |
-|---|---|---|---|---|---|
-| `qwen3.8-max` | Qwen3.8-Max-0902 | `https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic` | `qwen3.8-max` | 3 | primary |
-| `opus-5` | Opus 5 | `https://api.blvr.top` | `claude-opus-5` | 3 | primary |
-| `glm-5.3` | GLM-5.3 | 同 aliyun | `GLM-5.3` | 1 | auxiliary |
-| `kimi-k3` | Kimi K3 | 同 aliyun | `Kimi K3` | 1 | auxiliary |
+| key | label | base_url | model | 鉴权头 | 次数 | 角色 |
+|---|---|---|---|---|---|---|
+| `qwen3.8-max` | Qwen3.8-Max-0902 | `https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic` | `qwen3.8-max-0902` | `x-api-key` | 3 | primary |
+| `opus-5` | Opus 5 | `https://api.ebondai.com` | `claude-opus-5` | `x-api-key` | 3 | primary |
+| `glm-5.3` | GLM-5.3 | `https://ark.cn-beijing.volces.com/api/coding` | `glm-5.3` | **`Authorization`** | 1 | auxiliary |
+| `kimi-k3` | Kimi K3 | `https://ark.cn-beijing.volces.com/api/coding` | `kimi-k3` | **`Authorization`** | 1 | auxiliary |
 
-> ⚠️ aliyun 的 base_url **必须带 `/apps/anthropic` 后缀**；去掉后 `/v1/messages` 返回 404。
-> 三个 aliyun 模型共用一个 Key（`HARBOR_WINDOWS_ALIYUN_KEY`），Opus 单独用 `HARBOR_WINDOWS_BLVR_KEY`。
+关键参数（均在端点 JSON 内固化）：
+
+| key | `max_tokens` | `request_timeout` | 备注 |
+|---|---|---|---|
+| qwen3.8-max | 65536 | 900 | 给不足会在长上下文下被 thinking 吃光预算，末步正文为空 → INVALID |
+| opus-5 | 16000 | 默认 | ebondai 官方给的 baseURL 带 `/v1`，这里**必须去掉** |
+| glm-5.3 | 65536 | 1800 | **绝不要传 `thinking` 字段**（enabled → 强制深度推理吃光预算；disabled → 400） |
+| kimi-k3 | 32000 | — | 可传 `thinking.type=disabled` 关闭思考，更快更稳 |
+
+> ⚠️ 三类坑：
+> ① aliyun 的 base_url **必须带 `/apps/anthropic` 后缀**，去掉后 `/v1/messages` 返回 404；
+> ② **方舟（GLM/Kimi）只认 `Authorization: Bearer`**，传 `x-api-key` 会 401；
+> ③ 方舟模型 id 必须**小写连字符**（`glm-5.3` / `kimi-k3`），写成 `Kimi K3` 会 404。
+>
+> ⚠️ 超时与静默的区分：aliyun 单请求上限 900 s、方舟 1800 s，且方舟强制深度推理时单步可达数分钟。
+> 轨迹文件 mtime 长时间不更新**不等于进程已死**；判断存活性要看本机 `python.exe` 是否还在（见 7.4）。
 
 ### 7.2 命令
 
 ```bash
 pip install httpx
-export HARBOR_WINDOWS_ALIYUN_KEY=<key>
-export HARBOR_WINDOWS_BLVR_KEY=<key>
 
-# 全量
-python scripts/run_model_validation.py --tasks <assets> --out delivery-extras/tasks
+# 全量（不传 --only 时按端点顺序串行跑完全部）
+python -u scripts/run_model_validation.py \
+    --tasks <题包目录> --out <题包类型目录> --layout flat \
+    --config ~/.workbuddy/harbor-windows-endpoints.json
+
+# 分片并行：把 4 个模型拆成 4 个独立进程，各写自己的日志
+for M in opus-5 qwen3.8-max glm-5.3 kimi-k3; do
+  python -u scripts/run_model_validation.py --only "$M" --skip-existing \
+      --tasks <题包目录> --out <题包类型目录> --layout flat \
+      --config ~/.workbuddy/harbor-windows-endpoints.json > "log-$M.txt" 2>&1 &
+done
+wait
 
 # 冒烟（每模型 1 次，仅验证连通性）
-python scripts/run_model_validation.py --tasks <assets> --out delivery-extras/tasks --smoke
+python -u scripts/run_model_validation.py --tasks <题包目录> --smoke
 
 # 平台回填分数后只算区分度
-python scripts/run_model_validation.py --score-only --out delivery-extras/tasks
+python -u scripts/run_model_validation.py --score-only --out <题包类型目录> --layout flat
 ```
 
-可调项：`HARBOR_WINDOWS_MAX_TOKENS` / `TIMEOUT_SEC` / `MAX_RETRIES` / `ENDPOINTS_JSON`。
+**必须加 `-u`**：脚本输出重定向到文件时默认块缓冲，日志会长时间为空，无法判断进度。
+
+可调项：`--only` / `--run-index` / `--skip-existing` / `--agent-max-steps`，
+环境变量 `HARBOR_WINDOWS_MAX_TOKENS` / `TIMEOUT_SEC` / `MAX_RETRIES` / `ENDPOINTS_JSON`。
 
 ### 7.3 脚本职责边界（重要）
 
@@ -290,6 +316,65 @@ delivery-extras/
 
 `scripts/model_endpoints.template.json` 提供端点和凭据字段模板。
 复制为 `model_endpoints.local.json` 并填 Key（该名已在 `.gitignore` 中，不会入库）。
+
+### 7.8 断点续跑与存活判定（长耗时运行的必备操作）
+
+`--skip-existing`：某 run 的 `meta.json` 已存在且状态为 `VALID`/`INVALID` 时直接跳过。
+被外部终止的运行**不会写 `meta.json`**，因此会被自动重跑，不会把半成品当成结果。
+耗时可达 1–2 小时的批次务必带上此参数。
+
+> ⚠️ **后台 shell 会在会话切换时被回收**：把分片运行挂在会话的后台任务里，
+> 一旦会话被重建（例如长对话被压缩后继续），子进程可能连同 shell 一起被杀，
+> 且不会写任何 `meta.json`。症状是**所有模型同时静默**（不是单个模型卡住），
+> 与「某个模型自身很慢」的形态明显不同。
+>
+> 判定顺序：
+> 1. `tasklist /FI "IMAGENAME eq python.exe"` —— 一个进程都没有就说明进程已死，与端点无关；
+> 2. 用 `curl --max-time 20 -X POST {base_url}/v1/messages` 探端点，**无鉴权返回 401 即为正常**；
+> 3. 确认端点正常后，带 `--skip-existing` 重启分片即可，已完成的 run 不会被重跑。
+
+> ⚠️ **不要用 `nohup ... &` 启动长任务**（2026-10-01 实测第二次踩坑）：
+> 在 shell 里 `nohup python ... & echo pid=$!` 会让**该工具调用立即返回**，
+> 被 `&` 放到后台的 python 会随这次调用的 shell 一起被回收 —— 判据同样是
+> `tasklist` 里 python 归零、且轨迹文件时间戳冻结。
+>
+> 正确做法：用 agent 工具**自带的**后台执行能力（`run_in_background`）直接跑前台 python 命令，
+> 让工具持有该进程，不要自己 `&`、不要 `nohup`。
+>
+> 排查"是否只是变慢而不是死了"：看该 run 的 `trajectory-run-N.jsonl` 的 **mtime**。
+> mtime 在推进 = 还在跑；mtime 冻结（本次冻结了约 75 分钟）且 `tasklist` 无 python = 已死。
+
+### 7.9 Agent 命令挂死：`subprocess.run(timeout=)` 的管道 EOF 陷阱（必须知道）
+
+**症状**：单个模型的 run **长时间静默**（十几分钟到无限），但
+`tasklist` 里该 worker 进程还在、**没有任何子进程**、**没有活动 TCP 连接**，
+CPU 增量恒为 `0.000s`。轨迹文件停在某个 `run_command` 的 assistant 步，一直没有对应的
+`tool_result`。**不会自我恢复**，端点超时机制也救不了（它根本不在 API 调用里）。
+
+**根因**：`agent_harness._t_run_command` 早期用
+`subprocess.run(cmd, shell=True, capture_output=True, timeout=N)`。
+当被执行的命令留下**持有 stdout 管道的后代**（agent 写探针脚本的典型形态：
+`python probe.py` 内部又 `Popen` 了一个长跑子进程），超时分支里 CPython 会调用
+**不带超时的** `process.communicate()` 去回收，而管道 EOF 要等所有继承写端的后代退出
+—— 于是永久阻塞。
+
+**修复**（已在 `agent_harness.py` 落地）：把输出重定向到**临时文件**而不是管道，
+`Popen(...).wait(timeout)` 超时后先 `taskkill /F /T` 收整棵树再 `wait`。
+文件没有管道 EOF 语义，超时可靠返回，且顺带能保留截止前的部分输出。
+
+**排查工具**（本机 `wmic` 已被移除，PowerShell 通道可能不可用）：
+
+```bash
+# 列出进程树 + 完整命令行（纯 ctypes，不依赖 wmic / PowerShell）
+python scripts/list_processes.py --filter python --tree
+python scripts/list_processes.py --kill-tree <PID>     # 精确杀掉一棵树
+```
+
+判定阻塞 vs 空转：对可疑 PID 取两次 `GetProcessTimes` 的 CPU 增量。
+**增量恒为 0 = 阻塞死锁**（必须重启）；有增长 = 只是慢。
+
+回归验证脚本：`python scripts/verify_cmd_timeout_fix.py`
+（A 段证明旧实现 45s 不返回；B 段证明新实现 10.6s 返回且无遗留后代；C 段证明普通命令无回归）。
 
 ---
 

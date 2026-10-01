@@ -1,0 +1,320 @@
+diff --git a/wproc/processes.py b/wproc/processes.py
+index af7154d..dc2fa83 100644
+--- a/wproc/processes.py
++++ b/wproc/processes.py
+@@ -6,35 +6,182 @@
+ 
+ from __future__ import annotations
+ 
+-from typing import Mapping, Optional, Sequence
+-
++import platform
+ import subprocess
++import sys
++from typing import Mapping, Optional, Sequence
+ 
+ Command = Sequence[str]
+ 
++# Windows-specific imports
++if platform.system() == "Windows":
++    import ctypes
++    from ctypes import wintypes
++
++    # Windows API constants
++    PROCESS_TERMINATE = 0x0001
++    PROCESS_SET_QUOTA = 0x0100
++    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
++    JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
++
++    # Windows API functions
++    kernel32 = ctypes.windll.kernel32
++
++    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
++        _fields_ = [
++            ("PerProcessUserTimeLimit", ctypes.c_int64),
++            ("PerJobUserTimeLimit", ctypes.c_int64),
++            ("LimitFlags", wintypes.DWORD),
++            ("MinimumWorkingSetSize", ctypes.c_size_t),
++            ("MaximumWorkingSetSize", ctypes.c_size_t),
++            ("ActiveProcessLimit", wintypes.DWORD),
++            ("Affinity", ctypes.c_void_p),
++            ("PriorityClass", wintypes.DWORD),
++            ("SchedulingClass", wintypes.DWORD),
++        ]
++
++    class IO_COUNTERS(ctypes.Structure):
++        _fields_ = [
++            ("ReadOperationCount", ctypes.c_uint64),
++            ("WriteOperationCount", ctypes.c_uint64),
++            ("OtherOperationCount", ctypes.c_uint64),
++            ("ReadTransferCount", ctypes.c_uint64),
++            ("WriteTransferCount", ctypes.c_uint64),
++            ("OtherTransferCount", ctypes.c_uint64),
++        ]
++
++    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
++        _fields_ = [
++            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
++            ("IoInfo", IO_COUNTERS),
++            ("ProcessMemoryLimit", ctypes.c_size_t),
++            ("JobMemoryLimit", ctypes.c_size_t),
++            ("PeakProcessMemoryUsed", ctypes.c_size_t),
++            ("PeakJobMemoryUsed", ctypes.c_size_t),
++        ]
++
++
++class ProcessHandle:
++    """封装子进程与它在 Windows 上的 Job Object（如果有）。"""
++
++    def __init__(self, proc: subprocess.Popen, job_handle=None) -> None:
++        self.proc = proc
++        self.job_handle = job_handle
++
++    def __getattr__(self, name):
++        """把不认识的属性都转发给 Popen。"""
++        return getattr(self.proc, name)
++
+ 
+ def start_process(
+     command: Command,
+     cwd: Optional[str] = None,
+     env: Optional[Mapping[str, str]] = None,
+-) -> subprocess.Popen:
+-    """启动一个子进程，把 stdout 与 stderr 合并到同一个管道里。"""
+-    return subprocess.Popen(
+-        [str(item) for item in command],
+-        cwd=cwd,
+-        env=dict(env) if env is not None else None,
+-        stdin=subprocess.DEVNULL,
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
+-    )
+-
+-
+-def terminate_process(proc: subprocess.Popen) -> None:
+-    """结束一个子进程。
+-
+-    调用返回后 ``proc`` 一定已经退出，``proc.returncode`` 可用。
++) -> ProcessHandle:
++    """启动一个子进程，把 stdout 与 stderr 合并到同一个管道里。
++    
++    在 Windows 上会创建 Job Object 以确保进程树可以被整体终止。
++    """
++    if platform.system() == "Windows":
++        return _start_process_windows(command, cwd, env)
++    else:
++        proc = subprocess.Popen(
++            [str(item) for item in command],
++            cwd=cwd,
++            env=dict(env) if env is not None else None,
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++        )
++        return ProcessHandle(proc)
++
++
++def _start_process_windows(
++    command: Command,
++    cwd: Optional[str] = None,
++    env: Optional[Mapping[str, str]] = None,
++) -> ProcessHandle:
++    """Windows 版本：创建 Job Object 并把子进程加入其中。"""
++    job_handle = None
++    
++    try:
++        # 创建 Job Object
++        job_handle = kernel32.CreateJobObjectW(None, None)
++        if not job_handle:
++            raise OSError("Failed to create job object")
++
++        # 配置 Job：关闭 Job 时终止所有进程
++        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
++        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
++
++        result = kernel32.SetInformationJobObject(
++            job_handle,
++            9,  # JobObjectExtendedLimitInformation
++            ctypes.byref(info),
++            ctypes.sizeof(info),
++        )
++
++        if not result:
++            raise OSError("Failed to configure job object")
++
++        # 启动子进程（不使用特殊的 creation flags）
++        proc = subprocess.Popen(
++            [str(item) for item in command],
++            cwd=cwd,
++            env=dict(env) if env is not None else None,
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++        )
++
++        # 把进程加入 Job
++        process_handle = int(proc._handle)
++        result = kernel32.AssignProcessToJobObject(job_handle, process_handle)
++        
++        if not result:
++            # 如果加入失败，关闭 job 并继续（但进程已经启动了）
++            kernel32.CloseHandle(job_handle)
++            return ProcessHandle(proc, None)
++
++        return ProcessHandle(proc, job_handle)
++
++    except Exception:
++        # 任何异常都退回到普通模式
++        if job_handle:
++            kernel32.CloseHandle(job_handle)
++        
++        # 如果进程还没创建，现在创建它
++        proc = subprocess.Popen(
++            [str(item) for item in command],
++            cwd=cwd,
++            env=dict(env) if env is not None else None,
++            stdin=subprocess.DEVNULL,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++        )
++        return ProcessHandle(proc, None)
++
++
++def terminate_process(handle: ProcessHandle) -> None:
++    """结束一个子进程及其所有后代。
++
++    调用返回后 ``handle.proc`` 一定已经退出，``handle.proc.returncode`` 可用。
+     已经结束的进程不会被重复处理。
+     """
++    proc = handle.proc
+     if proc.poll() is None:
+-        proc.kill()
+-    proc.wait()
++        if platform.system() == "Windows" and handle.job_handle:
++            # 关闭 Job 会自动终止所有成员进程
++            kernel32.CloseHandle(handle.job_handle)
++            handle.job_handle = None
++            # 等待主进程退出
++            proc.wait()
++        else:
++            # 非 Windows 或没有 Job，只能杀直接子进程
++            proc.kill()
++            proc.wait()
++    else:
++        # 进程已经结束，清理 Job handle
++        if platform.system() == "Windows" and handle.job_handle:
++            kernel32.CloseHandle(handle.job_handle)
++            handle.job_handle = None
+diff --git a/wproc/runner.py b/wproc/runner.py
+index 45acdfd..618be04 100644
+--- a/wproc/runner.py
++++ b/wproc/runner.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import subprocess
++import threading
++import time
+ from typing import Mapping, Optional, Sequence, Union
+ 
+ from . import processes
+@@ -38,20 +40,88 @@ def run(
+         raise ValueError("command must not be empty")
+ 
+     try:
+-        proc = processes.start_process(argv, cwd=cwd, env=env)
++        handle = processes.start_process(argv, cwd=cwd, env=env)
+     except OSError as exc:
+         raise CommandNotStarted(str(exc)) from exc
+ 
++    # 在后台线程中收集输出，这样即使子进程退出后管道仍被后代持有，
++    # 我们也能立即返回已收集到的内容
++    output_chunks = []
++    output_lock = threading.Lock()
++    reader_done = threading.Event()
++    reader_error = [None]  # 用列表包装以便在闭包中修改
++
++    def read_output():
++        """持续读取输出直到管道关闭或读取失败。"""
++        try:
++            stdout = handle.proc.stdout
++            while True:
++                # 使用较小的块以便更快地响应
++                chunk = stdout.read(8192)
++                if not chunk:
++                    break
++                with output_lock:
++                    output_chunks.append(chunk)
++        except Exception as e:
++            # 管道关闭或其它读取错误
++            reader_error[0] = e
++        finally:
++            reader_done.set()
++
++    reader_thread = threading.Thread(target=read_output, daemon=True)
++    reader_thread.start()
++
++    # 监控子进程与时间预算
++    start_time = time.time()
++    timed_out = False
++    poll_interval = 0.02  # 更频繁的检查
++
+     try:
+-        output, _ = proc.communicate(timeout=timeout)
+-    except subprocess.TimeoutExpired:
+-        processes.terminate_process(proc)
+-        result = RunResult(returncode=proc.returncode, output=b"", timed_out=True)
+-        if check:
+-            raise CommandTimedOut(timeout, result)
+-        return result
++        while True:
++            returncode = handle.proc.poll()
++            if returncode is not None:
++                # 直接子进程已经结束，立即返回
++                # 不等待 reader_thread，因为后代可能还持有管道
++                break
++
++            # 检查是否超时
++            if timeout is not None:
++                elapsed = time.time() - start_time
++                if elapsed >= timeout:
++                    # 超时，终止进程树
++                    processes.terminate_process(handle)
++                    returncode = handle.proc.returncode
++                    timed_out = True
++                    break
+ 
+-    result = RunResult(returncode=proc.returncode, output=output or b"")
+-    if check and result.returncode != 0:
+-        raise CommandFailed(result)
++            # 短暂休眠避免忙等
++            time.sleep(poll_interval)
++
++    except KeyboardInterrupt:
++        # 用户中断，清理子进程
++        processes.terminate_process(handle)
++        raise
++
++    # 给 reader 线程足够时间收集输出
++    # 如果是超时情况，进程已被杀死，管道会关闭，reader 应该能很快结束
++    # 如果是正常结束，子进程已退出但后代可能还持有管道，我们不能无限等待
++    if timed_out:
++        # 超时情况：管道会被关闭，给 reader 充足时间读取缓冲区中的剩余数据
++        reader_thread.join(timeout=2.0)
++    else:
++        # 正常结束：子进程退了但后代可能还在，给较短时间
++        reader_thread.join(timeout=0.5)
++
++    # 收集已读取的输出
++    with output_lock:
++        output = b"".join(output_chunks)
++
++    result = RunResult(returncode=returncode, output=output, timed_out=timed_out)
++    
++    if check:
++        if timed_out:
++            raise CommandTimedOut(timeout, result)
++        elif result.returncode != 0:
++            raise CommandFailed(result)
++    
+     return result
