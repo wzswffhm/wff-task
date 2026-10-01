@@ -1,0 +1,296 @@
+diff --git a/winstall/transaction.py b/winstall/transaction.py
+index 61bcb26..7535df6 100644
+--- a/winstall/transaction.py
++++ b/winstall/transaction.py
+@@ -9,6 +9,7 @@ import shutil
+ from collections import namedtuple
+ 
+ from . import manifest, planner
++from .errors import ApplyFailed
+ 
+ ApplyResult = namedtuple("ApplyResult", "operation product version applied deferred")
+ 
+@@ -22,10 +23,25 @@ def _ensure_parent(path):
+ 
+ 
+ def _put_file(source, destination):
+-    """把 ``source`` 放到 ``destination``（原子替换）。"""
++    """把 ``source`` 放到 ``destination``（原子替换）。
++    
++    返回 True 表示成功，False 表示目标被占用。
++    其它异常向上传播。
++    """
+     temporary = destination + TMP_SUFFIX
+-    shutil.copyfile(source, temporary)
+-    os.replace(temporary, destination)
++    try:
++        shutil.copyfile(source, temporary)
++        os.replace(temporary, destination)
++        return True
++    except PermissionError:
++        # Windows 上文件被其它进程打开时会抛 PermissionError
++        # 清理临时文件（如果创建成功的话）
++        if os.path.exists(temporary):
++            try:
++                os.remove(temporary)
++            except:
++                pass
++        return False
+ 
+ 
+ def _delete_file(path):
+@@ -33,26 +49,184 @@ def _delete_file(path):
+         os.remove(path)
+ 
+ 
++def _backup_file(path):
++    """备份文件内容，返回备份路径。文件不存在时返回 None。"""
++    if not os.path.isfile(path):
++        return None
++    backup = path + ".winstall-backup"
++    shutil.copyfile(path, backup)
++    return backup
++
++
++def _restore_file(backup_path, target_path):
++    """从备份恢复文件。"""
++    if backup_path and os.path.isfile(backup_path):
++        shutil.copyfile(backup_path, target_path)
++        os.remove(backup_path)
++
++
++def _cleanup_backup(backup_path):
++    """清理备份文件。"""
++    if backup_path and os.path.isfile(backup_path):
++        try:
++            os.remove(backup_path)
++        except:
++            pass
++
++
++def _cleanup_temp_files(root, product):
++    """清理载荷目录下的所有临时文件。"""
++    payload = planner.destination(
++        type('obj', (), {'root': root, 'product': product, 'relpath': ''})(), 
++        type('obj', (), {'relpath': ''})()
++    )
++    if not os.path.isdir(payload):
++        return
++    for dirpath, dirnames, filenames in os.walk(payload):
++        for fname in filenames:
++            if fname.endswith(TMP_SUFFIX) or fname.endswith(".winstall-backup"):
++                try:
++                    os.remove(os.path.join(dirpath, fname))
++                except:
++                    pass
++
++
+ def apply_transaction(plan):
+-    """顺序执行 ``plan`` 中的动作，然后更新清单。"""
++    """顺序执行 ``plan`` 中的动作，然后更新清单。
++    
++    被占用的文件会推迟到下次执行，记录在 deferred 和清单的 pending_replace 中。
++    不可延迟的失败会触发完整回滚并抛出 ApplyFailed。
++    """
+     applied = []
+-    for action in plan.actions:
+-        target = planner.destination(plan, action)
+-        if action.kind == "write":
+-            _ensure_parent(target)
+-            _put_file(action.source, target)
+-        elif action.kind == "remove":
+-            _delete_file(target)
+-        else:
+-            raise ValueError("unknown action: %r" % (action.kind,))
+-        applied.append(action.relpath)
+-
++    deferred = []
++    backups = {}  # {target_path: backup_path}
++    created = []  # 本次新建的文件
++    deferred_backups = {}  # 被推迟的文件的备份，用于恢复旧内容
++    
++    # 读取当前清单，获取待处理的 pending_replace
+     data = manifest.read_manifest(plan.root)
+-    if plan.operation == planner.INSTALL:
+-        manifest.set_product(data, plan.product, plan.version, plan.files, [])
+-    else:
+-        manifest.drop_product(data, plan.product)
+-    manifest.write_manifest(plan.root, data)
+-
+-    return ApplyResult(plan.operation, plan.product, plan.version,
+-                       tuple(applied), ())
++    current = manifest.get_product(data, plan.product)
++    pending = set((current or {}).get("pending_replace") or [])
++    
++    try:
++        for action in plan.actions:
++            target = planner.destination(plan, action)
++            
++            if action.kind == "write":
++                _ensure_parent(target)
++                
++                # 如果文件已存在，先备份
++                if os.path.exists(target):
++                    if os.path.isdir(target):
++                        # 目标位置是目录，这是不可延迟的失败
++                        raise ApplyFailed(
++                            action.relpath,
++                            "target is a directory: %s" % target
++                        )
++                    backup = _backup_file(target)
++                    if backup:
++                        backups[target] = backup
++                else:
++                    # 新建文件
++                    created.append(target)
++                
++                # 尝试写入
++                success = _put_file(action.source, target)
++                if success:
++                    applied.append(action.relpath)
++                    # 从待处理列表中移除
++                    pending.discard(action.relpath)
++                    # 从新建列表中移除（因为实际写入成功了）
++                    if target in created:
++                        created.remove(target)
++                else:
++                    # 被占用，推迟
++                    deferred.append(action.relpath)
++                    pending.add(action.relpath)
++                    # 将备份转移到 deferred_backups，以便后续清理，但不恢复
++                    # （因为被占用的文件保持不动，不需要恢复）
++                    if target in backups:
++                        deferred_backups[target] = backups.pop(target)
++                    # 从新建列表中移除（因为实际没写入）
++                    if target in created:
++                        created.remove(target)
++                        
++            elif action.kind == "remove":
++                if os.path.exists(target):
++                    if os.path.isdir(target):
++                        raise ApplyFailed(
++                            action.relpath,
++                            "target is a directory: %s" % target
++                        )
++                    backup = _backup_file(target)
++                    if backup:
++                        backups[target] = backup
++                    _delete_file(target)
++                    applied.append(action.relpath)
++            else:
++                raise ValueError("unknown action: %r" % (action.kind,))
++        
++        # 所有动作执行完成（或推迟），更新清单
++        if plan.operation == planner.INSTALL:
++            manifest.set_product(
++                data, 
++                plan.product, 
++                plan.version, 
++                plan.files,
++                list(pending)
++            )
++        else:
++            manifest.drop_product(data, plan.product)
++        manifest.write_manifest(plan.root, data)
++        
++        # 成功：清理所有备份
++        for backup in backups.values():
++            _cleanup_backup(backup)
++        for backup in deferred_backups.values():
++            _cleanup_backup(backup)
++        
++        # 清理所有临时文件
++        _cleanup_temp_files(plan.root, plan.product)
++        
++        return ApplyResult(
++            plan.operation, 
++            plan.product, 
++            plan.version,
++            tuple(applied), 
++            tuple(deferred)
++        )
++        
++    except Exception as e:
++        # 回滚：恢复所有备份（包括已应用的和被推迟的）
++        for target, backup in backups.items():
++            try:
++                _restore_file(backup, target)
++            except:
++                pass
++        
++        # 被推迟的文件其实没被改动，但为了安全也恢复一下
++        for target, backup in deferred_backups.items():
++            try:
++                _restore_file(backup, target)
++            except:
++                pass
++        
++        # 删除所有新建的文件
++        for target in created:
++            try:
++                if os.path.isfile(target):
++                    os.remove(target)
++            except:
++                pass
++        
++        # 清理临时文件
++        _cleanup_temp_files(plan.root, plan.product)
++        
++        # 清单保持原样（不需要恢复，因为还没写入）
++        
++        # 如果是我们自己抛的 ApplyFailed，直接传播
++        if isinstance(e, ApplyFailed):
++            raise
++        
++        # 其它异常包装成 ApplyFailed
++        raise ApplyFailed(None, str(e))
+diff --git a/winstall/versions.py b/winstall/versions.py
+index 28a626d..794945f 100644
+--- a/winstall/versions.py
++++ b/winstall/versions.py
+@@ -38,18 +38,37 @@ def compare_versions(left, right):
+     """比较两个版本号。
+ 
+     返回 ``-1`` / ``0`` / ``1``。预发布版本低于同号的正式版。
++    版本号的每一段按十进制整数比较，不足四段补 0。
+     """
+     left_numbers, left_pre = split_version(left)
+     right_numbers, right_pre = split_version(right)
+-    if left_numbers == right_numbers:
+-        if left_pre == right_pre:
+-            return 0
+-        if not left_pre:
+-            return 1
+-        if not right_pre:
++    
++    # 把每段转成整数列表，不足四段补 0
++    left_parts = [int(p) for p in left_numbers.split(".") if p]
++    right_parts = [int(p) for p in right_numbers.split(".") if p]
++    
++    # 补齐到四段
++    while len(left_parts) < 4:
++        left_parts.append(0)
++    while len(right_parts) < 4:
++        right_parts.append(0)
++    
++    # 逐段比较
++    for l, r in zip(left_parts, right_parts):
++        if l < r:
+             return -1
+-        return 1 if left_pre > right_pre else -1
+-    return 1 if left_numbers > right_numbers else -1
++        elif l > r:
++            return 1
++    
++    # 数字部分相同，比较预发布标签
++    if left_pre == right_pre:
++        return 0
++    if not left_pre:  # 正式版高于预发布版
++        return 1
++    if not right_pre:
++        return -1
++    # 两个都是预发布版，按字符串比较
++    return 1 if left_pre > right_pre else -1
+ 
+ 
+ def is_upgrade(current, candidate):

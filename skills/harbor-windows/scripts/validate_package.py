@@ -115,14 +115,29 @@ def check_task_toml(task_dir, r, expect_schema=None):
     txt = open(p, encoding="utf-8", errors="replace").read()
 
     m = re.search(r'^\s*version\s*=\s*"([^"]+)"', txt, re.M)
+    ver = None
     if not m:
         r.fail("task.toml", "缺少 version 字段")
     else:
         ver = m.group(1)
         r.ok("task.toml", f"version = {ver}")
-        if expect_schema and ver != expect_schema:
-            r.flag("task.toml", f"version '{ver}' 与期望 schema '{expect_schema}' 不一致",
+
+    # 目标 Schema 版本与「题目 version」是两个不同口径：
+    # 前者来自 task.toml 顶部注释的显式声明，后者是题目内容版本号。
+    # 优先读显式声明；缺失时才退回 version 比较，并说明口径差异。
+    ms = re.search(r'目标\s*Schema\s*[:：]\s*([0-9.]+)', txt)
+    if ms:
+        schema = ms.group(1)
+        if expect_schema and schema != expect_schema:
+            r.flag("task.toml", f"声明目标 Schema '{schema}' 与期望 '{expect_schema}' 不一致",
                    "确认平台冻结的 Harbor Schema 版本；任何影响题面/环境/Solution/Tests 的修改须升级版本")
+        else:
+            r.ok("task.toml", f"目标 Schema = {schema}（与期望一致）")
+    elif expect_schema and ver:
+        r.flag("task.toml",
+               f"task.toml 未声明「目标 Schema」；其 version='{ver}' 是题目版本，"
+               f"与 --schema-version '{expect_schema}' 不是同一口径，无法直接比较",
+               "建议在 task.toml 顶部注释显式声明「目标 Schema: X.Y」以便校验")
 
     # 关键段落
     for section in ["[metadata]", "[agent]", "[verifier]", "[environment]"]:
@@ -416,6 +431,163 @@ def check_digest_recorded(pkg_root, r):
             r.fail("镜像身份", f"{os.path.basename(p)} 解析失败: {e}")
 
 
+def check_flat_identity(tid, base, r):
+    """平铺布局下的身份一致性：platform_import ↔ task.toml ↔ spec ↔ manifest。"""
+    pi_p = os.path.join(base, "platform_import.json")
+    tt_p = os.path.join(base, "task.toml")
+    sp_p = os.path.join(base, "tests", "swelive_spec.json")
+    mn_p = os.path.join(base, "extras", "metadata", "manifest.json")
+
+    for name, p in [("platform_import.json", pi_p), ("task.toml", tt_p),
+                    ("tests/swelive_spec.json", sp_p),
+                    ("extras/metadata/manifest.json", mn_p)]:
+        if not os.path.isfile(p):
+            r.fail("身份", f"{tid}: 缺 {name}")
+            return
+
+    try:
+        pi = json.load(open(pi_p, encoding="utf-8"))
+        sp = json.load(open(sp_p, encoding="utf-8"))
+        mn = json.load(open(mn_p, encoding="utf-8"))
+    except Exception as e:
+        r.fail("身份", f"{tid}: 身份文件解析失败: {e}")
+        return
+    tt = open(tt_p, encoding="utf-8", errors="replace").read()
+
+    # instance_id ↔ 目录名
+    if pi.get("instance_id") != tid:
+        r.fail("身份", f"{tid}: platform_import.instance_id='{pi.get('instance_id')}' 与目录名不一致")
+    else:
+        r.ok("身份", f"{tid}: instance_id 与目录名一致")
+
+    # task_hash 四处一致
+    m = re.search(r'task_hash\s*=\s*"?([0-9a-f]{64})"?', tt)
+    hashes = {
+        "platform_import.json": pi.get("task_hash"),
+        "tests/swelive_spec.json": sp.get("task_hash"),
+        "extras/metadata/manifest.json": mn.get("task_hash"),
+        "task.toml": m.group(1) if m else None,
+    }
+    uniq = {v for v in hashes.values() if v}
+    if None in hashes.values() or len(uniq) != 1:
+        r.fail("身份", f"{tid}: task_hash 在四处不一致",
+               "\n".join(f"  {k} = {v}" for k, v in hashes.items()))
+    else:
+        hv = next(iter(uniq))
+        if len(hv) != 64:
+            r.fail("身份", f"{tid}: task_hash 非 64 位十六进制: {hv}")
+        else:
+            r.ok("身份", f"{tid}: 四处 task_hash 一致 ({hv[:12]}…)")
+
+    # task_version 一致
+    vers = {pi.get("task_version"), sp.get("task_version"), mn.get("task_version")}
+    if None in vers or len(vers) != 1:
+        r.fail("身份", f"{tid}: task_version 不一致 {sorted(str(v) for v in vers)}")
+    else:
+        r.ok("身份", f"{tid}: task_version = {next(iter(vers))}")
+
+    # docker_image 一致（task.toml ↔ spec ↔ platform_import）
+    mi = re.search(r'docker_image\s*=\s*"([^"]+)"', tt)
+    trio = {"task.toml": mi.group(1) if mi else None,
+            "swelive_spec.json": sp.get("image_ref"),
+            "platform_import.json": pi.get("docker_image")}
+    vals = {v for v in trio.values() if v}
+    if None in trio.values() or len(vals) != 1:
+        r.flag("镜像一致", f"{tid}: docker_image 三处不一致", str(trio))
+    else:
+        r.ok("镜像一致", f"{tid}: docker_image 三处一致")
+
+
+def check_flat_extras(tid, base, r):
+    """平铺布局下每题自带的 extras/ 伴随材料。"""
+    ex = os.path.join(base, "extras")
+    if not os.path.isdir(ex):
+        r.fail("伴随材料", f"{tid}: 缺 extras/ 目录")
+        return
+
+    per_task = ["metadata", "evidence", "model_runs", "testcase_mapping.csv",
+                "quality_review.md", "remediation_and_retest.md"]
+    miss = [x for x in per_task if not os.path.exists(os.path.join(ex, x))]
+    if miss:
+        r.fail("伴随材料", f"{tid} extras 缺: {', '.join(miss)}")
+    else:
+        r.ok("伴随材料", f"{tid} 六项齐全")
+
+    md = os.path.join(ex, "metadata")
+    if os.path.isdir(md):
+        for f in ["source_and_license.json", "labels.json",
+                  "lineage_and_contamination.json", "manifest.json"]:
+            if not os.path.isfile(os.path.join(md, f)):
+                r.fail("伴随材料", f"{tid} metadata 缺 {f}")
+
+    mr = os.path.join(ex, "model_runs")
+    if os.path.isdir(mr):
+        models = [d.lower() for d in os.listdir(mr)]
+        for want in ["qwen", "opus", "glm", "kimi"]:
+            if not any(want in m for m in models):
+                r.fail("多模型", f"{tid} model_runs 缺 {want}")
+
+    ev = os.path.join(ex, "evidence")
+    if os.path.isdir(ev):
+        evs = [d.lower() for d in os.listdir(ev)]
+        for want in ["no_change", "golden", "clean_room",
+                     "negative_and_equivalent_controls", "cleanup_and_restore"]:
+            if not any(want in e for e in evs):
+                r.flag("对照证据", f"{tid} evidence 缺 {want}")
+
+
+def check_index_dir(idx, n, r):
+    """目录级汇总材料 _index/。"""
+    if not os.path.isdir(idx):
+        r.fail("伴随材料", "缺 _index/ 目录级汇总目录")
+        return
+    need = ["tasks_index.csv", "knowledge_tree_coverage_report.csv",
+            "validation_report.md", "model_summary.csv", "known_issues.md",
+            "checksums.sha256", "CHANGELOG.md"]
+    missing = [f for f in need if not os.path.isfile(os.path.join(idx, f))]
+    if missing:
+        r.fail("伴随材料", f"_index/ 缺: {', '.join(missing)}")
+    else:
+        r.ok("伴随材料", f"_index/ 目录级 7 个汇总文件齐全（覆盖 {n} 题）")
+
+    # tasks_index.csv 行数应与题数一致
+    p = os.path.join(idx, "tasks_index.csv")
+    if os.path.isfile(p):
+        rows = [ln for ln in open(p, encoding="utf-8").read().splitlines() if ln.strip()]
+        body = len(rows) - 1  # 去掉表头
+        if body != n:
+            r.flag("伴随材料", f"tasks_index.csv 数据行 {body} ≠ 题数 {n}")
+        else:
+            r.ok("伴随材料", f"tasks_index.csv 覆盖全部 {n} 题")
+
+
+def check_flat_package(pkg, r, schema_version):
+    """平铺布局：pkg 下每个含 task.toml 的子目录 = 一个自包含题包。"""
+    tasks = []
+    for d in sorted(os.listdir(pkg)):
+        full = os.path.join(pkg, d)
+        if os.path.isdir(full) and os.path.isfile(os.path.join(full, "task.toml")):
+            tasks.append((d, full))
+
+    if not tasks:
+        r.fail("模式", f"{pkg} 下未找到任何含 task.toml 的题目录")
+        return
+
+    r.ok("模式", f"平铺校验 {len(tasks)} 题（{pkg}）")
+    for tid, full in tasks:
+        check_structure(full, r)
+        check_task_toml(full, r, schema_version)
+        check_instruction_no_leak(full, r)
+        check_env_no_solution(full, r)
+        check_tests(full, r)
+        check_no_change_and_golden_shape(full, r)
+        check_flat_identity(tid, full, r)
+        check_flat_extras(tid, full, r)
+
+    check_index_dir(os.path.join(pkg, "_index"), len(tasks), r)
+    check_digest_recorded(pkg, r)
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
@@ -455,6 +627,22 @@ def main():
         cand = os.path.join(pkg, "delivery-extras")
         if os.path.isdir(cand) and not extras:
             extras = cand
+
+        # 平铺布局：pkg 下直接存在含 task.toml 的题目录（harbor-windows 型目录）
+        if not assets and not harbor:
+            flat = [d for d in sorted(os.listdir(pkg))
+                    if os.path.isdir(os.path.join(pkg, d))
+                    and os.path.isfile(os.path.join(pkg, d, "task.toml"))]
+            if flat:
+                check_flat_package(pkg, r, args.schema_version)
+                print(r.render())
+                if args.json:
+                    c = r.counts()
+                    with open(args.json, "w", encoding="utf-8") as f:
+                        json.dump({"summary": c, "items": r.items}, f,
+                                  ensure_ascii=False, indent=2)
+                    print(f"\n报告已写入 {args.json}")
+                return 1 if r.counts()["FAIL"] else 0
 
     if not assets and not pkg:
         print("错误: 需指定 --package 或 --harbor-assets", file=sys.stderr)

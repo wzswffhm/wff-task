@@ -1,0 +1,1696 @@
+diff --git a/_patch_tmp.py b/_patch_tmp.py
+new file mode 100644
+index 0000000..2ae0a9f
+--- /dev/null
++++ b/_patch_tmp.py
+@@ -0,0 +1,31 @@
++import io
++
++path = "wsync/fsops.py"
++with io.open(path, encoding="utf-8") as handle:
++    source = handle.read()
++
++old = """    try:
++        info = os.stat(source)
++        _utime(target, (info.st_atime_ns, info.st_mtime_ns))
++    except (OSError, SyncError):
++        return False
++    return True
++"""
++
++new = """    try:
++        info = os.stat(source)
++        current = os.stat(target)
++        if current.st_mtime_ns == info.st_mtime_ns:
++            return True  # 已经对齐，连时间戳都不必再写一次
++        _utime(target, (info.st_atime_ns, info.st_mtime_ns))
++    except (OSError, SyncError):
++        return False
++    return True
++"""
++
++assert old in source, "pattern not found"
++source = source.replace(old, new, 1)
++
++with io.open(path, "w", encoding="utf-8", newline="") as handle:
++    handle.write(source)
++print("patched")
+diff --git a/_probe_tmp.py b/_probe_tmp.py
+new file mode 100644
+index 0000000..1e2aa01
+--- /dev/null
++++ b/_probe_tmp.py
+@@ -0,0 +1,32 @@
++import os
++import stat
++import tempfile
++
++base = tempfile.mkdtemp(prefix="wsync-probe3-")
++p = os.path.join(base, "ro.txt")
++with open(p, "w") as fh:
++    fh.write("x")
++os.chmod(p, stat.S_IREAD)
++print("readonly:", not bool(os.stat(p).st_mode & stat.S_IWRITE))
++try:
++    os.utime(p, (1_600_000_000, 1_600_000_000))
++    print("utime on readonly file -> OK", os.stat(p).st_mtime)
++except OSError as exc:
++    print("utime on readonly file -> FAIL", type(exc).__name__, exc.errno,
++          getattr(exc, "winerror", None), exc.strerror)
++print("still readonly:", not bool(os.stat(p).st_mode & stat.S_IWRITE))
++
++d = os.path.join(base, "rodir")
++os.makedirs(d)
++os.chmod(d, stat.S_IREAD)
++try:
++    os.utime(d, (1_600_000_000, 1_600_000_000))
++    print("utime on readonly dir -> OK")
++except OSError as exc:
++    print("utime on readonly dir -> FAIL", type(exc).__name__, exc.errno,
++          getattr(exc, "winerror", None), exc.strerror)
++os.chmod(p, stat.S_IWRITE)
++os.chmod(d, stat.S_IWRITE)
++os.remove(p)
++os.rmdir(d)
++os.rmdir(base)
+diff --git a/_scratch_check.py b/_scratch_check.py
+new file mode 100644
+index 0000000..03472ad
+--- /dev/null
++++ b/_scratch_check.py
+@@ -0,0 +1,325 @@
++"""临时验收脚本（不属于仓库，运行后会被删除）。"""
++
++import os
++import shutil
++import stat
++import sys
++import tempfile
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from wsync import build_plan, sync_tree  # noqa: E402
++
++FAILURES = []
++
++
++def check(label, condition, extra=""):
++    if condition:
++        print("PASS", label)
++    else:
++        print("FAIL", label, extra)
++        FAILURES.append(label)
++
++
++def write(path, text, mtime=None):
++    path = os.path.abspath(path)
++    parent = os.path.dirname(path)
++    if parent:
++        os.makedirs(parent, exist_ok=True)
++    with open(path, "w", encoding="utf-8") as handle:
++        handle.write(text)
++    if mtime is not None:
++        os.utime(path, (mtime, mtime))
++    return path
++
++
++def read(path):
++    with open(path, encoding="utf-8") as handle:
++        return handle.read()
++
++
++def readonly(path):
++    os.chmod(path, stat.S_IREAD)
++    return path
++
++
++def listing(root):
++    out = []
++    for dirpath, dirnames, filenames in os.walk(root):
++        for name in filenames:
++            out.append(os.path.relpath(os.path.join(dirpath, name), root))
++    return sorted(out)
++
++
++def dirs(root):
++    out = []
++    for dirpath, dirnames, _filenames in os.walk(root):
++        for name in dirnames:
++            out.append(os.path.relpath(os.path.join(dirpath, name), root))
++    return sorted(out)
++
++
++def scenario():
++    base = tempfile.mkdtemp(prefix="wsync-check-")
++    return base, os.path.join(base, "source"), os.path.join(base, "target")
++
++
++# --- 1 只读条目 -----------------------------------------------------------
++base, source, target = scenario()
++write(os.path.join(source, "a.txt"), "new-a")
++write(os.path.join(source, "sub", "b.txt"), "new-b")
++write(os.path.join(source, "keep.txt"), "keep")
++readonly(write(os.path.join(target, "a.txt"), "old-a"))
++readonly(write(os.path.join(target, "sub", "b.txt"), "old-b"))
++readonly(write(os.path.join(target, "stale.txt"), "stale"))
++write(os.path.join(target, "keep.txt"), "keep")
++os.makedirs(os.path.join(target, "emptydir"), exist_ok=True)
++readonly(os.path.join(target, "emptydir"))
++os.makedirs(os.path.join(target, "ro-dir"), exist_ok=True)
++readonly(os.path.join(target, "ro-dir"))
++readonly(write(os.path.join(target, "ro-dir", "gone.txt"), "gone"))
++readonly(os.path.join(target, "sub"))
++
++result = sync_tree(source, target)
++check("1.ok", result.ok, result.failed)
++check("1.updated", sorted(result.updated) == ["a.txt", os.path.join("sub", "b.txt")], result.updated)
++check("1.deleted", sorted(result.deleted) == [os.path.join("ro-dir", "gone.txt"), "stale.txt"],
++      result.deleted)
++check("1.content-a", read(os.path.join(target, "a.txt")) == "new-a")
++check("1.content-b", read(os.path.join(target, "sub", "b.txt")) == "new-b")
++check("1.stale-gone", not os.path.exists(os.path.join(target, "stale.txt")))
++check("1.emptydir-gone", not os.path.exists(os.path.join(target, "emptydir")))
++check("1.ro-dir-gone", not os.path.exists(os.path.join(target, "ro-dir")))
++check("1.listing", listing(target) == ["a.txt", "keep.txt", os.path.join("sub", "b.txt")],
++      listing(target))
++check("1.dirs", dirs(target) == ["sub"], dirs(target))
++again = sync_tree(source, target)
++check("1.idempotent", not again.created and not again.updated and not again.deleted and again.ok,
++      (again.created, again.updated, again.deleted, again.failed))
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 2/3 大小写不同 -------------------------------------------------------
++base, source, target = scenario()
++write(os.path.join(source, "Report.PDF"), "new-content")
++write(os.path.join(source, "other.txt"), "other")
++write(os.path.join(target, "report.pdf"), "old-content")
++result = sync_tree(source, target)
++check("2.ok", result.ok, result.failed)
++check("2.content", read(os.path.join(target, "Report.PDF")) == "new-content")
++check("2.entries", len(os.listdir(target)) == 2, os.listdir(target))
++check("2.actions", sorted(result.created + result.updated + result.deleted) == ["Report.PDF", "other.txt"],
++      (result.created, result.updated, result.deleted))
++check("2.no-temp-leftover", all("wsync-tmp" not in name for name in os.listdir(target)), os.listdir(target))
++again = sync_tree(source, target)
++check("2.idempotent", not again.created and not again.updated and not again.deleted and again.ok,
++      (again.created, again.updated, again.deleted, again.failed))
++shutil.rmtree(base, ignore_errors=True)
++
++base, source, target = scenario()
++write(os.path.join(source, "Report.PDF"), "same")
++write(os.path.join(target, "report.pdf"), "same")
++result = sync_tree(source, target)
++check("3.no-action", not result.created and not result.updated and not result.deleted, result)
++check("3.kept", result.kept == ["Report.PDF"], result.kept)
++check("3.still-there", os.listdir(target) == ["report.pdf"]
++      and read(os.path.join(target, "report.pdf")) == "same", os.listdir(target))
++shutil.rmtree(base, ignore_errors=True)
++
++# 大小写不同的目录
++base, source, target = scenario()
++write(os.path.join(source, "Docs", "a.txt"), "a")
++write(os.path.join(target, "docs", "b.txt"), "b")
++result = sync_tree(source, target)
++check("3b.ok", result.ok, result.failed)
++check("3b.files", listing(target) == [os.path.join("docs", "a.txt")]
++      or listing(target) == [os.path.join("Docs", "a.txt")], listing(target))
++check("3b.content", read(os.path.join(target, "Docs", "a.txt")) == "a")
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 4 被占用的条目 -------------------------------------------------------
++base, source, target = scenario()
++write(os.path.join(source, "ok.txt"), "ok")
++write(os.path.join(source, "changed.txt"), "v2")
++write(os.path.join(target, "busy.log"), "original")
++write(os.path.join(target, "changed.txt"), "v1")
++write(os.path.join(target, "stale.txt"), "stale")
++readonly(write(os.path.join(target, "ro-stale.txt"), "ro"))
++handle = open(os.path.join(target, "busy.log"), "rb")
++try:
++    result = sync_tree(source, target)
++finally:
++    handle.close()
++failed_paths = [item["relpath"] for item in result.failed]
++check("4.busy-failed", failed_paths == ["busy.log"], result.failed)
++check("4.busy-action", result.failed[0]["action"] == "delete", result.failed)
++check("4.busy-still-there", os.path.exists(os.path.join(target, "busy.log")))
++check("4.busy-content", read(os.path.join(target, "busy.log")) == "original")
++check("4.others-done", sorted(result.created) == ["ok.txt"] and sorted(result.deleted) == ["ro-stale.txt", "stale.txt"]
++      and result.updated == ["changed.txt"], (result.created, result.updated, result.deleted))
++check("4.ro-stale-deleted", not os.path.exists(os.path.join(target, "ro-stale.txt")), result.failed)
++check("4.not-ok", not result.ok)
++check("4.error-text", all(item["error"] for item in result.failed), result.failed)
++check("4.no-temp", all("wsync-tmp" not in n for n in os.listdir(target)), os.listdir(target))
++shutil.rmtree(base, ignore_errors=True)
++
++# 只读 + 被占用
++base, source, target = scenario()
++write(os.path.join(source, "x.txt"), "x")
++locked = readonly(write(os.path.join(target, "locked.txt"), "locked"))
++handle = open(locked, "rb")
++try:
++    result = sync_tree(source, target)
++finally:
++    handle.close()
++check("4b.failed", [i["relpath"] for i in result.failed] == ["locked.txt"], result.failed)
++check("4b.created", result.created == ["x.txt"], result.created)
++check("4b.exists", os.path.exists(locked))
++shutil.rmtree(base, ignore_errors=True)
++
++# 被占用的文件需要被更新（内容不能写坏）
++base, source, target = scenario()
++write(os.path.join(source, "live.txt"), "new-content")
++live = write(os.path.join(target, "live.txt"), "old-content")
++handle = open(live, "rb")
++try:
++    result = sync_tree(source, target)
++finally:
++    handle.close()
++check("4c.recorded", len(result.failed) + len(result.updated) == 1, result)
++check("4c.file-exists", os.path.exists(live))
++check("4c.no-temp", all("wsync-tmp" not in n for n in os.listdir(target)), os.listdir(target))
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 5/6 类型冲突 ---------------------------------------------------------
++base, source, target = scenario()
++write(os.path.join(source, "bundle"), "payload")
++write(os.path.join(source, "keep.txt"), "keep")
++write(os.path.join(target, "bundle", "x.txt"), "old-x")
++readonly(write(os.path.join(target, "bundle", "ro.txt"), "old-ro"))
++os.makedirs(os.path.join(target, "bundle", "deep"), exist_ok=True)
++write(os.path.join(target, "keep.txt"), "keep")
++result = sync_tree(source, target)
++check("5.ok", result.ok, result.failed)
++check("5.is-file", os.path.isfile(os.path.join(target, "bundle")))
++check("5.content", read(os.path.join(target, "bundle")) == "payload")
++check("5.no-leftover", listing(target) == ["bundle", "keep.txt"], listing(target))
++check("5.dirs", dirs(target) == [], dirs(target))
++again = sync_tree(source, target)
++check("5.idempotent", not again.created and not again.updated and not again.deleted and again.ok,
++      (again.created, again.updated, again.deleted, again.failed))
++shutil.rmtree(base, ignore_errors=True)
++
++base, source, target = scenario()
++write(os.path.join(source, "Data", "x.txt"), "x")
++write(os.path.join(source, "Data", "deep", "y.txt"), "y")
++write(os.path.join(source, "unrelated.txt"), "u")
++readonly(write(os.path.join(target, "data"), "occupied"))
++write(os.path.join(target, "unrelated.txt"), "u")
++write(os.path.join(target, "other.txt"), "o")
++result = sync_tree(source, target)
++check("6.ok", result.ok, result.failed)
++check("6.dir-created", os.path.isdir(os.path.join(target, "Data")))
++check("6.files", read(os.path.join(target, "Data", "x.txt")) == "x"
++      and read(os.path.join(target, "Data", "deep", "y.txt")) == "y")
++check("6.deleted-only-conflict", sorted(result.deleted) == ["data", "other.txt"], result.deleted)
++check("6.unrelated-kept", read(os.path.join(target, "unrelated.txt")) == "u")
++check("6.listing", listing(target) == [os.path.join("Data", "deep", "y.txt"),
++                                      os.path.join("Data", "x.txt"), "unrelated.txt"], listing(target))
++again = sync_tree(source, target)
++check("6.idempotent", not again.created and not again.updated and not again.deleted and again.ok,
++      (again.created, again.updated, again.deleted, again.failed))
++shutil.rmtree(base, ignore_errors=True)
++
++# 源文件 vs 目标空只读目录
++base, source, target = scenario()
++write(os.path.join(source, "slot"), "content")
++os.makedirs(os.path.join(target, "slot"))
++readonly(os.path.join(target, "slot"))
++result = sync_tree(source, target)
++check("7.ok", result.ok, result.failed)
++check("7.file", os.path.isfile(os.path.join(target, "slot"))
++      and read(os.path.join(target, "slot")) == "content")
++shutil.rmtree(base, ignore_errors=True)
++
++# 目标目录树里有一个被占用的文件，源里同一路径是文件
++base, source, target = scenario()
++write(os.path.join(source, "pack"), "payload")
++busy = write(os.path.join(target, "pack", "busy.bin"), "busy")
++handle = open(busy, "rb")
++try:
++    result = sync_tree(source, target)
++finally:
++    handle.close()
++check("7b.failed-recorded", bool(result.failed), result)
++check("7b.busy-survives", os.path.exists(busy) and read(busy) == "busy")
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 8 内容判定与时间戳 ---------------------------------------------------
++base, source, target = scenario()
++stamp = 1_600_000_000
++write(os.path.join(source, "same-stamp.txt"), "version-2", mtime=stamp)
++write(os.path.join(target, "same-stamp.txt"), "version-1", mtime=stamp)
++write(os.path.join(source, "fresh.txt"), "fresh", mtime=stamp)
++write(os.path.join(source, "kept.txt"), "kept", mtime=stamp)
++write(os.path.join(target, "kept.txt"), "kept", mtime=stamp - 100)
++write(os.path.join(source, "big.bin"), os.urandom(0).hex() + "x" * 5000, mtime=stamp)
++write(os.path.join(target, "big.bin"), "y" * 5000, mtime=stamp)
++result = sync_tree(source, target)
++check("8.updated", sorted(result.updated) == ["big.bin", "same-stamp.txt"], result.updated)
++check("8.content", read(os.path.join(target, "same-stamp.txt")) == "version-2")
++check("8.content-big", read(os.path.join(target, "big.bin")).startswith("x"))
++for rel in ("same-stamp.txt", "fresh.txt", "kept.txt", "big.bin"):
++    src_mtime = os.stat(os.path.join(source, rel)).st_mtime_ns
++    dst_mtime = os.stat(os.path.join(target, rel)).st_mtime_ns
++    check("8.mtime " + rel, src_mtime == dst_mtime, (src_mtime, dst_mtime))
++again = sync_tree(source, target)
++check("8.noop", not again.created and not again.updated and not again.deleted and again.ok,
++      (again.created, again.updated, again.deleted, again.failed))
++check("8.kept", sorted(again.kept) == ["big.bin", "fresh.txt", "kept.txt", "same-stamp.txt"], again.kept)
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 9 只读源文件 ---------------------------------------------------------
++base, source, target = scenario()
++readonly(write(os.path.join(source, "ro-source.txt"), "from-read-only-source"))
++os.makedirs(os.path.join(source, "ro-nested"), exist_ok=True)
++readonly(write(os.path.join(source, "ro-nested", "inner.txt"), "inner"))
++readonly(os.path.join(source, "ro-nested"))
++result = sync_tree(source, target)
++check("9.ok", result.ok, result.failed)
++check("9.content", read(os.path.join(target, "ro-source.txt")) == "from-read-only-source")
++check("9.nested", read(os.path.join(target, "ro-nested", "inner.txt")) == "inner")
++again = sync_tree(source, target)
++check("9.noop", not again.created and not again.updated and not again.deleted and again.ok, again)
++# 只读源文件更新后仍然可读
++os.chmod(os.path.join(source, "ro-source.txt"), stat.S_IWRITE)
++write(os.path.join(source, "ro-source.txt"), "changed")
++readonly(os.path.join(source, "ro-source.txt"))
++result = sync_tree(source, target)
++check("9.update", read(os.path.join(target, "ro-source.txt")) == "changed", result.failed)
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 10 dry run -----------------------------------------------------------
++base, source, target = scenario()
++write(os.path.join(source, "new.txt"), "new")
++write(os.path.join(target, "stale.txt"), "stale")
++result = sync_tree(source, target, dry_run=True)
++check("10.dry", os.path.exists(os.path.join(target, "stale.txt"))
++      and not os.path.exists(os.path.join(target, "new.txt"))
++      and sorted(result.created + result.deleted) == ["new.txt", "stale.txt"], result)
++shutil.rmtree(base, ignore_errors=True)
++
++# --- 11 build_plan 配对 ---------------------------------------------------
++base, source, target = scenario()
++write(os.path.join(source, "Report.PDF"), "v2")
++write(os.path.join(target, "report.pdf"), "v1")
++plan = build_plan(source, target)
++check("11.plan", [e.action for e in plan.entries] == ["update"], plan.entries)
++check("11.by-action", [e.relpath for e in plan.by_action("update")] == ["Report.PDF"], plan.entries)
++check("11.actions", plan.actions() == ["update"], plan.actions())
++shutil.rmtree(base, ignore_errors=True)
++
++print()
++if FAILURES:
++    print("FAILED:", len(FAILURES), FAILURES)
++    sys.exit(1)
++print("ALL CHECKS PASSED")
+diff --git a/_scratch_check2.py b/_scratch_check2.py
+new file mode 100644
+index 0000000..4facdce
+--- /dev/null
++++ b/_scratch_check2.py
+@@ -0,0 +1,140 @@
++"""临时补充验收（不属于仓库，运行后会被删除）。"""
++
++import os
++import shutil
++import stat
++import sys
++import tempfile
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from wsync import sync_tree  # noqa: E402
++
++FAILURES = []
++
++
++def check(label, condition, extra=""):
++    print(("PASS " if condition else "FAIL ") + label, "" if condition else extra)
++    if not condition:
++        FAILURES.append(label)
++
++
++def write(path, text):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++def read(path):
++    with open(path, encoding="utf-8") as fh:
++        return fh.read()
++
++
++def ro(path):
++    os.chmod(path, stat.S_IREAD)
++    return path
++
++
++def tree(root):
++    out = []
++    for dirpath, dirnames, filenames in os.walk(root):
++        rel = os.path.relpath(dirpath, root)
++        for name in filenames:
++            out.append(os.path.normpath(os.path.join(rel, name)))
++        for name in dirnames:
++            out.append(os.path.normpath(os.path.join(rel, name)) + "/")
++    return sorted(out)
++
++
++def scenario():
++    base = tempfile.mkdtemp(prefix="wsync-check2-")
++    return base, os.path.join(base, "source"), os.path.join(base, "target")
++
++
++# C 深层只读目录整棵清掉
++base, source, target = scenario()
++write(os.path.join(source, "top.txt"), "top")
++deep = os.path.join(target, "a", "b", "c")
++write(os.path.join(deep, "file.txt"), "gone")
++ro(os.path.join(deep, "file.txt"))
++for part in ("c", "b", "a"):
++    ro(os.path.join(target, "a", "b", "c") if part == "c" else os.path.join(target, *("a", "b")[: {"b": 2, "a": 1}[part]]))
++result = sync_tree(source, target)
++check("C.ok", result.ok, result.failed)
++check("C.tree", tree(target) == ["top.txt"], tree(target))
++shutil.rmtree(base, ignore_errors=True)
++
++# D 目标把文件位置放成了一棵目录
++base, source, target = scenario()
++write(os.path.join(source, "x", "y.txt"), "payload")
++write(os.path.join(target, "x", "y.txt", "z.txt"), "stale")
++ro(os.path.join(target, "x", "y.txt", "z.txt"))
++result = sync_tree(source, target)
++check("D.ok", result.ok, result.failed)
++check("D.is-file", os.path.isfile(os.path.join(target, "x", "y.txt")))
++check("D.content", read(os.path.join(target, "x", "y.txt")) == "payload")
++check("D.tree", tree(target) == [os.path.join("x", "y.txt")], tree(target))
++again = sync_tree(source, target)
++check("D.idem", not again.created and not again.updated and not again.deleted and again.ok, again)
++shutil.rmtree(base, ignore_errors=True)
++
++# F 源文件 vs 目标同名（大小写不同）目录
++base, source, target = scenario()
++write(os.path.join(source, "pack"), "payload")
++write(os.path.join(target, "PACK", "inner.txt"), "stale")
++ro(os.path.join(target, "PACK"))
++result = sync_tree(source, target)
++check("F.ok", result.ok, result.failed)
++check("F.is-file", os.path.isfile(os.path.join(target, "pack")) and read(os.path.join(target, "pack")) == "payload")
++check("F.tree", [t.lower() for t in tree(target)] == ["pack"], tree(target))
++shutil.rmtree(base, ignore_errors=True)
++
++# G 目录被占用时 prune 不炸
++base, source, target = scenario()
++write(os.path.join(source, "s.txt"), "s")
++os.makedirs(os.path.join(target, "busydir"))
++busy = write(os.path.join(target, "busydir", "live.log"), "live")
++handle = open(busy, "rb")
++try:
++    result = sync_tree(source, target)
++finally:
++    handle.close()
++check("G.failed", [i["relpath"] for i in result.failed] == [os.path.join("busydir", "live.log")], result.failed)
++check("G.created", result.created == ["s.txt"], result.created)
++check("G.dir-kept", os.path.isdir(os.path.join(target, "busydir")))
++shutil.rmtree(base, ignore_errors=True)
++
++# H 目标根目录带只读属性
++base, source, target = scenario()
++write(os.path.join(source, "a", "b.txt"), "b")
++os.makedirs(target)
++ro(target)
++result = sync_tree(source, target)
++check("H.ok", result.ok, result.failed)
++check("H.content", read(os.path.join(target, "a", "b.txt")) == "b")
++os.chmod(target, stat.S_IWRITE)
++shutil.rmtree(base, ignore_errors=True)
++
++# I 二次同步完全静止（含只读、大小写、时间戳）
++base, source, target = scenario()
++write(os.path.join(source, "Report.PDF"), "same")
++os.utime(os.path.join(source, "Report.PDF"), (1_600_000_000, 1_600_000_000))
++write(os.path.join(source, "dir", "f.txt"), "f")
++os.utime(os.path.join(source, "dir", "f.txt"), (1_600_000_001, 1_600_000_001))
++write(os.path.join(target, "report.pdf"), "same")
++os.utime(os.path.join(target, "report.pdf"), (1_500_000_000, 1_500_000_000))
++first = sync_tree(source, target)
++check("I.first", first.created == [os.path.join("dir", "f.txt")] and first.kept == ["Report.PDF"]
++      and not first.updated and not first.deleted and first.ok, first)
++check("I.mtime-aligned",
++      os.stat(os.path.join(target, "report.pdf")).st_mtime_ns == os.stat(os.path.join(source, "Report.PDF")).st_mtime_ns)
++second = sync_tree(source, target)
++check("I.second-quiet", not second.created and not second.updated and not second.deleted and second.ok, second)
++check("I.entries", sorted(os.listdir(target)) == ["dir", "report.pdf"], os.listdir(target))
++shutil.rmtree(base, ignore_errors=True)
++
++print()
++if FAILURES:
++    print("FAILED:", FAILURES)
++    sys.exit(1)
++print("ALL EXTRA CHECKS PASSED")
+diff --git a/_scratch_dbg.py b/_scratch_dbg.py
+new file mode 100644
+index 0000000..f7661ae
+--- /dev/null
++++ b/_scratch_dbg.py
+@@ -0,0 +1,43 @@
++import os
++import shutil
++import stat
++import sys
++import tempfile
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from wsync import build_plan, sync_tree
++from wsync import fsops
++
++base = tempfile.mkdtemp(prefix="wsync-dbg-")
++source = os.path.join(base, "source")
++target = os.path.join(base, "target")
++
++
++def write(path, text):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++write(os.path.join(source, "Data", "x.txt"), "x")
++write(os.path.join(source, "Data", "deep", "y.txt"), "y")
++write(os.path.join(source, "unrelated.txt"), "u")
++p = write(os.path.join(target, "data"), "occupied")
++os.chmod(p, stat.S_IREAD)
++write(os.path.join(target, "unrelated.txt"), "u")
++write(os.path.join(target, "other.txt"), "o")
++
++plan = build_plan(source, target)
++for e in plan.entries:
++    print("PLAN", e.action, e.relpath, "|", e.source, "->", e.target)
++
++result = sync_tree(source, target)
++print("created", result.created)
++print("updated", result.updated)
++print("deleted", result.deleted)
++print("kept", result.kept)
++print("failed", result.failed)
++for dirpath, dirnames, filenames in os.walk(target):
++    print("DIR", os.path.relpath(dirpath, target), dirnames, filenames)
++shutil.rmtree(base, ignore_errors=True)
+diff --git a/wsync/__pycache__/__init__.cpython-313.pyc b/wsync/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd4d8b70daef35eb6f5e51ecbc978a8b3fef9704
+GIT binary patch
+literal 930
+zcmah{F>KR76g@kRo!Cj*B7sn+Qx<Ab1%#L?KtintoGL0!D~7f@nZzvy$Bw=osxqaN
+zP9Vxam%;+5LP$`=)`70<ose!RqIIKgKnGUtY?`ofvY!9{_x}6$|J`vuuOhbkzU<sR
+zmqKWtJ10y0YaGuqV;xlypsG+6%YrF_Xr>@#N+4k#OO?~646><!68lm)V`d?1s-T)0
+zXl4#_W*+ip0Saax^f68v`Y)iWd{cmd1x3%aECHd#V9BfD@9pR8!v~+254Jb(Eyt_-
+zivjLD{TRJoIoN*O*?81>wH0k`9Jb$fUTj4>>qqM^qm{Mj*^|Q$oBQpDsv51nk5)fL
+ztDDi<n~@P!#ca)k-@r)$r_uBw#J5|HTPID|@`f=lOhT~jgv^8Z>OYL3z;8j#CgA(w
+zFb*wPu*2BVV{x#9mK(B+uFiiFoO$f|Ax`p2{=Jb{CO)SR*a__hcD$4AdCPI_dXK_s
+zO>n$$h!bauRxNaVuQ)dxC(abXcAHjsrx&mRd??Q8>Jb|<(o=M>8n-hQ_c7|bt`jf?
+zgVSiX%4U(6{R!cQHyzk<L>H;bw<qI%X|~(0u26Y&(zrflP<hN4H`re)8^#2crzggE
+zRGMHTrCE-K7s3)%d*gqQzF4|kx}@hoV#k9t2lf;Z$Q%?71r9k5c@7y48iy<g{(>v|
+zDXI`s_iKbuIqo<}RJx*6ZaBQfo-S4RO?!+TD|W>a?Or`zo@#{Lw}B6eRbZto*Cpf~
+zI%a!_4#ZDumJr8tLPAQ-C7QX?@arwtz6NI*gHJv<&)`Q&5QLwiCP=>rkuWaoqVgWn
+a_fX|4s_df5x5DYR_DjlZ;<5r~82=A``5RdP
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsync/__pycache__/errors.cpython-313.pyc b/wsync/__pycache__/errors.cpython-313.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bac8fcafeccfd909701756dbf644e8e756e2a8c
+GIT binary patch
+literal 1163
+zcmbVLOHUI~6u!6b770FLf~*={m~J$hxFN)ah6O4lW;AYym!T9=Q(CywiLz^WwGA!Q
+zM=?^6LLfX0uSlTUqC0;?<4St(v@0})z30v#x^lrJ^Ub;E%suz}&U{m?t#u)|>b~tg
+zYcwIWFBX3;s}bPpQwY*XLKI0@GTq1bOw{B?*O6p?h^e_AT}G0n0ZG<&%Pq69hg$Wl
+z4YKxj>q*w8XC07r{*$%$xI8s#KkR(23<SMyZEBbm23anrZROefvHi%P%T?YS(%vld
+z$xm!zqm*A{6RSL#E|2fJ8@&NpQ5riW*x5{Jh<3R7%pzMD)>5N99^upR%KR{&o@JvW
+zqHij}*Pyyp-d+@aD}t^E7i;8TFcg-<{!mcyn2XMnZpE{YWZL5kw*((6KD~djK?<qV
+z>of9qLxF%_fo*!tYp6F6A3v(~5TsE%q8LVKl3-+#iCQExwf0y%R%(HAr3OH~3Sf-D
+zU=CW3$s6MU{<EK9D8PILwXN8S4nl%*uaA(Ti;&(>ml_c98AAG1IdEL5Bc$6;m2kix
+z^aVpuwiD77@<MQt5JhPA5;+{E{!TUQQwX6>U{Qq|73*{|?LIM9<yzl>PE`j%R}uag
+zMc*wq=sAe={HX>Y`c&!w)H?uLW}RoF<=qYTWw<>5fsO32^`Y|DjJ7<+l36gpK_S8R
+zUbA?Tzs>TGX`b2Ulbbv?$zs{cy9JnyuAq$yW9y+o@4Q%wqjV6*od|efydjFG5@3Uk
+zl?wps6M#}K!e{2#LXyRH%IkA1_No$1@Xx7IZrsqu6H%6W308zROSx4(87<{^4hk79
+zzog~YczmfmmnapcwCpyUnc(S7o?QRGDses)AUK?;k_}ZN-{x^pp;*|YTMereY(mAa
+zD$F1U0$>Jb^9!%9Py7JJSJo$`Hx_>QJHn!)$uQb&+5iP%a-|92rx|1X%VfruBNxI~
+nez;m9_Cp)SH&f0-1dl@p#;rItAQr7ytU7V_(h;mWvEKbRQ&M@!
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsync/__pycache__/fsops.cpython-313.pyc b/wsync/__pycache__/fsops.cpython-313.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f387318072d8ed0e6ea35f551686af0f5613d6fb
+GIT binary patch
+literal 23055
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsync/__pycache__/mirror.cpython-313.pyc b/wsync/__pycache__/mirror.cpython-313.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..00f8637a11ff1add46260e39432049c8633c16fa
+GIT binary patch
+literal 5035
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsync/__pycache__/planner.cpython-313.pyc b/wsync/__pycache__/planner.cpython-313.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0845e22faaa916e723992d6f0da6d3d08a2fc429
+GIT binary patch
+literal 4842
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsync/fsops.py b/wsync/fsops.py
+index d466d2a..4d77bbf 100644
+--- a/wsync/fsops.py
++++ b/wsync/fsops.py
+@@ -2,40 +2,96 @@
+ 
+ 所有直接接触磁盘的调用都集中在本模块，这样文件属性、路径形式和共享
+ 冲突的处理就只有一个地方需要关心。
++
++企业 Windows 目标环境下有几类状态必须在这里被消化掉，而不是抛给调用方：
++
++* **只读属性**：目标树常常是从旧备份盘整盘拷来的，里面残留只读文件与只读
++  目录。覆盖、删除、``rmdir`` 都会被它挡住，所以每个写操作都先原样试一次，
++  撞上权限错误就去掉只读属性再试；
++* **文件名大小写**：NTFS 不区分大小写，``Report.PDF`` 与 ``report.pdf`` 是
++  同一条路径。两个路径算不算“同一个东西”统一由 :func:`path_key` 判定；
++  同理，删除一个文件时绝不允许顺手删掉同名的目录；
++* **被占用的条目**：删不掉就是删不掉，归类成 :class:`TargetInUseError` 交给
++  上层记成失败条目，不允许把整次同步拖垮；
++* **写到一半失败**：覆盖走“同目录临时文件 + 原子替换”，替换不了就保持目标
++  原样，不会留下被截断的半成品。
+ """
+ 
+ from __future__ import annotations
+ 
++import errno
++import hashlib
++import itertools
+ import os
+ import shutil
+ import stat
+-from typing import Dict, Optional, Tuple
++from typing import Dict, List, Optional, Tuple
++
++from .errors import SyncError, TargetInUseError
+ 
+ __all__ = [
+     "join",
+     "path_key",
++    "ignores_case",
+     "list_entries",
+     "stat_signature",
++    "content_signature",
++    "same_content",
+     "is_readonly",
++    "clear_readonly",
+     "remove_file",
+     "remove_tree",
++    "ensure_parent_dir",
+     "copy_file",
++    "copy_times",
++    "align_times",
+     "prune_empty_dirs",
+ ]
+ 
++_CHUNK_SIZE = 1024 * 1024
++
++#: 权限类错误的 errno（Windows 上访问被拒与共享冲突都映射到 EACCES）。
++_PERMISSION_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
++
++#: Windows 的 ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION：条目被占用。
++_LOCKED_WINERRORS = frozenset({32, 33})
++
++#: Windows 的 ERROR_ACCESS_DENIED：通常就是只读属性在挡路。
++_DENIED_WINERRORS = frozenset({5})
++
++_READONLY_ATTR = getattr(stat, "FILE_ATTRIBUTE_READONLY", 1)
++
++_TEMP_COUNTER = itertools.count(1)
++
++
++# --------------------------------------------------------------------------
++# 路径与目录树
++# --------------------------------------------------------------------------
++
+ 
+ def join(root: str, relpath: str) -> str:
+     """把目标根目录和一个相对路径拼成绝对路径。"""
+     return os.path.join(root, relpath)
+ 
+ 
++def ignores_case() -> bool:
++    """当前平台的文件系统是否不区分文件名大小写。"""
++    return os.name == "nt"
++
++
+ def path_key(relpath: str) -> str:
+     """把相对路径规整成用于比较的键。
+ 
+     目标平台的文件系统如何认定“两个路径写的是同一个东西”，由本函数
+-    决定；调用方不应自己再做字符串拼比较。
++    决定；调用方不应自己再做字符串拼比较。在不区分大小写的文件系统上
++    （Windows/NTFS），只有大小写不同的两个路径会得到同一个键。
+     """
+-    return relpath.replace("/", os.sep)
++    normalized = relpath.replace("/", os.sep)
++    if os.altsep:
++        normalized = normalized.replace(os.altsep, os.sep)
++    if ignores_case():
++        normalized = os.path.normcase(normalized)
++    return normalized
+ 
+ 
+ def list_entries(root: str) -> Dict[str, str]:
+@@ -53,10 +109,16 @@ def list_entries(root: str) -> Dict[str, str]:
+     return entries
+ 
+ 
++# --------------------------------------------------------------------------
++# “内容是否变化”的判定
++# --------------------------------------------------------------------------
++
++
+ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+-    """返回用于“内容是否变化”判定的签名。
++    """返回 ``(大小, 修改时间)`` 元数据签名；读取失败时返回 ``None``。
+ 
+-    签名由大小与修改时间共同构成；读取失败时返回 ``None``。
++    元数据相同**不代表**内容相同——上游工具会就地改写文件并把修改时间戳
++    原样保留，所以“要不要更新”必须用 :func:`content_signature` 判定。
+     """
+     try:
+         info = os.stat(path)
+@@ -65,42 +127,387 @@ def stat_signature(path: str) -> Optional[Tuple[int, int]]:
+     return (info.st_size, info.st_mtime_ns)
+ 
+ 
++def _hash_file(path: str) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(_CHUNK_SIZE), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def content_signature(path: str) -> Optional[Tuple[int, str]]:
++    """返回用于“内容是否变化”判定的签名：``(大小, 内容摘要)``。
++
++    读取失败时返回 ``None``。
++    """
++    try:
++        size = os.path.getsize(path)
++        checksum = _hash_file(path)
++    except OSError:
++        return None
++    return (size, checksum)
++
++
++def same_content(source: str, target: str) -> bool:
++    """两个路径上的文件内容是否完全一致。"""
++    source_stat = stat_signature(source)
++    target_stat = stat_signature(target)
++    if source_stat is None or target_stat is None:
++        return False
++    if source_stat[0] != target_stat[0]:
++        return False  # 大小不同，内容必然不同，不必再读一遍
++    source_signature = content_signature(source)
++    target_signature = content_signature(target)
++    if source_signature is None or target_signature is None:
++        return False
++    return source_signature == target_signature
++
++
++# --------------------------------------------------------------------------
++# 只读属性
++# --------------------------------------------------------------------------
++
++
+ def is_readonly(path: str) -> bool:
+     """路径是否带有只读属性。"""
+     try:
+         info = os.stat(path)
+     except OSError:
+         return False
++    if getattr(info, "st_file_attributes", 0) & _READONLY_ATTR:
++        return True
+     return not bool(info.st_mode & stat.S_IWRITE)
+ 
+ 
++def clear_readonly(path: str) -> bool:
++    """去掉 ``path`` 的只读属性，确实去掉了才返回 ``True``。
++
++    路径不存在或改不动属性时返回 ``False``，不抛异常——调用方只是在重试
++    之前顺手试一下。
++    """
++    if not path or not is_readonly(path):
++        return False
++    try:
++        info = os.stat(path)
++        os.chmod(path, info.st_mode | stat.S_IWRITE | stat.S_IWUSR)
++    except OSError:
++        return False
++    return not is_readonly(path)
++
++
++def _is_permission_error(exc: BaseException) -> bool:
++    winerror = getattr(exc, "winerror", None)
++    if winerror in _LOCKED_WINERRORS or winerror in _DENIED_WINERRORS:
++        return True
++    return getattr(exc, "errno", None) in _PERMISSION_ERRNOS
++
++
++def _translate(path: str, exc: OSError) -> Exception:
++    """把“去掉只读属性也没用”的权限错误翻译成 wsync 的领域异常。
++
++    走到这里说明只读属性已经处理过了，剩下的权限错误基本上就是条目被别的
++    进程占用（Windows 上以 WinError 5 / 32 报告）。
++    """
++    if getattr(exc, "winerror", None) in _LOCKED_WINERRORS:
++        return TargetInUseError(str(exc))
++    if isinstance(exc, PermissionError) and not is_readonly(path):
++        return TargetInUseError(str(exc))
++    return exc
++
++
++def _with_readonly_retry(path: str, operation) -> None:
++    """执行 ``operation(path)``，撞上权限错误就去掉只读属性后重试。
++
++    依次尝试：原样执行 → 去掉自身只读属性 → 去掉父目录只读属性。都不行才
++    把错误抛出去，交给上层记成失败条目。
++    """
++    attempts = 0
++    while True:
++        try:
++            operation(path)
++            return
++        except OSError as exc:
++            if not _is_permission_error(exc):
++                raise
++            if not os.path.lexists(path):
++                return  # 已经不在了，等价于成功
++            if attempts >= 2:
++                raise _translate(path, exc) from exc
++            if attempts == 0:
++                clear_readonly(path)
++            else:
++                parent = os.path.dirname(path)
++                if not parent or not clear_readonly(parent):
++                    raise _translate(path, exc) from exc
++            attempts += 1
++
++
++# --------------------------------------------------------------------------
++# 删除
++# --------------------------------------------------------------------------
++
++
++def _remove(path: str) -> None:
++    if _is_real_dir(path):
++        os.rmdir(path)
++    else:
++        os.remove(path)
++
++
++def _is_real_dir(path: str) -> bool:
++    return os.path.isdir(path) and not os.path.islink(path)
++
++
++def _remove_dir(path: str) -> None:
++    _with_readonly_retry(path, _remove)
++
++
+ def remove_file(path: str) -> None:
+-    """删除单个文件。"""
+-    os.remove(path)
++    """删除单个文件。
++
++    * 文件本来就不存在 → 视为已删除（可能已被同一次同步里的冲突清理消化）；
++    * 文件带只读属性 → 去掉只读属性再删；
++    * 路径上是一棵目录 → **不动它**；
++    * 被别的进程占用 → 抛 :class:`TargetInUseError`，由上层记成失败条目。
++
++    最后一条在不区分大小写的文件系统上很关键：源里是目录 ``Data``、目标里
++    是文件 ``data`` 时，计划中的 ``delete data`` 会先被建目录的清理吃掉，等
++    真正轮到这条 delete 时，``data`` 指向的已经是刚建好的目录，顺手删掉就会
++    把整棵新目录毁掉。删除只针对文件，目录交给 :func:`remove_tree` 与
++    :func:`prune_empty_dirs`。
++    """
++    if not os.path.lexists(path):
++        return
++    if _is_real_dir(path):
++        return
++    _with_readonly_retry(path, _remove)
++
++
++def _collect(failures: List[BaseException], path: str) -> None:
++    try:
++        _with_readonly_retry(path, _remove)
++    except (OSError, SyncError) as exc:
++        failures.append(exc)
+ 
+ 
+ def remove_tree(path: str) -> None:
+-    """递归删除一棵目录树。"""
+-    shutil.rmtree(path)
++    """递归删除一棵目录树。
+ 
++    树里的只读文件、只读子目录都会先去掉只读属性再删；确实删不掉的条目
++    （例如被占用）不会让遍历半途而废，第一个错误在最后抛给上层。
++    """
++    if not os.path.lexists(path):
++        return
++    if not _is_real_dir(path):
++        _with_readonly_retry(path, _remove)
++        return
+ 
+-def copy_file(source: str, target: str) -> None:
+-    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。"""
+-    parent = os.path.dirname(target)
+-    if parent:
+-        os.makedirs(parent, exist_ok=True)
+-    with open(source, "rb") as src_handle, open(target, "wb") as dst_handle:
+-        shutil.copyfileobj(src_handle, dst_handle, length=1024 * 1024)
++    failures: List[BaseException] = []
++    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
++        for name in filenames:
++            _collect(failures, os.path.join(dirpath, name))
++        for name in dirnames:
++            child = os.path.join(dirpath, name)
++            # 指向目录的链接不会被 os.walk 展开，这里按文件删掉
++            if os.path.islink(child):
++                _collect(failures, child)
++        try:
++            _remove_dir(dirpath)
++        except (OSError, SyncError) as exc:
++            failures.append(exc)
++    if failures:
++        raise failures[0]
+ 
+ 
+ def prune_empty_dirs(root: str) -> None:
+-    """自底向上删除目标树中的空目录（不含 ``root`` 自身）。"""
++    """自底向上删除目标树中的空目录（不含 ``root`` 自身）。
++
++    只剩只读属性的空目录同样会被清掉；确实删不掉的（例如被占用）保持原样，
++    不影响其它目录的清理。
++    """
+     root = os.path.abspath(root)
+     for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+         if os.path.abspath(dirpath) == root:
+             continue
+         try:
+-            if not os.listdir(dirpath):
+-                os.rmdir(dirpath)
+-        except OSError:
+-            pass
++            if os.listdir(dirpath):
++                continue
++            _remove_dir(dirpath)
++        except (OSError, SyncError):
++            continue
++
++
++# --------------------------------------------------------------------------
++# 创建 / 覆盖
++# --------------------------------------------------------------------------
++
++
++def _make_dir(path: str) -> None:
++    try:
++        os.mkdir(path)
++    except FileExistsError:
++        if not os.path.isdir(path):
++            raise
++    except OSError as exc:
++        if not _is_permission_error(exc):
++            raise
++        clear_readonly(path)
++        parent = os.path.dirname(path)
++        if parent:
++            clear_readonly(parent)
++        try:
++            os.mkdir(path)
++        except FileExistsError:
++            if not os.path.isdir(path):
++                raise
++        except OSError as retry_exc:
++            if not _is_permission_error(retry_exc):
++                raise
++            raise _translate(path, retry_exc) from retry_exc
++
++
++def _ensure_dir(path: str) -> None:
++    """确保 ``path`` 是一个目录；挡在同一条路径上的文件会被清掉。"""
++    if os.path.isdir(path):
++        return
++    parent = os.path.dirname(path)
++    if parent and parent != path:
++        _ensure_dir(parent)
++    if os.path.lexists(path) and not _is_real_dir(path):
++        # 源在这里需要目录，目标却放着一个同名文件（可能只是大小写不同）。
++        # 只清掉构成冲突的这一条路径，其它条目不受影响。
++        remove_file(path)
++    _make_dir(path)
++
++
++def ensure_parent_dir(path: str) -> None:
++    """确保 ``path`` 的上级目录都存在，必要时让占位的文件“让位”。"""
++    parent = os.path.dirname(path)
++    if parent:
++        _ensure_dir(parent)
++
++
++def _open_for_write(path: str):
++    try:
++        return open(path, "wb")
++    except OSError as exc:
++        if not _is_permission_error(exc):
++            raise
++        clear_readonly(path)
++        parent = os.path.dirname(path)
++        if parent:
++            clear_readonly(parent)
++        try:
++            return open(path, "wb")
++        except OSError as retry_exc:
++            if not _is_permission_error(retry_exc):
++                raise
++            raise _translate(path, retry_exc) from retry_exc
++
++
++def _clear_way_for_file(target: str) -> None:
++    """把 ``target`` 这条路径腾出来，好让一个文件落在上面。"""
++    if _is_real_dir(target):
++        # 源里是文件、目标里是一整棵同名目录：整棵目录都已经过期
++        remove_tree(target)
++    elif os.path.lexists(target):
++        clear_readonly(target)
++
++
++def _replace(temp_path: str, target: str) -> None:
++    """把写好的临时文件原子替换到 ``target`` 上。"""
++    if os.path.lexists(target):
++        clear_readonly(target)
++    try:
++        os.replace(temp_path, target)
++    except OSError as exc:
++        if not _is_permission_error(exc):
++            raise
++        # 只读属性会挡住替换，去掉之后再试一次
++        clear_readonly(target)
++        try:
++            os.replace(temp_path, target)
++        except OSError as retry_exc:
++            if not _is_permission_error(retry_exc):
++                raise
++            raise _translate(target, retry_exc) from retry_exc
++
++
++def _temp_sibling(target: str) -> str:
++    return "{0}.wsync-tmp-{1}-{2}".format(target, os.getpid(), next(_TEMP_COUNTER))
++
++
++def _utime(path: str, stamp: Tuple[int, int]) -> None:
++    try:
++        os.utime(path, ns=stamp)
++    except OSError as exc:
++        if not _is_permission_error(exc):
++            raise
++        clear_readonly(path)
++        try:
++            os.utime(path, ns=stamp)
++        except OSError as retry_exc:
++            if not _is_permission_error(retry_exc):
++                raise
++            raise _translate(path, retry_exc) from retry_exc
++
++
++def copy_times(source: str, target: str) -> None:
++    """把 ``source`` 的访问/修改时间复制到 ``target``。
++
++    同步写完文件之后必须保留源的时间戳，否则目标看起来永远“变了”，下一次
++    同步会重复做无谓的动作。
++    """
++    info = os.stat(source)
++    _utime(target, (info.st_atime_ns, info.st_mtime_ns))
++
++
++def align_times(source: str, target: str) -> bool:
++    """尽力把 ``target`` 的时间戳对齐到 ``source``，失败返回 ``False``。
++
++    用于内容一致、本来不需要动的条目：不记任何动作，只是把时间戳补齐，让
++    目标成为源的忠实镜像。
++    """
++    try:
++        info = os.stat(source)
++        current = os.stat(target)
++        if current.st_mtime_ns == info.st_mtime_ns:
++            return True  # 已经对齐，连时间戳都不必再写一次
++        _utime(target, (info.st_atime_ns, info.st_mtime_ns))
++    except (OSError, SyncError):
++        return False
++    return True
++
++
++def copy_file(source: str, target: str) -> None:
++    """把 ``source`` 的内容写到 ``target``，必要时创建父目录。
++
++    顺带处理 Windows 目标树上的常见状态：
++
++    * 缺失的父目录自动创建；父目录的位置被一个同名文件占住时，先把那个
++      文件清掉（只动真正构成冲突的那条路径）；
++    * ``target`` 上是一棵目录时整棵删掉，是只读文件时去掉只读属性；
++    * 内容先写进同目录的临时文件，再原子替换到 ``target``：目标被占用时
++      替换会失败，原文件保持原样，不会留下写了一半的残骸；
++    * 替换前把源文件的修改时间带到内容上。
++    """
++    ensure_parent_dir(target)
++    _clear_way_for_file(target)
++    temp_path = _temp_sibling(target)
++    try:
++        with open(source, "rb") as src_handle:
++            with _open_for_write(temp_path) as dst_handle:
++                shutil.copyfileobj(src_handle, dst_handle, length=_CHUNK_SIZE)
++        copy_times(source, temp_path)
++        _replace(temp_path, target)
++    finally:
++        _discard(temp_path)
++
++
++def _discard(path: str) -> None:
++    """尽力清掉临时文件，清不掉也不影响主流程。"""
++    try:
++        if os.path.lexists(path):
++            _with_readonly_retry(path, _remove)
++    except (OSError, SyncError):
++        pass
+diff --git a/wsync/mirror.py b/wsync/mirror.py
+index f6b81ed..4b12f64 100644
+--- a/wsync/mirror.py
++++ b/wsync/mirror.py
+@@ -1,4 +1,9 @@
+-"""执行同步计划。"""
++"""执行同步计划。
++
++单个条目失败（目标文件被业务程序占用、ACL 拒绝访问……）不允许中断整次
++同步：失败被记进 :attr:`SyncResult.failed`，其余条目照常处理。只读属性属于
++可以自动修复的情况，在 :mod:`wsync.fsops` 里就地解决，不会变成失败条目。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,6 +12,7 @@ from dataclasses import dataclass, field
+ from typing import Dict, List
+ 
+ from . import fsops
++from .errors import SyncError
+ from .planner import CREATE, DELETE, KEEP, UPDATE, PlanEntry, build_plan
+ 
+ 
+@@ -48,6 +54,13 @@ def _record(result: SyncResult, action: str, relpath: str) -> None:
+         result.deleted.append(relpath)
+ 
+ 
++def _record_failure(result: SyncResult, entry: PlanEntry, error: BaseException) -> None:
++    message = str(error).strip() or error.__class__.__name__
++    result.failed.append(
++        {"action": entry.action, "relpath": entry.relpath, "error": message}
++    )
++
++
+ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> SyncResult:
+     """把 ``source_root`` 镜像同步到 ``target_root``。"""
+     source_root = os.path.abspath(source_root)
+@@ -61,12 +74,20 @@ def sync_tree(source_root: str, target_root: str, dry_run: bool = False) -> Sync
+ 
+     for entry in plan.entries:
+         if entry.action == KEEP:
++            # 内容一致就不算动作；只把时间戳对齐，保证目标是源的忠实镜像，
++            # 也保证下一次同步依然什么都不会做。
++            if not dry_run:
++                fsops.align_times(entry.source, entry.target)
+             result.kept.append(entry.relpath)
+             continue
+         if dry_run:
+             _record(result, entry.action, entry.relpath)
+             continue
+-        _apply(entry)
++        try:
++            _apply(entry)
++        except (OSError, SyncError) as exc:
++            _record_failure(result, entry, exc)
++            continue
+         _record(result, entry.action, entry.relpath)
+ 
+     if not dry_run:
+diff --git a/wsync/planner.py b/wsync/planner.py
+index f42cb36..e0c4944 100644
+--- a/wsync/planner.py
++++ b/wsync/planner.py
+@@ -1,9 +1,14 @@
+-"""把源树与目标树的差异计算成一份可执行的同步计划。"""
++"""把源树与目标树的差异计算成一份可执行的同步计划。
++
++比较路径时一律走 :func:`wsync.fsops.path_key`：在不区分大小写的文件系统上
++（Windows/NTFS），源里的 ``Report.PDF`` 与目标里的 ``report.pdf`` 是同一个
++文件，必须配对上；否则计划会同时生成一条 create 和一条 delete，把文件弄丢。
++"""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+-from typing import List, Optional
++from typing import Dict, List, Optional
+ 
+ from . import fsops
+ 
+@@ -37,11 +42,29 @@ class Plan:
+ 
+ 
+ def needs_update(source_path: str, target_path: str) -> bool:
+-    """目标文件是否需要被源文件覆盖。"""
+-    signature = fsops.stat_signature(source_path)
+-    if signature is None:
++    """目标文件是否需要被源文件覆盖。
++
++    判定依据是**内容本身**：大小不同直接算变化，大小相同再比内容摘要。
++    只看大小与修改时间会漏掉“就地改写并保留时间戳”的文件，也会让同步
++    自己刚写完的文件在下一次同步里被当成“变了”。
++    """
++    source_signature = fsops.stat_signature(source_path)
++    if source_signature is None:
+         return False
+-    return signature != fsops.stat_signature(target_path)
++    target_signature = fsops.stat_signature(target_path)
++    if target_signature is None:
++        return True
++    if source_signature[0] != target_signature[0]:
++        return True
++    return not fsops.same_content(source_path, target_path)
++
++
++def _index(files: Dict[str, str]) -> Dict[str, str]:
++    """``{path_key: 相对路径}``，用于在不区分大小写的文件系统上配对。"""
++    index: Dict[str, str] = {}
++    for relpath in sorted(files):
++        index.setdefault(fsops.path_key(relpath), relpath)
++    return index
+ 
+ 
+ def build_plan(source_root: str, target_root: str) -> Plan:
+@@ -49,29 +72,31 @@ def build_plan(source_root: str, target_root: str) -> Plan:
+     source_files = fsops.list_entries(source_root)
+     target_files = fsops.list_entries(target_root)
+ 
++    source_index = _index(source_files)
++    target_index = _index(target_files)
++
+     entries: List[PlanEntry] = []
+ 
+     for relpath in sorted(source_files):
+-        if relpath not in target_files:
+-            entries.append(
+-                PlanEntry(
+-                    CREATE,
+-                    relpath,
+-                    source_files[relpath],
+-                    fsops.join(target_root, relpath),
+-                )
+-            )
+-        elif needs_update(source_files[relpath], target_files[relpath]):
+-            entries.append(
+-                PlanEntry(UPDATE, relpath, source_files[relpath], target_files[relpath])
+-            )
++        key = fsops.path_key(relpath)
++        # 目标上“同一个文件”的相对路径；只有大小写不同时也能配上对
++        twin = target_index.get(key)
++        if twin is None:
++            action = CREATE
++            target_path = fsops.join(target_root, relpath)
+         else:
+-            entries.append(
+-                PlanEntry(KEEP, relpath, source_files[relpath], target_files[relpath])
+-            )
++            target_path = fsops.join(target_root, twin)
++            if needs_update(source_files[relpath], target_files[twin]):
++                action = UPDATE
++            else:
++                action = KEEP
++        entries.append(PlanEntry(action, relpath, source_files[relpath], target_path))
+ 
+     for relpath in sorted(target_files):
+-        if relpath not in source_files:
+-            entries.append(PlanEntry(DELETE, relpath, None, target_files[relpath]))
++        if fsops.path_key(relpath) in source_index:
++            continue
++        # 目标多出来的文件。若它占住了源里某个目录的位置（含只有大小写不同
++        # 的情形），也一样要删掉给源目录让位。
++        entries.append(PlanEntry(DELETE, relpath, None, target_files[relpath]))
+ 
+     return Plan(entries)

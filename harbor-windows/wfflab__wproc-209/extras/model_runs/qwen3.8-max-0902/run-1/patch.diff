@@ -1,0 +1,1256 @@
+diff --git a/_tmp_verify2_wproc.py b/_tmp_verify2_wproc.py
+new file mode 100644
+index 0000000..8e293a4
+--- /dev/null
++++ b/_tmp_verify2_wproc.py
+@@ -0,0 +1,142 @@
++"""Extra ad-hoc checks. TEMPORARY - deleted right after running."""
++
++from __future__ import annotations
++
++import ctypes
++import os
++import subprocess
++import sys
++import tempfile
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from wproc import run
++
++PY = sys.executable
++TMP = tempfile.mkdtemp(prefix="wproc-verify2-")
++STILL_ACTIVE = 259
++FAILURES = []
++
++
++def check(name, cond, extra=""):
++    print(("PASS  " if cond else "FAIL  ") + name + (("   -> " + repr(extra)) if extra != "" else ""))
++    if not cond:
++        FAILURES.append(name)
++
++
++def alive(pid):
++    k = ctypes.windll.kernel32
++    h = k.OpenProcess(0x1000, False, int(pid))
++    if not h:
++        return False
++    code = ctypes.c_ulong()
++    ok = k.GetExitCodeProcess(h, ctypes.byref(code))
++    k.CloseHandle(h)
++    return bool(ok) and code.value == STILL_ACTIVE
++
++
++def script(name, body):
++    path = os.path.join(TMP, name)
++    with open(path, "w", encoding="utf-8") as fh:
++        fh.write(body)
++    return path
++
++
++HEARTBEAT = script(
++    "heartbeat.py",
++    "import sys, time\n"
++    "end = time.time() + float(sys.argv[2])\n"
++    "fh = open(sys.argv[1], 'a')\n"
++    "while time.time() < end:\n"
++    "    fh.write('beat\\n')\n"
++    "    fh.flush()\n"
++    "    time.sleep(0.2)\n",
++)
++HB = repr(HEARTBEAT)
++
++print("9a. cmd /c start /b <worker>")
++START = script(
++    "starter.py",
++    "import subprocess, sys, time\n"
++    "p = subprocess.Popen(['cmd', '/c', 'start', '/b', '', sys.executable, " + HB + ", sys.argv[1], '120'])\n"
++    "print('started', flush=True)\n"
++    "time.sleep(120)\n",
++)
++heart = os.path.join(TMP, "h-9a.txt")
++res = run([PY, START, heart], timeout=3)
++time.sleep(1.5)
++a, b = (os.path.getsize(heart) if os.path.exists(heart) else -1,) * 2
++size_a = os.path.getsize(heart) if os.path.exists(heart) else -1
++time.sleep(1.5)
++size_b = os.path.getsize(heart) if os.path.exists(heart) else -1
++check("timed_out", res.timed_out is True, res)
++check("start /b worker stopped", size_a == size_b and size_a > 0, (size_a, size_b))
++
++print()
++print("9b. detached / new-process-group grandchild")
++DETACHED = script(
++    "detached.py",
++    "import subprocess, sys, time\n"
++    "flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP\n"
++    "p = subprocess.Popen([sys.executable, " + HB + ", sys.argv[1], '120'], creationflags=flags)\n"
++    "print('PIDS=' + str(p.pid), flush=True)\n"
++    "time.sleep(120)\n",
++)
++heart9b = os.path.join(TMP, "h-9b.txt")
++res = run([PY, DETACHED, heart9b], timeout=3)
++pids = []
++if "PIDS=" in res.text():
++    pids = [int(x) for x in res.text().split("PIDS=")[1].split()[0].split(",")]
++time.sleep(1.0)
++check("timed_out", res.timed_out is True, res)
++check("detached grandchild dead", pids and all(not alive(p) for p in pids), (pids, res.text()[:120]))
++
++print()
++print("9c. stdout/stderr keep their interleaving")
++res = run([PY, "-c", "import sys;sys.stdout.write('A\\n');sys.stdout.flush();"
++                     "sys.stderr.write('B\\n');sys.stderr.flush();"
++                     "sys.stdout.write('C\\n')"], timeout=20)
++check("interleaved order", res.text().replace("\r\n", "\n") == "A\nB\nC\n", res.text())
++
++print()
++print("9d. a command that produces no output at all")
++res = run([PY, "-c", "pass"], timeout=20)
++check("empty output", res.output == b"" and res.returncode == 0 and res.timed_out is False, res)
++
++print()
++print("9e. cwd + env still honoured together with the job object")
++work = os.path.join(TMP, "wd")
++os.makedirs(work)
++env = {"SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"), "WPROC_MARK": "yes"}
++res = run(
++    [PY, "-c", "import os;print(os.getcwd());print(os.environ.get('WPROC_MARK','<missing>'));"
++               "print('parent=' + ('present' if 'WPROC_ONLY' in os.environ else 'absent'))"],
++    cwd=work,
++    env=env,
++    timeout=20,
++)
++text = res.text()
++check("cwd honoured", work.lower() in text.lower(), text)
++check("env honoured", "yes" in text, text)
++
++print()
++print("9f. many short runs in a row do not leak handles")
++import ctypes.wintypes  # noqa: F401
++
++before = ctypes.windll.kernel32.GetProcessHandleCount if False else None
++k = ctypes.windll.kernel32
++h_before = ctypes.c_ulong()
++k.GetProcessHandleCount(k.GetCurrentProcess(), ctypes.byref(h_before))
++for _ in range(40):
++    run([PY, "-c", "print('x')"], timeout=20)
++h_after = ctypes.c_ulong()
++k.GetProcessHandleCount(k.GetCurrentProcess(), ctypes.byref(h_after))
++check("handle count stable", h_after.value - h_before.value < 20, (h_before.value, h_after.value))
++
++print()
++print("=" * 72)
++if FAILURES:
++    print("FAILURES:", FAILURES)
++    sys.exit(1)
++print("ALL EXTRA CHECKS PASSED")
+diff --git a/_tmp_verify_wproc.py b/_tmp_verify_wproc.py
+new file mode 100644
+index 0000000..1102168
+--- /dev/null
++++ b/_tmp_verify_wproc.py
+@@ -0,0 +1,359 @@
++"""Ad-hoc verification of the Windows process-tree semantics.
++
++TEMPORARY - deleted right after running; must not end up in the final patch.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import os
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++from wproc import CommandFailed, CommandNotStarted, CommandTimedOut, run
++from wproc import processes
++
++PY = sys.executable
++TMP = tempfile.mkdtemp(prefix="wproc-verify-")
++STILL_ACTIVE = 259
++FAILURES = []
++
++
++def check(name, cond, extra=""):
++    mark = "PASS  " if cond else "FAIL  "
++    tail = ("   -> " + repr(extra)) if extra != "" else ""
++    print(mark + name + tail)
++    if not cond:
++        FAILURES.append(name)
++
++
++def alive(pid):
++    k = ctypes.windll.kernel32
++    h = k.OpenProcess(0x1000, False, int(pid))
++    if not h:
++        return False
++    code = ctypes.c_ulong()
++    ok = k.GetExitCodeProcess(h, ctypes.byref(code))
++    k.CloseHandle(h)
++    return bool(ok) and code.value == STILL_ACTIVE
++
++
++def script(name, body):
++    path = os.path.join(TMP, name)
++    with open(path, "w", encoding="utf-8") as fh:
++        fh.write(body)
++    return path
++
++
++def pids_of(result):
++    text = result.text()
++    if "PIDS=" not in text:
++        return []
++    return [int(x) for x in text.split("PIDS=")[1].split()[0].split(",")]
++
++
++def size_of(path):
++    return os.path.getsize(path) if os.path.exists(path) else -1
++
++
++HEARTBEAT = script(
++    "heartbeat.py",
++    "import sys, time\n"
++    "end = time.time() + float(sys.argv[2])\n"
++    "fh = open(sys.argv[1], 'a')\n"
++    "while time.time() < end:\n"
++    "    fh.write('beat\\n')\n"
++    "    fh.flush()\n"
++    "    time.sleep(0.2)\n",
++)
++HB = repr(HEARTBEAT)
++
++SLEEPER = script("sleeper.py", "import sys, time\ntime.sleep(float(sys.argv[1]))\n")
++SL = repr(SLEEPER)
++
++CHAIN = script(
++    "chain.py",
++    "import subprocess, sys, time\n"
++    "heart = sys.argv[1]\n"
++    "pids = []\n"
++    "pids.append(subprocess.Popen([sys.executable, " + HB + ", heart, '120'], close_fds=False).pid)\n"
++    "pids.append(subprocess.Popen([sys.executable, " + SL + ", '120']).pid)\n"
++    "pids.append(subprocess.Popen(['cmd', '/c', sys.executable, " + SL + ", '120']).pid)\n"
++    "print('PIDS=' + ','.join(str(p) for p in pids), flush=True)\n"
++    "time.sleep(120)\n",
++)
++
++MID = script(
++    "mid.py",
++    "import subprocess, sys, time\n"
++    "p = subprocess.Popen([sys.executable, " + HB + ", sys.argv[1], '120'], close_fds=False)\n"
++    "print('PIDS=' + str(p.pid), flush=True)\n"
++    "time.sleep(120)\n",
++)
++MIDR = repr(MID)
++
++DEEP = script(
++    "deep.py",
++    "import subprocess, sys, time\n"
++    "inner = subprocess.Popen(['cmd', '/c', sys.executable, " + MIDR + ", sys.argv[1]],\n"
++    "                         close_fds=False, stdout=subprocess.PIPE, text=True)\n"
++    "print(inner.stdout.readline().strip(), flush=True)\n"
++    "time.sleep(120)\n",
++)
++
++LINGER = script(
++    "linger.py",
++    "import subprocess, sys\n"
++    "p = subprocess.Popen([sys.executable, " + HB + ", sys.argv[1], '20'], close_fds=False)\n"
++    "print('child-done')\n"
++    "sys.exit(int(sys.argv[2]))\n",
++)
++
++BIG = script(
++    "big.py",
++    "import sys, time\n"
++    "sys.stderr.write('early-stderr\\n')\n"
++    "sys.stderr.flush()\n"
++    "sys.stdout.write('BEGIN\\n')\n"
++    "sys.stdout.write('x' * (4096 * 128))\n"
++    "sys.stdout.write('\\nEND\\n')\n"
++    "sys.stdout.flush()\n"
++    "time.sleep(120)\n",
++)
++
++BIGLINGER = script(
++    "biglinger.py",
++    "import subprocess, sys\n"
++    "p = subprocess.Popen([sys.executable, " + HB + ", sys.argv[1], '20'], close_fds=False)\n"
++    "sys.stdout.write('HEAD' + 'y' * (4096 * 100) + 'TAIL')\n"
++    "sys.stdout.flush()\n",
++)
++
++FAILSCRIPT = script("fail.py", "import sys\nprint('about-to-fail')\nsys.exit(7)\n")
++
++print("=" * 72)
++print("1. timeout must stop the whole tree (and nothing else)")
++print("=" * 72)
++bystander = subprocess.Popen([PY, SLEEPER, "60"])
++heart = os.path.join(TMP, "heart-1.txt")
++started = time.monotonic()
++res = run([PY, CHAIN, heart], timeout=3)
++elapsed = time.monotonic() - started
++pids = pids_of(res)
++size_a = size_of(heart)
++time.sleep(2.0)
++size_b = size_of(heart)
++check("timed_out is True", res.timed_out is True, res)
++check("returned right after the budget", 2.5 <= elapsed <= 6.0, elapsed)
++check("descendants are dead", pids and all(not alive(p) for p in pids), pids)
++check("heartbeat stopped growing", size_a == size_b and size_a > 0, (size_a, size_b))
++check("unrelated bystander untouched", alive(bystander.pid), bystander.pid)
++bystander.kill()
++bystander.wait()
++
++print()
++print("1b. deep chain python -> cmd -> python -> python, timeout")
++heart1b = os.path.join(TMP, "heart-1b.txt")
++res = run([PY, DEEP, heart1b], timeout=4)
++pids = pids_of(res)
++size_a = size_of(heart1b)
++time.sleep(1.5)
++size_b = size_of(heart1b)
++check("timed_out", res.timed_out is True, res)
++check("great-grandchild reported", bool(pids), res.text()[:200])
++check("deep descendants dead", pids and all(not alive(p) for p in pids), pids)
++check("deep heartbeat stopped", size_a == size_b and size_a > 0, (size_a, size_b))
++
++print()
++print("1c. same, but job objects unavailable -> taskkill/sweep fallback")
++original_prepare = processes._prepare_job
++processes._prepare_job = lambda popen: None
++try:
++    bystander2 = subprocess.Popen([PY, SLEEPER, "60"])
++    heart1c = os.path.join(TMP, "heart-1c.txt")
++    res = run([PY, CHAIN, heart1c], timeout=3)
++    pids = pids_of(res)
++    size_a = size_of(heart1c)
++    time.sleep(1.5)
++    size_b = size_of(heart1c)
++    check("timed_out", res.timed_out is True, res)
++    check("fallback killed descendants", pids and all(not alive(p) for p in pids), pids)
++    check("fallback stopped the heartbeat", size_a == size_b and size_a > 0, (size_a, size_b))
++    check("bystander untouched (fallback)", alive(bystander2.pid), bystander2.pid)
++    bystander2.kill()
++    bystander2.wait()
++finally:
++    processes._prepare_job = original_prepare
++
++print()
++print("=" * 72)
++print("2. output written before the kill must survive (hundreds of KiB)")
++print("=" * 72)
++res = run([PY, BIG], timeout=3)
++check("timed_out is True", res.timed_out is True, res)
++check("stdout kept in full", res.output.count(b"x") == 4096 * 128, len(res.output))
++check("BEGIN kept", b"BEGIN" in res.output)
++check("END kept", b"END" in res.output)
++check("stderr kept", b"early-stderr" in res.output)
++
++print()
++print("=" * 72)
++print("3. child exits while a descendant keeps the pipe open")
++print("=" * 72)
++heart3 = os.path.join(TMP, "heart-3.txt")
++started = time.monotonic()
++res = run([PY, LINGER, heart3, "0"], timeout=25)
++elapsed = time.monotonic() - started
++check("timed_out is False", res.timed_out is False, res)
++check("returncode is the real one", res.returncode == 0, res.returncode)
++check("output collected", "child-done" in res.text(), res.text()[:80])
++check("returned immediately, not at the budget", elapsed < 4.0, elapsed)
++check("ok is True", res.ok is True)
++check("lingering grandchild survived", size_of(heart3) > 0)
++
++print()
++print("3b. same, but the child exits non-zero")
++res = run([PY, LINGER, os.path.join(TMP, "heart-3b.txt"), "9"], timeout=25)
++check("timed_out is False", res.timed_out is False, res)
++check("non-zero returncode kept", res.returncode == 9, res.returncode)
++check("output kept", "child-done" in res.text(), res.text()[:80])
++
++print()
++print("3c. child writes 400 KiB, exits, descendant holds the pipe")
++res = run([PY, BIGLINGER, os.path.join(TMP, "heart-3c.txt")], timeout=25)
++check("timed_out is False", res.timed_out is False, res)
++check("returncode 0", res.returncode == 0, res.returncode)
++check("all 400 KiB kept", res.output.count(b"y") == 4096 * 100, len(res.output))
++check("HEAD/TAIL kept", b"HEAD" in res.output and b"TAIL" in res.output)
++
++print()
++print("=" * 72)
++print("4. non-zero exit code and check=True")
++print("=" * 72)
++res = run([PY, FAILSCRIPT], timeout=20)
++check("returncode preserved", res.returncode == 7, res.returncode)
++check("timed_out is False", res.timed_out is False)
++check("ok is False", res.ok is False)
++check("output present", "about-to-fail" in res.text())
++try:
++    run([PY, FAILSCRIPT], timeout=20, check=True)
++    check("CommandFailed raised", False)
++except CommandFailed as exc:
++    check("CommandFailed raised", True)
++    check(
++        "CommandFailed carries result",
++        exc.result.returncode == 7 and "about-to-fail" in exc.result.text(),
++    )
++try:
++    run([PY, SLEEPER, "60"], timeout=2, check=True)
++    check("CommandTimedOut raised", False)
++except CommandTimedOut as exc:
++    check("CommandTimedOut raised", True)
++    check("CommandTimedOut carries result", exc.result is not None and exc.result.timed_out is True)
++    check("CommandTimedOut carries timeout", exc.timeout == 2, exc.timeout)
++try:
++    run([PY, CHAIN, os.path.join(TMP, "heart-4.txt")], timeout=2, check=True)
++    check("CommandTimedOut on a tree", False)
++except CommandTimedOut as exc:
++    check("CommandTimedOut on a tree", True)
++    check("timed-out result keeps output", "PIDS=" in exc.result.text(), exc.result.text()[:60])
++
++print()
++print("=" * 72)
++print("5. no timeout at all")
++print("=" * 72)
++res = run([PY, "-c", "print('plain')"])
++check("plain run", res.returncode == 0 and "plain" in res.text() and res.timed_out is False, res)
++started = time.monotonic()
++res = run([PY, LINGER, os.path.join(TMP, "heart-5.txt"), "0"])
++took = time.monotonic() - started
++check("no-budget run returns fast", took < 4.0, took)
++check("no-budget run correct", res.timed_out is False and res.returncode == 0, res)
++
++print()
++print("5b. tiny / zero timeout")
++started = time.monotonic()
++res = run([PY, SLEEPER, "30"], timeout=0)
++took = time.monotonic() - started
++check("timeout=0 -> timed_out", res.timed_out is True, res)
++check("timeout=0 is immediate", took < 2.0, took)
++res = run([PY, SLEEPER, "30"], timeout=0.2)
++check("timeout=0.2 -> timed_out", res.timed_out is True, res)
++
++print()
++print("=" * 72)
++print("6. argument validation and CommandNotStarted")
++print("=" * 72)
++try:
++    run(["definitely-not-a-real-command-xyz"], timeout=5)
++    check("CommandNotStarted raised", False)
++except CommandNotStarted:
++    check("CommandNotStarted raised", True)
++try:
++    run("python -c print(1)", timeout=5)
++    check("string command rejected", False)
++except TypeError:
++    check("string command rejected", True)
++try:
++    run([], timeout=5)
++    check("empty command rejected", False)
++except ValueError:
++    check("empty command rejected", True)
++
++print()
++print("=" * 72)
++print("7. legacy processes.start_process / terminate_process kills the tree")
++print("=" * 72)
++heart7 = os.path.join(TMP, "heart-7.txt")
++proc = processes.start_process([PY, CHAIN, heart7])
++time.sleep(2.5)
++processes.terminate_process(proc)
++check("legacy returncode available", proc.returncode is not None, proc.returncode)
++time.sleep(1.0)
++size_a = size_of(heart7)
++time.sleep(1.5)
++size_b = size_of(heart7)
++check("legacy terminate stopped the heartbeat", size_a == size_b and size_a > 0, (size_a, size_b))
++
++print()
++print("=" * 72)
++print("8. concurrent runs do not interfere")
++print("=" * 72)
++results = {}
++
++
++def worker(idx):
++    heart = os.path.join(TMP, "heart-8-" + str(idx) + ".txt")
++    if idx % 2 == 0:
++        results[idx] = run([PY, CHAIN, heart], timeout=3)
++    else:
++        results[idx] = run([PY, "-c", "print('fast-" + str(idx) + "')"], timeout=30)
++
++
++threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
++for t in threads:
++    t.start()
++for t in threads:
++    t.join()
++check("all concurrent runs finished", len(results) == 6, sorted(results))
++check(
++    "odd runs are clean",
++    all(results[i].returncode == 0 and not results[i].timed_out for i in (1, 3, 5)),
++)
++check("even runs timed out", all(results[i].timed_out for i in (0, 2, 4)))
++time.sleep(1.0)
++leftover = [p for i in (0, 2, 4) for p in pids_of(results[i]) if alive(p)]
++check("no concurrent descendant survived", not leftover, leftover)
++check("no stray reader threads", threading.active_count() < 12, threading.active_count())
++
++print()
++print("=" * 72)
++if FAILURES:
++    print("FAILURES:", FAILURES)
++    sys.exit(1)
++print("ALL CHECKS PASSED")
+diff --git a/wproc/processes.py b/wproc/processes.py
+index af7154d..9a8d9d0 100644
+--- a/wproc/processes.py
++++ b/wproc/processes.py
+@@ -2,23 +2,462 @@
+ 
+ 把「如何在 Windows 上创建并结束一个子进程」集中在一处，
+ 让 runner 只关心预算、输出与结果封装。
++
++Windows 上有两件事和 Linux 不一样，这个模块就是围绕它们写的：
++
++1. ``TerminateProcess``（也就是 ``Popen.kill()``）**只结束它拿到的那一个进程**。
++   子进程拉起来的编译器、打包器、``cmd /c`` 里的业务程序会原地活下来，
++   继续写文件、继续占着输出目录。这里用**作业对象（Job Object）**把整棵树圈起来：
++   子进程一旦被指派进作业，它此后创建的所有后代都会自动落进同一个作业，
++   ``TerminateJobObject`` 一次就能全部结束。作业是**匿名的、一次运行一个**，
++   所以清理范围严格限定在这次运行自己拉起来的进程上，不会波及无关进程。
++
++   这里刻意**没有**设置 ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``：一次运行正常
++   结束时，它顺手留下的后台进程应当继续活着（那是命令自己的语义），
++   不能因为我们关掉作业句柄就被顺手带走。只有超出时间预算被终止时才清树。
++
++2. PID 会被系统回收复用。所以按父子关系枚举出来的后代，下手之前要先握住句柄、
++   再核对创建时间（后代不可能比祖先更早创建），避免误伤恰好复用了同一个 PID
++   的无关进程。
+ """
+ 
+ from __future__ import annotations
+ 
+-from typing import Mapping, Optional, Sequence
+-
++import ctypes
++import os
+ import subprocess
++import time
++from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ Command = Sequence[str]
+ 
++_WINDOWS = os.name == "nt"
+ 
+-def start_process(
+-    command: Command,
+-    cwd: Optional[str] = None,
+-    env: Optional[Mapping[str, str]] = None,
++#: 结束进程时统一使用的退出码，与 ``Popen.kill()`` 在 Windows 上的行为一致。
++_KILL_EXIT_CODE = 1
++
++#: ``terminate_process()`` 承诺返回时直接子进程已经退出，这里是兜底等待上限。
++_WAIT_AFTER_TERMINATE = 5.0
++
++#: 作业对象不可用时，调用 Windows 自带 ``taskkill`` 的超时。
++_TASKKILL_TIMEOUT = 15.0
++
++#: 一次兜底清扫最多握住多少个后代句柄，防止进程炸弹把句柄耗光。
++_MAX_VICTIMS = 4096
++
++_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
++
++
++if _WINDOWS:
++    from ctypes import wintypes
++
++    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++    _ULONG_PTR = ctypes.c_size_t
++    _FILETIME_PTR = ctypes.POINTER(wintypes.FILETIME)
++
++    _PROCESS_TERMINATE = 0x0001
++    _PROCESS_SET_QUOTA = 0x0100
++    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
++
++    _TH32CS_SNAPPROCESS = 0x00000002
++
++    _INVALID_HANDLE = ctypes.c_void_p(-1).value
++
++    _MAX_PATH = 260
++
++    class _PROCESSENTRY32W(ctypes.Structure):
++        """``PROCESSENTRY32W``：Toolhelp32 快照里的一条进程记录。"""
++
++        _fields_ = [
++            ("dwSize", wintypes.DWORD),
++            ("cntUsage", wintypes.DWORD),
++            ("th32ProcessID", wintypes.DWORD),
++            ("th32DefaultHeapID", _ULONG_PTR),
++            ("th32ModuleID", wintypes.DWORD),
++            ("cntThreads", wintypes.DWORD),
++            ("th32ParentProcessID", wintypes.DWORD),
++            ("pcPriClassBase", ctypes.c_long),
++            ("dwFlags", wintypes.DWORD),
++            ("szExeFile", ctypes.c_wchar * _MAX_PATH),
++        ]
++
++    def _bind(name: str, restype, argtypes):
++        function = getattr(_kernel32, name)
++        function.restype = restype
++        function.argtypes = argtypes
++        return function
++
++    _CreateJobObjectW = _bind(
++        "CreateJobObjectW", wintypes.HANDLE, [wintypes.LPVOID, wintypes.LPCWSTR]
++    )
++    _AssignProcessToJobObject = _bind(
++        "AssignProcessToJobObject", wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE]
++    )
++    _TerminateJobObject = _bind(
++        "TerminateJobObject", wintypes.BOOL, [wintypes.HANDLE, wintypes.UINT]
++    )
++    _OpenProcess = _bind(
++        "OpenProcess", wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
++    )
++    _TerminateProcess = _bind(
++        "TerminateProcess", wintypes.BOOL, [wintypes.HANDLE, wintypes.UINT]
++    )
++    _GetProcessTimes = _bind(
++        "GetProcessTimes",
++        wintypes.BOOL,
++        [wintypes.HANDLE, _FILETIME_PTR, _FILETIME_PTR, _FILETIME_PTR, _FILETIME_PTR],
++    )
++    _CreateToolhelp32Snapshot = _bind(
++        "CreateToolhelp32Snapshot", wintypes.HANDLE, [wintypes.DWORD, wintypes.DWORD]
++    )
++    _Process32FirstW = _bind(
++        "Process32FirstW", wintypes.BOOL, [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
++    )
++    _Process32NextW = _bind(
++        "Process32NextW", wintypes.BOOL, [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
++    )
++    _CloseHandle = _bind("CloseHandle", wintypes.BOOL, [wintypes.HANDLE])
++
++    def _usable(handle) -> bool:
++        """句柄是不是真正可用（``NULL`` 与 ``INVALID_HANDLE_VALUE`` 都不算）。"""
++        return bool(handle) and handle != _INVALID_HANDLE
++
++    def _open_process(pid: int, access: int) -> Optional[int]:
++        try:
++            handle = _OpenProcess(access, False, pid)
++        except OSError:  # pragma: no cover - 防御性
++            return None
++        return handle if _usable(handle) else None
++
++    def _read_creation_time(handle: int) -> Optional[int]:
++        """读一个进程对象的创建时间（100ns 计时），读不到返回 ``None``。"""
++        creation = wintypes.FILETIME()
++        exited = wintypes.FILETIME()
++        kernel = wintypes.FILETIME()
++        user = wintypes.FILETIME()
++        try:
++            ok = _GetProcessTimes(
++                handle,
++                ctypes.byref(creation),
++                ctypes.byref(exited),
++                ctypes.byref(kernel),
++                ctypes.byref(user),
++            )
++        except OSError:  # pragma: no cover - 防御性
++            return None
++        if not ok:
++            return None
++        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
++
++    def _raw_handle(popen: subprocess.Popen) -> Optional[int]:
++        """取 ``Popen`` 底下的 Win32 进程句柄（借用，不关闭）。"""
++        handle = getattr(popen, "_handle", None)
++        if handle is None:
++            return None
++        try:
++            value = int(handle)
++        except (TypeError, ValueError):  # pragma: no cover - 防御性
++            return None
++        return value or None
++
++    def _creation_time_of(popen: subprocess.Popen) -> Optional[int]:
++        """本次运行直接子进程的创建时间，用来在清树前确认「这个 PID 还是它」。
++
++        进程对象在 ``Popen`` 释放句柄之前不会消失，所以子进程即便已经退出，
++        这里依然能读到它真实的创建时间。
++        """
++        handle = _raw_handle(popen)
++        if handle is not None:
++            created = _read_creation_time(handle)
++            if created is not None:
++                return created
++        owned = _open_process(popen.pid, _PROCESS_QUERY_LIMITED_INFORMATION)
++        if owned is None:
++            return None
++        try:
++            return _read_creation_time(owned)
++        finally:
++            _CloseHandle(owned)
++
++    def _create_job() -> Optional[int]:
++        """为一次运行创建一个匿名作业对象；创建不出来就返回 ``None``。"""
++        try:
++            job = _CreateJobObjectW(None, None)
++        except OSError:  # pragma: no cover - 防御性
++            return None
++        return job if _usable(job) else None
++
++    def _close_job(job: Optional[int]) -> None:
++        if job is None:
++            return
++        try:
++            _CloseHandle(job)
++        except OSError:  # pragma: no cover - 防御性
++            pass
++
++    def _terminate_job(job: int) -> None:
++        """结束作业里的每一个进程——也就是这次运行的整棵树。"""
++        try:
++            _TerminateJobObject(job, _KILL_EXIT_CODE)
++        except OSError:  # pragma: no cover - 防御性
++            pass
++
++    def _assign_to_job(job: int, popen: subprocess.Popen) -> bool:
++        """把子进程指派进作业；它此后创建的后代会自动落在同一个作业里。"""
++        handle = _raw_handle(popen)
++        borrowed = None
++        if handle is None:
++            borrowed = _open_process(popen.pid, _PROCESS_SET_QUOTA | _PROCESS_TERMINATE)
++            if borrowed is None:
++                return False
++            handle = borrowed
++        try:
++            return bool(_AssignProcessToJobObject(job, handle))
++        except OSError:  # pragma: no cover - 防御性
++            return False
++        finally:
++            if borrowed is not None:
++                _CloseHandle(borrowed)
++
++    def _snapshot_processes() -> Dict[int, int]:
++        """``{pid: 父 pid}``，只包含此刻还活着的进程。"""
++        try:
++            snapshot = _CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
++        except OSError:  # pragma: no cover - 防御性
++            return {}
++        if not _usable(snapshot):
++            return {}
++        table: Dict[int, int] = {}
++        entry = _PROCESSENTRY32W()
++        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
++        try:
++            if not _Process32FirstW(snapshot, ctypes.byref(entry)):
++                return table
++            while True:
++                table[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
++                if not _Process32NextW(snapshot, ctypes.byref(entry)):
++                    return table
++        except OSError:  # pragma: no cover - 防御性
++            return table
++        finally:
++            _CloseHandle(snapshot)
++
++    def _descendant_pids(root_pid: int) -> List[int]:
++        """按父子关系枚举 ``root_pid`` 的全部在世后代（不含它自己）。"""
++        table = _snapshot_processes()
++        if not table:
++            return []
++        children: Dict[int, List[int]] = {}
++        for pid, parent in table.items():
++            children.setdefault(parent, []).append(pid)
++        found: List[int] = []
++        seen = {root_pid}
++        stack = [root_pid]
++        while stack:
++            current = stack.pop()
++            for child in children.get(current, ()):
++                if child in seen:
++                    continue
++                seen.add(child)
++                found.append(child)
++                stack.append(child)
++        return found
++
++    def _open_descendants(
++        root_pid: int, root_created: Optional[int]
++    ) -> List[Tuple[int, int]]:
++        """枚举后代并握住句柄，返回 ``[(pid, handle), ...]``。
++
++        握住句柄有两层意义：句柄锁定的就是快照里那一个进程对象，PID 之后被复用
++        也不会误伤；再叠加创建时间校验（后代不可能比祖先更早创建），就能排掉
++        「这条父子链其实是 PID 复用造成的假象」这种情况。
++        """
++        victims: List[Tuple[int, int]] = []
++        for pid in _descendant_pids(root_pid):
++            if len(victims) >= _MAX_VICTIMS:  # pragma: no cover - 进程炸弹
++                break
++            handle = _open_process(
++                pid, _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION
++            )
++            if handle is None:
++                handle = _open_process(pid, _PROCESS_TERMINATE)
++                if handle is None:
++                    continue
++            else:
++                created = _read_creation_time(handle)
++                if (
++                    root_created is not None
++                    and created is not None
++                    and created < root_created
++                ):
++                    _CloseHandle(handle)
++                    continue
++            victims.append((pid, handle))
++        return victims
++
++    def _terminate_handles(victims: List[Tuple[int, int]]) -> None:
++        """结束并释放 ``victims`` 里的每一个进程（列表会被就地清空）。"""
++        while victims:
++            _pid, handle = victims.pop()
++            try:
++                _TerminateProcess(handle, _KILL_EXIT_CODE)
++            except OSError:  # pragma: no cover - 防御性
++                pass
++            finally:
++                try:
++                    _CloseHandle(handle)
++                except OSError:  # pragma: no cover - 防御性
++                    pass
++
++    def _taskkill_tree(pid: int) -> None:
++        """作业对象不可用时的兜底：用 Windows 自带的 ``taskkill /T`` 收进程树。"""
++        try:
++            subprocess.run(
++                ["taskkill", "/F", "/T", "/PID", str(pid)],
++                stdin=subprocess.DEVNULL,
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                timeout=_TASKKILL_TIMEOUT,
++                creationflags=_CREATE_NO_WINDOW,
++            )
++        except (OSError, subprocess.SubprocessError):  # pragma: no cover - 兜底路径
++            pass
++
++
++def _kill_direct(proc: subprocess.Popen) -> None:
++    """结束直接子进程本身；已经退出的进程不会被重复处理。"""
++    try:
++        if proc.poll() is None:
++            proc.kill()
++    except OSError:  # pragma: no cover - 进程可能刚刚自己退出
++        pass
++
++
++def _reap(proc: subprocess.Popen) -> None:
++    """给直接子进程收尸，保证 ``proc.returncode`` 可用。"""
++    try:
++        proc.wait(timeout=_WAIT_AFTER_TERMINATE)
++    except subprocess.TimeoutExpired:  # pragma: no cover - 防御性
++        pass
++    except OSError:  # pragma: no cover - 防御性
++        pass
++
++
++def _terminate_tree(
++    proc: subprocess.Popen, job: Optional[int], root_created: Optional[int]
++) -> None:
++    """结束 ``proc`` 以及它启动的全部后代进程。
++
++    不管中间哪一步出了意外，返回时 ``proc`` 都已经退出、``returncode`` 可用，
++    并且握住的句柄都已释放。
++    """
++    if not _WINDOWS:  # pragma: no cover - 目标平台是 Windows
++        _kill_direct(proc)
++        _reap(proc)
++        return
++
++    victims: List[Tuple[int, int]] = []
++    try:
++        # 快照必须在动手之前：祖先一被结束，父子链就从进程表里消失了。
++        # 只有确认这个 PID 仍然是我们启动的那个子进程，才敢顺着父子关系往下清。
++        if root_created is None or _creation_time_of(proc) == root_created:
++            victims = _open_descendants(proc.pid, root_created)
++        if job is not None:
++            # 作业里就是这次运行的整棵树，一次结束干净；上面的快照只是兜底。
++            _terminate_job(job)
++        else:
++            # 连作业对象都没拿到，退回到 Windows 自带的 taskkill。
++            _taskkill_tree(proc.pid)
++        _kill_direct(proc)
++    except Exception:  # pragma: no cover - 清理失败也不能把异常抛给调用方
++        _kill_direct(proc)
++    finally:
++        _terminate_handles(victims)
++        _reap(proc)
++
++
++class ProcessTree:
++    """一次运行所拥有的进程树：直接子进程，加上它的全部后代。
++
++    ``popen`` 是直接子进程，``run()`` 从它身上取退出码；作业句柄只用于清理，
++    对外不可见。
++    """
++
++    __slots__ = ("popen", "_job", "_root_created")
++
++    def __init__(
++        self,
++        popen: subprocess.Popen,
++        job: Optional[int] = None,
++        root_created: Optional[int] = None,
++    ) -> None:
++        self.popen = popen
++        self._job = job
++        self._root_created = root_created
++
++    @property
++    def pid(self) -> int:
++        return self.popen.pid
++
++    @property
++    def returncode(self) -> Optional[int]:
++        return self.popen.returncode
++
++    def poll(self) -> Optional[int]:
++        return self.popen.poll()
++
++    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
++        """等**直接子进程**退出。
++
++        这里刻意不等输出管道 EOF：管道可能还捏在它的后代手里，等 EOF 就会一路
++        等到时间预算耗尽。输出由 ``runner`` 的收集线程单独负责。
++        """
++        return self.popen.wait(timeout=timeout)
++
++    def terminate(self) -> None:
++        """结束整棵进程树。
++
++        调用返回后直接子进程一定已经退出、``returncode`` 可用，
++        并且属于这次运行的后代进程也一并停止；其它进程不受影响。
++        """
++        _terminate_tree(self.popen, self._job, self._root_created)
++
++    def close(self) -> None:
++        """释放作业句柄。不会结束任何进程。"""
++        job, self._job = self._job, None
++        if job is not None and _WINDOWS:  # pragma: no branch - 目标平台是 Windows
++            _close_job(job)
++
++    def __del__(self) -> None:  # pragma: no cover - 兜底
++        try:
++            self.close()
++        except Exception:
++            pass
++
++
++def _prepare_job(popen: subprocess.Popen) -> Optional[int]:
++    """给刚启动的子进程套上作业对象；套不上就返回 ``None``（退回 taskkill 兜底）。"""
++    if not _WINDOWS:  # pragma: no cover - 目标平台是 Windows
++        return None
++    job = None
++    try:
++        job = _create_job()
++        if job is None:
++            return None
++        if not _assign_to_job(job, popen):
++            _close_job(job)
++            job = None
++            return None
++        return job
++    except Exception:  # pragma: no cover - 任何意外都不该影响这次运行
++        _close_job(job)
++        return None
++
++
++def _spawn(
++    command: Command, cwd: Optional[str], env: Optional[Mapping[str, str]]
+ ) -> subprocess.Popen:
+-    """启动一个子进程，把 stdout 与 stderr 合并到同一个管道里。"""
+     return subprocess.Popen(
+         [str(item) for item in command],
+         cwd=cwd,
+@@ -29,12 +468,49 @@ def start_process(
+     )
+ 
+ 
++def start_process_tree(
++    command: Command,
++    cwd: Optional[str] = None,
++    env: Optional[Mapping[str, str]] = None,
++) -> ProcessTree:
++    """启动一个子进程，并把它整棵树登记进一个专属于这次运行的作业对象。
++
++    stdout 与 stderr 合并到同一个管道，stdin 是空设备。
++    """
++    popen = _spawn(command, cwd, env)
++    try:
++        root_created = _creation_time_of(popen) if _WINDOWS else None
++        job = _prepare_job(popen)
++    except Exception:  # pragma: no cover - 防御性；子进程已经起来了，不能抛
++        root_created, job = None, None
++    return ProcessTree(popen, job, root_created)
++
++
++def start_process(
++    command: Command,
++    cwd: Optional[str] = None,
++    env: Optional[Mapping[str, str]] = None,
++) -> subprocess.Popen:
++    """启动一个子进程，把 stdout 与 stderr 合并到同一个管道里。
++
++    返回的 ``Popen`` 身上挂着它所属的 :class:`ProcessTree`，因此交给
++    :func:`terminate_process` 时会连同整棵进程树一起结束。
++    """
++    tree = start_process_tree(command, cwd=cwd, env=env)
++    tree.popen._wproc_tree = tree  # type: ignore[attr-defined]
++    return tree.popen
++
++
+ def terminate_process(proc: subprocess.Popen) -> None:
+-    """结束一个子进程。
++    """结束一个子进程，以及它启动的全部后代进程。
+ 
+     调用返回后 ``proc`` 一定已经退出，``proc.returncode`` 可用。
+     已经结束的进程不会被重复处理。
+     """
+-    if proc.poll() is None:
+-        proc.kill()
+-    proc.wait()
++    tree = getattr(proc, "_wproc_tree", None)
++    if tree is None:
++        _kill_direct(proc)
++        _reap(proc)
++        return
++    tree.terminate()
++    tree.close()
+diff --git a/wproc/runner.py b/wproc/runner.py
+index 45acdfd..bac40dd 100644
+--- a/wproc/runner.py
++++ b/wproc/runner.py
+@@ -1,9 +1,23 @@
+-"""``wproc.run()``：时间预算、输出收集与结果封装。"""
++"""``wproc.run()``：时间预算、输出收集与结果封装。
++
++Windows 上的输出管道有两个坑，这个模块就是围绕它们写的：
++
++1. ``Popen.communicate()`` 等到**管道 EOF** 才返回，而 EOF 要等所有还握着写端的
++   进程都退出。子进程顺手留下的后台后代（``cmd /c start``、``close_fds=False``
++   拉起来的孙进程……）会一直握着写端，于是一条早就退出的命令被硬生生拖到时间
++   预算耗尽，报成 ``timed_out=True``，退出码和输出全都对不上。
++   所以这里**只等直接子进程退出**，输出交给后台线程边产生边抽走。
++2. 到点终止时，已经写出来的输出不能丢。收集线程一直在把管道里的数据搬进内存，
++   所以终止整棵树之后再把线程收干净，超时返回的结果同样带着完整输出——
++   几百 KiB 的构建日志也一样。
++"""
+ 
+ from __future__ import annotations
+ 
+ import subprocess
+-from typing import Mapping, Optional, Sequence, Union
++import threading
++import time
++from typing import List, Mapping, Optional, Sequence, Tuple, Union
+ 
+ from . import processes
+ from .errors import CommandFailed, CommandNotStarted, CommandTimedOut
+@@ -11,6 +25,120 @@ from .results import RunResult
+ 
+ Command = Union[Sequence[str], "list[str]"]
+ 
++#: 每次从管道里搬走的块大小。输出必须边产生边读走，否则子进程会卡在写管道上。
++_READ_CHUNK = 1 << 16
++
++#: 观察收集线程时的轮询间隔。
++_POLL_INTERVAL = 0.01
++
++#: 只要还在读到新数据就继续等；连续这么久没有新数据，就认为「该写的都写完了」。
++_IDLE_GRACE = 0.5
++
++#: 直接子进程退出后抽干管道的硬上限：绝不允许一路等到时间预算耗尽。
++_DRAIN_LIMIT = 2.0
++
++#: 无论如何也要给收集线程留这么点时间，把管道里已经写好的数据搬进来。
++_MIN_DRAIN = 0.25
++
++#: 整棵树被结束之后所有写端都已关闭，管道必然到达 EOF，这只是兜底上限。
++_DRAIN_LIMIT_AFTER_KILL = 5.0
++
++
++class _OutputCollector:
++    """在后台线程里把合并后的输出管道抽干。
++
++    数据一到就搬进内存，因此：
++
++    * 子进程不会因为管道写满而卡住（大输出场景）；
++    * 它退出之后，已经写出来的内容都还在手上，哪怕管道还被后代捏着不肯 EOF；
++    * 被强制终止时，终止之前的输出也一条不丢。
++    """
++
++    __slots__ = ("_stream", "_chunks", "_nbytes", "_lock", "_thread")
++
++    def __init__(self, stream) -> None:
++        self._stream = stream
++        self._chunks: List[bytes] = []
++        self._nbytes = 0
++        self._lock = threading.Lock()
++        self._thread = threading.Thread(
++            target=self._pump, name="wproc-output", daemon=True
++        )
++        self._thread.start()
++
++    def _pump(self) -> None:
++        # ``read1`` 最多做一次底层读，有数据就立刻返回；``read(n)`` 会一直凑够
++        # n 个字节，那样就又变成「等到 EOF」了。
++        read = getattr(self._stream, "read1", None)
++        if read is None:  # pragma: no cover - 防御性
++            read = self._stream.read
++        try:
++            while True:
++                try:
++                    data = read(_READ_CHUNK)
++                except (OSError, ValueError):
++                    break
++                if not data:  # EOF：所有写端都关掉了
++                    break
++                with self._lock:
++                    self._chunks.append(data)
++                    self._nbytes += len(data)
++        finally:
++            try:
++                self._stream.close()
++            except (OSError, ValueError):  # pragma: no cover - 防御性
++                pass
++
++    def bytes_read(self) -> int:
++        with self._lock:
++            return self._nbytes
++
++    def value(self) -> bytes:
++        with self._lock:
++            return b"".join(self._chunks)
++
++    @property
++    def finished(self) -> bool:
++        """收集线程是否已经结束（也就是管道是否已经 EOF）。"""
++        return not self._thread.is_alive()
++
++    def drain(self, idle_grace: float, hard_limit: float) -> bytes:
++        """把管道里已有的数据抽干，返回目前收集到的全部输出。
++
++        线程结束（管道 EOF）就立刻返回；否则最多等到「连续 ``idle_grace`` 秒没有
++        新数据」或 ``hard_limit`` 秒，取先到者。这样既不会因为一个握着管道不放的
++        后代进程而干等，也不会把已经写出来的输出丢掉。
++        """
++        deadline = time.monotonic() + hard_limit
++        idle_deadline = 0.0
++        seen = -1
++        while self._thread.is_alive():
++            self._thread.join(_POLL_INTERVAL)
++            now = time.monotonic()
++            current = self.bytes_read()
++            if current != seen:
++                seen = current
++                idle_deadline = now + idle_grace
++            if now >= idle_deadline or now >= deadline:
++                break
++        return self.value()
++
++
++def _remaining(deadline: Optional[float]) -> Optional[float]:
++    """距离预算耗尽还剩多少秒；没有预算时返回 ``None``。"""
++    if deadline is None:
++        return None
++    return max(0.0, deadline - time.monotonic())
++
++
++def _drain_limits(timed_out: bool, deadline: Optional[float]) -> Tuple[float, float]:
++    """收集输出时的（静默宽限，硬上限）。"""
++    if timed_out:
++        return _IDLE_GRACE, _DRAIN_LIMIT_AFTER_KILL
++    if deadline is None:
++        return _IDLE_GRACE, _DRAIN_LIMIT
++    return _IDLE_GRACE, min(_DRAIN_LIMIT, max(_MIN_DRAIN, _remaining(deadline) or 0.0))
++
+ 
+ def run(
+     command: Command,
+@@ -21,6 +149,9 @@ def run(
+ ) -> RunResult:
+     """运行一条命令，收集输出并在超出 ``timeout`` 秒时终止它。
+ 
++    到点终止时结束的是**整棵进程树**：这次运行拉起来的后代进程一并停止，
++    返回之后不会再有属于它的进程继续活动；同一台机器上的其它进程不受影响。
++
+     Args:
+         command: 参数序列，例如 ``["python", "build.py"]``。不接受整串字符串。
+         timeout: 挂钟预算，单位秒；``None`` 表示不限制。
+@@ -37,21 +168,42 @@ def run(
+     if not argv:
+         raise ValueError("command must not be empty")
+ 
++    # 预算从这一刻开始算，进程创建本身也占预算。
++    deadline = None if timeout is None else time.monotonic() + timeout
++
+     try:
+-        proc = processes.start_process(argv, cwd=cwd, env=env)
++        tree = processes.start_process_tree(argv, cwd=cwd, env=env)
+     except OSError as exc:
+         raise CommandNotStarted(str(exc)) from exc
+ 
++    timed_out = False
+     try:
+-        output, _ = proc.communicate(timeout=timeout)
+-    except subprocess.TimeoutExpired:
+-        processes.terminate_process(proc)
+-        result = RunResult(returncode=proc.returncode, output=b"", timed_out=True)
+-        if check:
+-            raise CommandTimedOut(timeout, result)
+-        return result
++        try:
++            collector = _OutputCollector(tree.popen.stdout)
++        except BaseException:
++            # 连收集线程都起不来，就不能把这个子进程留在后台。
++            tree.terminate()
++            raise
+ 
+-    result = RunResult(returncode=proc.returncode, output=output or b"")
+-    if check and result.returncode != 0:
+-        raise CommandFailed(result)
++        try:
++            # 只等直接子进程本身：它一退出，这次运行就结束了，
++            # 不再为了等后代释放输出管道而耗到预算用完。
++            tree.wait(_remaining(deadline))
++        except subprocess.TimeoutExpired:
++            timed_out = True
++            tree.terminate()
++
++        idle_grace, hard_limit = _drain_limits(timed_out, deadline)
++        output = collector.drain(idle_grace, hard_limit)
++    finally:
++        tree.close()
++
++    result = RunResult(
++        returncode=tree.returncode, output=output or b"", timed_out=timed_out
++    )
++    if check:
++        if timed_out:
++            raise CommandTimedOut(timeout, result)
++        if result.returncode != 0:
++            raise CommandFailed(result)
+     return result

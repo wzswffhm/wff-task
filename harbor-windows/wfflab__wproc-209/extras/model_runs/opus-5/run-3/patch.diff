@@ -1,0 +1,235 @@
+diff --git a/wproc/processes.py b/wproc/processes.py
+index af7154d..44875bf 100644
+--- a/wproc/processes.py
++++ b/wproc/processes.py
+@@ -6,35 +6,91 @@
+ 
+ from __future__ import annotations
+ 
+-from typing import Mapping, Optional, Sequence
+-
++import os
+ import subprocess
++import sys
++from typing import Mapping, Optional, Sequence
+ 
+ Command = Sequence[str]
+ 
++# Windows 平台特定常量
++if sys.platform == "win32":
++    CREATE_NEW_PROCESS_GROUP = 0x00000200
++    DETACHED_PROCESS = 0x00000008
++
+ 
+ def start_process(
+     command: Command,
+     cwd: Optional[str] = None,
+     env: Optional[Mapping[str, str]] = None,
+ ) -> subprocess.Popen:
+-    """启动一个子进程，把 stdout 与 stderr 合并到同一个管道里。"""
++    """启动一个子进程，把 stdout 与 stderr 合并到同一个管道里。
++    
++    在 Windows 上：
++    - 使用 CREATE_NEW_PROCESS_GROUP 让子进程树可以被整体终止
++    - 关闭句柄继承以防止后代进程继承 stdout/stderr 管道
++    """
++    kwargs = {
++        "cwd": cwd,
++        "env": dict(env) if env is not None else None,
++        "stdin": subprocess.DEVNULL,
++        "stdout": subprocess.PIPE,
++        "stderr": subprocess.STDOUT,
++    }
++    
++    if sys.platform == "win32":
++        # 创建新进程组，便于整体终止
++        # 关闭句柄继承，防止后代进程继承管道句柄
++        kwargs["creationflags"] = CREATE_NEW_PROCESS_GROUP
++        kwargs["close_fds"] = True
++    
+     return subprocess.Popen(
+         [str(item) for item in command],
+-        cwd=cwd,
+-        env=dict(env) if env is not None else None,
+-        stdin=subprocess.DEVNULL,
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
++        **kwargs
+     )
+ 
+ 
+ def terminate_process(proc: subprocess.Popen) -> None:
+-    """结束一个子进程。
++    """结束一个子进程及其整个进程树。
+ 
+     调用返回后 ``proc`` 一定已经退出，``proc.returncode`` 可用。
+     已经结束的进程不会被重复处理。
+     """
+     if proc.poll() is None:
+-        proc.kill()
+-    proc.wait()
++        if sys.platform == "win32":
++            # 在 Windows 上使用 taskkill /T 终止整个进程树
++            _terminate_process_tree_windows(proc.pid)
++            # 等待进程退出
++            try:
++                proc.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                # 如果 taskkill 没生效，强制 kill
++                proc.kill()
++                proc.wait()
++        else:
++            proc.kill()
++            proc.wait()
++    else:
++        # 进程已经结束，确保 wait 被调用以清理资源
++        proc.wait()
++
++
++def _terminate_process_tree_windows(pid: int) -> None:
++    """在 Windows 上终止整个进程树。
++    
++    使用 taskkill /F /T 命令强制终止进程及其所有子进程。
++    """
++    try:
++        # /F: 强制终止
++        # /T: 终止进程树（包括所有子进程）
++        # /PID: 指定进程 ID
++        subprocess.run(
++            ["taskkill", "/F", "/T", "/PID", str(pid)],
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            timeout=10,
++            check=False,  # 进程可能已经退出，忽略错误
++        )
++    except (subprocess.TimeoutExpired, OSError):
++        # taskkill 失败时静默处理，后续的 kill() 会兜底
++        pass
+diff --git a/wproc/runner.py b/wproc/runner.py
+index 45acdfd..e71267f 100644
+--- a/wproc/runner.py
++++ b/wproc/runner.py
+@@ -3,6 +3,9 @@
+ from __future__ import annotations
+ 
+ import subprocess
++import sys
++import threading
++import time
+ from typing import Mapping, Optional, Sequence, Union
+ 
+ from . import processes
+@@ -42,11 +45,26 @@ def run(
+     except OSError as exc:
+         raise CommandNotStarted(str(exc)) from exc
+ 
++    # 在 Windows 上使用自定义的输出收集逻辑
++    if sys.platform == "win32":
++        return _run_windows(proc, timeout, check)
++    else:
++        return _run_posix(proc, timeout, check)
++
++
++def _run_posix(
++    proc: subprocess.Popen,
++    timeout: Optional[float],
++    check: bool,
++) -> RunResult:
++    """Linux/macOS 使用标准的 communicate()。"""
+     try:
+         output, _ = proc.communicate(timeout=timeout)
+-    except subprocess.TimeoutExpired:
++    except subprocess.TimeoutExpired as exc:
+         processes.terminate_process(proc)
+-        result = RunResult(returncode=proc.returncode, output=b"", timed_out=True)
++        # 从异常中提取已读取的输出
++        collected = exc.output if exc.output else b""
++        result = RunResult(returncode=proc.returncode, output=collected, timed_out=True)
+         if check:
+             raise CommandTimedOut(timeout, result)
+         return result
+@@ -55,3 +73,84 @@ def run(
+     if check and result.returncode != 0:
+         raise CommandFailed(result)
+     return result
++
++
++def _run_windows(
++    proc: subprocess.Popen,
++    timeout: Optional[float],
++    check: bool,
++) -> RunResult:
++    """Windows 专用：异步收集输出，直接子进程退出后立即返回。
++    
++    关键行为：
++    1. 使用线程异步读取输出，避免阻塞
++    2. 直接子进程退出后立即返回，不等待管道关闭
++    3. 超时时收集已读取的输出
++    """
++    output_chunks = []
++    output_lock = threading.Lock()
++    reader_done = threading.Event()
++
++    def read_output():
++        """在后台线程中读取输出。"""
++        try:
++            while True:
++                chunk = proc.stdout.read(4096)
++                if not chunk:
++                    break
++                with output_lock:
++                    output_chunks.append(chunk)
++        except Exception:
++            # 管道关闭或其他读取错误，静默退出
++            pass
++        finally:
++            reader_done.set()
++
++    # 启动输出读取线程
++    reader = threading.Thread(target=read_output, daemon=True)
++    reader.start()
++
++    start_time = time.time()
++    timed_out = False
++
++    # 轮询直接子进程状态
++    while True:
++        returncode = proc.poll()
++        
++        if returncode is not None:
++            # 直接子进程已退出，立即返回
++            # 给读取线程一点时间收集剩余输出
++            reader_done.wait(timeout=0.5)
++            break
++        
++        # 检查超时
++        if timeout is not None:
++            elapsed = time.time() - start_time
++            if elapsed >= timeout:
++                timed_out = True
++                processes.terminate_process(proc)
++                # 给读取线程一点时间收集输出
++                reader_done.wait(timeout=0.5)
++                break
++        
++        # 短暂休眠避免忙等
++        time.sleep(0.05)
++
++    # 收集所有输出
++    with output_lock:
++        output = b"".join(output_chunks)
++
++    if timed_out:
++        result = RunResult(
++            returncode=proc.returncode,
++            output=output,
++            timed_out=True
++        )
++        if check:
++            raise CommandTimedOut(timeout, result)
++        return result
++
++    result = RunResult(returncode=proc.returncode, output=output)
++    if check and result.returncode != 0:
++        raise CommandFailed(result)
++    return result

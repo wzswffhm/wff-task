@@ -1,0 +1,9 @@
+修复了 winstall 在 Windows 上的三类故障：
+
+1. **版本比较按数值**：重写 `parse_version` 和 `compare_versions`，将四段版本号解析为十进制整数元组比较，预发布版本（如 1.0.0-beta）低于正式版。现在 1.10.0 > 1.9.0。
+
+2. **文件占用延迟处理**：在 `apply_transaction` 中捕获 Windows 的 PermissionError，被占用的文件保持旧内容不变，记录到 `ApplyResult.deferred` 和清单的 `pending_replace`；占用解除后再次执行同一计划时完成替换。
+
+3. **失败回滚机制**：执行前备份所有待覆盖文件的内容，遇到不可延迟的失败时（如目标是同名目录）逐字节恢复已覆盖文件、删除新建文件、恢复清单版本号，并清理所有临时文件。
+
+所有 11 个回归测试通过，公开 API 形状未变，只修改了 `winstall/transaction.py` 和 `winstall/versions.py` 两个实现文件。
