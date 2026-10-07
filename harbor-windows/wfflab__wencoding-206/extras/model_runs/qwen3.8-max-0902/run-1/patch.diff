@@ -1,28 +1,36 @@
 diff --git a/wtextio/codec.py b/wtextio/codec.py
-index b29ef63..22c4084 100644
+index b29ef63..49211c5 100644
 --- a/wtextio/codec.py
 +++ b/wtextio/codec.py
-@@ -4,6 +4,11 @@
- 是当前 ANSI 代码页（英文系统上通常是 cp1252），而 Linux 上是 UTF-8；
- 同一个程序在两个平台上按默认值写文件，落盘的字节并不一样。
- 所以对需要跨平台交换的文本，必须显式选定编码。
+@@ -1,45 +1,76 @@
+ """文本编码的选择。
+ 
+ 同一个字节能表示什么，完全取决于用什么编码去解。Windows 的「系统默认编码」
+-是当前 ANSI 代码页（英文系统上通常是 cp1252），而 Linux 上是 UTF-8；
+-同一个程序在两个平台上按默认值写文件，落盘的字节并不一样。
+-所以对需要跨平台交换的文本，必须显式选定编码。
++是当前 ANSI 代码页（简体中文系统上是 cp936，英文系统上通常是 cp1252），而
++Linux 上一般是 UTF-8；同一段代码在两个平台上按平台默认值写文件，落盘的字节
++并不一样：非 ASCII 文本可能直接抛 ``UnicodeEncodeError``，也可能写成功却在
++另一台机器上变成乱码。
 +
-+关键一点：``open()`` 收到 ``encoding=None`` 时会退回平台默认编码。所以「默认」
-+这个别名绝不能解析成 ``None``——那等于把编码选择权交回给平台，中文会在
-+Windows 上直接抛 ``UnicodeEncodeError``，重音字母会落盘成 cp1252 字节，
-+读回自己写的 UTF-8 文件也会变成乱码。本库的默认永远是显式的 UTF-8。
++所以对需要跨平台交换的文本，必须显式选定编码。本库把「默认」固定为 UTF-8，
++不随平台变化；需要字节序标记时使用带 BOM 的 UTF-8 变体（``utf-8-sig``）。
  """
  
  import locale
-@@ -15,12 +20,17 @@ DEFAULT_ENCODING = "utf-8"
+ 
+-#: 本库在「默认」情形下应当使用的编码。
++#: 本库在「默认」情形下应当使用的编码。固定为 UTF-8，与平台无关。
+ DEFAULT_ENCODING = "utf-8"
+ 
+ #: 带字节序标记的 UTF-8。
  BOM_ENCODING = "utf-8-sig"
  
  #: 编码别名到 ``open()`` 可接受名称的映射。
 +#:
-+#: 每一项都是一个显式的编码名，没有 ``None``：默认与 UTF-8 系别名都落到
-+#: :data:`DEFAULT_ENCODING`，需要 BOM 时落到 :data:`BOM_ENCODING`
-+#: （``utf-8-sig`` 会在写入时补 BOM、在读取时吃掉开头的 BOM）。
-+#: ``ansi`` 仍然指平台当前的 ANSI 代码页，只在确实要跟本地遗留程序交换时才用。
++#: 值一律是显式的编码名，不再出现 ``None``：``None`` 等于把选择权交回
++#: ``open()``，也就是交回平台默认值，那正是本库要避免的事情。
  ALIASES = {
 -    "default": None,
 -    "utf8": None,
@@ -37,15 +45,29 @@ index b29ef63..22c4084 100644
      "ansi": "mbcs",
      "latin-1": "latin-1",
      "cp1252": "cp1252",
-@@ -28,14 +38,20 @@ ALIASES = {
+ }
  
++#: 别名里可以随意出现、且不影响含义的分隔符。
++_SEPARATORS = frozenset("-_ \t")
++
++
++def normalize_alias(name):
++    """把编码别名归一化，便于比较。
++
++    去掉首尾空白、转小写、忽略 ``-`` / ``_`` / 空白分隔符，于是 ``UTF-8-BOM``、
++    ``utf_8_bom``、``utf8bom`` 归一化后是同一个键。``None`` 归一化成空字符串。
++    """
++    if name is None:
++        return ""
++    return "".join(ch for ch in str(name).strip().lower() if ch not in _SEPARATORS)
++
  
  def system_encoding():
 -    """返回当前平台的系统默认文本编码。"""
 +    """返回当前平台的系统默认文本编码。
 +
-+    只作为诊断信息：本库自己不会拿它当默认值，否则同一份代码在不同平台上
-+    会写出不同的字节。
++    只用于诊断和日志。本库不会拿它当默认值，否则同一段代码在不同平台上会写出
++    不同的字节。
 +    """
      return locale.getpreferredencoding(False)
  
@@ -54,111 +76,96 @@ index b29ef63..22c4084 100644
      """返回写读文件时应当交给 ``open()`` 的编码名。
  
 -    ``None`` 表示交给 ``open()`` 使用平台默认值。
-+    ``None``、空串和 ``"default"`` 都解析为 :data:`DEFAULT_ENCODING`（UTF-8），
-+    其余别名查 :data:`ALIASES`，不认识的名称原样交给 ``open()``。
-+    返回值始终是显式的编码名，落盘字节因此不随平台变化。
++    - ``None`` / ``"default"`` / 各种写法的 UTF-8 别名 → ``"utf-8"``
++    - 带 BOM 的写法（``utf-8-bom`` / ``utf-8-sig`` / ``UTF_8_BOM`` / ``utf8sig`` …）
++      → ``"utf-8-sig"``
++    - 其余名称原样透传，交给 ``open()`` 解释
      """
-     key = (name or "default").lower()
-     if key in ALIASES:
+-    key = (name or "default").lower()
+-    if key in ALIASES:
+-        return ALIASES[key]
++    key = normalize_alias(name)
++    if not key:
++        return DEFAULT_ENCODING
++    for alias, resolved in ALIASES.items():
++        if normalize_alias(alias) == key:
++            return resolved or DEFAULT_ENCODING
+     return name
+ 
+ 
 diff --git a/wtextio/reader.py b/wtextio/reader.py
-index 0524d8d..2d0bf56 100644
+index 0524d8d..3662eb9 100644
 --- a/wtextio/reader.py
 +++ b/wtextio/reader.py
-@@ -1,10 +1,21 @@
--"""从文件读回文本。"""
-+"""从文件读回文本。
-+
-+读取侧必须和写入侧用同一套编码策略：写出去是 UTF-8，读回来也要按 UTF-8 解。
-+如果这里交给 ``open()`` 用平台默认值，Windows 上就会按当前 ANSI 代码页去解
-+UTF-8 字节，中文和重音字母全成乱码。
-+"""
- 
- from .codec import encoding_for
+@@ -4,7 +4,12 @@ from .codec import encoding_for
  
  
  def read_text(path, encoding="default"):
 -    """读回整个文件。"""
 +    """读回整个文件。
 +
-+    ``encoding`` 与 :func:`wtextio.writer.write_text` 走同一个
-+    :func:`wtextio.codec.encoding_for`，默认 UTF-8，所以本库写出的文件
-+    用默认参数就能原样读回。``newline=""`` 表示不做换行翻译，
-+    磁盘上的 CRLF 原样交回调用方。
++    默认编码与 :func:`wtextio.write_text` 相同（UTF-8），因此本库写出的文件在
++    任何平台上都能按原样解回，外部生成的 UTF-8 文件也能正确读出，而不会被当成
++    系统 ANSI 代码页解成乱码。换行不做翻译，磁盘上的 CRLF 原样返回。
 +    """
      with open(path, "r", encoding=encoding_for(encoding), newline="") as fh:
          return fh.read()
  
 diff --git a/wtextio/writer.py b/wtextio/writer.py
-index b434479..544b8a7 100644
+index b434479..2691362 100644
 --- a/wtextio/writer.py
 +++ b/wtextio/writer.py
-@@ -1,24 +1,85 @@
+@@ -1,24 +1,68 @@
 -"""把文本写入文件。"""
 +"""把文本写入文件。
- 
--from .codec import encoding_for
-+落盘策略与平台无关，只有两条：
 +
-+* 编码由 :func:`wtextio.codec.encoding_for` 显式给出（默认 UTF-8），
-+  绝不传 ``None`` 让 ``open()`` 退回系统 ANSI 代码页；
-+* 换行固定翻译成 CRLF，并且不会因为文本里本来就带 CRLF 而写成 ``\\r\\r\\n``。
++落盘策略有两条：
++
++1. 编码由 :mod:`wtextio.codec` 决定，默认 UTF-8，不随平台变化；
++2. 换行固定为 CRLF，而且不能翻倍。
++
++第 2 条不能交给 ``open(..., newline="\\r\\n")`` 去做：那种翻译只认 ``\\n``，
++文本里本来就有的 ``\\r\\n`` 会被翻成 ``\\r\\r\\n``，而单独的 ``\\r`` 又会原样
++留在文件里。所以这里先把 CR / LF / CRLF 统一归一，再以 ``newline=""``（关闭
++翻译）原样落盘。
 +"""
-+
-+import os
-+
-+from .codec import BOM_ENCODING, DEFAULT_ENCODING, encoding_for
-+
-+#: 这些 ``newline`` 取值下 ``open()`` 不做换行翻译，文本原样落盘。
-+_NO_TRANSLATION = ("", "\n")
-+
-+
-+def _for_disk(text, newline):
-+    """把 ``text`` 整理成落盘后换行恰好是 ``newline`` 的形式。
-+
-+    ``open(..., newline="\\r\\n")`` 会把写入的每个 ``\\n`` 翻译成 ``\\r\\n``。
-+    文本里本来就有的 CRLF 如果不先折叠成 LF，就会被翻译成 ``\\r\\r\\n``
-+    ——磁盘上多出一个回车，读回来每行之间夹一个空行。先折叠、再交给翻译，
-+    换行就恰好是 CRLF；``\\r\\n``、``\\n`` 混用的文本也一样被统一。
-+
-+    调用方显式要求不翻译时（``newline`` 为 ``""`` 或 ``"\\n"``）原样写入，
-+    不动文本里的任何字符。
-+    """
-+    if newline in _NO_TRANSLATION:
-+        return text
-+    return text.replace("\r\n", "\n")
-+
-+
-+def _append_encoding(path, encoding):
-+    """返回追加时实际使用的编码名。
-+
-+    ``utf-8-sig`` 的编码器每开一次流都先吐一个 BOM。往已经有内容的文件里追加
-+    时，那会在文件中间插进一个 BOM，把后面的内容变成乱码；只有文件还是空的
-+    时候（新建或被清空）才需要写 BOM。
-+    """
-+    codec = encoding_for(encoding)
-+    if codec == BOM_ENCODING and _has_content(path):
-+        return DEFAULT_ENCODING
-+    return codec
-+
-+
-+def _has_content(path):
-+    """``path`` 是否已经存在且非空。"""
-+    try:
-+        return os.path.getsize(path) > 0
-+    except OSError:
-+        return False
  
+ from .codec import encoding_for
  
- def write_text(path, text, encoding="default", newline="\r\n"):
++#: 落盘使用的换行序列。
++CRLF = "\r\n"
++
++#: ``newline`` 参数可以取的值；其余取值（含 ``None`` / ``""``）一律回落到 CRLF。
++_NEWLINE_CHOICES = ("\r\n", "\n", "\r")
++
++
++def normalize_newlines(text, newline=CRLF):
++    """把 ``text`` 里已有的 CR / LF / CRLF 统一成 ``newline``。
+ 
+-def write_text(path, text, encoding="default", newline="\r\n"):
 -    """把 ``text`` 写入 ``path``，返回写入的字符数。"""
+-    with open(path, "w", encoding=encoding_for(encoding), newline=newline) as fh:
+-        fh.write(text)
++    归一化后的文本不会再出现 ``\\r\\r\\n`` 这类翻倍的换行。
++    """
++    if not text:
++        return text
++    if newline not in _NEWLINE_CHOICES:
++        newline = CRLF
++    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
++    if newline != "\n":
++        normalized = normalized.replace("\n", newline)
++    return normalized
++
++
++def write_text(path, text, encoding="default", newline=CRLF):
 +    """把 ``text`` 写入 ``path``，返回写入的字符数。
 +
-+    ``encoding`` 经 :func:`wtextio.codec.encoding_for` 解析，默认 UTF-8，
-+    因此中文、重音字母落盘的就是 UTF-8 字节，不随平台变化。
++    编码默认 UTF-8（见 :func:`wtextio.codec.encoding_for`），换行默认归一成
++    CRLF 落盘。
 +    """
-     with open(path, "w", encoding=encoding_for(encoding), newline=newline) as fh:
--        fh.write(text)
-+        fh.write(_for_disk(text, newline))
++    with open(path, "w", encoding=encoding_for(encoding), newline="") as fh:
++        fh.write(normalize_newlines(text, newline))
      return len(text)
  
  
@@ -168,11 +175,11 @@ index b434479..544b8a7 100644
 -        fh.write(text)
 +    """在 ``path`` 末尾追加 ``text``，返回追加的字符数。
 +
-+    追加与写入使用同一套编码策略，所以同一段文本不会因为分成两次写
-+    就出现两种编码。
++    追加同样按 UTF-8 编码、按 CRLF 归一换行；带 BOM 的编码在追加时不会再插入
++    一个 BOM。
 +    """
-+    with open(path, "a", encoding=_append_encoding(path, encoding), newline="\r\n") as fh:
-+        fh.write(_for_disk(text, "\r\n"))
++    with open(path, "a", encoding=encoding_for(encoding), newline="") as fh:
++        fh.write(normalize_newlines(text))
      return len(text)
  
  
@@ -181,11 +188,11 @@ index b434479..544b8a7 100644
 -    return write_text(path, "\r\n".join(lines) + "\r\n", encoding=encoding) if lines else write_text(
 -        path, "", encoding=encoding
 -    )
-+    """把若干行写成文本文件，返回写入的行数。
++    """把若干行写成以 CRLF 结尾的文本文件。
 +
-+    每行之间以及最后一行之后都是 CRLF；行内已有的换行同样按 CRLF 归一。
++    返回值与 :func:`write_text` 一致（写入的字符数）。``lines`` 为空时写出一个
++    0 字节的文件。
 +    """
-+    lines = list(lines)
-+    text = "\n".join(lines) + "\n" if lines else ""
-+    write_text(path, text, encoding=encoding)
-+    return len(lines)
++    if not lines:
++        return write_text(path, "", encoding=encoding)
++    return write_text(path, CRLF.join(lines) + CRLF, encoding=encoding)

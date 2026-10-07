@@ -1,0 +1,18 @@
+修复 wexec 在 Windows 上按名字查找/执行非 .exe 命令的三个缺陷，只改了 wexec/resolve.py 与 wexec/runner.py 两个实现文件（公开签名与既有语义保持不变，未新增第三方依赖，未触碰 tests/）。
+
+## wexec/resolve.py
+1. `executable_extensions()` 原来无条件返回兜底值 `(".exe",)`，现在真正解析 `PATHEXT`：按 `os.pathsep` 切分、去空白、丢弃空项、缺前导点时补上，并**保持 PATHEXT 声明的顺序与写法**；`PATHEXT` 缺失/为空时才回退到 `EXECUTABLE_EXTENSIONS`（保持原文档语义）。
+2. 新增 `candidate_names(name, extensions)`，按 `cmd.exe` 的真实规则生成候选名：
+   - 名字不带扩展名 → 依次拼接 PATHEXT 中的每个扩展名（顺序即优先级）；
+   - 名字已带 PATHEXT 声明的扩展名（`direct.CMD`、`tool.exe`）→ 只试它自己，绝不叠加成 `tool.exe.exe`（大小写不敏感比较，`.CMD`/`.cmd` 都认）；
+   - 名字带其它扩展名（`python3.12`）→ 先试原样再补 PATHEXT 扩展名，与 cmd.exe 实测行为一致，避免误伤带点但不是扩展名的名字。
+3. `resolve()` 改为「外层遍历 PATH 目录（去重）、内层按 PATHEXT 顺序试候选名」，与实测的 cmd.exe 解析顺序（目录优先）一致；名字含路径分隔符时只按给定位置解析、不再跑遍 PATH；仍返回 `os.path.abspath`，找不到抛 `CommandNotFound`。
+4. 新增 `_real_case()`：命中后用 `os.scandir` 换回磁盘上的真实大小写写法，避免 PATHEXT 大小写与文件名大小写不一致时返回与文件系统不符的路径（`hello.CMD` 不会变成 `hello.cmd`）；扫描失败时安全回退。
+
+## wexec/runner.py
+1. 新增 `INTERPRETER_EXTENSIONS = (".bat", ".cmd")` 与 `needs_command_interpreter()`：批处理脚本不能再直接交给 CreateProcess（WinError 193），必须经命令解释器启动。
+2. 新增 `command_interpreter()`：优先用 `%COMSPEC%`（存在性校验），否则 `resolve("cmd.exe")`，最后兜底字面量 `cmd.exe`——不依赖调用方设置的 PATHEXT/PATH。
+3. 新增 `_quote_for_cmd()` / `build_command_line()`：把命令行包成 `"<cmd.exe>" /D /S /C "<脚本> <参数…>"`（`/D` 跳过 AutoRun，`/S` 让 cmd 稳定剥掉最外层引号），参数按 list2cmdline 规则加引号，并对 `&|<>()^` 等 cmd 控制字符补引号保护；实测路径含空格、含 `( ) &`、参数含空格/元字符、空参数都能正确送达脚本。（对比过 `^` 脱字符方案：因 `cmd /c` 存在二次解析会失效，故采用引号方案。）
+4. `run()` 对批处理走上述命令行字符串、对普通可执行文件仍走原来的列表调用，`capture_output/text/timeout` 等参数不变；`cmd /c` 会原样带回脚本退出码，`run_ok()` 因此能如实反映失败码与 stderr。
+
+验证：仓库自带 5 个测试通过；另用系统临时目录里的一次性脚本逐条验证了 4 条验收标准及 LF 行尾脚本、嵌套 call/label、多目录 PATH、PATHEXT 缺失回退、COMSPEC 缺失、PATH 重复目录、绝对路径直调等边界，全部通过。验证脚本已删除，`__pycache__`/`.pytest_cache` 已清理，`git status` 只显示这两个实现文件的修改。

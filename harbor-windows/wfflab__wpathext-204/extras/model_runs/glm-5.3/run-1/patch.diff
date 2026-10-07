@@ -1,0 +1,737 @@
+diff --git a/_tmp_check.py b/_tmp_check.py
+new file mode 100644
+index 0000000..255db28
+--- /dev/null
++++ b/_tmp_check.py
+@@ -0,0 +1,227 @@
++import os
++import pathlib
++import subprocess
++import tempfile
++import time
++
++from wexec import CommandNotFound, executable_extensions, resolve, run, run_ok
++
++ok = fail = 0
++
++
++def check(label, cond, extra=""):
++    global ok, fail
++    if cond:
++        ok += 1
++        print("PASS  %s" % label)
++    else:
++        fail += 1
++        print("FAIL  %s  %s" % (label, extra))
++
++
++ORIG_PATH = os.environ["PATH"]
++ORIG_PATHEXT = os.environ["PATHEXT"]
++
++# ---------------------------------------------------------------- extensions
++print("PATHEXT default:", executable_extensions())
++check("default ext tuple", isinstance(executable_extensions(), tuple))
++
++os.environ["PATHEXT"] = ".CMD;.EXE;.BAT"
++check("pathext read", executable_extensions() == (".CMD", ".EXE", ".BAT"),
++      executable_extensions())
++os.environ["PATHEXT"] = ".cmd;.exe;.bat"
++check("pathext case kept", executable_extensions() == (".cmd", ".exe", ".bat"),
++      executable_extensions())
++os.environ["PATHEXT"] = "CMD;.EXE"
++check("dot normalization", executable_extensions() == (".CMD", ".EXE"),
++      executable_extensions())
++os.environ["PATHEXT"] = ".EXE;.EXE;"
++check("dupes dropped", executable_extensions() == (".EXE",), executable_extensions())
++del os.environ["PATHEXT"]
++check("fallback", executable_extensions() == (".exe",), executable_extensions())
++os.environ["PATHEXT"] = ""
++check("empty fallback", executable_extensions() == (".exe",), executable_extensions())
++os.environ["PATHEXT"] = ORIG_PATHEXT
++
++# ------------------------------------------------------------------ resolve
++d = tempfile.mkdtemp(prefix="wexec_t_")
++os.environ["PATH"] = d
++
++hello = os.path.join(d, "hello.CMD")
++with open(hello, "w") as f:
++    f.write("@echo off\necho hello-from-cmd\n")
++check("resolve hello (upper ext)", resolve("hello") == hello, resolve("hello"))
++
++os.remove(hello)
++hello_lower = os.path.join(d, "hello.cmd")
++with open(hello_lower, "w") as f:
++    f.write("@echo off\necho hello-from-cmd\n")
++check("resolve hello (lower ext on disk)", resolve("hello") == hello_lower,
++      resolve("hello"))
++
++direct = os.path.join(d, "direct.CMD")
++with open(direct, "w") as f:
++    f.write("@echo off\necho direct\n")
++check("resolve direct.CMD", resolve("direct.CMD") == direct, resolve("direct.CMD"))
++check("resolve direct.cmd", resolve("direct.cmd") == direct, resolve("direct.cmd"))
++
++tool = os.path.join(d, "tool.exe")
++with open(tool, "wb") as f:
++    f.write(b"")
++check("resolve tool.exe not doubled", resolve("tool.exe") == tool, resolve("tool.exe"))
++check("resolve tool -> tool.exe", resolve("tool") == tool, resolve("tool"))
++os.remove(tool)
++
++a_cmd = os.path.join(d, "multi.cmd")
++a_exe = os.path.join(d, "multi.exe")
++for p in (a_cmd, a_exe):
++    with open(p, "wb") as f:
++        f.write(b"")
++os.environ["PATHEXT"] = ".CMD;.EXE"
++check("order cmd first", resolve("multi") == a_cmd, resolve("multi"))
++os.environ["PATHEXT"] = ".EXE;.CMD"
++check("order exe first", resolve("multi") == a_exe, resolve("multi"))
++os.remove(a_cmd)
++os.remove(a_exe)
++
++d2 = tempfile.mkdtemp(prefix="wexec_t2_")
++os.environ["PATH"] = os.pathsep.join([d2, d])
++first = os.path.join(d2, "multi.exe")
++second = os.path.join(d, "multi.cmd")
++for p in (first, second):
++    with open(p, "wb") as f:
++        f.write(b"")
++os.environ["PATHEXT"] = ".CMD;.EXE"
++check("dir order wins", resolve("multi") == first, resolve("multi"))
++os.remove(first)
++os.remove(second)
++
++os.environ["PATH"] = d
++for name in ("nope-not-here", "nope.exe", ""):
++    try:
++        resolve(name)
++        check("missing %r raises" % name, False)
++    except CommandNotFound:
++        check("missing %r raises" % name, True)
++
++check("resolve absolute", resolve(direct) == direct, resolve(direct))
++check("resolve PathLike", resolve(pathlib.Path(direct)) == direct, resolve(direct))
++
++os.makedirs(os.path.join(d, "dircmd.cmd"), exist_ok=True)
++try:
++    resolve("dircmd")
++    check("dir not matched", False, resolve("dircmd"))
++except CommandNotFound:
++    check("dir not matched", True)
++
++sub = os.path.join(d, "sub")
++os.makedirs(sub, exist_ok=True)
++with open(os.path.join(sub, "rel.exe"), "wb") as f:
++    f.write(b"")
++old_cwd = os.getcwd()
++os.chdir(d)
++check("relative subdir", resolve(os.path.join("sub", "rel")) ==
++      os.path.join(sub, "rel.exe"), resolve(os.path.join("sub", "rel")))
++os.chdir(old_cwd)
++
++# --------------------------------------------------------------------- run
++os.environ["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
++
++with open(os.path.join(d, "hello.CMD"), "w") as f:
++    f.write("@echo off\necho hello-from-cmd\n")
++proc = run(["hello"])
++check("run cmd script rc", proc.returncode == 0, proc)
++check("run cmd script out", proc.stdout.strip() == "hello-from-cmd", repr(proc.stdout))
++
++with open(os.path.join(d, "hello.bat"), "w") as f:
++    f.write("@echo off\necho hello-from-bat\n")
++os.environ["PATHEXT"] = ".BAT;.CMD"
++proc = run(["hello"])
++check("run bat script out", proc.stdout.strip() == "hello-from-bat", repr(proc.stdout))
++check("run_ok on bat", run_ok(["hello"]) == "hello-from-bat")
++
++with open(os.path.join(d, "exit3.cmd"), "w") as f:
++    f.write("@echo off\nexit /b 3\n")
++check("exit /b 3 rc", run(["exit3"]).returncode == 3, run(["exit3"]).returncode)
++
++with open(os.path.join(d, "exit7.bat"), "w") as f:
++    f.write("@echo off\nexit 7\n")
++check("exit 7 rc", run(["exit7"]).returncode == 7, run(["exit7"]).returncode)
++
++with open(os.path.join(d, "echomsg.cmd"), "w") as f:
++    f.write("@echo off\necho [%1]\n")
++proc = run(["echomsg", "one"])
++check("simple arg passes", proc.stdout.strip() == "[one]", repr(proc.stdout))
++proc = run(["echomsg", "two words"])
++check("spaced arg reaches script", "two words" in proc.stdout, repr(proc.stdout))
++proc = run(["echomsg", "-DFOO=bar(x)"])
++check("parens arg", proc.returncode == 0 and "bar(x)" in proc.stdout,
++      (proc.returncode, repr(proc.stdout), repr(proc.stderr)))
++proc = run(["echomsg", "x&y"])
++check("ampersand arg", proc.returncode == 0 and "x&y" in proc.stdout,
++      (proc.returncode, repr(proc.stdout), repr(proc.stderr)))
++proc = run(["echomsg", "a|b<c>d^e"])
++check("meta arg", proc.returncode == 0, (proc.returncode, repr(proc.stdout),
++                                         repr(proc.stderr)))
++proc = run(["echomsg", ""])
++check("empty arg survives", proc.returncode == 0, (proc.returncode, proc.stdout))
++
++with open(os.path.join(d, "both.cmd"), "w") as f:
++    f.write("@echo off\necho out-line\necho err-line 1>&2\nexit /b 5\n")
++proc = run(["both"])
++check("stderr captured", proc.stderr.strip() == "err-line", repr(proc.stderr))
++check("rc 5", proc.returncode == 5, proc.returncode)
++try:
++    run_ok(["both"])
++    check("run_ok raises on failure", False)
++except RuntimeError as exc:
++    check("run_ok raises on failure", True, str(exc))
++
++sp = tempfile.mkdtemp(prefix="wexec space_")
++os.environ["PATH"] = sp
++with open(os.path.join(sp, "hello.CMD"), "w") as f:
++    f.write("@echo off\necho spaced\nexit /b 2\n")
++proc = run(["hello"])
++check("spaced path run", proc.returncode == 2 and proc.stdout.strip() == "spaced",
++      (proc.returncode, proc.stdout))
++proc = run(["hello", "a b", "c"])
++check("spaced path with args", proc.returncode == 2,
++      (proc.returncode, proc.stdout, proc.stderr))
++
++os.environ["PATH"] = ORIG_PATH
++os.environ["PATHEXT"] = ORIG_PATHEXT
++proc = run(["cmd", "/c", "exit 4"])
++check("exe run rc", proc.returncode == 4, proc.returncode)
++check("exe run output", run_ok(["cmd", "/c", "echo hi"]) == "hi")
++
++os.environ["PATH"] = sp
++with open(os.path.join(sp, "slow.cmd"), "w") as f:
++    f.write("@echo off\n%SystemRoot%\\System32\\ping.exe -n 4 127.0.0.1 >nul\n")
++try:
++    run(["slow"], timeout=1)
++    check("timeout", False)
++except subprocess.TimeoutExpired:
++    check("timeout", True)
++
++proc = run([os.path.join(sp, "hello.CMD")])
++check("run absolute script", proc.returncode == 2, proc.returncode)
++
++os.environ["COMSPEC"] = ""
++proc = run(["hello"])
++check("no COMSPEC fallback", proc.returncode == 2 and proc.stdout.strip() == "spaced",
++      (proc.returncode, proc.stdout, proc.stderr))
++del os.environ["COMSPEC"]
++proc = run(["hello"])
++check("COMSPEC deleted fallback", proc.returncode == 2, (proc.returncode, proc.stderr))
++os.environ["COMSPEC"] = r"C:\Windows\system32\cmd.exe"
++
++os.environ["PATH"] = ORIG_PATH
++os.environ["PATHEXT"] = ORIG_PATHEXT
++t0 = time.perf_counter()
++for _ in range(5):
++    resolve("cmd")
++print("resolve('cmd') x5: %.3fs" % (time.perf_counter() - t0))
++check("resolve cmd", os.path.isfile(resolve("cmd")))
++
++print()
++print("passed=%d failed=%d" % (ok, fail))
+diff --git a/_tmp_check2.py b/_tmp_check2.py
+new file mode 100644
+index 0000000..252c8d1
+--- /dev/null
++++ b/_tmp_check2.py
+@@ -0,0 +1,22 @@
++import os
++import subprocess
++import tempfile
++
++from wexec import run
++
++# cmd 的批处理参数本身就用 = , ; 分隔，这里只验证括号不会被
++# 我们的命令行层破坏（退出码为 0、前半段原样到达）。
++d = tempfile.mkdtemp(prefix="wexec_paren_")
++os.environ["PATH"] = d
++os.environ["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
++with open(os.path.join(d, "echomsg.cmd"), "w") as f:
++    f.write("@echo off\necho [%1]\n")
++
++for arg, expect in [("-DFOO=bar(x)", "-DFOO"), ("plain", "plain"), ("a^b", "a^b"),
++                    ("x&y", "x&y"), ("two words", "two words")]:
++    proc = run(["echomsg", arg])
++    print("%-16r rc=%s out=%r" % (arg, proc.returncode, proc.stdout.strip()))
++    assert proc.returncode == 0, (arg, proc.returncode, proc.stderr)
++    assert expect in proc.stdout, (arg, proc.stdout)
++
++print("all ok")
+diff --git a/tests/__pycache__/__init__.cpython-39.pyc b/tests/__pycache__/__init__.cpython-39.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b12909406ab62778c09650c309c71530f2d4cd0b
+GIT binary patch
+literal 195
+zcmYe~<>g`kg0HvtW`XF(AOaaM0yz#qT+9L_QW%06G#UL?G8BP?5yY<yXRDad;?$zz
+z7{`>{%)HFvlA^?t{Gu4gf&!PslEfIF{N%)(n2^-mf|&BOG~LAX)VvZ9D<?52KEAvl
+zu_Pn4qD0roz$7L;Cs)^0&p4*2G*8zsrX;nvq&Ox%9%y7qe7s&k<t+}I-29Z%oK!oI
+J3qAue0{}`CHJAVZ
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/test_wexec_basic.cpython-39-pytest-8.4.2.pyc b/tests/__pycache__/test_wexec_basic.cpython-39-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..fee02cc66cd52235db5644112755d60cbb7f52ec
+GIT binary patch
+literal 2969
+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
+A4gdfE
+
+literal 0
+HcmV?d00001
+
+diff --git a/wexec/__pycache__/__init__.cpython-39.pyc b/wexec/__pycache__/__init__.cpython-39.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fc8c167910643cc541c4ebad2dd2919c4f25fbc
+GIT binary patch
+literal 828
+zcmYjQO-~a+7~Zzq4;BerNIdSrOAl=X^g@iWVvQ!Gnot7SY%;TSmr~r>ZFaXUdRhby
+zH5ep*5mG-efIw9ApdbtNf2=p?EbNJs7f;SCiD5GHWZud9JnzTMNF5y<L&l%q2a`)-
+zhB>0f`9aQ@8)TV-1Y|~F<d7UzLnthSQACJ@s2x#R6cwT<Cd3dcuqZCXgL76*pf;fm
+zaRNu|sL)<y<k*Lha6yg_G08;bQix${%9K*z5A7FZ@_1p}fAbzUzIyN0ym}M={NdF<
+zo~+FCBPC7NYbM{?eR8}!i&tOyGaGpEpyjL{*^fESdpnDrJ-oAq=XU((&0}W)@9z2y
+z`(%9@H#YeDnfx6}_2%pN*;D-aHQsipeBgh&zYHNV$0{XNhVaOqhEOYMlTxtfAS|eo
+zR!kLC2oLRbGI^?aE+715rsaI{8e90+oVT>iLzpHdL3p}9@73*=vvyXCZ#yT=MdIVH
+zIGjKI9XGf5enqQRC8HnG1hb=g$dlr{`X>JNlH}>H?BTryTAxq)#3aLR=YWooq{%tm
+zx~*3<+2uyEq<dMz(2XSPc4tSk1H<{u&A}`nYT4Y--Fvwqx0`mjVo77F0+cCB(ae&r
+znQq)rOkJ%iZo8>SMqvWTCBq~^B1T1XV+4Ty;8C<M-J9-7CJg!v43<KKLX<*`LV`jY
+zg*bs+vcru7AnOGH+?YZWGtamIEnoyHfdFL$p)}(8U&w6-psE-&OCmzlBvl1qlQBAJ
+z6bgSQ2KvQellX`k8I`n>X&I8G8)Bwhz9m_bIH(sSRm>}>EY`-yQ&LgUEV@&rF#u|1
+z$(kUINcCR6A{JGYx|;42Nxi8aF?ft307TLPAYFdwCaxh}uBgg&dIcu^Dr~$fbTQNw
+HX2bsg7UMYy
+
+literal 0
+HcmV?d00001
+
+diff --git a/wexec/__pycache__/errors.cpython-39.pyc b/wexec/__pycache__/errors.cpython-39.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a51eb65da896cc7920fd1fff9097383307cac4d
+GIT binary patch
+literal 628
+zcmb7AO-mb56rC^42bKB@BnuaH5vi?iN)dyNc2R<0N+CRWyv}>k$jrR)%?wF*AqF&U
+zU5KtEw3{vzN@;gNO-ujAbZKVt3*5N!zR}VOZoF{syJzNd&OMimjb#;xi$DF1-|(JG
+z@P8Np79hPxP^eN-mKCZ}t*uavsatwQ1FTa6u)#FIIvrV6rbdGa7_YMiGjoIfui?Sb
+z@UR`7wW3~c_~SJC^x?eOGGXFYsDKtAy>Tc^si+{QQ57gPpwz?cn<DTPh2SEgkGo%^
+zll{2UjJus1ZV>r=0t!H1IyS;I#tyL=#$gs?o72FO{R50Q17h9$NnuR6iSe-_QlOiZ
+z%j)7Y^x9*>Lj`KroSNqg;&XutuKR-c1ij)Wu~3=WE~;0nd9ubFUv?IGi*em0{yJ;;
+z`6rKO(VAuF=cb<`5jgo7lw1TcX~COz-wA11Uf9#1q}2r9`z{X`xos1Nmbkyf1BV8a
+zKo)h6aw~=M%iN&%KJNS+^me12@A1d&=-Xkm*B_jIktY&T_Mh$RE-k-h<UWvp7n8U&
+lWr$ID!%VSZGS{zhCs{ZdzKbPHKfgZuy!7cwqlP|iTmc%>vYP+^
+
+literal 0
+HcmV?d00001
+
+diff --git a/wexec/__pycache__/resolve.cpython-39.pyc b/wexec/__pycache__/resolve.cpython-39.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..66e6b986c8ed16c40ab677c3197a01a0127f8d09
+GIT binary patch
+literal 5200
+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
+V4v)+8yvONrdulxEJ<oX>{tG$QUpW8(
+
+literal 0
+HcmV?d00001
+
+diff --git a/wexec/__pycache__/runner.cpython-39.pyc b/wexec/__pycache__/runner.cpython-39.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9e4b7187e82778662acb4caa7ee62dc706ed1d6
+GIT binary patch
+literal 3513
+zcmZve`)?H2702hb4=>9jEis{OqLmwnRw{--QmK(^)iI8OS{!7%q}m#Gm%U?W$-cNV
+zYlF3xjMv~tZ0v+r?C{v7U`z@zv=ta^<NsrR#j}r}sMOz3rS^Mf*2Z?S_T0JiI``gl
+zKKFZ0c=KkDfL~8+>11@XAiSW9wLcjbf54%I&@dq&Fp)_yF(6uJDIhVKDKR-N2V_xT
+zj)20P0S9w2_ka*^vMT1m*~K<7FV1eZnQg(jiv65zW!nbCfQM~oZ?K=Cw~0xug8$9*
+zyBMalG*QZrnos^woF6aU{afM2ggN-EaQ#kkYQX$@ae4msi@yFc-V>V3B3i#_xVWk%
+zV_m9W>QQP>gmtu$IO}oj&eYW(kI+jiKkCz(8gXcEq0xntVou5kd8}xskdyO*u5<~Q
+zi<JHtk3*qUSpOmv@)f?FH7BN*=bn|X^_8a2+7rR-%7Y{3<cv8nYmUrdf`#Fy=Iw#v
+z#QD;|RN>lv%#=$o<98TRQZp1XX1KLfEUK%gb;A)$cB|aj5j@n~*3@#Or3r1Y=`U?f
+z&8>$%Yi{+6+<}kp3A_rYR~?NXwf|XDxz^sm;?YD@(|K4=^7e*Q>R?z8xBn>_3CG&o
+z)Of1ByQ5=IxKmB&)Qg2r1cTi)G{)Ssf8Ph~ow4|y4{Hy!^K@d*`|aK8X*ELqgvx7E
+zXN>A#R0~EEy2?{rMH|#2Jetzqz#KGMj3Dt%Xd~2J`H@eZI4r-W(6RkWl;oveAtUe_
+z+>vt%d79T`;Ni*}a$c<T6vV*MAs-Zu)%J=RQTyano%M|)BQhs*<>g+fVnc$Bx{M?V
+zBJ7;1V=lzYoo>RgrKL;ecQ-af=jFms<7bCkk2E#DTo^6)O__6Z=EFybs1KCXV)ZW<
+zh7r5clUeim077QCDz6(tz|(q0)75xOGN}igpC4*Ic&MevgFt*9O|WFQ7I53o5A5%8
+zRgC$aT)|8XmzwB`@?^r0J5}8Zq~VNe9nqL-C?}KAgkLsXkz`y;sS!iruy0gF!U+~-
+zVfdT^Za1_)4e#1`RO61e9gQGu5x0qo{En!I5_(?IBl0(K|3}EvgeXMXCunpbCuW3B
+zF)t1aLqbks=<#>alUI5Ojxs28Ab3n3aO;kPLRQR*{9~pJ3Dt1<5N!}gdM9>MVPs@^
+zu5Wqndvm<MaQR_z;Yu-gwlFkN$}Se~EtQrASA6WVw=!+w#argWIQ;DK`0z8&4HZU*
+zeTQ3*Hnz0+C=PcA%%Mqp8x`+8E94el^qn<_9+&bn#rxCLU$|_JKQX@<HOI#aSFRPV
+z=MY!({FpiWltv>P70X%k!Bu<%079YNp%A_eg))_MUFBR~IUf&&z(Fa02kS8(_1lAx
+z;d5i=^Q-0$+2#5Bmf6y+znhB}vBnB!`O(tsgTg;A7rr`gF7(m5Xj!ksnss5IokJlw
+zKw+Q|W`tu~i1Q(#OE?OWPe}}Jy(czXaraAxRJ+emB4330Ju%=sl}_p^TZ2SZ9rm|+
+zI>qbv!PtLr2t74H>$PB*cc$am{k3&5(gdx(cJ<{RrDm5_<98Y!Eqx-zlMz+Z3~vl#
+zvLCLCMH4EX=wYsF-BHpiHNotj98R1uwg(#z9}FIDYHJ8Ke%jE|&<MeTOd0N#5$y^7
+z0+ZnuxLY^OXg8i{UYe}SD{cq3)uJ2l;W}bT3q8S)97WP+$;ofgdChF6*ehiuqLxVm
+zLPjJu^CFUutjk$}DUcY*Lx)71g3;d)qc;Z1eK}t!RN0}vy%C?SX+F$bgSy*D5}Q_n
+zLHb$6vvB!eh3k3q{5fL6dTQRjQoeqRcpE*po|P$U2$+Y-<%KD8_)g)%aC!QQ`S7_p
+zF;Lkj7QEofqGb8m1?Z5SENuM&)`i*e)eTh|{N8->h-PMeSI#bCXPFmn7IIIPm#!Bt
+zPcF}Wh1`hgmX;=$pWY;EmX4JN?GenmX?qhDu0A#|&03Qfqsa|ED_@!<!)K=e?+Ug*
+z$*hJ5tYKD%+q2?pX88_0N3x<Y`Xx?jmH(QW^(w}HiF?1N`@cfd^Ij#d1R;WP2w#xk
+z`zd0#60yF$jKW6USEA4F;BS+mchDG4q%~k_DIcdS<(F-_RVccKBSkcCm<vd@30OD!
+zhxk~dG$y#VfKKj5ZylG!<Z7Bbj*ARv)=?B?#ePwTsxoOOc<i;xBG8GFh&j*U9#PsW
+z>mZkORF^YSM$SsTO2U(oI>n5<L+Dj><)kB{pm=g2;km~Y@LQGsHwLkl6Z~R5U4Pwo
+zjDUUmxG;PdoB|{}=i%||9bMa)jHhBq-t36I#Yy8Tdb^=Sv9yuOC0N}HBUC?GN{H&K
+zc<IrGRB9JGG^kbI0H1PSA5enm+dR+TF~>&=xj}RAeChc`JlPA%O0%;7m!O;OH-ET6
+zvi)t&yf$Ocyf}ZcaN`<yU16}NnilGdr#0P|Nb0^5st-kteuh)^_9H+kx3%K1Qer2`
+zs<#&<1tI#ibP8UyLJyIWQ7~2TG{o>mAUt&>f?zRK|3_G}8Qp=ZXbqC9Z&*cLa~o3l
+zmPk0Ir@0zTru9@>Hx#R|bLr8ziaVsUN5iqS+QfO1bCNZycCyH_5H@5Cf%1@8?c#gs
+z1%iyfhbBPv0d0*9bLH>jVFM10gjR4WqFeHc)skEEN*;-70qgI-)_d#tr3tL^TaOF)
+z37%r&m_(|25}Nv@%s<e<ugx;u!-2vrFLcP&ptzr|9dr#omGq}DVv|TnUU^WO>7&dz
+za`WZFcXoK!!T{J%*P9pSp^Fg3a&`vVRGeHy;zjTwA(jIu%sp>c*6!QIed=k{%gjd^
+z$+wGr<lCj8$RZ~g9#p7lo`@uwYIs}H3G%z;Ys0DOOy%5gAnMVSbx8q{`F?z7je~L=
+zn`47-4JYCeOnw=_TXv#?Ydvu2TmMsJ{yW_Di_P@!HC(|UOGbi0tK75o$O^EV2B@Ki
+z%4A!XNE+>+)3hx+YX-J-(#n_ax_FYMV`@G5z>-`AVMTZq{A9Poz0JMV?e*;ZKMK{f
+AXaE2J
+
+literal 0
+HcmV?d00001
+
+diff --git a/wexec/resolve.py b/wexec/resolve.py
+index e01bd19..fe52610 100644
+--- a/wexec/resolve.py
++++ b/wexec/resolve.py
+@@ -3,6 +3,12 @@
+ Windows 上「命令名」通常不带扩展名，例如 ``where``、``git``、``build``。
+ Shell 之所以能找到它们，是因为按 :envvar:`PATHEXT` 里声明的扩展名顺序
+ 逐个试探。任何要自己启动外部程序的工具都必须照做，否则只能看见 ``.exe``。
++
++两个容易踩坑的地方这里都照顾到了：
++
++* ``PATHEXT`` 的顺序就是优先级，顺序换了结果就得跟着换；
++* 名字自带扩展名时（``tool.exe``、``direct.CMD``）必须原样使用，
++  不能再往上叠扩展名，否则会去找 ``tool.exe.exe``。
+ """
+ 
+ import os
+@@ -12,6 +18,9 @@ from .errors import CommandNotFound
+ #: 找不到 PATHEXT 时使用的兜底扩展名。
+ EXECUTABLE_EXTENSIONS = (".exe",)
+ 
++#: 目录列举失败时的哨兵，用来区分「目录是空的」和「目录读不出来」。
++_UNREADABLE = object()
++
+ 
+ def search_dirs():
+     """返回 PATH 中需要搜索的目录列表。"""
+@@ -23,8 +32,111 @@ def executable_extensions():
+     """返回按优先级排列的可执行扩展名。
+ 
+     优先使用环境变量 :envvar:`PATHEXT`；它缺失时才退回内置兜底值。
++
++    返回值保持 :envvar:`PATHEXT` 里的书写顺序（以及大小写）——这个顺序
++    就是查找时的优先级，`.CMD;.EXE` 和 `.EXE;.CMD` 会解析出不同的结果。
++    """
++    extensions = []
++    seen = set()
++    for raw in os.environ.get("PATHEXT", "").split(os.pathsep):
++        ext = raw.strip()
++        if not ext:
++            # PATHEXT 里混进的空段直接跳过
++            continue
++        if not ext.startswith("."):
++            # 容错：不带前导点的写法（``CMD``）也按 ``.CMD`` 理解
++            ext = "." + ext
++        key = ext.lower()
++        if key not in seen:  # 重复的扩展名只保留第一次出现
++            seen.add(key)
++            extensions.append(ext)
++    if not extensions:
++        # PATHEXT 缺失（或者全是空段）时才退回兜底值
++        return tuple(EXECUTABLE_EXTENSIONS)
++    return tuple(extensions)
++
++
++def _separators():
++    """当前平台上合法的路径分隔符。"""
++    return (os.sep, os.altsep) if os.altsep else (os.sep,)
++
++
++def _has_directory_part(name):
++    """``name`` 是否自带位置信息（绝对路径或相对子路径）。"""
++    if os.path.isabs(name):
++        return True
++    return any(sep in name for sep in _separators())
++
++
++def _candidate_names(name):
++    """按优先级返回 ``name`` 可能对应的文件名（已含扩展名）。"""
++    if os.path.splitext(name)[1]:
++        # 名字已经带了扩展名（tool.exe / direct.CMD）：原样使用。
++        # 这里绝不能再叠加扩展名，否则 tool.exe 会变成 tool.exe.exe。
++        return (name,)
++    return tuple(name + ext for ext in executable_extensions())
++
++
++def _candidate_paths(name):
++    """按优先级生成 ``name`` 的候选完整路径。"""
++    names = _candidate_names(name)
++
++    if os.path.isabs(name):
++        # 绝对路径：只在该位置找，PATH 不参与
++        for candidate in names:
++            yield candidate
++        return
++
++    if _has_directory_part(name):
++        # 相对子路径：先按名字写出的位置（相对当前目录）找
++        for candidate in names:
++            yield candidate
++
++    # 不带位置的命令名：逐个 PATH 目录、逐个 PATHEXT 扩展名试探。
++    # 目录在外层、扩展名在内层，和 cmd.exe 的查找顺序一致。
++    for directory in search_dirs():
++        for candidate in names:
++            yield os.path.join(directory, candidate)
++
++
++def _directory_index(directory, cache):
++    """返回 ``directory`` 的 ``{小写文件名: 实际文件名}`` 映射。
++
++    Windows 的文件系统不区分大小写：PATH 里写着 ``hello.CMD``、
++    PATHEXT 里写着 ``.cmd`` 时命中的是同一个文件。这里用目录列举
++    建索引，既能不区分大小写地匹配，又能把磁盘上的真实文件名
++    （连同真实大小写）返回给调用方。
++
++    目录列举失败（不存在、无权限……）时返回 :data:`_UNREADABLE`。
+     """
+-    return EXECUTABLE_EXTENSIONS
++    key = os.path.normcase(os.path.abspath(directory))
++    if key in cache:
++        return cache[key]
++
++    try:
++        entries = os.listdir(directory)
++    except OSError:
++        index = _UNREADABLE
++    else:
++        index = {}
++        for entry in entries:
++            index.setdefault(entry.lower(), entry)
++    cache[key] = index
++    return index
++
++
++def _match_entry(directory, filename, cache):
++    """在 ``directory`` 里找 ``filename``（不区分大小写）。
++
++    命中时返回磁盘上的真实文件名，找不到返回 ``None``。
++    """
++    index = _directory_index(directory, cache)
++    if index is _UNREADABLE:
++        # 目录列举不出来，退回逐个探测
++        if os.path.isfile(os.path.join(directory, filename)):
++            return filename
++        return None
++    return index.get(filename.lower())
+ 
+ 
+ def resolve(name):
+@@ -35,9 +147,20 @@ def resolve(name):
+     if not name:
+         raise CommandNotFound(name)
+ 
+-    for directory in search_dirs():
+-        candidate = os.path.join(directory, "%s.exe" % name)
+-        if os.path.isfile(candidate):
+-            return os.path.abspath(candidate)
++    if isinstance(name, os.PathLike):
++        name = os.fspath(name)
++    if isinstance(name, bytes):
++        name = os.fsdecode(name)
++
++    cache = {}
++    for candidate in _candidate_paths(name):
++        directory = os.path.dirname(candidate) or os.curdir
++        filename = os.path.basename(candidate)
++        entry = _match_entry(directory, filename, cache)
++        if entry is None:
++            continue
++        full = os.path.join(directory, entry)
++        if os.path.isfile(full):  # 同名的目录不算可执行文件
++            return os.path.abspath(full)
+ 
+     raise CommandNotFound(name)
+diff --git a/wexec/runner.py b/wexec/runner.py
+index db6ba24..0d6156f 100644
+--- a/wexec/runner.py
++++ b/wexec/runner.py
+@@ -1,18 +1,86 @@
+ """运行已经解析出来的命令。"""
+ 
++import os
+ import subprocess
+ 
+ from .resolve import resolve
+ 
++#: 这类脚本是给命令解释器看的，CreateProcess 没法直接启动它们，
++#: 必须交给 ``cmd.exe /c`` 去跑，否则会得到 WinError 193。
++_INTERPRETER_EXTENSIONS = (".bat", ".cmd")
++
++#: cmd.exe 命令行里有语法含义的字符。参数一旦被引号包住，这些字符
++#: 对 cmd 来说就只是普通字符，不会把命令行拆开。
++_CMD_META_CHARACTERS = "&|<>^"
++
++
++def _is_interpreter_script(path):
++    """``path`` 是否为需要命令解释器启动的批处理脚本。"""
++    return os.path.splitext(path)[1].lower() in _INTERPRETER_EXTENSIONS
++
++
++def _interpreter():
++    """返回命令解释器（COMSPEC，通常就是 cmd.exe）的路径。"""
++    comspec = os.environ.get("COMSPEC", "")
++    if comspec and os.path.isfile(comspec):
++        return comspec
++    # COMSPEC 不可用时退回系统默认位置。这里不能指望 PATH：
++    # 调用方很可能已经把 PATH 指到别的目录去了。
++    for root in (os.environ.get("SystemRoot"), os.environ.get("WINDIR"), r"C:\Windows"):
++        if not root:
++            continue
++        candidate = os.path.join(root, "System32", "cmd.exe")
++        if os.path.isfile(candidate):
++            return candidate
++    return "cmd.exe"
++
++
++def _quote_argument(argument):
++    """把一个参数编码成能穿过 cmd.exe 解析的形式。
++
++    先按 MSVCRT 的规则处理空格、制表符、引号和反斜杠，再对 cmd 的
++    元字符（``&``、``|``、``<``、``>``、``^``）补一层引号，免得它们
++    被当成命令行语法拆开。
++    """
++    quoted = subprocess.list2cmdline([argument])
++    if quoted.startswith('"') and quoted.endswith('"'):
++        return quoted
++    if any(char in quoted for char in _CMD_META_CHARACTERS):
++        return '"%s"' % quoted
++    return quoted
++
++
++def _script_command_line(path, args):
++    """构造 ``cmd.exe /c script args`` 形式的命令行。
++
++    整条内层命令外面再包一层引号：``cmd /c`` 会剥掉首尾各一个引号，
++    于是脚本路径和每个参数自己的引号都能原样保留下来。这也是路径里
++    带空格时唯一不会出错的做法。
++    """
++    parts = [subprocess.list2cmdline([path])]
++    parts.extend(_quote_argument(argument) for argument in args)
++    return '"%s" /d /c "%s"' % (_interpreter(), " ".join(parts))
++
+ 
+ def run(argv, timeout=None):
+-    """解析 ``argv[0]`` 并执行，返回 ``subprocess.CompletedProcess``。"""
++    """解析 ``argv[0]`` 并执行，返回 ``subprocess.CompletedProcess``。
++
++    批处理脚本（``.cmd`` / ``.bat``）经由命令解释器启动，脚本的退出码
++    以及标准输出/错误都会如实反映在返回结果里。
++    """
+     if not argv:
+         raise ValueError("argv must not be empty")
+ 
+     path = resolve(argv[0])
++    args = [str(a) for a in argv[1:]]
++
++    if _is_interpreter_script(path):
++        command = _script_command_line(path, args)
++    else:
++        command = [path] + args
++
+     return subprocess.run(
+-        [path] + [str(a) for a in argv[1:]],
++        command,
+         capture_output=True,
+         text=True,
+         timeout=timeout,

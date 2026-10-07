@@ -4,7 +4,8 @@
 
 对照 delivery/04-package-and-checklist.md §3 的 17 项中可静态验证的部分：
   #1 五件套齐全 / #2 solve.sh、test.sh 为 LF / #3 交付物文件名多处逐字节一致
-  #4 打分项条数与维度覆盖 / #7 task_id 三处一致 / #8 无真实密钥 / #9 无残留
+  #4 打分项条数与维度覆盖 / #4b rubrics.json(设计态) 与 tests/rubrics.toml(运行态) 判分定义一致
+  #7 task_id 三处一致 / #8 无真实密钥 / #9 无残留
   #10 文件名 <= 200 字节且无符号链接 / #12 prompt.md 含 {criteria} / #14 无不可见空白
   #15 [verifier.env] 的 judge 变量前缀与 [environment.env] 洁净
 
@@ -64,6 +65,7 @@ def main(argv):
     inst = set(re.findall(r'`([^`\s]+\.(?:md|py|png|xlsx|docx|pptx|csv|json))`', inst_txt))
     rtxt = (ROOT / 'tests/rubrics.toml').read_text(encoding='utf-8') if (ROOT / 'tests/rubrics.toml').is_file() else ''
     critf = {m[1] for m in re.findall(r'`(/app/output/)?([^`\s]+\.(?:md|py|png|xlsx|docx|pptx))`', rtxt)}
+    critf = {c for c in critf if 'input_files' not in c}   # 输入材料引用不算交付物
 
     # ---- #3 交付物文件名一致 ----
     if dpaths:
@@ -80,9 +82,36 @@ def main(argv):
         not_in_inst = dpaths - inst
         if not_in_inst:
             errors.append(f'#3 instruction.md 未列出的交付物: {sorted(not_in_inst)}')
-        bad = critf - dpaths
+        bad = {c for c in critf if c.split('/')[-1] not in {p.split('/')[-1] for p in dpaths}}
         if bad:
             warns.append(f'#3 rubrics.toml 引用的非交付物文件: {sorted(bad)}')
+        # ---- #3b 判据描述里的交付物"非全名"写法 ----
+        # 交付物基名共享 task-id 前缀时，rubric 描述中任何"去掉前缀"的写法都是隐患：
+        # 若同条判据又要求"逐字一致"，会与 instruction.md / task.toml 的全名冲突，
+        # 判官按字面比对即判 FAIL —— 连 oracle 也失分（FIN3-WKN-150 R01 实例：
+        # 判据写"chart01 材料覆盖与数据缺口"，实际文件名是
+        # FIN3-WKN-150_chart01_材料覆盖与数据缺口.png）。
+        _bn = {p.split('/')[-1] for p in dpaths}
+        _cp = os.path.commonprefix(sorted(_bn))
+        _cp = _cp[:_cp.rfind('_') + 1] if '_' in _cp else ''
+        if _cp and len(_cp) >= 4:
+            _tails = set()
+            for _b in _bn:
+                if _b.startswith(_cp):
+                    _t = _b[len(_cp):]
+                    for _v in {_t, _t.rsplit('.', 1)[0]}:
+                        if _v:
+                            _tails.add(_v); _tails.add(_v.replace('_', ' '))
+            _bad_forms = []
+            for _t in sorted(_tails):
+                for _m in re.finditer(re.escape(_t), rtxt):
+                    _s = _m.start()
+                    if _s >= len(_cp) and rtxt[_s - len(_cp):_s] == _cp:
+                        continue          # 该写法是全名的一部分，合法
+                    _bad_forms.append(_t); break
+            if _bad_forms:
+                warns.append('#3 rubrics.toml 出现交付物非全名写法'
+                             f'（须写全名含前缀与扩展名）: {_bad_forms}')
         if not [e for e in errors if e.startswith('#3')]:
             oks.append(f'#3 交付物文件名多处逐字节一致（{len(dpaths)} 项）')
 
@@ -93,6 +122,47 @@ def main(argv):
         oks.append(f'#4 打分项 {len(crit)} 条（正 {len(pos)} / 负 {len(crit)-len(pos)}）')
     else:
         warns.append('#4 tests/rubrics.toml 未解析到 criterion，请单独运行 check_rubrics.py')
+
+    # ---- #4b rubrics.json(设计态) 与 tests/rubrics.toml(运行态) 判分定义一致 ----
+    # 质检实例（FIN3-WKN-150，2026-10-05）：rubrics.json 的负向项只用负 weight 表示、
+    # 缺 "negate": true，与 tests/rubrics.toml 的 negate=true 表示法不对应，被判为
+    # "rubrics.json 与 tests/rubrics.toml 评分定义不一致"。运行态以 tests/rubrics.toml
+    # 为准；设计态 rubrics.json 必须与其判据集合、负向集合、正分池逐一对齐。
+    rp = ROOT / 'rubrics.json'
+    if rp.is_file() and crit:
+        try:
+            jd = json.loads(rp.read_text(encoding='utf-8'))
+        except Exception as e:
+            jd = None
+            errors.append(f'#4b rubrics.json 解析失败: {e}')
+        if isinstance(jd, dict):
+            jitems = [c for c in jd.get('items', []) if isinstance(c, dict)]
+            jids = {c.get('id') for c in jitems}
+            tids = {c.get('id') for c in crit}
+            if jids != tids:
+                errors.append(f'#4b rubrics.json 与 rubrics.toml 判据 id 集合不一致: '
+                              f'仅 json={sorted(jids - tids)} 仅 toml={sorted(tids - jids)}')
+            jneg = {c.get('id') for c in jitems if (c.get('weight') or 0) < 0 or c.get('negate')}
+            tneg = {c.get('id') for c in crit if c.get('negate')}
+            if jneg != tneg:
+                errors.append(f'#4b 负向项集合不一致: json={sorted(jneg)} toml={sorted(tneg)}')
+            miss_neg = [c.get('id') for c in jitems
+                        if (c.get('weight') or 0) < 0 and c.get('negate') is not True]
+            if miss_neg:
+                errors.append('#4b rubrics.json 负向项缺 "negate": true'
+                              f'（须负 weight + negate 双标记）: {sorted(miss_neg)}')
+            jsmax = round(sum((c.get('weight') or 0) for c in jitems if not c.get('negate')), 6)
+            tsmax = round(sum((c.get('weight') or 0) for c in crit if not c.get('negate')), 6)
+            if abs(jsmax - tsmax) > 1e-6:
+                errors.append(f'#4b 正分池 S_max 不一致: json={jsmax} toml={tsmax}')
+            decl = (jd.get('metadata', {}) or {}).get('scoring', {}).get('s_max')
+            if decl is not None and abs(float(decl) - tsmax) > 1e-6:
+                errors.append(f'#4b metadata.scoring.s_max={decl} 与正分池 {tsmax} 不符')
+            if not [e for e in errors if e.startswith('#4b')]:
+                oks.append(f'#4b rubrics.json 与 rubrics.toml 判分定义一致'
+                           f'（判据 {len(jitems)}，负向 {sorted(tneg)}，S_max {tsmax}）')
+    elif not rp.is_file():
+        warns.append('#4b 未找到 rubrics.json，跳过设计态/运行态一致性检查')
 
     # ---- #7 task_id 三处一致 ----
     tid = tt.get('metadata', {}).get('task_id', '')
@@ -123,9 +193,13 @@ def main(argv):
         oks.append('#8 无真实密钥')
 
     # ---- #9 残留 ----
+    # 例外：`跑分产物与轨迹/` 为验收口径要求的跑分归档目录（reward.json / reward-details.json
+    # 须按 06 号文档原名归档，见交付文档 §4），该目录内不视为"本地跑测残留"。
+    _ARCHIVE_DIR = '跑分产物与轨迹'
     bad_names = ('.git', '__pycache__', '.venv', '__MACOSX', '.DS_Store',
                  'reward.json', 'reward-details.json', 'reward_exit_message.json', 'jobs', 'logs')
-    bad = [str(p.relative_to(ROOT)) for p in ROOT.rglob('*') if p.name in bad_names]
+    bad = [str(p.relative_to(ROOT)) for p in ROOT.rglob('*')
+           if p.name in bad_names and _ARCHIVE_DIR not in p.relative_to(ROOT).parts]
     if bad:
         errors.append(f'#9 残留: {bad}')
     else:
@@ -153,9 +227,13 @@ def main(argv):
             oks.append(f'#12 prompt.md 含 {{criteria}}，总量 {tot/1024:.1f}KB')
 
     # ---- #14 不可见空白 ----
+    # 例外：`跑分产物与轨迹/` 归档目录内的模型原始交付物（如 qwen 备忘录）可能含 U+00A0/U+3000，
+    # 属模型正常输出，非题目核心文件问题；与 #9 同口径豁免该目录。
     inv = re.compile(r'[\u00a0\u3000]')
     inv_hits = []
     for p in list(ROOT.rglob('*.toml')) + list(ROOT.rglob('*.md')) + list(ROOT.rglob('*.json')):
+        if _ARCHIVE_DIR in p.relative_to(ROOT).parts:
+            continue
         if p.is_file() and inv.search(p.read_text(encoding='utf-8', errors='ignore')):
             inv_hits.append(str(p.relative_to(ROOT)))
     if inv_hits:

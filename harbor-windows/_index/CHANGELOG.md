@@ -124,3 +124,15 @@ v1.0 的多模型实测显示 16 条 required 对主流模型过于宽松：Opus
 ### 已知未完成
 - 镜像未构建（`image_digest` 待回填）。
 - 8 题对照验证未执行；9 题多模型区分度验证未执行。
+
+## 2026-10-02 替换链第三棒：新增 wfflab__wstamp-211（NTFS 时间戳语义）
+
+- `wfflab__wstamp-211`：备份工具库 wstamp 的「同步状态 = 内容 + mtime」缺陷族 +
+  Win32 属性事务。主方向：文件系统与路径；难度：L4；语言：Python；bugfix；
+  required F2P 8 条、P2P 8 条；task_hash 9a381fd5cce5…。
+- 选题依据：多模型运行数据中 Qwen3.8-Max-0902 的唯一失手模式
+  （wsync-142 上 test_sync_is_idempotent_and_preserves_source_mtime 3 轮挂 2 次，
+  同步只比较内容、漏 mtime 回写分支）；其余考点位于 Opus 已验证可靠区。
+- 本机验证：base 8F2P 全失败 / 8P2P 全通过；oracle 全过；
+  L2 nochg 0.0 / golden 1.0；对照证据 12 项全符合预期（3 反例 0.0、等价 1.0）。
+- 替换链状态：wsync-142（replaced）→ wproc-209（判死）→ winstall-210（判死）→ wstamp-211（验证中）。

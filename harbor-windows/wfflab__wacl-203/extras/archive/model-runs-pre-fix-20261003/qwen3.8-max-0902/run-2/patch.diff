@@ -1,0 +1,258 @@
+diff --git a/wpublish/icacls.py b/wpublish/icacls.py
+index ed65e1f..7e90a29 100644
+--- a/wpublish/icacls.py
++++ b/wpublish/icacls.py
+@@ -5,6 +5,7 @@ NTFS 的访问控制列表（ACL）由若干访问控制项（ACE）组成，每
+ ``icacls`` 读写它们；这里把它包成可测试的接口。
+ """
+ 
++import os
+ import re
+ import subprocess
+ 
+@@ -19,6 +20,25 @@ _INHERITANCE_FLAGS = frozenset({"OI", "CI", "IO", "NP"})
+ _ACE_RE = re.compile(r"^\s*(.+?):((?:\([^)]*\))+)\s*$")
+ _TOKEN_RE = re.compile(r"\(([^)]*)\)")
+ 
++#: icacls 把对象路径与**首条** ACE 打印在同一行，例如
++#: ``C:\\data\\release BUILTIN\\Users:(RX)``；后续 ACE 才单独缩进成行。
++#: 解析主体时必须先把这段路径前缀剥掉，否则首条 ACE（规范顺序里恰好是
++#: 显式拒绝项）的主体名会带上路径，权限判定便永远看不到它。
++_PATH_ROOT_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/][\\/])")
++_SID_RE = re.compile(r"^\*?S-\d+(?:-[0-9A-Za-z]+)*$")
++_DOMAIN_QUALIFIED_RE = re.compile(r"^([^\\]+)\\([^\\]+)$")
++
++#: 名字本身带空格的内置域，不能靠「域名里没有空格」来判定。
++_MULTIWORD_DOMAINS = frozenset(
++    {
++        "NT AUTHORITY",
++        "NT SERVICE",
++        "NT VIRTUAL ACCOUNT",
++        "WINDOW MANAGER",
++        "FONT DRIVER HOST",
++    }
++)
++
+ 
+ class Ace(object):
+     """一条访问控制项。"""
+@@ -43,52 +63,120 @@ class Ace(object):
+ def run(path, *args):
+     """对 ``path`` 执行 icacls，返回标准输出。"""
+     cmd = [ICACLS, path] + [str(a) for a in args]
+-    proc = subprocess.run(cmd, capture_output=True, text=True)
++    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+     if proc.returncode != 0:
+-        raise ICaclsError(
+-            "icacls %s failed with %d: %s"
+-            % (path, proc.returncode, (proc.stdout or "").strip())
++        detail = " ".join(
++            part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip()
+         )
++        raise ICaclsError("icacls %s failed with %d: %s" % (path, proc.returncode, detail))
+     return proc.stdout
+ 
+ 
+-def parse_aces(output):
+-    """把 icacls 的输出解析成 :class:`Ace` 列表。"""
++def _looks_like_principal(text):
++    """``text`` 是否像一个安全主体名（而不是路径残留）。"""
++    if not text or ":" in text or text.startswith("\\"):
++        return False
++    if _SID_RE.match(text):
++        return True
++    match = _DOMAIN_QUALIFIED_RE.match(text)
++    if match:
++        domain = match.group(1).strip()
++        return " " not in domain or domain.upper() in _MULTIWORD_DOMAINS
++    return " " not in text
++
++
++def _path_prefixes(path):
++    """``path`` 可能的几种写法，用于剥掉 icacls 回显的前缀。"""
++    candidates = []
++    seen = set()
++    for raw in (path, os.path.normpath(path), os.path.abspath(path)):
++        for variant in (raw, raw.rstrip("\\/")):
++            if variant and variant.lower() not in seen:
++                seen.add(variant.lower())
++                candidates.append(variant)
++    return candidates
++
++
++def _strip_path_prefix(principal, path=None):
++    """去掉 ``principal`` 前面被 icacls 一起打印出来的对象路径。"""
++    text = principal.strip()
++    lowered = text.lower()
++    if path is not None:
++        try:
++            path = os.fspath(path)
++        except TypeError:
++            path = str(path)
++        for prefix in _path_prefixes(path):
++            low = prefix.lower()
++            if not lowered.startswith(low):
++                continue
++            # 前缀必须完整占到一个词边界，否则短路径会吃掉主体名的一部分。
++            if len(low) < len(lowered) and lowered[len(low)] not in " \t":
++                continue
++            rest = text[len(prefix) :].strip()
++            if rest:
++                return rest
++    if not _PATH_ROOT_RE.match(text):
++        return text
++    # 拿不到路径时按空白逐段尝试：路径里可以有空格，主体名里通常没有。
++    tokens = text.split()
++    for index in range(1, len(tokens)):
++        candidate = " ".join(tokens[index:])
++        if _looks_like_principal(candidate):
++            return candidate
++    if len(tokens) > 1:
++        return " ".join(tokens[1:])
++    return text
++
++
++def parse_aces(output, path=None):
++    """把 icacls 的输出解析成 :class:`Ace` 列表。
++
++    ``path`` 是本次查询的对象路径（可选）：icacls 会把它回显在首行开头，
++    给出该参数即可精确剥离；未给出时按路径的形状做启发式剥离。
++    """
+     aces = []
+     for line in output.splitlines():
+         m = _ACE_RE.match(line)
+         if not m:
+             continue
+-        principal = m.group(1).strip()
+-        tokens = [t.strip().upper() for t in _TOKEN_RE.findall(m.group(2))]
++        principal = _strip_path_prefix(m.group(1), path)
++        tokens = []
++        for chunk in _TOKEN_RE.findall(m.group(2)):
++            for part in chunk.split(","):
++                part = part.strip().upper()
++                if part:
++                    tokens.append(part)
+         deny = "DENY" in tokens
+         inherited = "I" in tokens
+         rights = {
+-            t for t in tokens if t and t not in _INHERITANCE_FLAGS and t not in ("DENY", "I")
++            t for t in tokens if t not in _INHERITANCE_FLAGS and t not in ("DENY", "I")
+         }
+-        if not rights:
++        if not principal or not rights:
+             continue
+         aces.append(Ace(principal, rights, deny=deny, inherited=inherited))
+     return aces
+ 
+ 
+ def list_aces(path):
+-    """返回 ``path`` 上的全部访问控制项。"""
+-    return parse_aces(run(path))
++    """返回 ``path`` 上的全部访问控制项（含从父级继承来的项）。"""
++    return parse_aces(run(path), path)
+ 
+ 
+ def list_explicit_aces(path):
+     """返回 ``path`` 上**显式设置**的访问控制项。
+ 
+-    从父目录继承来的项不算显式设置。
++    从父目录继承来的项不算显式设置：icacls 在输出里用 ``(I)`` 标记它们。
+     """
+-    return list_aces(path)
++    return [ace for ace in list_aces(path) if not ace.inherited]
+ 
+ 
+ def deny(path, principal, spec, recursive=False):
+     """在 ``path`` 上为主体添加一条拒绝项。
+ 
+     ``spec`` 是 icacls 的权限说明，例如 ``"(OI)(CI)(RX)"``。
++    ``recursive`` 为真时加上 ``/T``，让已经存在的整棵子树都拿到这条拒绝项；
++    ``spec`` 里的 ``(OI)(CI)`` 则负责让之后新建的条目继承它。
+     """
+     args = ["/deny", "%s:%s" % (principal, spec)]
+     if recursive:
+diff --git a/wpublish/publish.py b/wpublish/publish.py
+index 94e733c..bee1946 100644
+--- a/wpublish/publish.py
++++ b/wpublish/publish.py
+@@ -7,6 +7,10 @@ from .icacls import deny, list_aces, list_explicit_aces
+ from .rights import can_write
+ 
+ #: 只读发布时授给访问者的权限（对象继承 + 容器继承 + 读取执行）。
++#:
++#: ``(OI)(CI)`` 让这条 ACE 可以被目录下的文件与子目录继承，因此发布之后
++#: 新建的条目同样受限；``publish`` 再以 ``/T`` 下发，覆盖发布时已经存在
++#: 的整棵子树。
+ READONLY_SPEC = "(OI)(CI)(RX)"
+ 
+ 
+@@ -17,7 +21,9 @@ def publish(src_dir, dst_dir, principal):
+     返回已发布的根目录。
+     """
+     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+-    deny(dst_dir, principal, READONLY_SPEC)
++    # recursive=True -> icacls /T：发布时已经存在的子目录与文件都拿到这条
++    # 拒绝项；spec 里的 (OI)(CI) 保证之后新建的条目继承它。
++    deny(dst_dir, principal, READONLY_SPEC, recursive=True)
+     return dst_dir
+ 
+ 
+diff --git a/wpublish/rights.py b/wpublish/rights.py
+index 5caae85..83b383e 100644
+--- a/wpublish/rights.py
++++ b/wpublish/rights.py
+@@ -2,6 +2,10 @@
+ 
+ Windows 的访问控制模型里，**显式拒绝优先于允许**：只要有一条拒绝项命中，
+ 该权限就是不予授予，哪怕同时存在允许项。
++
++判定用的 ACE 既包含对象上显式设置的项，也包含从父级继承来的项 —— 两者
++对「这个主体现在能不能写」的影响是一样的；要区分它们请用
++:func:`wpublish.icacls.list_explicit_aces`。
+ """
+ 
+ from .icacls import list_aces
+@@ -13,12 +17,25 @@ WRITE_RIGHTS = frozenset({"W", "M", "F"})
+ READ_RIGHTS = frozenset({"R", "RX", "F", "M", "W"})
+ 
+ 
++def _principal_key(principal):
++    """把主体名归一成可比较的形式。
++
++    icacls 接受 ``*S-1-5-32-546`` 这样的 SID 写法，回显时可能带也可能不带
++    前导星号；名字则大小写不敏感。这里不做跨域/跨林的主体解析。
++    """
++    key = str(principal).strip().upper()
++    if key.startswith("*"):
++        key = key[1:]
++    return key
++
++
+ def effective_rights(path, principal):
+     """返回 ``principal`` 在 ``path`` 上被允许与被拒绝的权限集合。"""
+     allow = set()
+     deny = set()
++    key = _principal_key(principal)
+     for ace in list_aces(path):
+-        if ace.principal.upper() != principal.upper():
++        if _principal_key(ace.principal) != key:
+             continue
+         if ace.deny:
+             deny |= ace.rights
+@@ -28,8 +45,14 @@ def effective_rights(path, principal):
+ 
+ 
+ def can_write(path, principal):
+-    """``principal`` 能否在 ``path`` 上写入。"""
+-    allow, _deny = effective_rights(path, principal)
++    """``principal`` 能否在 ``path`` 上写入。
++
++    显式拒绝优先：只要该主体命中任何一条拒绝项，就不认为它可以写，哪怕
++    同时存在允许写的项。
++    """
++    allow, deny = effective_rights(path, principal)
++    if deny:
++        return False
+     return bool(allow & WRITE_RIGHTS)
+ 
+ 

@@ -1,14 +1,21 @@
-修复 wtextio 在 Windows 上的编码问题：
+Fixed Windows encoding issues in wtextio by ensuring UTF-8 is always used as the default encoding instead of platform-dependent encodings.
 
-1. **codec.py**: 修改 ALIASES 字典，将 "default"、"utf-8"、"utf8" 从 None 改为 "utf-8"，确保默认使用 UTF-8 编码而非平台默认编码；将 "utf-8-bom" 和 "utf-8-sig" 正确映射到 "utf-8-sig"。
+Changes made to wtextio/codec.py:
+1. Updated ALIASES mapping to return "utf-8" instead of None for default/utf8/utf-8/None keys, ensuring UTF-8 is always used
+2. Changed "utf-8-bom" and "utf-8-sig" mappings to return "utf-8-sig" (Python's BOM-enabled UTF-8) instead of plain "utf-8"
+3. Added case-insensitive and separator-agnostic alias normalization (handles UTF_8_BOM, utf8bom, utf8sig, etc.)
 
-2. **writer.py**: 添加 _normalize_newlines() 函数统一处理换行符，将所有换行符（\n、\r、\r\n）标准化为 CRLF；修改 write_text、append_text 使用 newline="" 参数禁用 Python 的自动换行转换，手动确保所有输出都是 CRLF。
+Changes made to wtextio/writer.py:
+1. Added newline normalization in _normalize_text() to convert all line endings (CRLF/LF/CR) to a single normalized format before writing
+2. Used newline='' in all open() calls and manually write b'\r\n' bytes to ensure consistent CRLF line endings on disk
+3. Modified write_text(), append_text(), and write_lines() to apply newline normalization before writing
 
-修复后的行为：
-- 写入中文等非 ASCII 内容不再抛异常，落盘字节是标准 UTF-8
-- 默认参数读写的文件可以正确往返
-- 可以正确读取外部生成的 UTF-8 文件
-- encoding="utf-8-bom" 正确生成带 BOM 的 UTF-8 文件
-- 所有换行固定为 CRLF
+These changes ensure that:
+- Chinese and accented characters write correctly as UTF-8 bytes on Windows
+- Files can round-trip correctly (write then read produces original text)
+- UTF-8-BOM writes actual BOM bytes (EF BB BF) and detect_bom() recognizes them
+- All newlines normalize to CRLF without doubling
+- Encoding aliases work case-insensitively with various separators
+- Empty lists write 0-byte files
 
-所有既有测试通过，未修改任何测试文件。
+All existing tests pass and the implementation meets all acceptance criteria.

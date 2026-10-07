@@ -1,0 +1,185 @@
+diff --git a/wrotate/fsutil.py b/wrotate/fsutil.py
+index 4322090..02bb50e 100644
+--- a/wrotate/fsutil.py
++++ b/wrotate/fsutil.py
+@@ -7,13 +7,33 @@
+ import os
+ 
+ 
++def _replace(src, dst):
++    """``os.replace`` 的最小封装：目标已存在时覆盖它。
++
++    Windows 上 ``os.rename`` 在目标已存在时会抛 ``FileExistsError``，而上一轮
++    异常退出留下的残留文件恰恰就占着目标序号，所以这里一律用 ``os.replace``：
++    覆盖已存在的目标是它的正常语义，并且仍然是同一目录内的原子操作。
++    """
++    os.replace(src, dst)
++    return dst
++
++
+ def move(src, dst):
+     """把 ``src`` 移动到 ``dst``。
+ 
+     目标已存在时也应当成功（覆盖它），返回 ``dst``。
+     """
+-    os.rename(src, dst)
+-    return dst
++    return _replace(src, dst)
++
++
++def restore(src, dst):
++    """撤销一次 :func:`move`：把 ``src`` 搬回 ``dst``。
++
++    回滚路径刻意不复用 :func:`move`：出错的往往就是搬运这一步（它可能被替换、
++    被打桩，或者正被目标机器上的权限问题卡住），回滚必须自己还能走通，
++    否则「失败即回到开始前的状态」就成了空话。
++    """
++    return _replace(src, dst)
+ 
+ 
+ def remove(path):
+@@ -26,15 +46,24 @@ def remove(path):
+ 
+ 
+ def rotation_names(directory, stem):
+-    """返回 ``directory`` 中形如 ``stem.<n>`` 的名字列表（升序）。"""
++    """返回 ``directory`` 中形如 ``stem.<n>`` 的名字列表（按序号升序）。
++
++    排序必须按**序号**而不是按文件名的字典序，否则 ``stem.10`` 会排在
++    ``stem.2`` 前面，轮转的先后次序与保留份数都会挑错文件。
++    """
+     names = []
++    prefix = stem + "."
+     for name in os.listdir(directory):
+-        if not name.startswith(stem + "."):
++        if not name.startswith(prefix):
++            continue
++        suffix = name[len(prefix):]
++        if not suffix.isdigit():
++            continue
++        # isdigit() 对 "²"、"٣" 这类字符同样成立，但它们不是我们认识的序号
++        if not suffix.isascii():
+             continue
+-        suffix = name[len(stem) + 1:]
+-        if suffix.isdigit():
+-            names.append(name)
+-    return sorted(names)
++        names.append(name)
++    return sorted(names, key=rotation_index)
+ 
+ 
+ def rotation_index(name):
+diff --git a/wrotate/rotator.py b/wrotate/rotator.py
+index 3a31f7d..21cca5d 100644
+--- a/wrotate/rotator.py
++++ b/wrotate/rotator.py
+@@ -2,6 +2,16 @@
+ 
+ 按序号滚动日志文件：``app.log`` → ``app.log.1`` → ``app.log.2`` ……，
+ 并按保留份数把最老的那些删掉。
++
++实现上有三条硬性要求，都是 Windows 上真实踩过的坑：
++
++* 搬运必须**从序号最大的开始**往大处挪。反过来（先挪 ``.1``）会撞上还没搬走
++  的下一代——上一轮异常退出留下的残留文件往往就占着目标序号；顺序对了，每
++  一步的目标位置要么本来就空着，要么刚被上一步腾空，世代内容依次接力。
++* 一轮搬运要么全部成功，要么原路撤销。中途失败留下半截结果比失败本身更糟
++  ——序号之间会出现空洞，日志顺序对不上，谁也说不清哪一份是哪一代。
++* 保留份数按**序号**判断，不按文件名的字典序：``app.log.10`` 在字典序里排在
++  ``app.log.2`` 前面，按名字排序会把最新的一份当成最老的删掉。
+ """
+ 
+ import os
+@@ -29,33 +39,77 @@ class Rotator(object):
+         """返回当前存在的轮转文件名（按序号升序）。"""
+         return fsutil.rotation_names(self.directory, self.stem)
+ 
++    def _rotation_path(self, index):
++        """返回序号 ``index`` 对应的完整路径。"""
++        return "%s.%d" % (self.path, index)
++
++    def _plan(self):
++        """给出本轮要执行的搬运计划：按执行顺序排列的 ``(src, dst)``。
++
++        顺序是「序号从大到小」，最后一步才把当前日志挪到 ``.1``。
++        """
++        plan = []
++        for name in reversed(self.rotations()):
++            index = fsutil.rotation_index(name)
++            src = os.path.join(self.directory, name)
++            plan.append((src, self._rotation_path(index + 1)))
++        plan.append((self.path, self._rotation_path(1)))
++        return plan
++
++    @staticmethod
++    def _undo(done):
++        """按相反顺序撤销已经完成的搬运，尽力回到开始前的状态。
++
++        撤销自身出错时不去覆盖原始异常：原始异常才是要报给调用方的原因，
++        回滚只是「能救多少救多少」。
++        """
++        for src, dst in reversed(done):
++            try:
++                fsutil.restore(dst, src)
++            except Exception:  # noqa: BLE001 - 回滚失败不该盖住原始错误
++                continue
++
+     def rotate(self):
+         """把当前日志滚成 ``.1``，并把已有轮转依次后移。
+ 
++        目标序号上已经有残留文件时同样成功完成：残留被继续往后挪，各世代内容
++        依次接力。任何一步失败都会把已经完成的搬运原路撤销，再抛出原始异常，
++        不会留下半截结果。
++
+         返回本次被写入的新路径列表。
+         """
+         if not os.path.exists(self.path):
+             return []
+ 
+-        moved = []
+-        for name in self.rotations():
+-            index = fsutil.rotation_index(name)
+-            src = os.path.join(self.directory, name)
+-            dst = "%s.%d" % (self.path, index + 1)
+-            fsutil.move(src, dst)
+-            moved.append(dst)
+-
+-        dst = "%s.1" % self.path
+-        fsutil.move(self.path, dst)
+-        moved.append(dst)
+-        return moved
++        done = []
++        for src, dst in self._plan():
++            try:
++                fsutil.move(src, dst)
++            except BaseException:
++                if not os.path.exists(src) and os.path.exists(dst):
++                    # 搬运其实已经生效、只是随后才报错，这一步也得撤销
++                    done.append((src, dst))
++                self._undo(done)
++                raise
++            done.append((src, dst))
++        return [dst for _src, dst in done]
+ 
+     def prune(self):
+-        """删除超出保留份数的轮转文件，返回被删除的名字列表。"""
++        """删除超出保留份数的轮转文件，返回被删除的名字列表。
++
++        序号越小越新：保留的是序号最小的 ``keep`` 份（``.1`` … ``.keep``），
++        删掉的是序号最大的那些，并按序号从大到小的顺序删。
++        """
+         names = self.rotations()
+-        ordered = sorted(names, reverse=True)
++        keep = self.keep if self.keep > 0 else 0
++        drop = len(names) - keep
++        if drop <= 0:
++            return []
++
++        # 序号降序：最老的一份排在最前面，正是要先删的那一份
++        oldest_first = sorted(names, key=fsutil.rotation_index, reverse=True)
+         removed = []
+-        for name in ordered[self.keep:]:
++        for name in oldest_first[:drop]:
+             if fsutil.remove(os.path.join(self.directory, name)):
+                 removed.append(name)
+         return removed

@@ -1,0 +1,251 @@
+diff --git a/winpipe/client.py b/winpipe/client.py
+index b5ac547..6f91d31 100644
+--- a/winpipe/client.py
++++ b/winpipe/client.py
+@@ -2,11 +2,16 @@
+ 
+ from __future__ import annotations
+ 
++import time
++
+ from . import native
+-from .errors import WPipeError
++from .errors import PipeBusyError, WPipeError
++from .framing import FrameDecoder, pack_frame
+ 
+ __all__ = ["PipeClient"]
+ 
++_EOL_BROKEN = (native.ERROR_BROKEN_PIPE, native.ERROR_NO_DATA)
++
+ 
+ def _resolve_name(name):
+     """把 ``foo`` 形态补全为 ``\\\\.\\pipe\\foo``。"""
+@@ -30,29 +35,56 @@ class PipeClient:
+         self.timeout_ms = timeout_ms
+         self.buffer_size = buffer_size
+         self._handle = None
++        self._decoder = FrameDecoder()
+ 
+     # ------------------------------------------------------------ 生命周期
+     def connect(self):
+-        """连接到服务端管道。"""
+-        handle = native.open_pipe(_resolve_name(self.name))
+-        if not native.is_valid(handle):
+-            raise WPipeError("connection", "cannot open %r" % (self.name,),
+-                             winerror=native.last_error())
+-        self._handle = handle
+-        return True
++        """连接到服务端管道。
++
++        目标名下所有实例都忙（ERROR_PIPE_BUSY）时，在预算内用 WaitNamedPipe
++        等待实例释放并重试；预算耗尽抛 PipeBusyError。
++        """
++        full_name = _resolve_name(self.name)
++        deadline = time.monotonic() + max(self.timeout_ms, 0) / 1000.0
++        while True:
++            handle = native.open_pipe(full_name)
++            if native.is_valid(handle):
++                self._handle = handle
++                self._decoder = FrameDecoder()
++                return True
++            winerror = native.last_error()
++            if winerror != native.ERROR_PIPE_BUSY:
++                raise WPipeError("connection", "cannot open %r" % (self.name,),
++                                 winerror=winerror)
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise PipeBusyError(self.name, timeout_ms=self.timeout_ms, winerror=winerror)
++            native.wait_pipe(full_name, max(int(min(remaining, 0.1) * 1000), 1))
+ 
+     # ------------------------------------------------------------ 数据面
+     def send(self, payload):
+         """发送一条应用层消息。"""
+-        return native.write(self._handle, payload)
++        return native.write(self._handle, pack_frame(payload))
+ 
+     def send_bytes(self, data):
+         """写入一段原始字节（不分帧）。"""
+         return native.write(self._handle, data)
+ 
+     def recv(self):
+-        """接收一条应用层消息。"""
+-        return native.read(self._handle, self.buffer_size)
++        """接收一条应用层消息；对端关闭时返回 ``None``。"""
++        while True:
++            payload = self._decoder.pop()
++            if payload is not None:
++                return payload
++            try:
++                chunk = native.read(self._handle, self.buffer_size)
++            except OSError as exc:
++                if getattr(exc, "winerror", None) in _EOL_BROKEN:
++                    return None
++                raise
++            if not chunk:
++                return None
++            self._decoder.feed(chunk)
+ 
+     def recv_raw(self):
+         """读取一段原始字节（不分帧）。"""
+diff --git a/winpipe/framing.py b/winpipe/framing.py
+new file mode 100644
+index 0000000..67b5756
+--- /dev/null
++++ b/winpipe/framing.py
+@@ -0,0 +1,54 @@
++"""长度前缀分帧（4 字节小端长度 + payload）。"""
++
++from __future__ import annotations
++
++import struct
++
++__all__ = ["HEADER_SIZE", "FrameDecoder", "pack_frame"]
++
++HEADER_SIZE = 4
++_MAX_PAYLOAD = 0xFFFFFFFF
++
++
++def pack_frame(payload):
++    """把 payload 打包成一帧（4 字节小端长度 + payload）。"""
++    if isinstance(payload, str):
++        payload = payload.encode("utf-8")
++    if len(payload) > _MAX_PAYLOAD:
++        raise ValueError("payload too large to frame")
++    return struct.pack("<I", len(payload)) + payload
++
++
++class FrameDecoder:
++    """累积字节流，并按长度前缀切出完整帧。
++
++    字节模式下管道不保留写入边界：一个帧可能跨多次读到达，多个帧也可能
++    在一次读里一起到达。因此接收端必须自己缓冲并切分。
++    """
++
++    def __init__(self, max_payload=_MAX_PAYLOAD):
++        self._buffer = bytearray()
++        self._max_payload = max_payload
++
++    def feed(self, chunk):
++        """把一段新到达的字节追加进缓冲区。"""
++        if chunk:
++            self._buffer.extend(chunk)
++
++    def pop(self):
++        """取出一个完整帧；不足一帧时返回 ``None``。"""
++        if len(self._buffer) < HEADER_SIZE:
++            return None
++        (length,) = struct.unpack_from("<I", self._buffer, 0)
++        if length > self._max_payload:
++            raise ValueError("declared frame length %d exceeds limit" % length)
++        if len(self._buffer) < HEADER_SIZE + length:
++            return None
++        end = HEADER_SIZE + length
++        payload = bytes(self._buffer[HEADER_SIZE:end])
++        del self._buffer[:end]
++        return payload
++
++    def pending(self):
++        """缓冲区中尚未构成完整帧的字节数。"""
++        return len(self._buffer)
+diff --git a/winpipe/server.py b/winpipe/server.py
+index cba220f..30abf89 100644
+--- a/winpipe/server.py
++++ b/winpipe/server.py
+@@ -4,9 +4,27 @@ from __future__ import annotations
+ 
+ from . import native
+ from .errors import WPipeError
++from .framing import FrameDecoder, pack_frame
+ 
+ __all__ = ["PipeServer"]
+ 
++_EOL_BROKEN = (native.ERROR_BROKEN_PIPE, native.ERROR_NO_DATA)
++
++
++def _validate_name(name):
++    """校验并规范化管道名，返回 ``\\\\.\\pipe\\<name>`` 形式。"""
++    if not isinstance(name, str) or not name:
++        raise WPipeError("name", "pipe name must be a non-empty string")
++    probe = name
++    if probe.startswith(native.PIPE_PREFIX):
++        probe = probe[len(native.PIPE_PREFIX):]
++    if not probe:
++        raise WPipeError("name", "pipe name must not be empty")
++    for ch in probe:
++        if ch in ("/", "\\") or ord(ch) < 0x20:
++            raise WPipeError("name", "illegal character in pipe name: %r" % (name,))
++    return native.PIPE_PREFIX + probe
++
+ 
+ def _resolve_name(name):
+     """把 ``foo`` 形态补全为 ``\\\\.\\pipe\\foo``。"""
+@@ -32,39 +50,61 @@ class PipeServer:
+         self.buffer_size = buffer_size
+         self.message_mode = message_mode
+         self._handle = None
++        self._decoder = FrameDecoder()
+ 
+     # ------------------------------------------------------------ 生命周期
+     def create_instance(self, first_instance=False):
+         """创建服务端管道实例，返回句柄。"""
++        full_name = _validate_name(self.name)
++        self.name = full_name
+         handle = native.create_pipe(
+-            _resolve_name(self.name),
++            full_name,
+             instances=self.instances,
+             buffer_size=self.buffer_size,
+             message_mode=self.message_mode,
+             first_instance=first_instance,
+         )
+         if not native.is_valid(handle):
+-            raise WPipeError("connection", "CreateNamedPipe failed for %r" % (self.name,),
++            raise WPipeError("connection", "CreateNamedPipe failed for %r" % (full_name,),
+                              winerror=native.last_error())
+         self._handle = handle
++        self._decoder = FrameDecoder()
+         return handle
+ 
+     def accept(self):
+-        """等待并接受一个客户端连接。"""
++        """等待并接受一个客户端连接。
++
++        客户端可能在 ConnectNamedPipe 之前就已完成打开，此时 Win32 返回
++        FALSE 且 GetLastError()==ERROR_PIPE_CONNECTED——连接其实已经建立。
++        """
+         ok = native.connect(self._handle)
+         if not ok:
+-            raise WPipeError("connection", "ConnectNamedPipe failed for %r" % (self.name,),
+-                             winerror=native.last_error())
++            winerror = native.last_error()
++            if winerror != native.ERROR_PIPE_CONNECTED:
++                raise WPipeError("connection", "ConnectNamedPipe failed for %r" % (self.name,),
++                                 winerror=winerror)
+         return True
+ 
+     # ------------------------------------------------------------ 数据面
+     def read_frame(self):
+-        """读取一条完整的应用层消息。"""
+-        return native.read(self._handle, self.buffer_size)
++        """读取一条完整的应用层消息；对端关闭时返回 ``None``。"""
++        while True:
++            payload = self._decoder.pop()
++            if payload is not None:
++                return payload
++            try:
++                chunk = native.read(self._handle, self.buffer_size)
++            except OSError as exc:
++                if getattr(exc, "winerror", None) in _EOL_BROKEN:
++                    return None
++                raise
++            if not chunk:
++                return None
++            self._decoder.feed(chunk)
+ 
+     def write_frame(self, payload):
+         """发送一条应用层消息。"""
+-        return native.write(self._handle, payload)
++        return native.write(self._handle, pack_frame(payload))
+ 
+     def read_raw(self):
+         """读取一段原始字节（不分帧）。"""

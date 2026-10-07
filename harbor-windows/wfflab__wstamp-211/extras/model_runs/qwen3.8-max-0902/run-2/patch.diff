@@ -1,0 +1,1714 @@
+diff --git a/_out_tmp.txt b/_out_tmp.txt
+new file mode 100644
+index 0000000..5030a00
+--- /dev/null
++++ b/_out_tmp.txt
+@@ -0,0 +1,37 @@
++wstamp: a.txt (target path is a directory: C:\Users\Administrator\AppData\Local\Temp\wsverify_vs5taax\target\a.txt)
++wstamp: blocked.txt ([Errno 13] Permission denied: 'C:\\Users\\Administrator\\AppData\\Local\\Temp\\wsverify_vs5taax\\target\\blocked.txt')
++wstamp: d ([WinError 183] 当文件已存在时，无法创建该文件。: 'C:\\Users\\Administrator\\AppData\\Local\\Temp\\wsverifyzb8byiph\\target\\d')
++PASS  snapshot_fields
++PASS  stamp_file_exact_ns_and_keeps_atime
++PASS  stamp_file_accepts_pathlike
++PASS  stamp_file_readonly_raises_and_writes_nothing
++PASS  stamp_file_missing_path
++PASS  set_times_helper
++PASS  copy_stamp_times_and_attrs
++PASS  copy_stamp_overwrites_readonly_dst
++PASS  copy_stamp_creates_parent_dirs
++PASS  copy_stamp_hidden_only
++PASS  sync_created_updated_restamped_deleted
++PASS  sync_creates_whole_tree
++PASS  sync_restamped_keeps_dst_atime
++PASS  sync_in_sync_reports_nothing
++PASS  sync_carries_attributes
++PASS  sync_updates_readonly_target
++PASS  sync_restamps_readonly_target_and_keeps_attr
++PASS  sync_readonly_source_file_created
++PASS  sync_deletes_readonly_extra
++PASS  sync_failed_entries_do_not_abort
++PASS  sync_src_dir_where_dst_has_file
++PASS  sync_missing_src_raises
++PASS  report_paths_are_relative_and_joined
++PASS  directory_mtimes_restored
++PASS  directory_mtimes_restored_after_changes
++PASS  directory_mtime_restored_with_readonly_dir
++PASS  dry_run_reports_without_touching
++PASS  dry_run_missing_dst_root
++PASS  dry_run_deletes_nothing
++PASS  report_shape
++PASS  idempotent_second_run
++PASS  pathlike_arguments
++------------------------------------------------------------
++total=32 failed=0 []
+diff --git a/_probe_tmp.py b/_probe_tmp.py
+new file mode 100644
+index 0000000..cd52197
+--- /dev/null
++++ b/_probe_tmp.py
+@@ -0,0 +1,128 @@
++"""TEMPORARY probe - will be deleted."""
++import ctypes
++import os
++import shutil
++import sys
++import tempfile
++
++RO = 0x01
++HIDDEN = 0x02
++k32 = ctypes.windll.kernel32
++
++
++def ga(p):
++    return k32.GetFileAttributesW(str(p))
++
++
++def sa(p, v):
++    if not k32.SetFileAttributesW(str(p), v):
++        raise ctypes.WinError()
++
++
++root = tempfile.mkdtemp(prefix="wsexp")
++try:
++    f = os.path.join(root, "ro.txt")
++    open(f, "wb").write(b"x")
++    print("attrs fresh file:", hex(ga(f)))
++    sa(f, ga(f) | RO)
++    print("attrs after RO:", hex(ga(f)))
++    st = os.stat(f)
++    print("mtime%100", st.st_mtime_ns % 100, "atime%100", st.st_atime_ns % 100)
++    try:
++        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns - 1000000))
++        print("utime readonly file: OK (unexpected)")
++    except OSError as e:
++        print("utime readonly file FAILED:", type(e).__name__, e.winerror)
++
++    d = os.path.join(root, "rodir")
++    os.makedirs(d)
++    sa(d, ga(d) | RO)
++    print("dir attrs:", hex(ga(d)))
++    std = os.stat(d)
++    try:
++        os.utime(d, ns=(std.st_atime_ns, std.st_mtime_ns - 1000000))
++        print("utime readonly dir: OK")
++    except OSError as e:
++        print("utime readonly dir FAILED:", type(e).__name__, e.winerror)
++
++    child = os.path.join(d, "child.txt")
++    try:
++        open(child, "wb").write(b"y")
++        print("create file inside readonly dir: OK")
++    except OSError as e:
++        print("create inside readonly dir FAILED:", type(e).__name__, e.winerror)
++    try:
++        os.remove(child)
++        print("remove file inside readonly dir: OK")
++    except OSError as e:
++        print("remove inside readonly dir FAILED:", type(e).__name__, e.winerror)
++
++    f2 = os.path.join(root, "ro2.txt")
++    open(f2, "wb").write(b"z")
++    sa(f2, ga(f2) | RO)
++    try:
++        os.remove(f2)
++        print("remove readonly file: OK (unexpected)")
++    except OSError as e:
++        print("remove readonly file FAILED:", type(e).__name__, e.winerror)
++    try:
++        shutil.rmtree(d)
++        print("rmtree readonly dir: OK")
++    except OSError as e:
++        print("rmtree readonly dir FAILED:", type(e).__name__, e.winerror)
++    try:
++        os.rmdir(d)
++        print("rmdir readonly dir: OK")
++    except OSError as e:
++        print("rmdir readonly dir FAILED:", type(e).__name__, e.winerror)
++
++    missing = os.path.join(root, "nope.txt")
++    print("GA on missing (default restype):", ga(missing), "eq 0xFFFFFFFF:", ga(missing) == 0xFFFFFFFF)
++    k32.GetFileAttributesW.restype = ctypes.c_uint
++    print("GA on missing (DWORD restype):", hex(ga(missing)), "err:", ctypes.GetLastError())
++
++    try:
++        open(root, "rb").read()
++        print("open dir read: OK (unexpected)")
++    except OSError as e:
++        print("open dir read FAILED:", type(e).__name__, e.winerror)
++
++    srcf = os.path.join(root, "src.txt")
++    dstf = os.path.join(root, "dst.txt")
++    open(srcf, "wb").write(b"aaa")
++    open(dstf, "wb").write(b"bbb")
++    sa(dstf, ga(dstf) | RO)
++    try:
++        shutil.copyfile(srcf, dstf)
++        print("copyfile onto readonly dst: OK (unexpected)")
++    except OSError as e:
++        print("copyfile onto readonly dst FAILED:", type(e).__name__, e.winerror)
++
++    tf = os.path.join(root, "ns.txt")
++    open(tf, "wb").write(b"n")
++    t = 1700000000123456700
++    os.utime(tf, ns=(t, t))
++    print("exact 100-multiple roundtrip:", os.stat(tf).st_mtime_ns == t)
++    t2 = 1700000000123456789
++    os.utime(tf, ns=(t2, t2))
++    print("non-multiple:", t2, "->", os.stat(tf).st_mtime_ns, "truncated:", t2 - os.stat(tf).st_mtime_ns)
++
++    pdir = os.path.join(root, "pdir")
++    os.makedirs(os.path.join(pdir, "sub"))
++    sub = os.path.join(pdir, "sub")
++    b = os.stat(pdir).st_mtime_ns
++    sa(sub, ga(sub) | HIDDEN)
++    print("parent mtime changed by child SetFileAttributes:", b != os.stat(pdir).st_mtime_ns)
++    b = os.stat(pdir).st_mtime_ns
++    os.utime(sub, ns=(b, b - 500000000))
++    print("parent mtime changed by child utime:", b != os.stat(pdir).st_mtime_ns)
++finally:
++    for base, dirs, files in os.walk(root):
++        for name in dirs + files:
++            try:
++                sa(os.path.join(base, name), 0x80)
++            except OSError:
++                pass
++    shutil.rmtree(root, ignore_errors=True)
++    print("cleaned:", not os.path.exists(root))
++print(sys.version)
+diff --git a/_probe_tmp2.py b/_probe_tmp2.py
+new file mode 100644
+index 0000000..6ba6e0e
+--- /dev/null
++++ b/_probe_tmp2.py
+@@ -0,0 +1,116 @@
++"""TEMPORARY probe 2 - will be deleted."""
++import ctypes
++import os
++import shutil
++import tempfile
++import time
++from ctypes import wintypes
++
++RO = 0x01
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
++k32.GetFileAttributesW.restype = wintypes.DWORD
++k32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
++k32.SetFileAttributesW.restype = wintypes.BOOL
++
++
++def ga(p):
++    v = k32.GetFileAttributesW(str(p))
++    if v == 0xFFFFFFFF:
++        raise ctypes.WinError(ctypes.get_last_error())
++    return v
++
++
++def sa(p, v):
++    if not k32.SetFileAttributesW(str(p), v):
++        raise ctypes.WinError(ctypes.get_last_error())
++
++
++root = tempfile.mkdtemp(prefix="wsexp2")
++try:
++    f = os.path.join(root, "ro.txt")
++    with open(f, "wb") as fh:
++        fh.write(b"x")
++    old = os.stat(f).st_mtime_ns
++    sa(f, ga(f) | RO)
++    new = old - 5_000_000_000
++    try:
++        os.utime(f, ns=(os.stat(f).st_atime_ns, new))
++        got = os.stat(f).st_mtime_ns
++        print("utime on readonly file -> applied:", got == new, "got", got, "want", new)
++    except OSError as e:
++        print("utime readonly raised:", type(e).__name__, e.winerror, e.errno)
++
++    # restore readonly after stamping: does it perturb mtime?
++    sa(f, ga(f) & ~RO)
++    os.utime(f, ns=(os.stat(f).st_atime_ns, new))
++    sa(f, ga(f) | RO)
++    print("mtime after re-readonly:", os.stat(f).st_mtime_ns == new, "attrs", hex(ga(f)))
++
++    # does copyfile touch src atime?
++    src = os.path.join(root, "s.txt")
++    dst = os.path.join(root, "d.txt")
++    with open(src, "wb") as fh:
++        fh.write(b"hello")
++    a0 = os.stat(src).st_atime_ns
++    shutil.copyfile(src, dst)
++    a1 = os.stat(src).st_atime_ns
++    print("src atime changed by copyfile:", a0 != a1)
++    print("dst attrs:", hex(ga(dst)), "src attrs:", hex(ga(src)))
++    print("dst mtime == src mtime:", os.stat(dst).st_mtime_ns == os.stat(src).st_mtime_ns)
++
++    # copy2 behaviour
++    dst2 = os.path.join(root, "d2.txt")
++    shutil.copy2(src, dst2)
++    print("copy2 dst mtime equal:", os.stat(dst2).st_mtime_ns == os.stat(src).st_mtime_ns)
++    print("copy2 dst atime equal:", os.stat(dst2).st_atime_ns == os.stat(src).st_atime_ns)
++
++    # setting attributes to exactly 0x80 / 0 and to 0x21
++    sa(dst, 0)
++    print("attrs after set 0:", hex(ga(dst)))
++    sa(dst, 0x21)
++    print("attrs after set 0x21:", hex(ga(dst)))
++
++    # exclusive lock simulation: does opening with msvcrt lock block copyfile?
++    lk = os.path.join(root, "lk.txt")
++    with open(lk, "wb") as fh:
++        fh.write(b"data")
++    fh = os.open(lk, os.O_RDWR)
++    import msvcrt
++    msvcrt.locking(fh, msvcrt.LK_NBLCK, 1)
++    try:
++        shutil.copyfile(src, lk)
++        print("copyfile over byte-locked file: OK")
++    except OSError as e:
++        print("copyfile over byte-locked file FAILED:", type(e).__name__, e.winerror, e.errno)
++    msvcrt.locking(fh, msvcrt.LK_UNLCK, 1)
++    os.close(fh)
++
++    # share-mode-none lock via CreateFileW
++    lk2 = os.path.join(root, "lk2.txt")
++    with open(lk2, "wb") as fh:
++        fh.write(b"data")
++    GENERIC_WRITE = 0x40000000
++    h = k32.CreateFileW(lk2, GENERIC_WRITE, 0, None, 3, 0, None)
++    print("CreateFileW handle:", h)
++    try:
++        with open(lk2, "rb") as fh:
++            fh.read()
++        print("read share-locked file: OK")
++    except OSError as e:
++        print("read share-locked file FAILED:", type(e).__name__, e.winerror, e.errno)
++    try:
++        os.utime(lk2, ns=(1700000000000000000, 1700000000000000000))
++        print("utime share-locked file: OK")
++    except OSError as e:
++        print("utime share-locked file FAILED:", type(e).__name__, e.winerror, e.errno)
++    k32.CloseHandle(h)
++finally:
++    for base, dirs, files in os.walk(root):
++        for name in dirs + files:
++            try:
++                sa(os.path.join(base, name), 0x80)
++            except OSError:
++                pass
++    shutil.rmtree(root, ignore_errors=True)
++    print("cleaned:", not os.path.exists(root))
+diff --git a/_probe_tmp3.py b/_probe_tmp3.py
+new file mode 100644
+index 0000000..bcef913
+--- /dev/null
++++ b/_probe_tmp3.py
+@@ -0,0 +1,79 @@
++"""TEMPORARY probe 3 - atime update behaviour. Will be deleted."""
++import ctypes
++import os
++import shutil
++import tempfile
++import time
++from ctypes import wintypes
++
++root = tempfile.mkdtemp(prefix="wsexp3")
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++k32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
++k32.SetFileAttributesW.restype = wintypes.BOOL
++k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
++k32.GetFileAttributesW.restype = wintypes.DWORD
++try:
++    p = os.path.join(root, "f.txt")
++    with open(p, "wb") as fh:
++        fh.write(b"hello world")
++    a0 = os.stat(p).st_atime_ns
++    m0 = os.stat(p).st_mtime_ns
++    time.sleep(0.05)
++    with open(p, "rb") as fh:
++        fh.read()
++    a1 = os.stat(p).st_atime_ns
++    time.sleep(0.05)
++    a2 = os.stat(p).st_atime_ns
++    time.sleep(0.05)
++    with open(p, "rb") as fh:
++        fh.read()
++    a3 = os.stat(p).st_atime_ns
++    print("read bumped:", a1 != a0, "| stat bumped:", a2 != a1, "| read2 bumped:", a3 != a2)
++    print("deltas:", a1 - a0, a3 - a2)
++    print("mtime stable:", os.stat(p).st_mtime_ns == m0)
++    print("multiples of 100:", all(x % 100 == 0 for x in (a0, a1, a2, a3, m0)))
++
++    cap = os.stat(p).st_atime_ns
++    with open(p, "rb") as fh:
++        fh.read()
++    bumped = os.stat(p).st_atime_ns != cap
++    os.utime(p, ns=(cap, os.stat(p).st_mtime_ns))
++    print("read bumped again:", bumped, "| atime restored exactly:", os.stat(p).st_atime_ns == cap)
++
++    s = os.path.join(root, "s.txt")
++    with open(s, "wb") as fh:
++        fh.write(b"abc")
++    k32.SetFileAttributesW(s, 0x21)
++    d = os.path.join(root, "d.txt")
++    snap = os.stat(s)
++    shutil.copyfile(s, d)
++    os.utime(d, ns=(snap.st_atime_ns, snap.st_mtime_ns))
++    k32.SetFileAttributesW(d, k32.GetFileAttributesW(s))
++    sd = os.stat(d)
++    print("copy: mtime equal:", sd.st_mtime_ns == snap.st_mtime_ns,
++          "| atime equal:", sd.st_atime_ns == snap.st_atime_ns,
++          "| attrs:", hex(k32.GetFileAttributesW(d)), hex(k32.GetFileAttributesW(s)))
++    print("src atime bumped by copy:", os.stat(s).st_atime_ns != snap.st_atime_ns)
++
++    # directory atime bump when listing?
++    dd = os.path.join(root, "dd")
++    os.makedirs(dd)
++    da = os.stat(dd).st_atime_ns
++    dm = os.stat(dd).st_mtime_ns
++    os.listdir(dd)
++    print("dir atime bumped by listdir:", os.stat(dd).st_atime_ns != da,
++          "| dir mtime bumped:", os.stat(dd).st_mtime_ns != dm)
++
++    # makedirs in an existing dir bumps parent mtime?
++    before = os.stat(root).st_mtime_ns
++    os.makedirs(os.path.join(root, "newsub"))
++    print("parent mtime bumped by mkdir:", os.stat(root).st_mtime_ns != before)
++finally:
++    for base, dirs, files in os.walk(root):
++        for name in dirs + files:
++            try:
++                k32.SetFileAttributesW(os.path.join(base, name), 0x80)
++            except OSError:
++                pass
++    shutil.rmtree(root, ignore_errors=True)
++    print("cleaned:", not os.path.exists(root))
+diff --git a/_probe_tmp4.py b/_probe_tmp4.py
+new file mode 100644
+index 0000000..73654fb
+--- /dev/null
++++ b/_probe_tmp4.py
+@@ -0,0 +1,38 @@
++"""TEMPORARY probe 4 - atime bump rule. Will be deleted."""
++import os
++import tempfile
++import time
++
++HOUR = 3600 * 10**9
++root = tempfile.mkdtemp(prefix="wsexp4")
++try:
++    p = os.path.join(root, "f.txt")
++    with open(p, "wb") as fh:
++        fh.write(b"hello world")
++    now = time.time_ns()
++    for label, back in (("2h", 2 * HOUR), ("30m", 30 * 60 * 10**9), ("1min", 60 * 10**9), ("0", 0)):
++        target = ((now - back) // 100) * 100
++        os.utime(p, ns=(target, target))
++        before = os.stat(p).st_atime_ns
++        time.sleep(0.02)
++        with open(p, "rb") as fh:
++            fh.read()
++        after = os.stat(p).st_atime_ns
++        print("atime %s old -> bumped: %s (delta %d ns)" % (label, before != after, after - before))
++
++    # does merely os.stat'ing many times bump? no (checked). does open for write bump mtime only?
++    p2 = os.path.join(root, "g.txt")
++    with open(p2, "wb") as fh:
++        fh.write(b"x")
++    a = os.stat(p2).st_atime_ns
++    with open(p2, "rb") as fh:
++        fh.read()
++    b = os.stat(p2).st_atime_ns
++    with open(p2, "rb") as fh:
++        fh.read()
++    c = os.stat(p2).st_atime_ns
++    print("fresh file: read1 bump", a != b, "read2 bump", b != c, "delta1", b - a, "delta2", c - b)
++finally:
++    import shutil
++    shutil.rmtree(root, ignore_errors=True)
++    print("cleaned:", not os.path.exists(root))
+diff --git a/_probe_tmp5.py b/_probe_tmp5.py
+new file mode 100644
+index 0000000..660ae64
+--- /dev/null
++++ b/_probe_tmp5.py
+@@ -0,0 +1,55 @@
++"""TEMPORARY probe 5 - atime stability right after a write. Deleted before submit."""
++import os
++import shutil
++import tempfile
++import time
++
++root = tempfile.mkdtemp(prefix="wsexp5")
++try:
++    p = os.path.join(root, "a.txt")
++    with open(p, "wb") as fh:
++        fh.write(b"new")
++    vals = []
++    for i in range(12):
++        vals.append(os.stat(p).st_atime_ns)
++        time.sleep(0.005)
++    print("atime samples after write (deltas):", [vals[i + 1] - vals[i] for i in range(len(vals) - 1)])
++    m = [os.stat(p).st_mtime_ns for _ in range(3)]
++    print("mtime stable:", len(set(m)) == 1)
++
++    # now the exact failing sequence
++    q = os.path.join(root, "b.txt")
++    with open(q, "wb") as fh:
++        fh.write(b"other")
++    with open(p, "wb") as fh:
++        fh.write(b"new2")
++    a0 = os.stat(p).st_atime_ns
++    with open(q, "wb") as fh:
++        fh.write(b"xxxxx")
++    a1 = os.stat(p).st_atime_ns
++    shutil.copyfile(p, os.path.join(root, "c.txt"))
++    a2 = os.stat(p).st_atime_ns
++    print("a0", a0, "a1", a1, "a2", a2, "| a1-a0", a1 - a0, "| a2-a1", a2 - a1)
++
++    # does copyfile itself bump src atime when src was just written?
++    r = os.path.join(root, "d.txt")
++    with open(r, "wb") as fh:
++        fh.write(b"z")
++    b0 = os.stat(r).st_atime_ns
++    shutil.copyfile(r, os.path.join(root, "e.txt"))
++    b1 = os.stat(r).st_atime_ns
++    print("copyfile bump on fresh src:", b1 - b0)
++
++    # same but with a 5ms gap between write and snapshot
++    s = os.path.join(root, "f.txt")
++    with open(s, "wb") as fh:
++        fh.write(b"z")
++    time.sleep(0.02)
++    c0 = os.stat(s).st_atime_ns
++    time.sleep(0.02)
++    shutil.copyfile(s, os.path.join(root, "g.txt"))
++    c1 = os.stat(s).st_atime_ns
++    print("copyfile bump after 20ms gap:", c1 - c0)
++finally:
++    shutil.rmtree(root, ignore_errors=True)
++    print("cleaned:", not os.path.exists(root))
+diff --git a/_probe_tmp6.py b/_probe_tmp6.py
+new file mode 100644
+index 0000000..ce41361
+--- /dev/null
++++ b/_probe_tmp6.py
+@@ -0,0 +1,48 @@
++"""TEMPORARY probe 6 - why dst atime drifts after copy_stamp. Deleted before submit."""
++import os
++import tempfile
++import time
++from pathlib import Path
++
++from wstamp import copy_stamp, snapshot_times
++from wstamp.attributes import get_attributes, set_attributes
++
++root = Path(tempfile.mkdtemp(prefix="wsexp6"))
++try:
++    for trial in range(3):
++        src = root / ("s%d.txt" % trial)
++        dst = root / ("d%d.txt" % trial)
++        with open(str(src), "wb") as fh:
++            fh.write(b"new")
++        with open(str(dst), "wb") as fh:
++            fh.write(b"old-old-old")
++        if trial:
++            set_attributes(str(dst), get_attributes(str(dst)) | 0x01)
++        snap = snapshot_times(str(src))
++        t0 = time.perf_counter_ns()
++        copy_stamp(str(src), str(dst))
++        t1 = time.perf_counter_ns()
++        got = snapshot_times(str(dst))
++        src_after = snapshot_times(str(src))
++        print("trial", trial, "readonly-dst", bool(trial))
++        print("  src snap atime", snap["atime_ns"], "mtime", snap["mtime_ns"])
++        print("  dst got  atime", got["atime_ns"], "mtime", got["mtime_ns"])
++        print("  atime equal:", got["atime_ns"] == snap["atime_ns"],
++              "delta:", got["atime_ns"] - snap["atime_ns"])
++        print("  mtime equal:", got["mtime_ns"] == snap["mtime_ns"])
++        print("  src atime after copy:", src_after["atime_ns"] - snap["atime_ns"])
++        print("  copy took us:", (t1 - t0) / 1000.0)
++        time.sleep(0.05)
++        again = snapshot_times(str(dst))
++        print("  dst atime 50ms later delta:", again["atime_ns"] - got["atime_ns"])
++        time.sleep(0.05)
++finally:
++    import shutil
++    for base, dirs, files in os.walk(str(root)):
++        for name in dirs + files:
++            try:
++                set_attributes(os.path.join(base, name), 0x80)
++            except OSError:
++                pass
++    shutil.rmtree(str(root), ignore_errors=True)
++    print("cleaned:", not root.exists())
+diff --git a/_probe_tmp7.py b/_probe_tmp7.py
+new file mode 100644
+index 0000000..5551cde
+--- /dev/null
++++ b/_probe_tmp7.py
+@@ -0,0 +1,46 @@
++"""TEMPORARY probe 7 - replicate the failing verification case. Deleted before submit."""
++import os
++import tempfile
++import time
++from pathlib import Path
++
++from wstamp import copy_stamp, snapshot_times
++from wstamp.attributes import get_attributes, set_attributes
++
++
++def mkfile(p, data=b"data", mtime_ns=None, at=None):
++    p = Path(p)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    with open(str(p), "wb") as fh:
++        fh.write(data)
++    if mtime_ns is not None:
++        a = at if at is not None else os.stat(str(p)).st_atime_ns
++        os.utime(str(p), ns=(a, mtime_ns))
++    return p
++
++
++for trial in range(4):
++    t = Path(tempfile.mkdtemp(prefix="wsexp7"))
++    src = mkfile(t / "s.txt", b"new")
++    dst = mkfile(t / "d.txt", b"old-old-old")
++    set_attributes(str(dst), get_attributes(str(dst)) | 0x01)
++    snap = snapshot_times(str(src))
++    inner_before = snapshot_times(str(src))
++    copy_stamp(str(src), str(dst))
++    got = snapshot_times(str(dst))
++    print("trial", trial)
++    print("  snap     atime", snap["atime_ns"], "mtime", snap["mtime_ns"])
++    print("  inner    atime", inner_before["atime_ns"], "delta", inner_before["atime_ns"] - snap["atime_ns"])
++    print("  dst      atime", got["atime_ns"], "delta-vs-snap", got["atime_ns"] - snap["atime_ns"])
++    print("  dst mtime ok:", got["mtime_ns"] == snap["mtime_ns"])
++    print("  dst attrs:", hex(get_attributes(str(dst))), "src attrs:", hex(get_attributes(str(src))))
++    time.sleep(0.01)
++    print("  dst atime later delta:", snapshot_times(str(dst))["atime_ns"] - got["atime_ns"])
++    import shutil
++    for base, dirs, files in os.walk(str(t)):
++        for name in dirs + files:
++            try:
++                set_attributes(os.path.join(base, name), 0x80)
++            except OSError:
++                pass
++    shutil.rmtree(str(t), ignore_errors=True)
+diff --git a/_verify_tmp.py b/_verify_tmp.py
+new file mode 100644
+index 0000000..5852948
+--- /dev/null
++++ b/_verify_tmp.py
+@@ -0,0 +1,571 @@
++"""TEMPORARY verification script (deleted before submit)."""
++
++import ctypes
++import os
++import shutil
++import sys
++import tempfile
++import time
++import traceback
++from ctypes import wintypes
++from pathlib import Path
++
++from wstamp import (
++    SyncReport,
++    WStampError,
++    copy_stamp,
++    snapshot_times,
++    stamp_file,
++    sync_tree,
++)
++from wstamp.stamps import set_times
++
++RO = 0x01
++HIDDEN = 0x02
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
++k32.GetFileAttributesW.restype = wintypes.DWORD
++k32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
++k32.SetFileAttributesW.restype = wintypes.BOOL
++k32.CreateFileW.restype = wintypes.HANDLE
++k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
++                            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
++
++TESTS = []
++
++
++def test(fn):
++    TESTS.append(fn)
++    return fn
++
++
++def attrs(p):
++    v = k32.GetFileAttributesW(str(p))
++    assert v != 0xFFFFFFFF, "missing path %s" % p
++    return v
++
++
++def setattrs(p, v):
++    assert k32.SetFileAttributesW(str(p), v), "setattr failed on %s" % p
++
++
++def mkfile(p, data=b"data", mtime_ns=None, at=None):
++    p = Path(p)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    with open(str(p), "wb") as fh:
++        fh.write(data)
++    if mtime_ns is not None:
++        a = at if at is not None else os.stat(str(p)).st_atime_ns
++        os.utime(str(p), ns=(a, mtime_ns))
++    return p
++
++
++def raises(exc_type, fn, *a, **kw):
++    try:
++        fn(*a, **kw)
++    except exc_type as exc:
++        return exc
++    raise AssertionError("expected %s, nothing raised" % exc_type.__name__)
++
++
++DAY = 86400 * 10**9
++OLD = ((time.time_ns() - 3 * DAY) // 100) * 100
++
++
++# ---------------------------------------------------------------- 1 snapshot
++@test
++def snapshot_fields(t):
++    p = mkfile(t / "a.txt")
++    snap = snapshot_times(str(p))
++    st = os.stat(str(p))
++    assert snap["mtime_ns"] == st.st_mtime_ns
++    assert snap["atime_ns"] == st.st_atime_ns
++    assert snap["created"] == st.st_ctime
++    assert isinstance(snap["mtime_ns"], int) and isinstance(snap["atime_ns"], int)
++    assert isinstance(snap["created"], float)
++    assert snap["mtime_ns"] % 100 == 0
++
++
++# ----------------------------------------------------------------- 2 stamping
++@test
++def stamp_file_exact_ns_and_keeps_atime(t):
++    p = mkfile(t / "a.txt")
++    before = snapshot_times(str(p))
++    target = ((before["mtime_ns"] - DAY) // 100) * 100
++    assert target % 100 == 0
++    stamp_file(str(p), target)
++    after = snapshot_times(str(p))
++    assert after["mtime_ns"] == target, (after["mtime_ns"], target)
++    assert after["atime_ns"] == before["atime_ns"], (after["atime_ns"], before["atime_ns"])
++    assert after["created"] == before["created"]
++    assert attrs(str(p)) == attrs(str(p))
++
++
++@test
++def stamp_file_accepts_pathlike(t):
++    p = mkfile(t / "a.txt")
++    before = snapshot_times(str(p))
++    stamp_file(p, before["mtime_ns"] - 1000)
++    after = snapshot_times(str(p))
++    assert after["mtime_ns"] == before["mtime_ns"] - 1000
++    assert after["atime_ns"] == before["atime_ns"]
++
++
++@test
++def stamp_file_readonly_raises_and_writes_nothing(t):
++    p = mkfile(t / "ro.txt")
++    before = snapshot_times(str(p))
++    setattrs(str(p), attrs(str(p)) | RO)
++    exc = raises(WStampError, stamp_file, str(p), before["mtime_ns"] - 10**9)
++    assert exc.kind == "readonly", exc.kind
++    assert isinstance(exc, OSError)
++    after = snapshot_times(str(p))
++    assert after["mtime_ns"] == before["mtime_ns"], "must not write"
++    assert after["atime_ns"] == before["atime_ns"]
++    assert attrs(str(p)) & RO
++
++
++@test
++def stamp_file_missing_path(t):
++    raises(OSError, stamp_file, str(t / "nope.txt"), OLD)
++
++
++@test
++def set_times_helper(t):
++    p = mkfile(t / "a.txt")
++    tgt = ((time.time_ns() - DAY) // 100) * 100
++    set_times(str(p), tgt + 100, tgt)
++    snap = snapshot_times(str(p))
++    assert snap["mtime_ns"] == tgt and snap["atime_ns"] == tgt + 100
++    setattrs(str(p), attrs(str(p)) | RO)
++    exc = raises(WStampError, set_times, str(p), tgt, tgt)
++    assert exc.kind == "readonly"
++
++
++# ------------------------------------------------------------------- 3 copying
++@test
++def copy_stamp_times_and_attrs(t):
++    src = mkfile(t / "s.txt", b"payload")
++    os.utime(str(src), ns=(OLD + 500, OLD))
++    setattrs(str(src), attrs(str(src)) | RO | HIDDEN)
++    snap = snapshot_times(str(src))
++    dst = t / "d.txt"
++    copy_stamp(str(src), str(dst))
++    got = snapshot_times(str(dst))
++    assert got["mtime_ns"] == snap["mtime_ns"], (got["mtime_ns"], snap["mtime_ns"])
++    assert got["atime_ns"] == snap["atime_ns"], (got["atime_ns"], snap["atime_ns"])
++    assert attrs(str(dst)) == attrs(str(src)), (hex(attrs(str(dst))), hex(attrs(str(src))))
++    assert attrs(str(dst)) & RO and attrs(str(dst)) & HIDDEN
++    assert dst.read_bytes() == b"payload"
++
++
++@test
++def copy_stamp_overwrites_readonly_dst(t):
++    src = mkfile(t / "s.txt", b"new")
++    dst = mkfile(t / "d.txt", b"old-old-old")
++    setattrs(str(dst), attrs(str(dst)) | RO)
++    snap = snapshot_times(str(src))
++    copy_stamp(str(src), str(dst))
++    got = snapshot_times(str(dst))
++    assert dst.read_bytes() == b"new"
++    assert got["mtime_ns"] == snap["mtime_ns"]
++    assert got["atime_ns"] == snap["atime_ns"]
++    assert attrs(str(dst)) == attrs(str(src))
++
++
++@test
++def copy_stamp_creates_parent_dirs(t):
++    src = mkfile(t / "s.txt", b"x")
++    dst = t / "sub" / "deep" / "d.txt"
++    copy_stamp(str(src), str(dst))
++    assert dst.read_bytes() == b"x"
++
++
++@test
++def copy_stamp_hidden_only(t):
++    src = mkfile(t / "s.txt", b"x")
++    setattrs(str(src), attrs(str(src)) | HIDDEN)
++    dst = t / "d.txt"
++    copy_stamp(str(src), str(dst))
++    assert attrs(str(dst)) == attrs(str(src))
++    assert attrs(str(dst)) & HIDDEN and not attrs(str(dst)) & RO
++
++
++# --------------------------------------------------------------------- 4 sync
++def build_tree(root):
++    root.mkdir(parents=True, exist_ok=True)
++    mkfile(root / "a.txt", b"alpha")
++    mkfile(root / "sub" / "b.txt", b"beta")
++    mkfile(root / "sub" / "deep" / "c.txt", b"gamma")
++    return root
++
++
++@test
++def sync_created_updated_restamped_deleted(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    mkfile(dst / "old.txt", b"old")                                  # deleted
++    mkfile(dst / "a.txt", b"ALPHA-DIFFERENT")                        # updated
++    mkfile(dst / "sub" / "b.txt", b"beta", mtime_ns=OLD)             # restamped
++    src_c = snapshot_times(str(src / "sub" / "deep" / "c.txt"))
++    mkfile(dst / "sub" / "deep" / "c.txt", b"gamma", mtime_ns=src_c["mtime_ns"],
++           at=src_c["atime_ns"])                                      # in sync
++
++    report = sync_tree(str(src), str(dst))
++    assert report.created == [], report.created
++    assert report.updated == ["a.txt"], report.updated
++    assert report.restamped == [os.path.join("sub", "b.txt")], report.restamped
++    assert report.deleted == ["old.txt"], report.deleted
++    assert report.failed == [], report.failed
++    assert os.path.sep == "\\" and "\\" in report.restamped[0]
++    for rel in ("a.txt", os.path.join("sub", "b.txt"), os.path.join("sub", "deep", "c.txt")):
++        s = snapshot_times(os.path.join(str(src), rel))
++        d = snapshot_times(os.path.join(str(dst), rel))
++        assert s["mtime_ns"] == d["mtime_ns"], rel
++        assert open(os.path.join(str(src), rel), "rb").read() == open(
++            os.path.join(str(dst), rel), "rb").read()
++    assert not (dst / "old.txt").exists()
++
++
++@test
++def sync_creates_whole_tree(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    report = sync_tree(str(src), str(dst))
++    assert sorted(report.created) == sorted(
++        ["a.txt", os.path.join("sub", "b.txt"), os.path.join("sub", "deep", "c.txt")]), report.created
++    assert (report.updated, report.restamped, report.deleted, report.failed) == ([], [], [], [])
++    assert (dst / "sub" / "deep" / "c.txt").read_bytes() == b"gamma"
++
++
++@test
++def sync_restamped_keeps_dst_atime(t):
++    src = t / "source"
++    mkfile(src / "a.txt", b"same")
++    dst = t / "target"
++    mkfile(dst / "a.txt", b"same", mtime_ns=OLD, at=OLD)
++    before = snapshot_times(str(dst / "a.txt"))
++    report = sync_tree(str(src), str(dst))
++    assert report.restamped == ["a.txt"], (report.restamped, report.failed)
++    assert (report.created, report.updated, report.deleted, report.failed) == ([], [], [], [])
++    after = snapshot_times(str(dst / "a.txt"))
++    assert after["mtime_ns"] == snapshot_times(str(src / "a.txt"))["mtime_ns"]
++    assert after["atime_ns"] == before["atime_ns"], (after["atime_ns"], before["atime_ns"])
++
++
++@test
++def sync_in_sync_reports_nothing(t):
++    src = t / "source"
++    mkfile(src / "a.txt", b"same")
++    s = snapshot_times(str(src / "a.txt"))
++    dst = t / "target"
++    mkfile(dst / "a.txt", b"same", mtime_ns=s["mtime_ns"], at=s["atime_ns"])
++    before = snapshot_times(str(dst / "a.txt"))
++    report = sync_tree(str(src), str(dst))
++    assert (report.created, report.updated, report.restamped, report.deleted, report.failed) == (
++        [], [], [], [], [])
++    after = snapshot_times(str(dst / "a.txt"))
++    assert after["mtime_ns"] == before["mtime_ns"]
++    assert after["atime_ns"] == before["atime_ns"], (after["atime_ns"], before["atime_ns"])
++
++
++@test
++def sync_carries_attributes(t):
++    src = t / "source"
++    mkfile(src / "ro.txt", b"r")
++    setattrs(str(src / "ro.txt"), attrs(str(src / "ro.txt")) | RO | HIDDEN)
++    mkfile(src / "h.txt", b"h")
++    setattrs(str(src / "h.txt"), attrs(str(src / "h.txt")) | HIDDEN)
++    dst = t / "target"
++    report = sync_tree(str(src), str(dst))
++    assert sorted(report.created) == ["h.txt", "ro.txt"], report.created
++    assert report.failed == []
++    assert attrs(str(dst / "ro.txt")) == attrs(str(src / "ro.txt")), hex(attrs(str(dst / "ro.txt")))
++    assert attrs(str(dst / "h.txt")) == attrs(str(src / "h.txt"))
++    assert attrs(str(dst / "ro.txt")) & RO and attrs(str(dst / "h.txt")) & HIDDEN
++    assert snapshot_times(str(dst / "ro.txt"))["mtime_ns"] == snapshot_times(str(src / "ro.txt"))["mtime_ns"]
++
++
++@test
++def sync_updates_readonly_target(t):
++    src = t / "source"
++    mkfile(src / "a.txt", b"new content")
++    dst = t / "target"
++    mkfile(dst / "a.txt", b"old")
++    setattrs(str(dst / "a.txt"), attrs(str(dst / "a.txt")) | RO)
++    report = sync_tree(str(src), str(dst))
++    assert report.updated == ["a.txt"], (report.updated, report.failed)
++    assert (dst / "a.txt").read_bytes() == b"new content"
++    assert snapshot_times(str(dst / "a.txt"))["mtime_ns"] == snapshot_times(str(src / "a.txt"))["mtime_ns"]
++
++
++@test
++def sync_restamps_readonly_target_and_keeps_attr(t):
++    src = t / "source"
++    mkfile(src / "a.txt", b"same")
++    dst = t / "target"
++    mkfile(dst / "a.txt", b"same", mtime_ns=OLD, at=OLD)
++    setattrs(str(dst / "a.txt"), attrs(str(dst / "a.txt")) | RO | HIDDEN)
++    before_attrs = attrs(str(dst / "a.txt"))
++    before_atime = snapshot_times(str(dst / "a.txt"))["atime_ns"]
++    report = sync_tree(str(src), str(dst))
++    assert report.restamped == ["a.txt"], (report.restamped, report.failed)
++    got = snapshot_times(str(dst / "a.txt"))
++    assert got["mtime_ns"] == snapshot_times(str(src / "a.txt"))["mtime_ns"]
++    assert got["atime_ns"] == before_atime, (got["atime_ns"], before_atime)
++    assert attrs(str(dst / "a.txt")) == before_attrs, (hex(attrs(str(dst / "a.txt"))), hex(before_attrs))
++
++
++@test
++def sync_readonly_source_file_created(t):
++    src = t / "source"
++    mkfile(src / "ro.txt", b"r")
++    setattrs(str(src / "ro.txt"), attrs(str(src / "ro.txt")) | RO)
++    dst = t / "target"
++    report = sync_tree(str(src), str(dst))
++    assert report.created == ["ro.txt"], (report.created, report.failed)
++    assert attrs(str(dst / "ro.txt")) & RO
++    assert snapshot_times(str(dst / "ro.txt"))["mtime_ns"] == snapshot_times(str(src / "ro.txt"))["mtime_ns"]
++    # second run: already in sync
++    second = sync_tree(str(src), str(dst))
++    assert (second.created, second.updated, second.restamped, second.failed) == ([], [], [], []), vars(second)
++
++
++@test
++def sync_deletes_readonly_extra(t):
++    src = t / "source"
++    src.mkdir()
++    dst = t / "target"
++    mkfile(dst / "ro.txt", b"x")
++    setattrs(str(dst / "ro.txt"), attrs(str(dst / "ro.txt")) | RO | HIDDEN)
++    mkfile(dst / "plain.txt", b"y")
++    mkfile(dst / "rodir" / "inner.txt", b"z")
++    setattrs(str(dst / "rodir" / "inner.txt"), attrs(str(dst / "rodir" / "inner.txt")) | RO)
++    setattrs(str(dst / "rodir"), attrs(str(dst / "rodir")) | RO)
++    report = sync_tree(str(src), str(dst))
++    assert sorted(report.deleted) == ["plain.txt", "ro.txt", "rodir"], report.deleted
++    assert report.failed == [], report.failed
++    assert os.listdir(str(dst)) == [], os.listdir(str(dst))
++
++
++@test
++def sync_failed_entries_do_not_abort(t):
++    src = t / "source"
++    mkfile(src / "a.txt", b"aaa")
++    mkfile(src / "blocked.txt", b"bbb")
++    mkfile(src / "z.txt", b"zzz")
++    dst = t / "target"
++    os.makedirs(str(dst / "a.txt"))                       # 同名目录占据
++    mkfile(dst / "a.txt" / "inner.txt", b"inner")
++    mkfile(dst / "blocked.txt", b"old")                   # 被独占占用
++    handle = k32.CreateFileW(str(dst / "blocked.txt"), 0x40000000, 0, None, 3, 0, None)
++    assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
++    try:
++        report = sync_tree(str(src), str(dst))
++    finally:
++        k32.CloseHandle(handle)
++    assert sorted(report.failed) == ["a.txt", "blocked.txt"], (report.failed, report.created)
++    assert report.created == ["z.txt"], report.created
++    assert (dst / "z.txt").read_bytes() == b"zzz"
++    assert os.path.isdir(str(dst / "a.txt"))
++    assert (dst / "a.txt" / "inner.txt").read_bytes() == b"inner"
++
++
++@test
++def sync_src_dir_where_dst_has_file(t):
++    src = t / "source"
++    mkfile(src / "d" / "in.txt", b"i")
++    dst = t / "target"
++    mkfile(dst / "d", b"i am a file")
++    report = sync_tree(str(src), str(dst))
++    assert "d" in report.failed, vars(report)
++    assert (dst / "d").read_bytes() == b"i am a file"
++
++
++@test
++def sync_missing_src_raises(t):
++    raises(OSError, sync_tree, str(t / "nope"), str(t / "target"))
++
++
++# ------------------------------------------------------------- 5 relative path
++@test
++def report_paths_are_relative_and_joined(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    report = sync_tree(str(src), str(dst))
++    allp = report.created + report.updated + report.restamped + report.deleted + report.failed
++    assert allp
++    for p in allp:
++        assert not os.path.isabs(p), p
++        assert str(t) not in p, p
++        assert not p.startswith(("\\", "/")), p
++    assert os.path.join("sub", "deep", "c.txt") in report.created, report.created
++
++
++# ------------------------------------------------------------- 6 dir mtimes
++@test
++def directory_mtimes_restored(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    sync_tree(str(src), str(dst))
++    for rel in ("", "sub", os.path.join("sub", "deep")):
++        s = os.stat(os.path.join(str(src), rel) if rel else str(src))
++        d = os.stat(os.path.join(str(dst), rel) if rel else str(dst))
++        assert s.st_mtime_ns == d.st_mtime_ns, (rel, s.st_mtime_ns, d.st_mtime_ns)
++
++
++@test
++def directory_mtimes_restored_after_changes(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    mkfile(dst / "old.txt", b"old")
++    mkfile(dst / "sub" / "b.txt", b"different", mtime_ns=OLD)
++    report = sync_tree(str(src), str(dst))
++    assert report.failed == [], report.failed
++    for rel in ("", "sub", os.path.join("sub", "deep")):
++        s = os.stat(os.path.join(str(src), rel) if rel else str(src))
++        d = os.stat(os.path.join(str(dst), rel) if rel else str(dst))
++        assert s.st_mtime_ns == d.st_mtime_ns, rel
++
++
++@test
++def directory_mtime_restored_with_readonly_dir(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    sync_tree(str(src), str(dst))
++    setattrs(str(dst / "sub"), attrs(str(dst / "sub")) | RO)
++    mkfile(src / "sub" / "new.txt", b"new")
++    report = sync_tree(str(src), str(dst))
++    assert report.created == [os.path.join("sub", "new.txt")], vars(report)
++    assert attrs(str(dst / "sub")) & RO, hex(attrs(str(dst / "sub")))
++    s = os.stat(str(src / "sub"))
++    d = os.stat(str(dst / "sub"))
++    assert s.st_mtime_ns == d.st_mtime_ns, (s.st_mtime_ns, d.st_mtime_ns)
++
++
++# ------------------------------------------------------------------ 7 dry run
++@test
++def dry_run_reports_without_touching(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    mkfile(dst / "old.txt", b"old")
++    mkfile(dst / "a.txt", b"ALPHA-DIFFERENT")
++    mkfile(dst / "sub" / "b.txt", b"beta", mtime_ns=OLD, at=OLD)
++    dst_mtime_before = os.stat(str(dst)).st_mtime_ns
++    sub_mtime_before = os.stat(str(dst / "sub")).st_mtime_ns
++
++    dry = sync_tree(str(src), str(dst), dry_run=True)
++    assert dry.created == [os.path.join("sub", "deep", "c.txt")], dry.created
++    assert dry.updated == ["a.txt"], dry.updated
++    assert dry.restamped == [os.path.join("sub", "b.txt")], dry.restamped
++    assert dry.deleted == ["old.txt"], dry.deleted
++    assert dry.failed == [], dry.failed
++
++    assert (dst / "old.txt").exists()
++    assert (dst / "a.txt").read_bytes() == b"ALPHA-DIFFERENT"
++    assert not (dst / "sub" / "deep").exists()
++    assert snapshot_times(str(dst / "sub" / "b.txt"))["mtime_ns"] == OLD
++    assert os.stat(str(dst)).st_mtime_ns == dst_mtime_before
++    assert os.stat(str(dst / "sub")).st_mtime_ns == sub_mtime_before
++
++    real = sync_tree(str(src), str(dst))
++    assert sorted(real.created) == sorted(dry.created)
++    assert real.updated == dry.updated
++    assert real.restamped == dry.restamped
++    assert real.deleted == dry.deleted
++    assert (dst / "sub" / "deep" / "c.txt").read_bytes() == b"gamma"
++
++
++@test
++def dry_run_missing_dst_root(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    report = sync_tree(str(src), str(dst), dry_run=True)
++    assert not dst.exists()
++    assert sorted(report.created) == sorted(
++        ["a.txt", os.path.join("sub", "b.txt"), os.path.join("sub", "deep", "c.txt")]), report.created
++    assert report.failed == [], report.failed
++
++
++@test
++def dry_run_deletes_nothing(t):
++    src = t / "source"
++    src.mkdir()
++    dst = t / "target"
++    mkfile(dst / "ro.txt", b"x")
++    setattrs(str(dst / "ro.txt"), attrs(str(dst / "ro.txt")) | RO)
++    mkfile(dst / "rodir" / "in.txt", b"y")
++    report = sync_tree(str(src), str(dst), dry_run=True)
++    assert report.deleted == ["ro.txt", "rodir"], report.deleted
++    assert (dst / "ro.txt").exists() and (dst / "rodir" / "in.txt").exists()
++    assert attrs(str(dst / "ro.txt")) & RO
++
++
++# ------------------------------------------------------------------ 8 report
++@test
++def report_shape(t):
++    r = SyncReport()
++    assert (r.created, r.updated, r.restamped, r.deleted, r.failed) == ([], [], [], [], [])
++    assert "SyncReport" in repr(r)
++
++
++@test
++def idempotent_second_run(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    first = sync_tree(str(src), str(dst))
++    assert first.failed == [] and len(first.created) == 3
++    second = sync_tree(str(src), str(dst))
++    assert (second.created, second.updated, second.restamped, second.deleted, second.failed) == (
++        [], [], [], [], []), vars(second)
++    for rel in ("", "sub", os.path.join("sub", "deep")):
++        s = os.stat(os.path.join(str(src), rel) if rel else str(src))
++        d = os.stat(os.path.join(str(dst), rel) if rel else str(dst))
++        assert s.st_mtime_ns == d.st_mtime_ns, rel
++
++
++@test
++def pathlike_arguments(t):
++    src = build_tree(t / "source")
++    dst = t / "target"
++    report = sync_tree(src, dst)
++    assert report.created and report.failed == []
++    copy_stamp(src / "a.txt", dst / "copy.txt")
++    assert snapshot_times(dst / "copy.txt")["mtime_ns"] == snapshot_times(src / "a.txt")["mtime_ns"]
++    assert (dst / "copy.txt").read_bytes() == b"alpha"
++
++
++def _cleanup(root):
++    for base, dirs, files in os.walk(str(root)):
++        for name in dirs + files:
++            try:
++                k32.SetFileAttributesW(os.path.join(base, name), 0x80)
++            except OSError:
++                pass
++    try:
++        k32.SetFileAttributesW(str(root), 0x80)
++    except OSError:
++        pass
++    shutil.rmtree(str(root), ignore_errors=True)
++
++
++def main():
++    failures = []
++    for fn in TESTS:
++        root = Path(tempfile.mkdtemp(prefix="wsverify"))
++        try:
++            fn(root)
++            print("PASS  %s" % fn.__name__)
++        except Exception:
++            failures.append(fn.__name__)
++            print("FAIL  %s" % fn.__name__)
++            traceback.print_exc()
++        finally:
++            _cleanup(root)
++    print("-" * 60)
++    print("total=%d failed=%d %s" % (len(TESTS), len(failures), failures))
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/wstamp/__init__.py b/wstamp/__init__.py
+index 428921b..5527b9b 100644
+--- a/wstamp/__init__.py
++++ b/wstamp/__init__.py
+@@ -1,13 +1,14 @@
+ """wstamp —— 带 Windows 语义的文件时间戳与属性工具库。"""
+ 
+ from .errors import WStampError
+-from .stamps import snapshot_times, stamp_file
++from .stamps import set_times, snapshot_times, stamp_file
+ from .copier import copy_stamp
+ from .sync import SyncReport, sync_tree
+ 
+ __all__ = [
+     "WStampError",
+     "snapshot_times",
++    "set_times",
+     "stamp_file",
+     "copy_stamp",
+     "SyncReport",
+diff --git a/wstamp/attributes.py b/wstamp/attributes.py
+index 17ae7fe..a4baba5 100644
+--- a/wstamp/attributes.py
++++ b/wstamp/attributes.py
+@@ -2,35 +2,87 @@
+ 
+ Windows 的文件属性不走 POSIX 权限位，只能通过 Win32 的
+ ``GetFileAttributesW`` / ``SetFileAttributesW`` 读取与设置。
++
++两个 API 的原型必须显式声明：``ctypes`` 默认把返回值当成 32 位有符号
++``c_int``，于是 ``GetFileAttributesW`` 的失败值 ``0xFFFFFFFF`` 会变成 ``-1``，
++「路径不存在」就会被误判成「带只读属性」（``-1 & 0x01 == 1``）。
+ """
+ 
+ import ctypes
++import os
++from ctypes import wintypes
++
++#: 只读属性位。带这个位的文件无法被覆写 / 删除（WinError 5）。
++FILE_ATTRIBUTE_READONLY = 0x01
++#: 隐藏属性位。
++FILE_ATTRIBUTE_HIDDEN = 0x02
++#: 系统属性位。
++FILE_ATTRIBUTE_SYSTEM = 0x04
++#: 目录属性位。
++FILE_ATTRIBUTE_DIRECTORY = 0x10
++#: 归档属性位。
++FILE_ATTRIBUTE_ARCHIVE = 0x20
++#: 「没有其他属性」。只能单独出现，不能与其它位组合。
++FILE_ATTRIBUTE_NORMAL = 0x80
++
++#: ``GetFileAttributesW`` 的失败返回值。
++INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+ 
+-_FILE_ATTRIBUTE_READONLY = 0x01
+-_FILE_ATTRIBUTE_HIDDEN = 0x02
++# 属性位掩码，避免 ``~FILE_ATTRIBUTE_READONLY`` 之类运算产生负数。
++_ATTRIBUTE_MASK = 0xFFFFFFFF
+ 
+-_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
++# 兼容旧代码里的私有常量名。
++_FILE_ATTRIBUTE_READONLY = FILE_ATTRIBUTE_READONLY
++_FILE_ATTRIBUTE_HIDDEN = FILE_ATTRIBUTE_HIDDEN
++_INVALID_FILE_ATTRIBUTES = INVALID_FILE_ATTRIBUTES
++
++_kernel32 = ctypes.windll.kernel32
++
++_kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
++_kernel32.GetFileAttributesW.restype = wintypes.DWORD
++_kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
++_kernel32.SetFileAttributesW.restype = wintypes.BOOL
++
++
++def _as_text(path):
++    """把 ``str`` / ``os.PathLike`` / ``bytes`` 统一成 Win32 需要的文本路径。"""
++    value = os.fspath(path)
++    if isinstance(value, bytes):
++        value = os.fsdecode(value)
++    return value
+ 
+ 
+ def get_attributes(path):
+     """返回 ``GetFileAttributesW`` 的原始属性位。"""
+-    value = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+-    if value == _INVALID_FILE_ATTRIBUTES:
++    value = _kernel32.GetFileAttributesW(_as_text(path))
++    if value == INVALID_FILE_ATTRIBUTES:
+         raise ctypes.WinError()
+     return value
+ 
+ 
+ def is_readonly(path):
+     """路径是否带只读属性。"""
+-    return bool(get_attributes(path) & _FILE_ATTRIBUTE_READONLY)
++    return bool(get_attributes(path) & FILE_ATTRIBUTE_READONLY)
+ 
+ 
+ def is_hidden(path):
+     """路径是否带隐藏属性。"""
+-    return bool(get_attributes(path) & _FILE_ATTRIBUTE_HIDDEN)
++    return bool(get_attributes(path) & FILE_ATTRIBUTE_HIDDEN)
+ 
+ 
+ def set_attributes(path, attrs):
+     """把路径的属性位整体设置为 ``attrs``。"""
+-    if not ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs):
++    if not _kernel32.SetFileAttributesW(_as_text(path), int(attrs) & _ATTRIBUTE_MASK):
+         raise ctypes.WinError()
++
++
++def clear_readonly(path):
++    """清除只读属性，返回清除**之前**的属性位。
++
++    只读目标上的写动作（覆写、回写时间戳、删除）会先走这里，动作完成后由
++    调用方决定是恢复原属性位还是写入源的属性位。
++    """
++    attrs = get_attributes(path)
++    if attrs & FILE_ATTRIBUTE_READONLY:
++        set_attributes(path, attrs & ~FILE_ATTRIBUTE_READONLY)
++    return attrs
+diff --git a/wstamp/copier.py b/wstamp/copier.py
+index 5396702..7092cbe 100644
+--- a/wstamp/copier.py
++++ b/wstamp/copier.py
+@@ -1,14 +1,50 @@
+-"""单文件复制与时间戳 / 属性搬运。"""
++"""单文件复制与时间戳 / 属性搬运。
++
++复制一个文件要带走三样东西：字节、时间戳（纳秒级）、Win32 属性位。顺序很
++关键：
++
++1. **先**取源的时间快照 —— 复制动作本身要读取源文件，在开启了 last-access
++   更新的卷上这会刷新源的 atime，事后再取就拿不到原值了。
++2. 落盘字节。目标已存在且带只读属性时先清掉只读位，否则覆写会被拒绝
++   （WinError 5）。
++3. 写时间戳（mtime 与 atime 都要，逐纳秒对齐源）。必须放在设置属性之前，
++   因为只读目标无法 ``utime``。
++4. 最后把源的属性位整体写到目标上（只读 / 隐藏等原样搬运）。
++"""
+ 
+ import os
+ import shutil
+ 
++from .attributes import FILE_ATTRIBUTE_READONLY, get_attributes, set_attributes
++from .stamps import set_times, snapshot_times
++
+ 
+ def copy_stamp(src, dst):
+-    """复制单个文件，把源的时间戳尽量带过去。
++    """复制单个文件，并把源的时间戳与属性原样带到目标。
+ 
+-    目前先用 ``copyfile`` 落盘，再把源的 mtime（秒）设到目标上。
++    完成后 ``dst`` 的 ``mtime_ns`` / ``atime_ns`` 与复制前取到的 ``src`` 快照
++    逐纳秒相等，``dst`` 的属性位与 ``src`` 完全一致。
+     """
++    src = os.fspath(src)
++    dst = os.fspath(dst)
++
++    # (1) 复制会刷新源的 atime，快照必须取在复制之前。
++    snap = snapshot_times(src)
++    src_attrs = get_attributes(src)
++
++    parent = os.path.dirname(dst)
++    if parent and not os.path.isdir(parent):
++        os.makedirs(parent, exist_ok=True)
++
++    # (2) 已存在的只读目标无法被覆写：先清掉只读位，属性在第 (4) 步按源重写。
++    if os.path.exists(dst):
++        attrs = get_attributes(dst)
++        if attrs & FILE_ATTRIBUTE_READONLY:
++            set_attributes(dst, attrs & ~FILE_ATTRIBUTE_READONLY)
+     shutil.copyfile(src, dst)
+-    st = os.stat(src)
+-    os.utime(dst, (st.st_mtime, st.st_mtime))
++
++    # (3) 时间戳：mtime 与 atime 都按源的快照写回（必须在设置属性之前）。
++    set_times(dst, snap["atime_ns"], snap["mtime_ns"])
++
++    # (4) 属性位：源的全部 Win32 属性原样出现在目标上。
++    set_attributes(dst, src_attrs)
+diff --git a/wstamp/stamps.py b/wstamp/stamps.py
+index af82301..f0320bb 100644
+--- a/wstamp/stamps.py
++++ b/wstamp/stamps.py
+@@ -1,9 +1,19 @@
+-"""文件时间戳的读取与设置。"""
++"""文件时间戳的读取与设置。
++
++NTFS 的时间戳以 100ns 为存储粒度：``os.utime(ns=...)`` 会把纳秒值截断到
++100ns 的整数倍，读回来时再乘回 100。因此只要写入的是 100 的倍数，读回的
++值就与写入值逐纳秒相等（秒级精度是不够的，备份流水线要按 mtime 判定同步
++状态）。
++"""
+ 
+ import os
+ 
++from .attributes import FILE_ATTRIBUTE_READONLY, get_attributes
+ from .errors import WStampError
+ 
++#: NTFS 时间戳的存储粒度（纳秒）。
++NTFS_GRANULARITY_NS = 100
++
+ 
+ def snapshot_times(path):
+     """返回路径的时间戳快照。
+@@ -14,6 +24,9 @@ def snapshot_times(path):
+     - ``atime_ns``：访问时间（整数纳秒）。
+     - ``created``：文件创建时间。Windows 上 ``st_ctime`` 就是创建时间
+       （birth time），这一点与 Linux（ctime = 元数据变更时间）不同。
++
++    ``os.stat`` 只读元数据，不会刷新目标的 atime，因此可以放心地用它取出
++    「写之前」的 atime 以便随后原样写回。
+     """
+     st = os.stat(path)
+     return {
+@@ -23,11 +36,47 @@ def snapshot_times(path):
+     }
+ 
+ 
++def set_times(path, atime_ns, mtime_ns):
++    """把 ``(atime, mtime)`` 一次设置为整数纳秒。
++
++    目标是只读文件时不做任何写动作，直接抛
++    :class:`WStampError(kind="readonly")`：Windows 对只读文件的时间戳写入会
++    被拒绝（WinError 5）。这里是调用方显式的时间戳入口，不应悄悄改掉目标的
++    属性位；需要在只读目标上写时间戳的调用方（如 :func:`wstamp.sync.sync_tree`）
++    应自己先清属性、写完再恢复。
++    """
++    _reject_readonly(path)
++    try:
++        os.utime(path, ns=(int(atime_ns), int(mtime_ns)))
++    except PermissionError as exc:
++        # 兜底：属性位读取与写入之间目标被别人改成只读。
++        if getattr(exc, "winerror", None) == 5:
++            raise _readonly_error(path) from exc
++        raise
++
++
+ def stamp_file(path, mtime_ns):
+     """把 ``path`` 的 mtime 精确设置为整数纳秒 ``mtime_ns``。
+ 
+-    注意：NTFS 以 100ns 为存储粒度，因此 ``mtime_ns`` 应当是 100 的倍数，
+-    否则会被截断。
++    - **只改 mtime**：atime 原样保留（写回当前值），不能被顺手改掉。
++    - ``mtime_ns`` 应当是 100 的倍数（NTFS 存储粒度），否则会被截断；写入
++      后读回的值与传入值逐纳秒相等。
++    - 目标带只读属性时不做任何写动作，抛
++      :class:`WStampError(kind="readonly")`。
+     """
+-    # 直接把 (atime, mtime) 都设成目标值。
+-    os.utime(path, ns=(mtime_ns, mtime_ns))
++    _reject_readonly(path)
++    atime_ns = os.stat(path).st_atime_ns
++    set_times(path, atime_ns, int(mtime_ns))
++
++
++def _reject_readonly(path):
++    """只读目标上不允许直接写时间戳。"""
++    if get_attributes(path) & FILE_ATTRIBUTE_READONLY:
++        raise _readonly_error(path)
++
++
++def _readonly_error(path):
++    return WStampError(
++        "readonly",
++        "target is read-only, refusing to write timestamps: %s" % (path,),
++    )
+diff --git a/wstamp/sync.py b/wstamp/sync.py
+index 4777911..1dc6f19 100644
+--- a/wstamp/sync.py
++++ b/wstamp/sync.py
+@@ -1,7 +1,31 @@
+-"""目录树同步。"""
++"""目录树同步。
+ 
++同步状态的定义是 ``(字节内容, mtime_ns)`` 二元组，每个文件条目按下面的规则
++落到 :class:`SyncReport` 的某一类里（元素是相对 ``dst`` 的路径，
++``os.path.join`` 风格，Windows 下是反斜杠）：
++
++- 目标缺失               -> 复制内容 + 时间戳 + 属性，记入 ``created``
++- 字节内容不同           -> 覆写 + 时间戳 + 属性，记入 ``updated``
++- 内容相同但 mtime 不同  -> 只回写时间戳（保持目标 atime 不变），记入
++  ``restamped``
++- 目标多余               -> 删除（只读条目先清属性），记入 ``deleted``
++- 其他无法完成的条目     -> 记入 ``failed``，并且**不中断**整次同步
++
++条目填充会刷新父目录的 mtime，所以目录时间戳留到最后、按「先深层后浅层」
++的顺序从源恢复，保证目标树的目录 mtime 与源一致。
++
++``dry_run=True`` 时计算同样的报告，但不对目标树做任何写入（不创建、不覆写、
++不删除、不写时间戳）。
++"""
++
++import logging
+ import os
+-import shutil
++
++from .attributes import FILE_ATTRIBUTE_READONLY, clear_readonly, set_attributes
++from .copier import copy_stamp
++from .stamps import snapshot_times
++
++_LOG = logging.getLogger("wstamp")
+ 
+ 
+ class SyncReport:
+@@ -10,70 +34,194 @@ class SyncReport:
+     def __init__(self):
+         self.created = []
+         self.updated = []
++        self.restamped = []
+         self.deleted = []
+         self.failed = []
+ 
++    def __repr__(self):
++        return (
++            "SyncReport(created=%r, updated=%r, restamped=%r, deleted=%r, failed=%r)"
++            % (self.created, self.updated, self.restamped, self.deleted, self.failed)
++        )
++
+ 
+ def sync_tree(src, dst, dry_run=False):
+     """把 ``src`` 目录树同步到 ``dst``，返回 :class:`SyncReport`。"""
++    src = os.fspath(src)
++    dst = os.fspath(dst)
+     report = SyncReport()
+-    _sync_dir(src, dst, "", report, dry_run)
++    # 前序收集的 (dst_dir, rel, 源目录 mtime_ns)，最后逆序（先深层后浅层）恢复。
++    dir_times = []
++    _sync_dir(src, dst, "", report, dry_run, dir_times)
+     _prune(src, dst, "", report, dry_run)
++    if not dry_run:
++        _restore_dir_times(dir_times, report)
+     return report
+ 
+ 
+-def _sync_dir(src, dst, rel, report, dry_run):
+-    src_dir = os.path.join(src, rel) if rel else src
+-    dst_dir = os.path.join(dst, rel) if rel else dst
++def _join(base, rel):
++    return os.path.join(base, rel) if rel else base
++
++
++def _child(rel, name):
++    return os.path.join(rel, name) if rel else name
++
++
++def _record_failed(report, rel_path, exc):
++    """记录一个无法完成的条目，同步继续。"""
++    report.failed.append(rel_path)
++    _LOG.warning("wstamp: %s (%s)", rel_path, exc)
++
++
++def _sync_dir(src, dst, rel, report, dry_run, dir_times):
++    src_dir = _join(src, rel)
++    dst_dir = _join(dst, rel)
++
+     if not dry_run:
+-        os.makedirs(dst_dir, exist_ok=True)
+-    for name in sorted(os.listdir(src_dir)):
+-        src_path = os.path.join(src_dir, name)
+-        rel_path = os.path.join(rel, name) if rel else name
+-        if os.path.isdir(src_path):
+-            _sync_dir(src, dst, rel_path, report, dry_run)
+-            continue
+-        dst_path = os.path.join(dst, rel_path)
+         try:
+-            with open(src_path, "rb") as fh:
+-                src_bytes = fh.read()
+-            if not os.path.exists(dst_path):
+-                if not dry_run:
+-                    shutil.copyfile(src_path, dst_path)
+-                report.created.append(rel_path)
+-            else:
+-                with open(dst_path, "rb") as fh:
+-                    dst_bytes = fh.read()
+-                if src_bytes != dst_bytes:
+-                    if not dry_run:
+-                        shutil.copyfile(src_path, dst_path)
+-                    report.updated.append(rel_path)
+-                # 内容相同时视为一致，不做任何动作。
++            os.makedirs(dst_dir, exist_ok=True)
+         except OSError as exc:
+-            report.failed.append(rel_path)
+-            print("wstamp: %s (%s)" % (rel_path, exc))
++            if not rel:
++                # 目标根目录都建不起来，整次同步没有意义。
++                raise
++            # 目标位置被同名文件占据之类：这个子树无法同步。
++            _record_failed(report, rel, exc)
++            return
++
++    try:
++        names = sorted(os.listdir(src_dir))
++    except OSError as exc:
++        if not rel:
++            raise
++        _record_failed(report, rel, exc)
++        return
++
++    dir_times.append((dst_dir, rel, os.stat(src_dir).st_mtime_ns))
++
++    for name in names:
++        src_path = os.path.join(src_dir, name)
++        rel_path = _child(rel, name)
++        if os.path.isdir(src_path):
++            _sync_dir(src, dst, rel_path, report, dry_run, dir_times)
++        else:
++            _sync_file(src_path, os.path.join(dst, rel_path), rel_path, report, dry_run)
++
++
++def _sync_file(src_path, dst_path, rel_path, report, dry_run):
++    try:
++        src_snap = snapshot_times(src_path)
++
++        if os.path.isdir(dst_path):
++            # 目标位置被同名目录占据，文件条目无法落地。
++            _record_failed(report, rel_path, "target path is a directory: %s" % dst_path)
++            return
++
++        with open(src_path, "rb") as fh:
++            src_bytes = fh.read()
++
++        if not os.path.exists(dst_path):
++            if not dry_run:
++                copy_stamp(src_path, dst_path)
++            report.created.append(rel_path)
++            return
++
++        # 快照必须取在读取内容之前：读取目标会刷新它的 atime，而 restamped
++        # 分支要求 atime 保持原值。
++        dst_snap = snapshot_times(dst_path)
++        with open(dst_path, "rb") as fh:
++            dst_bytes = fh.read()
++
++        if src_bytes != dst_bytes:
++            if not dry_run:
++                copy_stamp(src_path, dst_path)
++            report.updated.append(rel_path)
++            return
++
++        if dst_snap["mtime_ns"] != src_snap["mtime_ns"]:
++            # 内容一致、mtime 不一致：只回写时间戳，atime 保持目标原值。
++            if not dry_run:
++                _write_times(dst_path, dst_snap["atime_ns"], src_snap["mtime_ns"])
++            report.restamped.append(rel_path)
++            return
++
++        # 内容与 mtime 都一致：条目已同步，不做任何动作（只把比较读取时被刷
++        # 新的 atime 还原回去，保证「无动作」在目标树上不可观测）。
++        if not dry_run:
++            _restore_atime(dst_path, dst_snap["atime_ns"])
++    except Exception as exc:  # 单个条目的问题不能中断整次同步
++        _record_failed(report, rel_path, exc)
+ 
+ 
+ def _prune(src, dst, rel, report, dry_run):
+-    dst_dir = os.path.join(dst, rel) if rel else dst
++    dst_dir = _join(dst, rel)
+     if not os.path.isdir(dst_dir):
+         return
+-    src_dir = os.path.join(src, rel) if rel else src
+-    for name in sorted(os.listdir(dst_dir)):
++    src_dir = _join(src, rel)
++    try:
++        names = sorted(os.listdir(dst_dir))
++    except OSError as exc:
++        if rel:
++            _record_failed(report, rel, exc)
++        return
++    for name in names:
+         dst_path = os.path.join(dst_dir, name)
+-        rel_path = os.path.join(rel, name) if rel else name
++        rel_path = _child(rel, name)
+         src_path = os.path.join(src_dir, name)
+         if not os.path.exists(src_path):
++            # 目标多余：删除（只读条目先清属性再删）。
+             try:
+-                if os.path.isdir(dst_path):
+-                    if not dry_run:
+-                        shutil.rmtree(dst_path)
+-                else:
+-                    if not dry_run:
+-                        os.remove(dst_path)
++                if not dry_run:
++                    _remove(dst_path)
+                 report.deleted.append(rel_path)
+-            except OSError as exc:
+-                report.failed.append(rel_path)
+-                print("wstamp: %s (%s)" % (rel_path, exc))
+-        elif os.path.isdir(dst_path):
++            except Exception as exc:
++                _record_failed(report, rel_path, exc)
++        elif os.path.isdir(dst_path) and os.path.isdir(src_path):
+             _prune(src, dst, rel_path, report, dry_run)
++
++
++def _restore_dir_times(dir_times, report):
++    """把目录 mtime 从源恢复回去（先深层后浅层）。
++
++    前序遍历的逆序天然满足「子目录先于父目录」，所以父目录的时间戳总是最后
++    写，不会被后续动作再刷掉。目录的 atime 保持目标自己的值。
++    """
++    for dst_dir, rel, mtime_ns in reversed(dir_times):
++        if not os.path.isdir(dst_dir):
++            continue
++        try:
++            _write_times(dst_dir, os.stat(dst_dir).st_atime_ns, mtime_ns)
++        except Exception as exc:
++            _record_failed(report, rel, exc)
++
++
++def _write_times(path, atime_ns, mtime_ns):
++    """写时间戳；目标带只读属性时先清掉、写完恢复原属性位。"""
++    attrs = clear_readonly(path)
++    try:
++        os.utime(path, ns=(int(atime_ns), int(mtime_ns)))
++    finally:
++        if attrs & FILE_ATTRIBUTE_READONLY:
++            set_attributes(path, attrs)
++
++
++def _restore_atime(path, atime_ns):
++    """把比较读取时被刷新的 atime 还原（尽力而为，不产生报告条目）。"""
++    try:
++        st = os.stat(path)
++        if st.st_atime_ns == int(atime_ns):
++            return
++        _write_times(path, atime_ns, st.st_mtime_ns)
++    except OSError as exc:
++        _LOG.debug("wstamp: keep atime of %s failed (%s)", path, exc)
++
++
++def _remove(path):
++    """删除文件或整棵目录树；只读条目先清除属性再删。"""
++    if os.path.isdir(path) and not os.path.islink(path):
++        for name in sorted(os.listdir(path)):
++            _remove(os.path.join(path, name))
++        clear_readonly(path)
++        os.rmdir(path)
++    else:
++        clear_readonly(path)
++        os.remove(path)

@@ -1,0 +1,193 @@
+diff --git a/tests/test_wscan_semantics.py b/tests/test_wscan_semantics.py
+new file mode 100644
+index 0000000..3787de9
+--- /dev/null
++++ b/tests/test_wscan_semantics.py
+@@ -0,0 +1,187 @@
++"""wscan 的 Windows 扫描 / 去重语义回归测试（隐藏测试）。
++
++被测语义全部来自 instruction.md 的验收标准：
++- 遍历不进入重解析点目录（junction）；os.walk 无论 followlinks 与否都会进入，
++  必须用 lstat 的 st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT 隔离；
++- 硬链接簇按文件身份 (st_dev, st_ino) 分组，不是按大小/修改时间；
++- dedupe 用「link 到临时名 + os.replace 落位」处理已存在的目标；
++- 只读属性先清除再替换。
++"""
++
++import os
++import stat
++import subprocess
++
++import pytest
++
++from wscan import ScanResult, WScanError, dedupe, scan_tree
++
++REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
++
++
++def _write(path, data):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "wb") as f:
++        f.write(data)
++
++
++def _read(path):
++    with open(path, "rb") as f:
++        return f.read()
++
++
++def _set_mtime(path, ns):
++    os.utime(path, ns=(ns, ns))
++
++
++def _mkjunc(link, target):
++    """用 mklink /J 创建 junction（无需管理员权限）。"""
++    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True)
++    if r.returncode != 0:
++        raise AssertionError("mklink /J failed: %r" % (r.stderr,))
++    assert os.lstat(link).st_file_attributes & REPARSE_POINT
++
++
++# --------------------------------------------------------------- junction 隔离
++
++def test_scan_skips_junction_inside_tree(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "real", "a.txt"), b"A" * 10)
++    _write(os.path.join(root, "real", "b.txt"), b"B" * 20)
++    _mkjunc(os.path.join(root, "junc"), os.path.join(root, "real"))
++    result = scan_tree(root)
++    assert result.files == ["real\\a.txt", "real\\b.txt"]
++    assert result.total_bytes == 30
++    assert result.hard_link_groups == []
++
++
++def test_scan_skips_junction_pointing_outside(tmp_path):
++    outside = str(tmp_path / "outside")
++    os.makedirs(outside)
++    _write(os.path.join(outside, "secret.txt"), b"S" * 7)
++    root = str(tmp_path / "tree")
++    os.makedirs(root)
++    _write(os.path.join(root, "mine.txt"), b"M")
++    _mkjunc(os.path.join(root, "leak"), outside)
++    result = scan_tree(root)
++    assert result.files == ["mine.txt"]
++    assert result.total_bytes == 1
++
++
++def test_dedupe_skips_junction(tmp_path):
++    root = str(tmp_path)
++    real = os.path.join(root, "real")
++    os.makedirs(real)
++    _write(os.path.join(real, "data.txt"), b"J" * 5)
++    _mkjunc(os.path.join(root, "junc"), real)
++    _write(os.path.join(root, "twin.txt"), b"J" * 5)
++    linked = dedupe(root)
++    assert linked == ["twin.txt"]
++    st_real = os.stat(os.path.join(real, "data.txt"))
++    st_twin = os.stat(os.path.join(root, "twin.txt"))
++    assert (st_twin.st_dev, st_twin.st_ino) == (st_real.st_dev, st_real.st_ino)
++    assert st_real.st_nlink == 2
++    assert _read(os.path.join(real, "data.txt")) == b"J" * 5
++
++
++# --------------------------------------------------------------- root 校验
++
++def test_scan_raises_for_missing_root(tmp_path):
++    with pytest.raises(WScanError) as excinfo:
++        scan_tree(str(tmp_path / "no-such-dir"))
++    assert excinfo.value.kind == "root"
++
++
++# --------------------------------------------------------------- 身份分组
++
++def test_hard_link_groups_use_file_identity(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "a.txt"), b"same")
++    os.link(os.path.join(root, "a.txt"), os.path.join(root, "b.txt"))
++    _write(os.path.join(root, "copy.txt"), b"same")
++    st = os.stat(os.path.join(root, "a.txt"))
++    _set_mtime(os.path.join(root, "copy.txt"), st.st_mtime_ns)
++    result = scan_tree(root)
++    assert result.hard_link_groups == [["a.txt", "b.txt"]]
++
++
++# --------------------------------------------------------------- 去重
++
++def test_dedupe_links_content_duplicates(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "keep.txt"), b"DATA")
++    os.link(os.path.join(root, "keep.txt"), os.path.join(root, "alias.txt"))
++    _write(os.path.join(root, "copy.txt"), b"DATA")
++    _set_mtime(os.path.join(root, "copy.txt"), 1_500_000_000_000000000)
++    linked = dedupe(root)
++    st_keep = os.stat(os.path.join(root, "keep.txt"))
++    st_copy = os.stat(os.path.join(root, "copy.txt"))
++    assert linked == ["copy.txt"]
++    assert (st_copy.st_dev, st_copy.st_ino) == (st_keep.st_dev, st_keep.st_ino)
++    assert st_copy.st_nlink == 3
++    assert _read(os.path.join(root, "copy.txt")) == b"DATA"
++    assert _read(os.path.join(root, "alias.txt")) == b"DATA"
++
++
++def test_dedupe_clears_readonly_and_links(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "one.txt"), b"RR")
++    _write(os.path.join(root, "two.txt"), b"RR")
++    _set_mtime(os.path.join(root, "two.txt"), 1_600_000_000_000000000)
++    os.chmod(os.path.join(root, "two.txt"), stat.S_IREAD)
++    linked = dedupe(root)
++    st1 = os.stat(os.path.join(root, "one.txt"))
++    st2 = os.stat(os.path.join(root, "two.txt"))
++    assert linked == ["two.txt"]
++    assert (st2.st_dev, st2.st_ino) == (st1.st_dev, st1.st_ino)
++    assert st1.st_nlink == 2
++    assert _read(os.path.join(root, "two.txt")) == b"RR"
++
++
++# --------------------------------------------------------------- 不回归
++
++def test_scan_simple_tree(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "a.txt"), b"12345")
++    _write(os.path.join(root, "sub", "b.txt"), b"1234567890")
++    result = scan_tree(root)
++    assert result.files == ["a.txt", "sub\\b.txt"]
++    assert result.total_bytes == 15
++    assert result.hard_link_groups == []
++
++
++def test_scan_empty_tree(tmp_path):
++    result = scan_tree(str(tmp_path))
++    assert result.files == []
++    assert result.total_bytes == 0
++    assert result.hard_link_groups == []
++
++
++def test_scan_reports_hard_link_pair(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "x.bin"), b"P")
++    os.link(os.path.join(root, "x.bin"), os.path.join(root, "y.bin"))
++    _write(os.path.join(root, "other.bin"), b"Q")
++    _set_mtime(os.path.join(root, "x.bin"), 1_700_000_000_000000000)
++    _set_mtime(os.path.join(root, "other.bin"), 1_600_000_000_000000000)
++    result = scan_tree(root)
++    assert result.hard_link_groups == [["x.bin", "y.bin"]]
++
++
++def test_scan_same_size_different_content_not_grouped(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "d1.bin"), b"111111")
++    _write(os.path.join(root, "d2.bin"), b"222222")
++    _set_mtime(os.path.join(root, "d1.bin"), 1_700_000_000_000000000)
++    _set_mtime(os.path.join(root, "d2.bin"), 1_600_000_000_000000000)
++    assert scan_tree(root).hard_link_groups == []
++
++
++def test_dedupe_noop_when_unique(tmp_path):
++    root = str(tmp_path)
++    _write(os.path.join(root, "a.txt"), b"1" * 3)
++    _write(os.path.join(root, "b.txt"), b"2" * 3)
++    _set_mtime(os.path.join(root, "b.txt"), 1_600_000_000_000000000)
++    assert dedupe(root) == []
++    assert _read(os.path.join(root, "a.txt")) == b"111"
++    assert _read(os.path.join(root, "b.txt")) == b"222"

@@ -1,0 +1,275 @@
+diff --git a/wscan/dupes.py b/wscan/dupes.py
+index 76670b5..f335c3b 100644
+--- a/wscan/dupes.py
++++ b/wscan/dupes.py
+@@ -1,9 +1,15 @@
+ """内容级去重：把重复文件替换为硬链接。"""
+ 
+ import hashlib
++import itertools
+ import os
++import stat as _stat
++
++from .scan import FILE_ATTRIBUTE_READONLY, _check_root, _iter_plain_files
+ 
+ _CHUNK = 1 << 20
++_TMP_INFIX = ".wscan-tmp-"
++_tmp_seq = itertools.count(1)
+ 
+ 
+ def _digest(path):
+@@ -14,24 +20,92 @@ def _digest(path):
+     return h.hexdigest()
+ 
+ 
++def _identity(path):
++    """文件身份 ``(st_dev, st_ino)``；NTFS 硬链接共享同一身份。
++
++    必须现取：旧的 stat 对象不会随建链/替换自动刷新。
++    """
++    st = os.stat(path)
++    return (st.st_dev, st.st_ino)
++
++
++def _clear_readonly(path):
++    """清除只读属性。
++
++    ``FILE_ATTRIBUTE_READONLY`` 会让 ``unlink`` / ``replace`` 失败
++    （WinError 5），``os.chmod(path, S_IWRITE)`` 可以清掉它。
++    """
++    attrs = getattr(os.stat(path), "st_file_attributes", 0)
++    if attrs & FILE_ATTRIBUTE_READONLY:
++        os.chmod(path, _stat.S_IWRITE)
++
++
++def _temp_link_path(path):
++    """在 ``path`` 同目录下生成一个当前不存在的临时名。
++
++    必须同目录：``os.replace`` 只有在同卷时才是真正的改名，硬链接也不
++    能跨卷。
++    """
++    directory = os.path.dirname(path) or "."
++    name = os.path.basename(path)
++    pid = os.getpid()
++    while True:
++        candidate = os.path.join(
++            directory, "%s%s%d-%d" % (name, _TMP_INFIX, pid, next(_tmp_seq)))
++        if not os.path.lexists(candidate):
++            return candidate
++
++
++def _replace_with_hard_link(source, target):
++    """把 ``target`` 替换成指向 ``source`` 的硬链接。
++
++    ``os.link(src, dst)`` 在 ``dst`` 已存在时抛 ``FileExistsError``
++    （WinError 183），即使目标是同一个文件也不例外；所以先 link 到同目录
++    的临时名，再 ``os.replace`` 覆盖回原路径——临时名用完即消失。
++    替换后 ``target`` 的属性与时间戳随 ``source``（NTFS 硬链接属性共享）。
++    """
++    _clear_readonly(target)
++    tmp = _temp_link_path(target)
++    os.link(source, tmp)
++    try:
++        os.replace(tmp, target)
++    except BaseException:
++        try:
++            os.unlink(tmp)
++        except OSError:
++            pass
++        raise
++
++
+ def dedupe(root):
+     """把内容相同的重复文件替换为指向规范的硬链接。
+ 
++    * root 校验与遍历语义同 ``scan_tree``（不进入重解析点目录）；
++    * 按内容（sha256）分组，簇内 canonical 为相对路径字典序最小者；
++    * 簇内文件身份与 canonical 不同的路径被替换为硬链接，身份已相同的
++      （本来就是硬链接）不动；
++    * canonical 的内容不会被改动。
++
+     返回被转换为硬链接的相对路径（已排序）。
+     """
+-    groups = {}
+-    for dirpath, _dirnames, filenames in os.walk(root):
+-        for name in filenames:
+-            path = os.path.join(dirpath, name)
+-            rel = os.path.relpath(path, root)
+-            groups.setdefault(_digest(path), []).append(rel)
+-    linked = []
+-    for paths in groups.values():
++    base = _check_root(root)
++    by_digest = {}
++    for rel, path, _st in _iter_plain_files(base):
++        by_digest.setdefault(_digest(path), []).append(rel)
++
++    replaced = []
++    for paths in by_digest.values():
+         if len(paths) < 2:
+             continue
+         paths.sort()
+-        canonical = os.path.join(root, paths[0])
++        canonical_rel = paths[0]
++        canonical = os.path.join(base, canonical_rel)
++        canonical_id = _identity(canonical)
+         for rel in paths[1:]:
+-            os.link(canonical, os.path.join(root, rel))
+-            linked.append(rel)
+-    return sorted(linked)
++            target = os.path.join(base, rel)
++            if _identity(target) == canonical_id:
++                # 本来就是同一个文件的硬链接：不动
++                continue
++            _replace_with_hard_link(canonical, target)
++            replaced.append(rel)
++    return sorted(replaced)
+diff --git a/wscan/scan.py b/wscan/scan.py
+index 4f8ef7a..9ebad22 100644
+--- a/wscan/scan.py
++++ b/wscan/scan.py
+@@ -1,6 +1,28 @@
+-"""目录扫描与统计。"""
++"""目录扫描与统计（Windows 文件身份感知）。
++
++两个 Windows 事实决定了本模块的实现方式：
++
++* **junction（目录联接）不是符号链接**：``os.path.islink`` 对它返回
++  ``False``，``os.walk`` 无论 ``followlinks`` 取值如何都会进入它；重解析
++  点只能通过 ``st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT``
++  （来自 ``os.lstat`` 或 ``DirEntry.stat(follow_symlinks=False)``）观察。
++  因此遍历必须自己写，逐条目判断重解析点。
++* **NTFS 硬链接共享同一个文件身份** ``(st_dev, st_ino)``：硬链接簇必须
++  按身份分组；按大小/修改时间分组会把无关文件误判成硬链接。
++
++另外注意 ``DirEntry.stat()`` 在 Windows 上不填 ``st_ino``/``st_nlink``
++（恒为 0），文件身份只能用 ``os.stat`` 取。
++"""
+ 
+ import os
++import stat as _stat
++
++from .errors import WScanError
++
++# Windows FILE_ATTRIBUTE_* 位；非 Windows 平台取不到 st_file_attributes，
++# 按 0 处理（此时退化为用 S_ISLNK 判断符号链接）。
++FILE_ATTRIBUTE_READONLY = 0x1
++FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+ 
+ 
+ class ScanResult:
+@@ -22,20 +44,103 @@ class ScanResult:
+             len(self.files), self.total_bytes, len(self.hard_link_groups))
+ 
+ 
++def _is_reparse_point(st):
++    """``st`` 是否描述一个重解析点（junction / 符号链接 / 挂载点……）。
++
++    ``st`` 必须来自 ``os.lstat(path)`` 或
++    ``DirEntry.stat(follow_symlinks=False)``。
++    """
++    attrs = getattr(st, "st_file_attributes", 0)
++    if attrs & FILE_ATTRIBUTE_REPARSE_POINT:
++        return True
++    # 非 Windows：退化为符号链接判断
++    return bool(_stat.S_ISLNK(st.st_mode))
++
++
++def _check_root(root):
++    """校验 ``root`` 是已存在的目录，否则抛 ``WScanError(kind="root")``。
++
++    返回规范化（绝对化）后的 root，供遍历与路径拼接使用。
++    """
++    try:
++        is_dir = os.path.isdir(root)
++    except (OSError, TypeError, ValueError):
++        is_dir = False
++    if not is_dir:
++        raise WScanError(
++            "root", root=root,
++            message="wscan root error: %r is not an existing directory" % (root,))
++    return os.path.abspath(root)
++
++
++def _iter_plain_files(root):
++    """深度优先遍历 ``root``，产出其中的普通文件。
++
++    遍历语义（``scan_tree`` 与 ``dedupe`` 共用）：
++
++    * 不进入任何带重解析点的目录（junction、目录符号链接），其内部条目
++      一律不产出；
++    * 带重解析点的文件同样不产出；
++    * 目录本身不产出，只产出普通文件。
++
++    每次产出 ``(rel, path, st)``：``rel`` 是相对 ``root`` 的路径
++    （``os.path.join`` 风格，Windows 下为反斜杠），``path`` 是完整路径，
++    ``st`` 是 ``os.stat(path)`` 的结果——重解析点已被排除，所以
++    ``(st.st_dev, st.st_ino)`` 就是真实的文件身份。
++    """
++    base = os.path.abspath(root)
++    stack = [base]
++    while stack:
++        dirpath = stack.pop()
++        try:
++            with os.scandir(dirpath) as it:
++                entries = list(it)
++        except OSError:
++            # 读不了的目录（权限等）直接跳过，不影响其余部分
++            continue
++        subdirs = []
++        paths = []
++        for entry in entries:
++            try:
++                entry_st = entry.stat(follow_symlinks=False)
++            except OSError:
++                continue
++            if _is_reparse_point(entry_st):
++                # junction / 符号链接：目录不进入，文件不统计
++                continue
++            if _stat.S_ISDIR(entry_st.st_mode):
++                subdirs.append(entry.path)
++            elif _stat.S_ISREG(entry_st.st_mode):
++                paths.append(entry.path)
++        # 逆序入栈 => 出栈时按字典序遍历，结果稳定
++        stack.extend(sorted(subdirs, reverse=True))
++        for path in sorted(paths):
++            try:
++                st = os.stat(path)
++            except OSError:
++                continue
++            yield os.path.relpath(path, base), path, st
++
++
+ def scan_tree(root):
+-    """扫描 ``root`` 目录树，统计文件、总字节与硬链接簇。"""
++    """扫描 ``root`` 目录树，统计文件、总字节与硬链接簇。
++
++    * root 必须是已存在的目录，否则抛 ``WScanError(kind="root")``；
++    * 遍历不进入任何重解析点目录，也不统计重解析点文件；
++    * ``files`` 为相对 ``root`` 的路径，已排序；
++    * ``total_bytes`` 为这些普通文件的 ``st_size`` 之和；
++    * ``hard_link_groups`` 按文件身份 ``(st_dev, st_ino)`` 分组，只保留
++      路径数 >= 2 的簇；簇内路径已排序，簇按首路径排序。
++    """
++    base = _check_root(root)
+     files = []
+-    by_signature = {}
++    by_identity = {}
+     total = 0
+-    for dirpath, dirnames, filenames in os.walk(root):
+-        for name in filenames:
+-            path = os.path.join(dirpath, name)
+-            rel = os.path.relpath(path, root)
+-            st = os.stat(path)
+-            files.append(rel)
+-            total += st.st_size
+-            by_signature.setdefault((st.st_size, st.st_mtime_ns), []).append(rel)
++    for rel, _path, st in _iter_plain_files(base):
++        files.append(rel)
++        total += st.st_size
++        by_identity.setdefault((st.st_dev, st.st_ino), []).append(rel)
+     files.sort()
+-    groups = [sorted(paths) for paths in by_signature.values() if len(paths) > 1]
+-    groups.sort()
++    groups = [sorted(paths) for paths in by_identity.values() if len(paths) > 1]
++    groups.sort(key=lambda group: group[0])
+     return ScanResult(files=files, total_bytes=total, hard_link_groups=groups)

@@ -1,0 +1,148 @@
+diff --git a/wsafename/rules.py b/wsafename/rules.py
+index c480514..828f415 100644
+--- a/wsafename/rules.py
++++ b/wsafename/rules.py
+@@ -4,7 +4,7 @@
+ 以及净化名称时需要用到的常量。
+ """
+ 
+-#: Win32 保留设备名。
++#: Win32 保留设备名的**基名**部分（不含扩展名）。
+ RESERVED_BASE_NAMES = frozenset(
+     ["CON", "PRN", "AUX", "NUL"]
+     + ["COM%d" % i for i in range(1, 10)]
+@@ -26,9 +26,38 @@ def has_illegal_chars(name):
+     return any(ch in ILLEGAL_CHARS for ch in name)
+ 
+ 
++def reserved_base_name(name):
++    """返回 Win32 判定保留设备名时实际使用的那一段。
++
++    Win32 只取**第一个点之前**的部分，并忽略其首尾空白与大小写：
++
++    >>> reserved_base_name("con.tar.gz")
++    'CON'
++    >>> reserved_base_name("console.txt")
++    'CONSOLE'
++    >>> reserved_base_name("com10.log")
++    'COM10'
++    """
++    return name.split(".", 1)[0].strip().upper()
++
++
+ def is_reserved(name):
+-    """``name`` 是否是 Windows 保留设备名。"""
+-    return name.strip().upper() in RESERVED_BASE_NAMES
++    """``name`` 是否是 Windows 保留设备名。
++
++    判定只看第一个点之前的那一段，因此 ``CON``、``CON.txt``、
++    ``con.tar.gz`` 都是保留名；而 ``console.txt``、``mycon``、
++    ``com10.log`` 的基名不在保留列表里，可以正常使用。
++    """
++    return reserved_base_name(name) in RESERVED_BASE_NAMES
++
++
++def has_stripped_tail(name):
++    """``name`` 是否以 Windows 会静默丢弃的点或空格结尾。
++
++    这类名称无法原样落盘：``report.`` 与 ``report`` 会指向同一个条目，
++    ``...`` 更是会退化成空名称。
++    """
++    return bool(name) and name != name.rstrip(TRAILING_CHARS)
+ 
+ 
+ def is_valid(name):
+@@ -39,4 +68,6 @@ def is_valid(name):
+         return False
+     if has_illegal_chars(name):
+         return False
++    if has_stripped_tail(name):
++        return False
+     return not is_reserved(name)
+diff --git a/wsafename/sanitize.py b/wsafename/sanitize.py
+index 400d136..8f45142 100644
+--- a/wsafename/sanitize.py
++++ b/wsafename/sanitize.py
+@@ -1,7 +1,7 @@
+ """把用户提供的名称转换成可以安全落盘的名称。"""
+ 
+ from .errors import InvalidNameError
+-from .rules import ILLEGAL_CHARS, MAX_SEGMENT_LENGTH
++from .rules import ILLEGAL_CHARS, MAX_SEGMENT_LENGTH, TRAILING_CHARS
+ 
+ #: 替换非法字符时使用的字符。
+ REPLACEMENT = "_"
+@@ -14,21 +14,30 @@ def sanitize(name, replacement=REPLACEMENT):
+ 
+     1. 去掉首尾空白
+     2. 把非法字符替换为 ``replacement``
+-    3. 截断到 :data:`wsafename.rules.MAX_SEGMENT_LENGTH`
+-
+-    返回净化后的名称。``name`` 不是字符串时抛 ``TypeError``；
+-    净化结果不可用时抛 :class:`InvalidNameError`。
++    3. 去掉 Windows 会静默丢弃的尾部点与空格，使 ``report.`` 与 ``report``
++       得到同一个落盘名
++    4. 截断到 :data:`wsafename.rules.MAX_SEGMENT_LENGTH`；截断可能重新暴露出
++       尾部点与空格，因此再执行一次第 3 步
++
++    返回净化后的名称。``name`` 不是字符串时抛 ``TypeError``；净化后不再剩下
++    任何可用字符（例如 ``"..."``、只有空白的输入）时抛
++    :class:`InvalidNameError`，不会把底层 ``OSError`` 透传给调用方。
+     """
+     if not isinstance(name, str):
+         raise TypeError("name must be str, got %s" % type(name).__name__)
+ 
+     cleaned = name.strip()
+ 
+-    out = [replacement if ch in ILLEGAL_CHARS else ch for ch in cleaned]
+-    cleaned = "".join(out)
++    cleaned = "".join(
++        replacement if ch in ILLEGAL_CHARS else ch for ch in cleaned
++    )
++
++    # Windows 在解析路径时会丢弃名称尾部的点与空格，落盘名必须与之一致，
++    # 否则 "report." 与 "report" 会被当成两个名称，磁盘上却只有一个条目。
++    cleaned = cleaned.rstrip(TRAILING_CHARS)
+ 
+     if len(cleaned) > MAX_SEGMENT_LENGTH:
+-        cleaned = cleaned[:MAX_SEGMENT_LENGTH]
++        cleaned = cleaned[:MAX_SEGMENT_LENGTH].rstrip(TRAILING_CHARS)
+ 
+     if not cleaned:
+         raise InvalidNameError("name is empty after sanitizing: %r" % (name,))
+diff --git a/wsafename/store.py b/wsafename/store.py
+index 32b0767..2746e2c 100644
+--- a/wsafename/store.py
++++ b/wsafename/store.py
+@@ -3,7 +3,7 @@
+ import os
+ 
+ from .errors import InvalidNameError
+-from .rules import is_valid
++from .rules import is_reserved, is_valid
+ from .sanitize import sanitize as _sanitize
+ 
+ 
+@@ -36,13 +36,21 @@ class FileStore:
+         return os.path.isfile(self.target_path(name))
+ 
+     def save(self, name, data):
+-        """把 ``data``（bytes）写入 ``name`` 对应的文件，返回落盘名称。"""
++        """把 ``data``（bytes）写入 ``name`` 对应的文件，返回落盘名称。
++
++        名称不可用时抛 :class:`InvalidNameError`，并且**不会**在目标目录里
++        留下任何条目：校验发生在打开文件之前。
++        """
+         if not isinstance(data, (bytes, bytearray)):
+             raise TypeError("data must be bytes-like")
+ 
+         target = self.sanitize(name)
+ 
+         if not is_valid(target):
++            if is_reserved(target):
++                raise InvalidNameError(
++                    "%r is a reserved Windows device name" % (target,)
++                )
+             raise InvalidNameError("%r is not usable on Windows" % (target,))
+ 
+         with open(os.path.join(self.root, target), "wb") as fh:

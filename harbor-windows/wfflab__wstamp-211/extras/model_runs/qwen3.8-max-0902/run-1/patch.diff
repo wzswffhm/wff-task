@@ -1,0 +1,449 @@
+diff --git a/wstamp/attributes.py b/wstamp/attributes.py
+index 17ae7fe..73bffb8 100644
+--- a/wstamp/attributes.py
++++ b/wstamp/attributes.py
+@@ -6,31 +6,72 @@ Windows 的文件属性不走 POSIX 权限位，只能通过 Win32 的
+ 
+ import ctypes
+ 
+-_FILE_ATTRIBUTE_READONLY = 0x01
+-_FILE_ATTRIBUTE_HIDDEN = 0x02
++FILE_ATTRIBUTE_READONLY = 0x01
++FILE_ATTRIBUTE_HIDDEN = 0x02
++FILE_ATTRIBUTE_SYSTEM = 0x04
++FILE_ATTRIBUTE_DIRECTORY = 0x10
++FILE_ATTRIBUTE_ARCHIVE = 0x20
++FILE_ATTRIBUTE_NORMAL = 0x80
+ 
+-_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
++INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
++
++# 兼容既有的模块内私有名。
++_FILE_ATTRIBUTE_READONLY = FILE_ATTRIBUTE_READONLY
++_FILE_ATTRIBUTE_HIDDEN = FILE_ATTRIBUTE_HIDDEN
++_INVALID_FILE_ATTRIBUTES = INVALID_FILE_ATTRIBUTES
++
++_KERNEL32 = None
++
++
++def _kernel32():
++    """惰性初始化 kernel32，并声明正确的函数原型。
++
++    ``GetFileAttributesW`` 返回 DWORD：ctypes 默认的 ``c_int`` restype
++    会把失败标记 ``0xFFFFFFFF`` 折叠成 ``-1``，导致错误检测失效，
++    因此必须显式声明 ``restype`` / ``argtypes``。
++    """
++    global _KERNEL32
++    if _KERNEL32 is None:
++        kernel32 = ctypes.windll.kernel32
++        kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
++        kernel32.GetFileAttributesW.restype = ctypes.c_uint32
++        kernel32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
++        kernel32.SetFileAttributesW.restype = ctypes.c_int
++        _KERNEL32 = kernel32
++    return _KERNEL32
+ 
+ 
+ def get_attributes(path):
+     """返回 ``GetFileAttributesW`` 的原始属性位。"""
+-    value = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+-    if value == _INVALID_FILE_ATTRIBUTES:
++    value = _kernel32().GetFileAttributesW(str(path))
++    if value == INVALID_FILE_ATTRIBUTES:
+         raise ctypes.WinError()
+     return value
+ 
+ 
+ def is_readonly(path):
+     """路径是否带只读属性。"""
+-    return bool(get_attributes(path) & _FILE_ATTRIBUTE_READONLY)
++    return bool(get_attributes(path) & FILE_ATTRIBUTE_READONLY)
+ 
+ 
+ def is_hidden(path):
+     """路径是否带隐藏属性。"""
+-    return bool(get_attributes(path) & _FILE_ATTRIBUTE_HIDDEN)
++    return bool(get_attributes(path) & FILE_ATTRIBUTE_HIDDEN)
+ 
+ 
+ def set_attributes(path, attrs):
+     """把路径的属性位整体设置为 ``attrs``。"""
+-    if not ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs):
++    if not _kernel32().SetFileAttributesW(str(path), int(attrs)):
+         raise ctypes.WinError()
++
++
++def clear_readonly(path):
++    """清除路径的只读位（若存在），返回清除前的原始属性位。
++
++    对只读目标的写动作（覆写 / 回写时间 / 删除）必须先走这一步，
++    完成后由调用方用 :func:`set_attributes` 恢复应有的属性位。
++    """
++    attrs = get_attributes(path)
++    if attrs & FILE_ATTRIBUTE_READONLY:
++        set_attributes(path, attrs & ~FILE_ATTRIBUTE_READONLY)
++    return attrs
+diff --git a/wstamp/copier.py b/wstamp/copier.py
+index 5396702..34df437 100644
+--- a/wstamp/copier.py
++++ b/wstamp/copier.py
+@@ -3,12 +3,56 @@
+ import os
+ import shutil
+ 
++from .attributes import (
++    FILE_ATTRIBUTE_READONLY,
++    get_attributes,
++    set_attributes,
++)
++from .stamps import snapshot_times
++
+ 
+ def copy_stamp(src, dst):
+-    """复制单个文件，把源的时间戳尽量带过去。
++    """复制单个文件，并携带源的时间戳（纳秒级）与全部 Win32 属性位。
++
++    - 目标的 ``mtime_ns`` / ``atime_ns`` 与源逐纳秒相等。
++    - 源的全部属性位（只读、隐藏等）原样出现在目标上。
++
++    实现要点：
++
++    - 先取源的时间快照再复制：复制动作（读取源数据）可能刷新源的
++      atime，事后再取就不是复制前的值了。
++    - 时间戳用 ``os.utime(..., ns=...)`` 以纳秒写入（NTFS 存储粒度
++      100ns，100 的倍数可逐纳秒往返）。
++    - 属性设置必须放在时间戳之后：若源带只读位，先设属性会让随后的
++      ``utime`` 被 Windows 拒绝（WinError 5）。
++    - 目标已存在且带只读位时先清除只读再覆写，最终属性以源为准。
++    """
++    snap = snapshot_times(src)
++    attrs = get_attributes(src)
++    apply_copy(src, dst, snap, attrs)
+ 
+-    目前先用 ``copyfile`` 落盘，再把源的 mtime（秒）设到目标上。
++
++def apply_copy(src, dst, snap, attrs):
++    """把 ``src`` 复制到 ``dst``：时间戳取 ``snap``，属性位取 ``attrs``。
++
++    ``snap`` 必须是读取 ``src`` 内容**之前**取得的 :func:`snapshot_times`
++    快照（读取可能刷新源的 atime）。目录树同步在比较完字节之后复用
++    这个入口，避免比较用的读取污染最终写到目标上的时间戳。
++
++    顺序固定为：清除目标只读位（若有）→ 复制内容 → 纳秒级时间戳 →
++    属性位。属性必须最后设，否则只读目标无法 ``utime``。
+     """
++    _ensure_writable(dst)
+     shutil.copyfile(src, dst)
+-    st = os.stat(src)
+-    os.utime(dst, (st.st_mtime, st.st_mtime))
++    os.utime(dst, ns=(snap["atime_ns"], snap["mtime_ns"]))
++    set_attributes(dst, attrs)
++
++
++def _ensure_writable(path):
++    """目标已存在且带只读位时先清除只读，使覆写 / ``utime`` 可行。"""
++    try:
++        attrs = get_attributes(path)
++    except OSError:
++        return
++    if attrs & FILE_ATTRIBUTE_READONLY:
++        set_attributes(path, attrs & ~FILE_ATTRIBUTE_READONLY)
+diff --git a/wstamp/stamps.py b/wstamp/stamps.py
+index af82301..61a666d 100644
+--- a/wstamp/stamps.py
++++ b/wstamp/stamps.py
+@@ -2,6 +2,7 @@
+ 
+ import os
+ 
++from .attributes import is_readonly
+ from .errors import WStampError
+ 
+ 
+@@ -26,8 +27,21 @@ def snapshot_times(path):
+ def stamp_file(path, mtime_ns):
+     """把 ``path`` 的 mtime 精确设置为整数纳秒 ``mtime_ns``。
+ 
+-    注意：NTFS 以 100ns 为存储粒度，因此 ``mtime_ns`` 应当是 100 的倍数，
+-    否则会被截断。
++    - 只修改 mtime：atime 保持原值（先读出当前值再原样写回）。
++    - NTFS 以 100ns 为存储粒度，``mtime_ns`` 应当是 100 的倍数，
++      这样写入之后可以逐纳秒读回、完全相等。
++    - 目标带只读属性时不做任何写动作，直接抛
++      ``WStampError(kind="readonly")``：Windows 对只读文件的 ``utime``
++      会以 WinError 5 失败。``stamp_file`` 是调用方显式的时间戳设置
++      入口，不应静默修改目标属性。
+     """
+-    # 直接把 (atime, mtime) 都设成目标值。
+-    os.utime(path, ns=(mtime_ns, mtime_ns))
++    if is_readonly(path):
++        raise WStampError(
++            "readonly",
++            "refusing to stamp read-only target (WinError 5 would follow): %s"
++            % (str(path),),
++        )
++    mtime_ns = int(mtime_ns)
++    # 只动 mtime：atime 用当前值原样写回。
++    atime_ns = os.stat(path).st_atime_ns
++    os.utime(path, ns=(atime_ns, mtime_ns))
+diff --git a/wstamp/sync.py b/wstamp/sync.py
+index 4777911..176aaf3 100644
+--- a/wstamp/sync.py
++++ b/wstamp/sync.py
+@@ -1,8 +1,30 @@
+-"""目录树同步。"""
++"""目录树同步。
++
++条目的同步状态定义为 ``(字节内容, mtime_ns)`` 二元组：
++
++- 目标缺失 → 复制内容 + 时间戳 + 属性，记入 ``created``；
++- 字节内容不同 → 覆写 + 时间戳 + 属性，记入 ``updated``；
++- 字节内容相同但 ``mtime_ns`` 不同 → 只回写目标的时间戳（保持目标
++  atime 不变），记入 ``restamped``；
++- 目标多余 → 删除（只读条目先清属性再删），记入 ``deleted``；
++- 其他无法完成的条目 → 记入 ``failed``，不中断整次同步。
++
++报告中的路径一律相对 ``dst``（``os.path.join`` 风格，Windows 下为
++反斜杠），不是绝对路径。
++"""
+ 
+ import os
+ import shutil
+ 
++from .attributes import (
++    FILE_ATTRIBUTE_READONLY,
++    clear_readonly,
++    get_attributes,
++    set_attributes,
++)
++from .copier import apply_copy, copy_stamp
++from .stamps import snapshot_times
++
+ 
+ class SyncReport:
+     """一次同步的动作记录。列表元素是相对 ``dst`` 的路径。"""
+@@ -10,15 +32,35 @@ class SyncReport:
+     def __init__(self):
+         self.created = []
+         self.updated = []
++        self.restamped = []
+         self.deleted = []
+         self.failed = []
+ 
++    def __repr__(self):
++        return (
++            "SyncReport(created=%r, updated=%r, restamped=%r, deleted=%r, failed=%r)"
++            % (
++                self.created,
++                self.updated,
++                self.restamped,
++                self.deleted,
++                self.failed,
++            )
++        )
++
+ 
+ def sync_tree(src, dst, dry_run=False):
+-    """把 ``src`` 目录树同步到 ``dst``，返回 :class:`SyncReport`。"""
++    """把 ``src`` 目录树同步到 ``dst``，返回 :class:`SyncReport`。
++
++    ``dry_run=True`` 时计算同样的报告，但不改动目标树：不创建、
++    不覆写、不删除、不写时间戳。
++    """
+     report = SyncReport()
+     _sync_dir(src, dst, "", report, dry_run)
+     _prune(src, dst, "", report, dry_run)
++    # 目录的 mtime 必须在条目填充完成之后从源恢复（先深层后浅层）：
++    # 前面的创建 / 覆写 / 删除都会刷新父目录的 mtime。
++    _restore_dir_times(src, dst, report, dry_run)
+     return report
+ 
+ 
+@@ -26,32 +68,85 @@ def _sync_dir(src, dst, rel, report, dry_run):
+     src_dir = os.path.join(src, rel) if rel else src
+     dst_dir = os.path.join(dst, rel) if rel else dst
+     if not dry_run:
+-        os.makedirs(dst_dir, exist_ok=True)
+-    for name in sorted(os.listdir(src_dir)):
++        try:
++            os.makedirs(dst_dir, exist_ok=True)
++        except OSError:
++            if not rel:
++                raise
++            # 目标位置被同名文件占据等：整个子树无法同步。
++            report.failed.append(rel)
++            return
++    try:
++        names = sorted(os.listdir(src_dir))
++    except OSError:
++        if not rel:
++            raise
++        report.failed.append(rel)
++        return
++    for name in names:
+         src_path = os.path.join(src_dir, name)
+         rel_path = os.path.join(rel, name) if rel else name
+         if os.path.isdir(src_path):
+             _sync_dir(src, dst, rel_path, report, dry_run)
+             continue
+-        dst_path = os.path.join(dst, rel_path)
+-        try:
+-            with open(src_path, "rb") as fh:
+-                src_bytes = fh.read()
+-            if not os.path.exists(dst_path):
+-                if not dry_run:
+-                    shutil.copyfile(src_path, dst_path)
+-                report.created.append(rel_path)
+-            else:
+-                with open(dst_path, "rb") as fh:
+-                    dst_bytes = fh.read()
+-                if src_bytes != dst_bytes:
+-                    if not dry_run:
+-                        shutil.copyfile(src_path, dst_path)
+-                    report.updated.append(rel_path)
+-                # 内容相同时视为一致，不做任何动作。
+-        except OSError as exc:
+-            report.failed.append(rel_path)
+-            print("wstamp: %s (%s)" % (rel_path, exc))
++        _sync_file(src_path, os.path.join(dst, rel_path), rel_path, report, dry_run)
++
++
++def _sync_file(src_path, dst_path, rel_path, report, dry_run):
++    try:
++        if not os.path.exists(dst_path):
++            # 目标缺失：复制内容 + 时间戳 + 属性。
++            # copy_stamp 会先取源快照再复制（读取源可能刷新其 atime）。
++            if not dry_run:
++                copy_stamp(src_path, dst_path)
++            report.created.append(rel_path)
++            return
++        # 快照必须赶在读取内容之前：读取可能刷新 atime。
++        # 对 dst 先取快照，restamp 时才能保持目标 atime 原值。
++        src_snap = snapshot_times(src_path)
++        src_attrs = get_attributes(src_path)
++        dst_snap = snapshot_times(dst_path)
++        with open(src_path, "rb") as fh:
++            src_bytes = fh.read()
++        with open(dst_path, "rb") as fh:  # dst 位置被同名目录占据时在此抛出
++            dst_bytes = fh.read()
++        if src_bytes != dst_bytes:
++            # 字节内容不同：覆写 + 时间戳 + 属性（属性以源为准）。
++            if not dry_run:
++                apply_copy(src_path, dst_path, src_snap, src_attrs)
++            report.updated.append(rel_path)
++        elif src_snap["mtime_ns"] != dst_snap["mtime_ns"]:
++            # 字节内容相同但 mtime 不同：只回写目标的时间戳，
++            # 保持目标 atime 不变。
++            if not dry_run:
++                _stamp_mtime(
++                    dst_path, src_snap["mtime_ns"], atime_ns=dst_snap["atime_ns"]
++                )
++            report.restamped.append(rel_path)
++        # (字节, mtime_ns) 二元组一致：条目已同步，无需任何动作。
++    except OSError:
++        # 目标被占用、被同名目录占据等：记入 failed，不中断整次同步。
++        report.failed.append(rel_path)
++
++
++def _stamp_mtime(path, mtime_ns, atime_ns=None):
++    """把 ``path`` 的 mtime 设为纳秒级 ``mtime_ns``，保持 atime。
++
++    ``atime_ns`` 未给出时现读现写（目录场景）。只读目标先清除只读
++    属性、完成后恢复原属性位——只有 :func:`wstamp.stamp_file` 这个
++    单点 API 才直接报错。
++    """
++    attrs = get_attributes(path)
++    cleared = bool(attrs & FILE_ATTRIBUTE_READONLY)
++    if cleared:
++        set_attributes(path, attrs & ~FILE_ATTRIBUTE_READONLY)
++    try:
++        if atime_ns is None:
++            atime_ns = os.stat(path).st_atime_ns
++        os.utime(path, ns=(atime_ns, mtime_ns))
++    finally:
++        if cleared:
++            set_attributes(path, attrs)
+ 
+ 
+ def _prune(src, dst, rel, report, dry_run):
+@@ -59,21 +154,71 @@ def _prune(src, dst, rel, report, dry_run):
+     if not os.path.isdir(dst_dir):
+         return
+     src_dir = os.path.join(src, rel) if rel else src
+-    for name in sorted(os.listdir(dst_dir)):
++    try:
++        names = sorted(os.listdir(dst_dir))
++    except OSError:
++        if rel:
++            report.failed.append(rel)
++        return
++    for name in names:
+         dst_path = os.path.join(dst_dir, name)
+         rel_path = os.path.join(rel, name) if rel else name
+         src_path = os.path.join(src_dir, name)
+         if not os.path.exists(src_path):
++            # 目标多余：删除（只读条目先清属性再删）。
+             try:
+-                if os.path.isdir(dst_path):
+-                    if not dry_run:
+-                        shutil.rmtree(dst_path)
+-                else:
+-                    if not dry_run:
+-                        os.remove(dst_path)
++                if not dry_run:
++                    if os.path.isdir(dst_path):
++                        _remove_tree(dst_path)
++                    else:
++                        _remove_file(dst_path)
+                 report.deleted.append(rel_path)
+-            except OSError as exc:
++            except OSError:
+                 report.failed.append(rel_path)
+-                print("wstamp: %s (%s)" % (rel_path, exc))
+         elif os.path.isdir(dst_path):
+             _prune(src, dst, rel_path, report, dry_run)
++
++
++def _remove_file(path):
++    clear_readonly(path)
++    os.remove(path)
++
++
++def _remove_tree(path):
++    # ``rmtree`` 对只读文件 / 目录会失败：自底向上把只读位全部清掉。
++    for root, dirnames, filenames in os.walk(path, topdown=False):
++        for name in filenames:
++            _clear_readonly_quiet(os.path.join(root, name))
++        for name in dirnames:
++            _clear_readonly_quiet(os.path.join(root, name))
++    _clear_readonly_quiet(path)
++    shutil.rmtree(path)
++
++
++def _clear_readonly_quiet(path):
++    try:
++        clear_readonly(path)
++    except OSError:
++        pass
++
++
++def _restore_dir_times(src, dst, report, dry_run):
++    """按源恢复目标树的目录 mtime（先深层后浅层，根目录最后）。
++
++    同步会在目标创建 / 删除条目，这会刷新父目录的 mtime，因此必须
++    在条目填充完成之后统一恢复，使目标树的目录 mtime 与源一致。
++    ``os.walk(topdown=False)`` 保证子目录先于父目录处理，浅层的值
++    不会被后续写操作冲掉。
++    """
++    if dry_run:
++        return
++    for src_dir, _dirnames, _filenames in os.walk(src, topdown=False):
++        rel = os.path.relpath(src_dir, src)
++        dst_dir = dst if rel == "." else os.path.join(dst, rel)
++        if not os.path.isdir(dst_dir):
++            continue
++        try:
++            _stamp_mtime(dst_dir, snapshot_times(src_dir)["mtime_ns"])
++        except OSError:
++            if rel != ".":
++                report.failed.append(rel)

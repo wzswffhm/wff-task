@@ -1,0 +1,163 @@
+diff --git a/wtask/duration.py b/wtask/duration.py
+index 3df99a7..801da8e 100644
+--- a/wtask/duration.py
++++ b/wtask/duration.py
+@@ -39,9 +39,16 @@ def parse_duration(text):
+ 
+ 
+ def format_duration(value):
+-    """把 ``timedelta`` 写成 ISO-8601 文本。
++    """把 ``timedelta`` 规范化为 ISO-8601 文本。
+ 
+-    只写非零分量，零时长写作 ``PT0S``。
++    规范化规则（契约）：
++
++    * 先把总秒数分解为「天 + 小时 + 分钟 + 秒」，即 ``P<n>DT<n>H<n>M<n>S``；
++    * 只写非零分量（天为 0 时省略 ``<n>D``，时分秒全为 0 时省略 ``T`` 段）；
++    * 零时长统一写作 ``PT0S``。
++
++    例：``timedelta(hours=72)` → ``"P3D"``；``timedelta(hours=2)` → ``"PT2H"``；
++    ``timedelta(minutes=90)` → ``"PT1H30M"``。
+     """
+     if not isinstance(value, timedelta):
+         raise TaskDefError("duration", "format_duration expects timedelta")
+@@ -50,13 +57,18 @@ def format_duration(value):
+         raise TaskDefError("duration", "negative duration is not representable")
+     if total == 0:
+         return "PT0S"
+-    hours, rem = divmod(total, 3600)
++    days, rem = divmod(total, 86400)
++    hours, rem = divmod(rem, 3600)
+     minutes, seconds = divmod(rem, 60)
+-    out = "PT"
+-    if hours:
+-        out += "%dH" % hours
+-    if minutes:
+-        out += "%dM" % minutes
+-    if seconds:
+-        out += "%dS" % seconds
++    out = "P"
++    if days:
++        out += "%dD" % days
++    if hours or minutes or seconds:
++        out += "T"
++        if hours:
++            out += "%dH" % hours
++        if minutes:
++            out += "%dM" % minutes
++        if seconds:
++            out += "%dS" % seconds
+     return out
+diff --git a/wtask/schedule.py b/wtask/schedule.py
+index 52abc47..4d61be6 100644
+--- a/wtask/schedule.py
++++ b/wtask/schedule.py
+@@ -30,8 +30,8 @@ def _week_start(day):
+ 
+ 
+ def _week_index(day):
+-    """返回 ``day`` 在本月内的周序号（1 起）。"""
+-    return day.day // 7 + 1
++    """返回 ``day`` 在本月内的周序号（1 起）。1 号到 7 号为第 1 周。"""
++    return (day.day - 1) // 7 + 1
+ 
+ 
+ def _weeks_in_month(day):
+@@ -46,8 +46,12 @@ def _match_week(day, wanted):
+     1..4 表示第 n 周；**5 表示该月的最后一周**（可能是第 4 周，例如 2 月）。
+     """
+     index = _week_index(day)
++    last = _weeks_in_month(day)
+     for w in wanted:
+-        if index == w:
++        if w == 5:
++            if index == last:
++                return True
++        elif index == w:
+             return True
+     return False
+ 
+@@ -55,12 +59,17 @@ def _match_week(day, wanted):
+ def _day_matches(trigger, day):
+     """``day`` 这一天是否是这个触发器的一个主出现日（不看时刻）。"""
+     if trigger.type == "daily":
+-        return day.day % trigger.days_interval == 0
++        return (day - trigger.start.date()).days % trigger.days_interval == 0
+ 
+     if trigger.type == "weekly":
+-        return _weekday_index(day) in trigger.days_of_week
++        if _weekday_index(day) not in trigger.days_of_week:
++            return False
++        weeks = (_week_start(day) - _week_start(trigger.start.date())).days // 7
++        return weeks % trigger.weeks_interval == 0
+ 
+     if trigger.type == "monthly":
++        if trigger.months and day.month not in trigger.months:
++            return False
+         return day.day in trigger.days_of_month
+ 
+     if trigger.type == "monthly_dow":
+@@ -108,9 +117,11 @@ def _expand(trigger, occurrence, after, count):
+     step = 0
+     while len(runs) < count and step < 100000:
+         offset = rep.interval * step
+-        if rep.duration is not None and offset > rep.duration:
++        if rep.duration is not None and offset >= rep.duration:
+             break
+         moment = occurrence + offset
++        if trigger.end is not None and moment > trigger.end:
++            break
+         if moment > after:
+             runs.append(moment)
+         step += 1
+@@ -134,6 +145,8 @@ def next_runs(task, after, count):
+ 
+     moments = set()
+     for trigger in task.triggers:
++        if not trigger.enabled:
++            continue
+         for occurrence in _primary_occurrences(trigger, after):
+             moments.update(_expand(trigger, occurrence, after, count))
+ 
+diff --git a/wtask/xmlio.py b/wtask/xmlio.py
+index d0076c2..b7e3d77 100644
+--- a/wtask/xmlio.py
++++ b/wtask/xmlio.py
+@@ -164,6 +164,8 @@ def _parse_calendar(element):
+         _check_children(schedule, ("DaysInterval",), "ScheduleByDay")
+         interval_text = _text(schedule, "DaysInterval")
+         days_interval = _parse_int(interval_text, "DaysInterval") if interval_text else 1
++        if not 1 <= days_interval <= 365:
++            raise TaskDefError("range", "DaysInterval out of 1..365")
+         return Trigger(
+             type="daily", start=start, end=end, enabled=enabled,
+             days_interval=days_interval, repetition=repetition,
+@@ -251,6 +253,8 @@ def parse_task_xml(text):
+         raise TaskDefError("schema", "root element must be <Task>")
+ 
+     version = (root.get("version") or "").strip()
++    if version not in SUPPORTED_VERSIONS:
++        raise TaskDefError("version", "unsupported task version: %r" % version)
+ 
+     holders = _children(root, "Triggers")
+     if not holders:
+@@ -266,7 +270,7 @@ def parse_task_xml(text):
+         elif local == "TimeTrigger":
+             triggers.append(_parse_time(child))
+         else:
+-            continue
++            raise TaskDefError("trigger", "unknown trigger <%s>" % local)
+     if not triggers:
+         raise TaskDefError("structure", "<Triggers> is empty")
+ 
+@@ -278,7 +282,9 @@ def parse_task_xml(text):
+             fields["enabled"] = _parse_bool(enabled_text, "Enabled")
+         limit_text = _text(settings, "ExecutionTimeLimit")
+         if limit_text is not None:
+-            fields["execution_time_limit"] = parse_duration(limit_text)
++            limit = parse_duration(limit_text)
++            # PT0S 语义 = 不限执行时长，模型里用 None 表示
++            fields["execution_time_limit"] = None if limit == timedelta(0) else limit
+         policy = _text(settings, "MultipleInstancesPolicy")
+         if policy:
+             fields["multiple_instances"] = policy

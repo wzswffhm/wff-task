@@ -1,0 +1,30 @@
+## 定位到的缺陷与修复
+
+**1. `publish` 权限只下发到根目录（症状 1）** — `wpublish/publish.py`
+`deny(dst_dir, principal, READONLY_SPEC)` 既没有 `recursive=True`，而且把「授给访问者的只读权限」（`READONLY_SPEC` 注释写的是「授给」）当成了拒绝项下发，结果根部变成「不可读」而子树照样可写。改为：
+- `grant(dst_dir, principal, READONLY_SPEC, recursive=True)` —— `(OI)(CI)(RX)` 授读；
+- `deny(dst_dir, principal, WRITE_DENY_SPEC, recursive=True)` —— 新增常量 `WRITE_DENY_SPEC = "(OI)(CI)(W)"` 拒写。
+`/T` 覆盖发布时已存在的目录与文件，`(OI)(CI)` 继承标志覆盖发布之后新建的条目；显式拒绝优先，最终效果就是整棵子树只读。签名与返回值不变。
+
+**2. `can_write` 忽略拒绝项（症状「显式拒绝优先」失效）** — `wpublish/rights.py`
+原代码 `allow, _deny = effective_rights(...)` 直接丢弃了拒绝集，只看允许集。补回拒绝优先判定，并区分「挡住写」与「挡住读」的权限集合：拒绝写不再连带把读也判死（否则只读发布后 `can_read` 恒为 False），同时支持 icacls 的具体权限字母（`WD/AD/GW/...`）。`WRITE_RIGHTS`/`READ_RIGHTS` 等既有公开常量原样保留。
+
+**3. `list_explicit_aces` 把继承项当显式项（症状 3）** — `wpublish/icacls.py`
+原来直接 `return list_aces(path)`，现在过滤掉带 `(I)` 标记的项；`explicit_grants`/审计因此不再凭空多出「显式授予」条目。
+
+**4. 解析 icacls 输出时首条 ACE 的主体名被污染** — `wpublish/icacls.py`
+`icacls <path>` 会把目标路径回显在首条 ACE 的行首（`C:\data BUILTIN\Guests:(OI)(CI)(DENY)(W)`），旧正则把整段路径当成了主体名，导致按主体匹配全部落空。`parse_aces` 新增可选参数 `path`（默认 `None`，向后兼容），按「已知路径 → 输出对齐列 → 形状推断」三级剥离前缀；同时把 `(RD,WD)` 这类逗号列表拆成单个权限字母，并过滤 `processed file:` / `Successfully processed` 等噪声行。
+
+**5. 新增 `wpublish/principal.py`（同一主体的不同写法）**
+icacls 输入要求 `*S-1-5-32-546`，输出却显示 `BUILTIN\Guests`（解析不了时显示不带星号的 SID），旧的字符串比较永远匹配不上。用标准库 `ctypes` 调 `LookupAccountSidW/LookupAccountNameW` 做**本地范围**解析（不跨域跨林），带 lru_cache，任何失败都退回归一化字符串比较，断网/非 Windows 也能导入使用；`effective_rights` 改用它比对。
+
+`wpublish/__init__.py` 相应导出新增名字，既有导出与所有公开签名均未改变；`audit` 的语义（只报告子树内仍可写的路径）保持不变。
+
+## 验证（真实 Windows + icacls）
+仓库自带 7 项测试全部通过；临时脚本逐条核对验收标准后已删除，未新增/修改 `tests/`：
+1. 发布后子树内已存在的目录与文件 5/5 都带拒绝项；
+2. 发布后新建的文件、新建的子目录及其中的文件都带（继承的）拒绝项；
+3. 只授 `(W)` 时 `can_write` 为 True，再拒 `(W)` 后变 False；
+4. `list_explicit_aces` 在整棵子树上都不返回带继承标记的项；
+5. `audit` 对刚发布完的目录返回 `[]`；
+6. 额外确认只读语义成立：`can_read` True、`can_write` False；重复发布幂等；有人在子目录重新开写权限时继承的拒绝项仍然生效（`audit` 仍为空）；相对路径、名字形式主体（`BUILTIN\Guests`/`Guests`）均正常。

@@ -1,8 +1,8 @@
 diff --git a/wtextio/codec.py b/wtextio/codec.py
-index b29ef63..b40333b 100644
+index b29ef63..5f2ff43 100644
 --- a/wtextio/codec.py
 +++ b/wtextio/codec.py
-@@ -16,11 +16,11 @@ BOM_ENCODING = "utf-8-sig"
+@@ -16,16 +16,27 @@ BOM_ENCODING = "utf-8-sig"
  
  #: 编码别名到 ``open()`` 可接受名称的映射。
  ALIASES = {
@@ -19,13 +19,73 @@ index b29ef63..b40333b 100644
      "ansi": "mbcs",
      "latin-1": "latin-1",
      "cp1252": "cp1252",
-@@ -35,7 +35,8 @@ def system_encoding():
+ }
+ 
++#: 分隔符归一化后的紧凑别名表：大小写、``-``/``_``/空格差异在这里抹平。
++_COMPACT_ALIASES = {
++    "default": DEFAULT_ENCODING,
++    "utf8": DEFAULT_ENCODING,
++    "utf8bom": BOM_ENCODING,
++    "utf8sig": BOM_ENCODING,
++    "ansi": "mbcs",
++    "latin1": "latin-1",
++    "cp1252": "cp1252",
++}
++
+ 
+ def system_encoding():
+     """返回当前平台的系统默认文本编码。"""
+@@ -35,9 +46,14 @@ def system_encoding():
  def encoding_for(name):
      """返回写读文件时应当交给 ``open()`` 的编码名。
  
 -    ``None`` 表示交给 ``open()`` 使用平台默认值。
 +    默认值随平台变化的做法会让同一份输入在两个平台上落成不同的字节，
-+    因此这里固定返回 UTF-8；只有调用方显式指定其它编码时才透传。
++    因此默认族别名固定返回 UTF-8；BOM 族别名固定返回带 BOM 的变体；
++    其余别名先做分隔符归一化再查表，都未命中时原样透传。
      """
      key = (name or "default").lower()
++    compact = key.replace("_", "").replace("-", "").replace(" ", "")
++    if compact in _COMPACT_ALIASES:
++        return _COMPACT_ALIASES[compact]
      if key in ALIASES:
+         return ALIASES[key]
+     return name
+diff --git a/wtextio/writer.py b/wtextio/writer.py
+index b434479..0533788 100644
+--- a/wtextio/writer.py
++++ b/wtextio/writer.py
+@@ -3,22 +3,28 @@
+ from .codec import encoding_for
+ 
+ 
++def _normalise_newlines(text):
++    """把 CRLF / CR 统一成 LF，再交给 ``open()`` 的 ``newline`` 策略翻译，
++    避免已有的 ``\\r\\n`` 被再次翻译成 ``\\r\\r\\n``。"""
++    return text.replace("\r\n", "\n").replace("\r", "\n")
++
++
+ def write_text(path, text, encoding="default", newline="\r\n"):
+     """把 ``text`` 写入 ``path``，返回写入的字符数。"""
+     with open(path, "w", encoding=encoding_for(encoding), newline=newline) as fh:
+-        fh.write(text)
++        fh.write(_normalise_newlines(text))
+     return len(text)
+ 
+ 
+ def append_text(path, text, encoding="default"):
+     """在 ``path`` 末尾追加 ``text``，返回追加的字符数。"""
+     with open(path, "a", encoding=encoding_for(encoding), newline="\r\n") as fh:
+-        fh.write(text)
++        fh.write(_normalise_newlines(text))
+     return len(text)
+ 
+ 
+ def write_lines(path, lines, encoding="default"):
+     """把若干行写成文本文件，返回写入的行数。"""
+-    return write_text(path, "\r\n".join(lines) + "\r\n", encoding=encoding) if lines else write_text(
+-        path, "", encoding=encoding
+-    )
++    # 行尾只给 "\n"，换行统一交给 write_text 的 newline 策略处理。
++    body = "\n".join(lines) + "\n" if lines else ""
++    return write_text(path, body, encoding=encoding)

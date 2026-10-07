@@ -278,6 +278,9 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `references/05-delivery-structure.md` | 交付目录树 + delivery-extras 字段 |
 | `references/06-acceptance-gates.md` | 一票否决 + DoD + 验收层级 |
 | `references/07-legacy-conversion.md` | 旧 6 题转换的 12 项重做 + 变更对比 |
+| `references/08-model-validation.md` | 多模型跑分自检：端点/命令/权限、QWEN thinking（§7.10）、计划任务绝对路径（§7.11）、**传输层超时（§7.12）**、网关非流式硬墙（§7.13）、**流式是正解（§7.14）** |
+| `references/09-gz-package-analysis.md` | 压缩包结构分析 |
+| `references/10-windows-ops-pitfalls.md` | Windows 题运维坑：容器适配 6 坑、计划任务编排 3 坑、飞书写回编码坑、`runner.py` 参数化与并行 |
 | `references/08-model-validation.md` | 多模型门槛、区分度计算、稳定性验收 |
 | `references/09-gz-package-analysis.md` | 对 `Windows_SWE_d70d30df` 27 题现包的实测分析 |
 | `scripts/validate_package.py` | 题包结构与身份一致性校验（实测 27 题包可用） |

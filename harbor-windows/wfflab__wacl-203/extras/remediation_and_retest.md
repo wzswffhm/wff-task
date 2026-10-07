@@ -25,3 +25,13 @@
 | R-3 | 多模型区分度验证未执行 | 按出题方要求本轮不跑；待平台 harness 回填分数后执行 |
 
 > 上述三项补齐后，须重新执行所有受影响环节，并升级 `task_version`。
+
+## 2026-10-03 缺陷修复（模型验证发现）
+
+**触发**：首轮模型验证（Qwen×3 / Opus×3）两模型同一条 P2P `test_audit_on_untouched_tree_is_not_empty` 三轮 consistently 失败；本机用 base+oracle 复测，oracle 同样挂——判定为测试缺陷而非模型弱点。
+
+**根因**：测试从全新目录的默认 ACL 里找持 `W` 权限字母的主体，但默认 ACE 只有 F/RX 等字母，`principal_for` 恒为 `None`；另有判分环境 `PYTHONUTF8=1` 下 `icacls` GBK 输出解码崩溃的隐患（判定环境无该变量，未触发）。
+
+**修复**：测试改为 `grant(TEST_SID, "(W)", recursive=True)` 后确定性取证；同时把 `test_explicit_aces_exclude_inherited` 重写为「父目录授权 + 子目录断言继承项被排除」的可观测形式（原写法在 base 上因临时目录无 `(I)` 标志而平凡通过，F2P 标签失真）。
+
+**实测**（本机 2026-10-03，PYTHONUTF8=0）：base 1 失败（即新 F2P）/19 通过；oracle 20/20 通过。旧 model_runs 已归档至 `extras/archive/model-runs-pre-fix-20261003/`，身份哈希重算。

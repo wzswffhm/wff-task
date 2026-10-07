@@ -240,11 +240,17 @@ S_max（满分基准） = Σ 全部正向条目的 weight        ← 负向条�
 ## Verification（交付前必跑）
 
 1. `04-package-and-checklist.md` 的 17 项自检全过。
-2. `bash -n tests/test.sh` 与 `python3 -m py_compile tests/finalize.py` 通过；两者与官方模板逐字节比对。
-3. rubrics.toml 用脚本统计：条数、`name == id`、weight 集合、likert 锚点、Critically Important ≥2、内容质量锚点 ≥30%、"总是需要"维度覆盖。
-4. G4 记录留档：oracle 主分、`verifier_error`、镜像自检 `OK`。
-5. G5 记录留档：三模型分数、均分、是否有模型得分。
-6. 解压 zip 复核层级与无残留后提交。
+2. **甲方机器门禁全跑**（`04-package-and-checklist.md` §0b，**以此为准**）：
+   `client_gates.py` 一键跑 validate_task_package / validate_rubrics / check_complexity(先 self-test) /
+   check_rubric_style --strict / 集中度 / 打包权限 / 批次配额，结论 0 必须整改
+   （脚本口径冲突按甲方分级表降为提示/waive，waiver 在质检报告单列）。
+3. `bash -n tests/test.sh` 与 `python3 -m py_compile tests/finalize.py` 通过；两者与官方模板逐字节比对。
+4. rubrics.toml 用脚本统计：条数、`name == id`、weight 集合、likert 锚点、Critically Important ≥2、内容质量锚点 ≥30%、"总是需要"维度覆盖。
+5. **判分复算**（`06-model-validation.md` §7）：各执行体按 rewardkit 公式复算与 reward.json 一致，
+   description/weight 与现行 rubrics.toml 零漂移（漂移即重跑判官）。
+6. G4 记录留档：oracle 主分、`verifier_error`、镜像自检 `OK`。
+7. G5 记录留档：三模型分数、均分、是否有模型得分、**距 0.7 的余量**。
+8. 解压 zip 复核层级与无残留后提交。
 
 ## 参考文件索引
 
@@ -253,7 +259,7 @@ S_max（满分基准） = Σ 全部正向条目的 weight        ← 负向条�
 | `01-bundle-structure.md` | 题包结构、组件清单、容器内路径与可见性、资源上限 |
 | `02-task-toml.md` | task.toml schema 1.4 完整模板、逐字段说明、deliverables 五条命名规则 |
 | `03-rubrics-and-prompt.md` | rubrics.toml 字段约束、权重档位、likert 锚点、prompt.md 六规则与模板、维度体系、Rubric 五项准则 |
-| `04-package-and-checklist.md` | 打包命名、目录层级、提交前 17 项自检、返修、交付文档与环境变量模板 |
+| `04-package-and-checklist.md` | 打包命名、目录层级、提交前 17 项自检、**甲方机器门禁（§0b，以此为准）**、返修、交付文档与环境变量模板 |
 | `05-environment-and-solve.md` | Dockerfile 完整模板、镜像硬性要求与自检、solution/solve.sh 要求 |
 | `06-model-validation.md` | 三模型难度验证流程、等级区间、跑分轨迹留档要求 |
 | `07-pitfalls.md` | 高频故障与踩坑录（含"静默 0 分"成因与排查） |

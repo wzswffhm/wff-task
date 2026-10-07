@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Summarize and qualify Windows Harbor runner result.json files.
+
+A run counts as a *scored attempt* only when both stages succeeded:
+
+* the agent finished on its own terms (``completed``) or exhausted its declared
+  turn budget (``max_turns``), and
+* the verifier produced a self-consistent ``VALID`` report.
+
+Upstream, authentication, gateway, malformed-response, environment, runner and
+verifier-infrastructure failures are **not** valid scored runs and must be
+re-run, not scored (``generate-win/SKILL.md`` section 5).  This matters because
+a mid-flight agent death still leaves a self-consistent ``verdict=0`` behind
+against an untouched workspace -- counting it would fabricate differentiation.
+
+Qualification additionally requires a **pinned qualification epoch**
+(``--after``): per ``references/qualification-gates.md`` only results created
+after that timestamp may enter the official set, so without it this script
+reports ``qualified=false`` instead of guessing.  Every selected run records its
+run ID, task ID/version, verdict, duration, agent status and verifier-log hash
+so each result stays traceable to the raw artifact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REQUIRED_MODELS = {"QWEN": 3, "OPUS": 3, "GLM": 1, "KIMI": 1}
+
+# Agent terminal states that represent a real, scorable candidate attempt.
+# Anything else is an infrastructure / provider / malformed-response failure.
+# SKILL.md section 5: "Provider, authentication, gateway, malformed-response,
+# environment, runner, and verifier-infrastructure failures are not valid scored
+# runs. Diagnose and retry them; do not turn them into score 0."  A candidate
+# compile/test failure is still score 0, provided *the agent itself* finished
+# (``completed``) or exhausted its declared turn budget (``max_turns``).
+SCORED_AGENT_STATUSES = frozenset({"completed", "max_turns"})
+
+
+def parse_after(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def load_result(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    data["result_path"] = str(path.resolve())
+    data["run_id"] = path.parent.parent.name
+    data["run_label"] = path.parent.name
+    data["mtime_utc"] = dt.datetime.fromtimestamp(
+        path.stat().st_mtime, tz=dt.timezone.utc
+    ).isoformat()
+    test_log = path.parent / "test.log"
+    if test_log.exists():
+        data["test_log_sha256"] = hashlib.sha256(test_log.read_bytes()).hexdigest()
+    return data
+
+
+def compact(item: dict[str, Any]) -> dict[str, Any]:
+    """Project a run onto the evidence fields required by qualification-gates.md.
+
+    "Select result files deterministically and record their run IDs, task
+    version, verdict, duration, agent status, and verifier-log hash when
+    available."  Each selected run must therefore carry its own task identity so
+    the raw artifact can be traced and cross-checked independently.
+    """
+    agent = item.get("agent") or {}
+    report = ((item.get("test") or {}).get("report") or {})
+    return {
+        "run_id": item.get("run_id"),
+        "run_label": item.get("run_label"),
+        "result_path": item.get("result_path"),
+        "model": item.get("model_alias"),
+        "mode": item.get("mode"),
+        "task_id": item.get("task_id"),
+        "task_version": item.get("task_version"),
+        "verdict": item.get("verdict"),
+        "report_status": report.get("status"),
+        "reason": item.get("reason"),
+        "duration_seconds": item.get("duration_seconds"),
+        "agent_status": agent.get("status"),
+        "turns": agent.get("turns"),
+        "test_log_sha256": item.get("test_log_sha256"),
+        "mtime_utc": item.get("mtime_utc"),
+    }
+
+
+def agent_failure(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Return failure details when the agent stage did not reach a scored state.
+
+    Controls (``no-change`` / ``golden``) never execute an agent, so they are
+    exempt.  For ``candidate`` runs the agent must terminate inside
+    :data:`SCORED_AGENT_STATUSES`; a missing agent block, ``error`` (upstream
+    timeout / gateway fault / runner exception) or ``no_tool_call`` (the model
+    never emitted a tool call, i.e. a malformed response) means the run measured
+    infrastructure rather than the candidate, and must not be scored.
+    """
+    if item.get("mode") != "candidate":
+        return None
+    agent = item.get("agent") or {}
+    status = agent.get("status")
+    if status in SCORED_AGENT_STATUSES:
+        return None
+    return {
+        "agent_status": status,
+        "turns": agent.get("turns"),
+        "summary": str(agent.get("summary") or "")[:300],
+    }
+
+
+def valid_scored_result(item: dict[str, Any]) -> bool:
+    """Accept only a completed verifier report whose score is self-consistent.
+
+    The verifier report alone is not sufficient evidence of a scored run.  When
+    the agent dies mid-flight (e.g. ``TimeoutError: The read operation timed
+    out``) the verifier still evaluates the untouched workspace and emits a
+    self-consistent ``report.status=VALID, verdict=0`` pair.  Counting that as a
+    legitimate 0 silently fabricates differentiation.  Such runs are excluded
+    here so the gate fails loudly with "not enough valid runs" instead.
+    """
+    if agent_failure(item):
+        return False
+    report = ((item.get("test") or {}).get("report") or {})
+    verdict = item.get("verdict")
+    return (
+        str(report.get("status", "")).upper() == "VALID"
+        and verdict in (0, 1)
+        and report.get("score") == verdict
+        and report.get("task_id") == item.get("task_id")
+        and report.get("task_version") == item.get("task_version")
+        and bool(item.get("test_log_sha256"))
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workspace-root", required=True)
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--after", help="Qualification epoch as ISO-8601 timestamp")
+    parser.add_argument("--control-runs", type=int, default=3)
+    parser.add_argument("--output")
+    args = parser.parse_args()
+
+    root = Path(args.workspace_root).resolve()
+    run_root = root / "runs" / args.task_id
+    after = parse_after(args.after)
+    loaded: list[dict[str, Any]] = []
+    if run_root.exists():
+        for path in run_root.glob("*/*/result.json"):
+            if after:
+                mtime = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+                if mtime < after:
+                    continue
+            item = load_result(path)
+            if item and item.get("task_id") == args.task_id:
+                loaded.append(item)
+    loaded.sort(key=lambda item: item.get("mtime_utc", ""))
+
+    no_change = [item for item in loaded if item.get("mode") == "no-change"]
+    golden = [item for item in loaded if item.get("mode") == "golden"]
+    candidates = [item for item in loaded if item.get("mode") == "candidate"]
+
+    selected_no_change = [item for item in no_change if valid_scored_result(item)][-args.control_runs :]
+    selected_golden = [item for item in golden if valid_scored_result(item)][-args.control_runs :]
+    controls_ok = (
+        len(selected_no_change) == args.control_runs
+        and all(item.get("verdict") == 0 for item in selected_no_change)
+        and len(selected_golden) == args.control_runs
+        and all(item.get("verdict") == 1 for item in selected_golden)
+    )
+
+    model_summary: dict[str, Any] = {}
+    models_ok = True
+    for model, required in REQUIRED_MODELS.items():
+        attempts = [item for item in candidates if str(item.get("model_alias", "")).upper() == model]
+        valid = [item for item in attempts if valid_scored_result(item)]
+        selected = valid[-required:]
+        enough = len(selected) == required
+        models_ok = models_ok and enough
+        model_summary[model] = {
+            "required": required,
+            "valid_count": len(valid),
+            "attempt_count": len(attempts),
+            "selected": [compact(item) for item in selected],
+            "scores": [item.get("verdict") for item in selected],
+            "score_sum": sum(int(item.get("verdict")) for item in selected),
+            "invalid_attempts": [
+                compact(item)
+                for item in attempts
+                if item.get("verdict") == "INVALID" and not agent_failure(item)
+            ],
+            # Runs dropped because the agent stage did not finish: upstream /
+            # gateway / malformed-response failures.  These must be re-run, not
+            # scored, so they are reported separately from verifier INVALIDs.
+            "excluded_agent_failures": [
+                {**compact(item), "exclusion": agent_failure(item)}
+                for item in attempts
+                if agent_failure(item)
+            ],
+            "complete": enough,
+        }
+
+    differentiation_ok = (
+        model_summary["OPUS"]["complete"]
+        and model_summary["QWEN"]["complete"]
+        and model_summary["OPUS"]["score_sum"] > model_summary["QWEN"]["score_sum"]
+    )
+    task_versions = sorted({str(item.get("task_version")) for item in loaded if item.get("task_version")})
+    version_consistent = len(task_versions) <= 1
+    # references/qualification-gates.md: "Use a qualification epoch timestamp
+    # immediately after the last material task/verifier/environment change.
+    # Only results created after that timestamp may enter the official set."
+    # Without a pinned epoch the official set cannot be bounded, so
+    # qualification is withheld rather than guessed.
+    epoch_ok = bool(after)
+    qualified = (
+        controls_ok and models_ok and differentiation_ok and version_consistent and epoch_ok
+    )
+    agent_failures_excluded = sum(
+        len(model_summary[model]["excluded_agent_failures"]) for model in REQUIRED_MODELS
+    )
+
+    result = {
+        "generated_at": dt.datetime.now().astimezone().isoformat(),
+        "workspace_root": str(root),
+        "task_id": args.task_id,
+        "task_versions": task_versions,
+        "qualification_epoch": args.after,
+        "controls": {
+            "required_each": args.control_runs,
+            "no_change": [compact(item) for item in selected_no_change],
+            "golden": [compact(item) for item in selected_golden],
+            "passed": controls_ok,
+        },
+        "models": model_summary,
+        "gates": {
+            "controls_passed": controls_ok,
+            "model_counts_complete": models_ok,
+            "opus_sum_greater_than_qwen": differentiation_ok,
+            "task_version_consistent": version_consistent,
+            "epoch_pinned": bool(after),
+            "agent_failures_excluded": agent_failures_excluded,
+            "qualified": qualified,
+        },
+    }
+    if not after:
+        print(
+            "[error] no qualification epoch supplied -> qualification WITHHELD "
+            "(qualified=false). references/qualification-gates.md requires that "
+            "only results created after the epoch timestamp may enter the official "
+            "set, and SKILL.md section 5 requires summarize_model_runs.py to be run "
+            "WITH the qualification epoch. Re-run with --after <ISO-8601>.",
+            file=sys.stderr,
+        )
+    if agent_failures_excluded:
+        print(
+            f"[warn] {agent_failures_excluded} candidate run(s) excluded because the "
+            "agent stage did not complete (upstream / gateway / malformed-response "
+            "failure). Re-run them; they are not scored attempts.",
+            file=sys.stderr,
+        )
+
+    encoded = json.dumps(result, ensure_ascii=False, indent=2)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(encoded + "\n", encoding="utf-8")
+    print(encoded)
+    return 0 if qualified else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,9 @@
+修复 wdl 在 Windows/NTFS 上丢失备用数据流（ADS）的三处缺陷，仅改动 wdl/ 包内源码（archive.py、streams.py、unblock.py），公开签名与既有语义不变，未新增任何第三方依赖：
+
+1. wdl/archive.py — copy_file：shutil.copy2 只复制主数据，不带 ADS，导致归档副本丢失 Zone.Identifier。现在复制主数据后显式遍历 PORTABLE_STREAMS：源上存在的流用 read_stream/write_stream 原样搬到目标（逐字节一致）；源上没有的流则从目标上 remove_stream，保证副本与源的标记状态完全一致（archive_tree 经由 copy_file 自动获得同样行为，嵌套子目录亦保留流）。
+
+2. wdl/streams.py — stream_size：原来错误地返回 os.path.getsize(path)（主数据大小），现改为对流路径 stream_path(path, name) 取 getsize，返回流本身的字节数；流不存在仍返回 0。另外给 remove_stream 的 os.remove 加了 FileNotFoundError 兜底（检查与删除之间的竞态同样返回 False），其余接口行为不变。
+
+3. wdl/unblock.py — unblock：原来无条件 os.remove 流路径，对干净文件直接抛 FileNotFoundError。现改为委托幂等的 remove_stream(path, ZONE_STREAM)：无标记返回 False 且不抛异常，有标记则真正删除该流并返回 True，主数据不受影响；is_blocked 改用 stream_exists，语义不变。
+
+验证（Windows + NTFS 实机）：仓库自带 tests/ 4 项全部通过；另用一次性脚本在系统临时目录逐条验证验收标准——copy_file 后目标 Zone.Identifier 存在且内容逐字节一致、archive_tree 嵌套子目录同样保留流、stream_size 返回流字节数（26）而非主数据大小（7）、unblock 对干净文件幂等返回 False / 对带标记文件返回 True 并真正清除且保留主数据，全部通过。验证脚本未写入仓库，__pycache__ 已清理，tests/ 未做任何改动。

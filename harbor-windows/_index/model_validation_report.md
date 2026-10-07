@@ -1,18 +1,21 @@
 # 多模型验证报告
 
-生成时间：2026-10-01
+生成时间：2026-10-04
 
 ## 1. 区分度准入汇总
 
 | task_id | Qwen score_sum | Opus score_sum | 满足条件 | 结论 |
 |---|---|---|---|---|
-| wfflab__winstall-210 | None | 1.0 | - | BLOCKED — 主模型有效运行不足 3 次，暂不可判定 |
+| wfflab__wtask-216 | 3.0 | 3.0 | - | FAIL — 两者正式分和相同且不全为 0（Opus 3.0 vs Qwen 3.0） |
 
 ## 2. 逐模型运行状态
 
 | task_id | 模型 | 要求 | VALID | INVALID | PENDING | 状态 |
 |---|---|---|---|---|---|---|
-| wfflab__winstall-210 | Opus 5 | 3 | 3 | 0 | 0 | READY |
+| wfflab__wtask-216 | Qwen3.8-Max-0902 | 3 | 3 | 0 | 0 | READY |
+| wfflab__wtask-216 | Opus 5 | 3 | 3 | 0 | 0 | READY |
+| wfflab__wtask-216 | GLM-5.3 | 1 | 1 | 0 | 0 | READY |
+| wfflab__wtask-216 | Kimi K3 | 1 | 1 | 0 | 0 | READY |
 
 ## 3. 准入规则
 

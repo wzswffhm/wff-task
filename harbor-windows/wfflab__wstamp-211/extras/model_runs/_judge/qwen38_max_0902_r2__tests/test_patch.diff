@@ -1,0 +1,298 @@
+diff --git a/tests/test_windows_timestamp_semantics.py b/tests/test_windows_timestamp_semantics.py
+new file mode 100644
+index 0000000..328d6b9
+--- /dev/null
++++ b/tests/test_windows_timestamp_semantics.py
+@@ -0,0 +1,292 @@
++"""wstamp 的 Windows 时间戳 / 属性语义回归测试（隐藏测试）。
++
++被测语义全部来自 instruction.md 的验收标准：
++- 文件的同步状态 = (字节内容, mtime_ns)，二者任一不同都必须被同步；
++- NTFS 时间戳粒度 100ns，测试用的纳秒值都是 100 的倍数；
++- 只读 / 隐藏属性是真实 Win32 属性位，复制必须原样带过去；
++- 对只读目标：stamp_file 报 ``WStampError(kind="readonly")``；
++  sync/copy 的写动作先清只读属性、完成后恢复。
++"""
++
++import ctypes
++import os
++import stat
++
++import pytest
++
++from wstamp import (
++    SyncReport,
++    WStampError,
++    copy_stamp,
++    snapshot_times,
++    stamp_file,
++    sync_tree,
++)
++
++FILE_ATTRIBUTE_READONLY = 0x01
++FILE_ATTRIBUTE_HIDDEN = 0x02
++
++ATIME = 1_500_000_000_000000000
++MTIME_A = 1_700_000_000_123456700
++MTIME_B = 1_650_000_000_777777700
++MTIME_OLD = 1_600_000_000_000000000
++
++
++def _write(path, data, mtime_ns=None, atime_ns=ATIME):
++    with open(path, "wb") as fh:
++        fh.write(data)
++    if mtime_ns is not None:
++        os.utime(path, ns=(atime_ns, mtime_ns))
++
++
++def _attrs(path):
++    return ctypes.windll.kernel32.GetFileAttributesW(str(path))
++
++
++def _set_attr_bits(path, bits):
++    value = _attrs(path)
++    assert value != 0xFFFFFFFF
++    assert ctypes.windll.kernel32.SetFileAttributesW(str(path), value | bits)
++
++
++def _clear_attr_bits(path, bits):
++    value = _attrs(path)
++    assert value != 0xFFFFFFFF
++    assert ctypes.windll.kernel32.SetFileAttributesW(str(path), value & ~bits)
++
++
++def _is_readonly(path):
++    return bool(_attrs(path) & FILE_ATTRIBUTE_READONLY)
++
++
++def _is_hidden(path):
++    return bool(_attrs(path) & FILE_ATTRIBUTE_HIDDEN)
++
++
++# ---------------------------------------------------------------- F2P：只读语义
++
++def test_stamp_file_on_readonly_file_raises_readonly_error(tmp_path):
++    """对只读文件设置时间戳必须报 ``WStampError(kind="readonly")``。"""
++    path = tmp_path / "ro.txt"
++    _write(str(path), b"data", mtime_ns=MTIME_OLD)
++    os.chmod(str(path), stat.S_IREAD)
++    try:
++        assert _is_readonly(str(path))
++        with pytest.raises(WStampError) as excinfo:
++            stamp_file(str(path), MTIME_A)
++        assert excinfo.value.kind == "readonly"
++    finally:
++        os.chmod(str(path), stat.S_IWRITE)
++
++
++def test_stamp_file_keeps_access_time_unchanged(tmp_path):
++    """stamp_file 只动 mtime，atime 必须保持原值。"""
++    path = tmp_path / "a.txt"
++    _write(str(path), b"hello", mtime_ns=MTIME_A)
++    before = os.stat(str(path)).st_atime_ns
++    stamp_file(str(path), MTIME_B)
++    st = os.stat(str(path))
++    assert st.st_mtime_ns == MTIME_B
++    assert st.st_atime_ns == before
++
++
++# ---------------------------------------------------------------- F2P：复制的属性搬运
++
++def test_copy_stamp_preserves_mtime_and_atime_exactly(tmp_path):
++    """复制后目标的 mtime/atime 必须与源逐纳秒一致。"""
++    src = tmp_path / "src.bin"
++    dst = tmp_path / "dst.bin"
++    _write(str(src), b"payload", mtime_ns=MTIME_B)
++    st = os.stat(str(src))
++    copy_stamp(str(src), str(dst))
++    got = os.stat(str(dst))
++    assert got.st_mtime_ns == st.st_mtime_ns
++    assert got.st_atime_ns == st.st_atime_ns
++
++
++def test_copy_stamp_preserves_hidden_attribute(tmp_path):
++    """源带隐藏属性时，目标也必须带隐藏属性。"""
++    src = tmp_path / "secret.txt"
++    dst = tmp_path / "secret.copy.txt"
++    _write(str(src), b"hidden data")
++    _set_attr_bits(str(src), FILE_ATTRIBUTE_HIDDEN)
++    try:
++        copy_stamp(str(src), str(dst))
++        assert _is_hidden(str(dst))
++    finally:
++        _clear_attr_bits(str(src), FILE_ATTRIBUTE_HIDDEN)
++        if dst.exists():
++            _clear_attr_bits(str(dst), FILE_ATTRIBUTE_HIDDEN)
++
++
++def test_copy_stamp_preserves_readonly_attribute(tmp_path):
++    """源带只读属性时，目标也必须带只读属性。"""
++    src = tmp_path / "lock.txt"
++    dst = tmp_path / "lock.copy.txt"
++    _write(str(src), b"frozen data")
++    _set_attr_bits(str(src), FILE_ATTRIBUTE_READONLY)
++    try:
++        copy_stamp(str(src), str(dst))
++        assert _is_readonly(str(dst))
++    finally:
++        _clear_attr_bits(str(src), FILE_ATTRIBUTE_READONLY)
++        if dst.exists():
++            _clear_attr_bits(str(dst), FILE_ATTRIBUTE_READONLY)
++
++
++# ---------------------------------------------------------------- F2P：同步状态 = 内容 + mtime
++
++def test_sync_restamps_target_when_content_matches_but_mtime_differs(tmp_path):
++    """内容相同但 mtime 不同：不算更新，但要回写时间并记入 restamped。"""
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    src.mkdir()
++    dst.mkdir()
++    _write(str(src / "a.txt"), b"same bytes", mtime_ns=MTIME_A)
++    _write(str(dst / "a.txt"), b"same bytes", mtime_ns=MTIME_OLD)
++
++    report = sync_tree(str(src), str(dst))
++
++    assert report.restamped == ["a.txt"]
++    assert os.stat(str(dst / "a.txt")).st_mtime_ns == MTIME_A
++
++
++def test_sync_preserves_directory_mtimes(tmp_path):
++    """目录 mtime 必须在填充完成后从源恢复（先深层后浅层）。"""
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    deep_t = 1_620_000_000_000000000
++    docs_t = 1_610_000_000_000000000
++    os.makedirs(str(src / "docs" / "deep"))
++    _write(str(src / "docs" / "deep" / "x.txt"), b"deep", mtime_ns=MTIME_A)
++    os.utime(str(src / "docs" / "deep"), ns=(ATIME, deep_t))
++    os.utime(str(src / "docs"), ns=(ATIME, docs_t))
++
++    sync_tree(str(src), str(dst))
++
++    assert os.stat(str(dst / "docs" / "deep")).st_mtime_ns == deep_t
++    assert os.stat(str(dst / "docs")).st_mtime_ns == docs_t
++
++
++def test_sync_second_run_reports_no_actions(tmp_path):
++    """第一次同步之后，紧接着的第二次同步不得产生任何动作。"""
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    os.makedirs(str(src / "sub"))
++    _write(str(src / "a.txt"), b"one", mtime_ns=MTIME_A)
++    _write(str(src / "sub" / "b.txt"), b"two", mtime_ns=MTIME_B)
++
++    sync_tree(str(src), str(dst))
++    second = sync_tree(str(src), str(dst))
++
++    assert second.created == []
++    assert second.updated == []
++    assert second.restamped == []
++    assert second.deleted == []
++
++
++# ---------------------------------------------------------------- P2P：既有行为的回归保护
++
++def test_snapshot_times_reports_birth_time_field(tmp_path):
++    """created 字段取 Windows 创建时间（st_ctime）。"""
++    path = tmp_path / "a.txt"
++    _write(str(path), b"data")
++    snap = snapshot_times(str(path))
++    st = os.stat(str(path))
++    assert snap["created"] == st.st_ctime
++    assert snap["mtime_ns"] == st.st_mtime_ns
++
++
++def test_stamp_file_sets_mtime_nanosecond_precision(tmp_path):
++    """mtime 纳秒级精确设置（NTFS 100ns 粒度）。"""
++    path = tmp_path / "a.txt"
++    _write(str(path), b"data")
++    stamp_file(str(path), MTIME_A)
++    assert os.stat(str(path)).st_mtime_ns == MTIME_A
++
++
++def test_sync_creates_missing_files_and_subdirectories(tmp_path):
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    os.makedirs(str(src / "sub"))
++    _write(str(src / "a.txt"), b"aaa")
++    _write(str(src / "sub" / "b.txt"), b"bbb")
++
++    report = sync_tree(str(src), str(dst))
++
++    assert report.created == [os.path.join("a.txt"), os.path.join("sub", "b.txt")]
++    assert (dst / "a.txt").read_bytes() == b"aaa"
++    assert (dst / "sub" / "b.txt").read_bytes() == b"bbb"
++
++
++def test_sync_updates_files_when_content_differs(tmp_path):
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    src.mkdir()
++    dst.mkdir()
++    _write(str(src / "a.txt"), b"new content")
++    _write(str(dst / "a.txt"), b"old content")
++
++    report = sync_tree(str(src), str(dst))
++
++    assert report.updated == ["a.txt"]
++    assert (dst / "a.txt").read_bytes() == b"new content"
++
++
++def test_sync_deletes_stale_entries(tmp_path):
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    src.mkdir()
++    dst.mkdir()
++    _write(str(dst / "gone.txt"), b"bye")
++
++    report = sync_tree(str(src), str(dst))
++
++    assert report.deleted == ["gone.txt"]
++    assert not (dst / "gone.txt").exists()
++
++
++def test_sync_records_unwritable_entry_and_continues(tmp_path):
++    """目标上无法写入的条目记入 failed，其余条目仍须完成。"""
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    src.mkdir()
++    dst.mkdir()
++    _write(str(src / "conflict.txt"), b"i am a file")
++    (dst / "conflict.txt").mkdir()
++    _write(str(src / "ok.txt"), b"fine")
++
++    report = sync_tree(str(src), str(dst))
++
++    assert report.failed == ["conflict.txt"]
++    assert report.created == ["ok.txt"]
++    assert (dst / "ok.txt").read_bytes() == b"fine"
++
++
++def test_dry_run_reports_without_touching_target(tmp_path):
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    src.mkdir()
++    dst.mkdir()
++    _write(str(src / "new.txt"), b"arriving")
++    _write(str(dst / "stale.txt"), b"leaving")
++
++    report = sync_tree(str(src), str(dst), dry_run=True)
++
++    assert report.created == ["new.txt"]
++    assert report.deleted == ["stale.txt"]
++    assert (dst / "stale.txt").exists()
++    assert not (dst / "new.txt").exists()
++
++
++def test_sync_report_lists_are_relative_paths(tmp_path):
++    src = tmp_path / "source"
++    dst = tmp_path / "target"
++    os.makedirs(str(src / "sub"))
++    _write(str(src / "sub" / "b.txt"), b"bbb")
++
++    report = sync_tree(str(src), str(dst))
++
++    assert report.created == [os.path.join("sub", "b.txt")]
++    for entry in report.created + report.updated + report.deleted + report.failed:
++        assert not os.path.isabs(entry)

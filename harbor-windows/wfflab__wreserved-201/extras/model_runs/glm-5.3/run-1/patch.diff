@@ -1,0 +1,84 @@
+diff --git a/wsafename/__init__.py b/wsafename/__init__.py
+index 0892783..414459f 100644
+--- a/wsafename/__init__.py
++++ b/wsafename/__init__.py
+@@ -14,6 +14,7 @@ from .rules import (
+     ILLEGAL_CHARS,
+     MAX_SEGMENT_LENGTH,
+     RESERVED_BASE_NAMES,
++    TRAILING_CHARS,
+     has_illegal_chars,
+     is_reserved,
+     is_valid,
+@@ -32,6 +33,7 @@ __all__ = [
+     "NameTooLongError",
+     "REPLACEMENT",
+     "RESERVED_BASE_NAMES",
++    "TRAILING_CHARS",
+     "WSafeNameError",
+     "has_illegal_chars",
+     "is_reserved",
+diff --git a/wsafename/rules.py b/wsafename/rules.py
+index c480514..2a7cc22 100644
+--- a/wsafename/rules.py
++++ b/wsafename/rules.py
+@@ -27,8 +27,14 @@ def has_illegal_chars(name):
+ 
+ 
+ def is_reserved(name):
+-    """``name`` 是否是 Windows 保留设备名。"""
+-    return name.strip().upper() in RESERVED_BASE_NAMES
++    """``name`` 是否是 Windows 保留设备名。
++
++    Win32 在匹配设备名时只看**第一个点之前**的那一段（并忽略该段的
++    首尾空白），因此 ``CON``、``CON.txt``、``con.tar.gz``、``CON.``
++    都是保留名，而 ``console.txt``、``mycon``、``com10.log`` 不是。
++    """
++    base = name.partition(".")[0]
++    return base.strip().upper() in RESERVED_BASE_NAMES
+ 
+ 
+ def is_valid(name):
+diff --git a/wsafename/sanitize.py b/wsafename/sanitize.py
+index 400d136..11edbe7 100644
+--- a/wsafename/sanitize.py
++++ b/wsafename/sanitize.py
+@@ -1,7 +1,7 @@
+ """把用户提供的名称转换成可以安全落盘的名称。"""
+ 
+ from .errors import InvalidNameError
+-from .rules import ILLEGAL_CHARS, MAX_SEGMENT_LENGTH
++from .rules import ILLEGAL_CHARS, MAX_SEGMENT_LENGTH, TRAILING_CHARS
+ 
+ #: 替换非法字符时使用的字符。
+ REPLACEMENT = "_"
+@@ -15,9 +15,16 @@ def sanitize(name, replacement=REPLACEMENT):
+     1. 去掉首尾空白
+     2. 把非法字符替换为 ``replacement``
+     3. 截断到 :data:`wsafename.rules.MAX_SEGMENT_LENGTH`
++    4. 去掉 Windows 会静默丢弃的尾部点与空格
++       （:data:`wsafename.rules.TRAILING_CHARS`）
++
++    第 4 步放在截断之后，保证返回值就是 Windows 实际落盘的名称：
++    ``report.`` 与 ``report`` 会得到同一个落盘名，而不是一个带尾点、
++    一个不带尾点的两个名字。
+ 
+     返回净化后的名称。``name`` 不是字符串时抛 ``TypeError``；
+-    净化结果不可用时抛 :class:`InvalidNameError`。
++    净化结果不可用（例如 ``...``、``.`` 或纯空白输入）时抛
++    :class:`InvalidNameError`，而不是把底层 OSError 透传给调用方。
+     """
+     if not isinstance(name, str):
+         raise TypeError("name must be str, got %s" % type(name).__name__)
+@@ -30,6 +37,11 @@ def sanitize(name, replacement=REPLACEMENT):
+     if len(cleaned) > MAX_SEGMENT_LENGTH:
+         cleaned = cleaned[:MAX_SEGMENT_LENGTH]
+ 
++    # Windows 在把名称交给底层 API 之前会静默丢弃尾部的点与空格。
++    # 这里主动去掉它们，让净化结果与磁盘上真正出现的条目保持一致；
++    # 放在截断之后执行，避免截断本身又切出新的尾部点/空格。
++    cleaned = cleaned.rstrip(TRAILING_CHARS)
++
+     if not cleaned:
+         raise InvalidNameError("name is empty after sanitizing: %r" % (name,))
+ 

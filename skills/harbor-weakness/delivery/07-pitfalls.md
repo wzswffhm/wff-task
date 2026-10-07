@@ -14,6 +14,7 @@
 | A8 | TOML 解析失败、整题判分不可用 | 从编辑器粘贴中文时带入 **U+00A0 / U+3000** 等不可见空白 | 提交前扫 `grep -rlP "[\x{00A0}\x{3000}]"` |
 | A9 | 判分器中途被杀却留下"有效 0 分" | fail-closed 兜底被破坏 | 不得改动 `test.sh` 的 fail-closed 段；`verifier_error=1` 是"不可信"，**必须重评而非记零分** |
 | A10 | 空产物得分 | judge 因**参考答案满足**而给分 | 保留 `Reference-solution policy` 段："不得因参考答案满足就给分，一切以候选交付物为准" |
+| A11 | **单条判据 1 小时不跳条**，最终烧到 `[judge].timeout` 才被杀、该判据给错分 | judge（`claude-code` + `mode=individual`）陷**死循环**：模型在单条判据会话内**反复 emit `StructuredOutput`**（实测 397+ 次仍增长），claude-code 不终止 | **偶发**，重跑即可。识别：容器内取最新 `/root/.claude/projects/-app/*.jsonl`，统计 `tool_use.name=="StructuredOutput"`；**>15 且仍增长 = 死循环**（正常 1–2 次）。分母口径：`sessions` 数 = 已判条数（每条判据一个会话），**会话数长期不变 = 卡住**；正常慢时每 1–2 min 新建会话。伴随特征：`claude -p` etime 涨而 pcpu≈3%、会话文件 size 持续增长。处置：`systemctl stop <unit>` + `docker rm -f <container>` + 删 run 目录 + **原样重跑**（勿改 rubrics/模型） |
 
 ## B. 结构与一致性类
 
@@ -28,6 +29,11 @@
 | B7 | 评分通道泄漏给被测模型 | `JUDGE_*` 写进了 `[environment].env` | `JUDGE_*` **只写 `[verifier.env]`**；`[environment].env` 遵循最小必要原则 |
 | B8 | 平台不替换 `${VAR}`、本地判官全失败 | 本地自测没导 KEY | 本地自测自行 `export`；toml 里保持 `${VAR:-}` 占位符**原样** |
 | B9 | 整题无分 / 内容丢失 | `solve.sh` / `test.sh` 是 CRLF 或无执行位 | **LF + `chmod +x`** |
+| B10 | **oracle 也拿不到该分**（如 "交付物齐全" 必得分项恒判 FAIL） | criterion description 里交付物用了**非全名简写**（去掉 task-id 前缀 / 缺扩展名，如写 "chart01 材料覆盖与数据缺口"，实际文件是 `FIN3-WKN-150_chart01_材料覆盖与数据缺口.png`），同条判据又要求"文件名须逐字一致" → judge 按字面比对判 FAIL | 判据引用交付物**必须写全名**（含 task-id 前缀 + 扩展名，并加反引号），与 instruction.md / task.toml 的 artifacts **逐字节一致**；提交前跑 `check_package.py`，其 **#3b** 会对"非全名写法"告警 |
+| B11 | **质检判"`rubrics.json` 与 `tests/rubrics.toml` 评分定义不一致"（SCORING 必修、"必须以同一判据版本同步两份文件并重跑"）** | 设计态 `rubrics.json` 的负向项**只用负 `weight` 表示、缺 `"negate": true`**，而运行态 `tests/rubrics.toml` 用 `negate = true` + 正 weight；两套表示法不对应（`validate_rubrics`/preflight 会以"negate 集合差、正分池不符"报错，即便两侧实际正分池相等） | `rubrics.json` 的负向项**必须同时写** 负 `weight` **与** `"negate": true`（**双标记**），并与 `tests/rubrics.toml` 的判据 id 集合、负向集合、正分池 `S_max` 逐一对齐（以 149 的 JSON 写法为准）；提交前跑 `check_package.py`，其 **#4b** 校验设计态/运行态判分定义一致 |
+| B12 | **甲方 `validate_rubrics` 文本正则误伤**：报 "toml negate 集合 3 条 / 正分池比 JSON 少 3"，但 tomllib 实际解析 negate={N01,N02}、正分池双侧一致 | `tests/rubrics.toml` 的**节注释行**含字面子串 `negate = true`（如「落到本文件为 negate = true + 正 weight」），甲方脚本按 `'negate = true' in 块` 子串判定、把注释吞进前一条判据块 | TOML 注释/描述**避免出现 `negate = true` 等甲方解析器敏感字面串**（改写为「negate 形式」等等价表述）；纯注释改动不影响判分（tomllib 忽略注释），无需重跑；定位方法：用 `re.findall(r'\[\[criterion\]\](.*?)(?=\n\[\[criterion\]\]|\Z)', toml, re.S)` 复现甲方分块 |
+| B13 | 甲方 `check_instruction_anchors.py` 对自有批次报「锚点缺失 N 个」 | 脚本**硬编码甲方自有批次** FIN-127/128/129-W 的锚点清单，对本 skill 产出的题包**不可复用** | 忽略其输出；判据锚点在题面/材料的命中性**人工逐条核**（对照 instruction.md 与 `environment/input_files/`），并在质检报告注明该脚本不适用 |
+| B14 | 甲方 `check_package_permissions.py` 对 `FIN3-WKN-xxx_task.zip` / `_answer.zip` 报「缺 交付文档/跑分产物与轨迹 等」FAIL | 该脚本按**批次包**结构校验（批次根须有 交付文档.md 与 跑分产物与轨迹/）；task/answer 是**拆分包**（task=设计态五件套、answer=仅 golden），本来就不含这些 | 批次包必须 PASS；task/answer 拆分包的 FAIL 属**口径不符、非缺陷**，在质检报告注明即可 |
 
 ## C. 环境与镜像类
 
@@ -88,4 +94,12 @@ grep -E 'weight *= *(-|[0-9.]+)' tests/rubrics.toml | grep -v '\-'
 grep -n "Deliverables to inspect" tests/rubrics.toml | wc -l
 find . -type l | wc -l                                     # 应为 0
 grep -rlP "[\x{00A0}\x{3000}]" --include="*.toml" --include="*.md" . | wc -l   # 应为 0
+
+# 5) 静态门禁（含 #3b 交付物全名、#4b 设计态/运行态判分定义一致）
+python3 ../scripts/check_package.py .                      # 期望 [PASS]，无 #3/#3b/#4b 告警
+python3 ../scripts/check_rubrics.py tests/rubrics.toml     # 期望 G3 门禁全通过
+
+# 6) 甲方机器门禁（04 §0b，以此为准）
+python3 ../scripts/client_gates.py . --zip <批次zip> \
+    --runs-dir <正式批次的跑分产物与轨迹> --waive check_rubric_style.py   # 期望 0 必须整改
 ```

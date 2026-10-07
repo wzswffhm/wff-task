@@ -1,0 +1,199 @@
+diff --git a/wrotate/fsutil.py b/wrotate/fsutil.py
+index 4322090..7b08d76 100644
+--- a/wrotate/fsutil.py
++++ b/wrotate/fsutil.py
+@@ -11,8 +11,12 @@ def move(src, dst):
+     """把 ``src`` 移动到 ``dst``。
+ 
+     目标已存在时也应当成功（覆盖它），返回 ``dst``。
++
++    Windows 上 ``os.rename`` 在目标已存在时会抛 ``FileExistsError``，
++    所以这里用 ``os.replace``：它保证「覆盖式改名」，在服务上一轮异常退出、
++    目标序号上还压着残留文件时也能把搬运做完。
+     """
+-    os.rename(src, dst)
++    os.replace(src, dst)
+     return dst
+ 
+ 
+@@ -26,7 +30,11 @@ def remove(path):
+ 
+ 
+ def rotation_names(directory, stem):
+-    """返回 ``directory`` 中形如 ``stem.<n>`` 的名字列表（升序）。"""
++    """返回 ``directory`` 中形如 ``stem.<n>`` 的名字列表（按序号升序）。
++
++    排序按**序号**而不是按文件名的字典序，否则 ``app.log.10`` 会排在
++    ``app.log.2`` 前面，轮转时世代顺序就乱了。
++    """
+     names = []
+     for name in os.listdir(directory):
+         if not name.startswith(stem + "."):
+@@ -34,7 +42,8 @@ def rotation_names(directory, stem):
+         suffix = name[len(stem) + 1:]
+         if suffix.isdigit():
+             names.append(name)
+-    return sorted(names)
++    names.sort(key=rotation_index)
++    return names
+ 
+ 
+ def rotation_index(name):
+diff --git a/wrotate/rotator.py b/wrotate/rotator.py
+index 3a31f7d..8e59a4d 100644
+--- a/wrotate/rotator.py
++++ b/wrotate/rotator.py
+@@ -4,11 +4,15 @@
+ 并按保留份数把最老的那些删掉。
+ """
+ 
++import contextlib
+ import os
+ 
+ from . import fsutil
+ from .errors import RotationError
+ 
++#: 回滚期间用来暂存「目标序号上原有内容」的文件名后缀。
++_UNDO_SUFFIX = ".wrotate-undo"
++
+ 
+ class Rotator(object):
+     """一个日志文件的轮转器。"""
+@@ -32,30 +36,44 @@ class Rotator(object):
+     def rotate(self):
+         """把当前日志滚成 ``.1``，并把已有轮转依次后移。
+ 
+-        返回本次被写入的新路径列表。
++        返回本次被写入的新路径列表（按搬运顺序：序号从大到小，最后是 ``.1``）。
++
++        搬运按序号从大到小进行，于是每个目标序号在搬进去之前都刚被腾空，不会
++        覆盖掉还没搬走的世代；即便目标上真的压着残留（服务上一轮异常退出留下
++        的文件），:func:`fsutil.move` 也会覆盖它而不是抛 ``FileExistsError``。
++
++        中途失败时，已经完成的搬运会按相反顺序逐条撤销，目录回到轮转开始前的
++        状态，不会留下「一半世代已经后移、一半还没动」的半截结果；撤销完之后
++        原样抛出触发失败的那个异常。
+         """
+         if not os.path.exists(self.path):
+             return []
+ 
+-        moved = []
+-        for name in self.rotations():
+-            index = fsutil.rotation_index(name)
+-            src = os.path.join(self.directory, name)
+-            dst = "%s.%d" % (self.path, index + 1)
+-            fsutil.move(src, dst)
+-            moved.append(dst)
+-
+-        dst = "%s.1" % self.path
+-        fsutil.move(self.path, dst)
+-        moved.append(dst)
+-        return moved
++        journal = []
++        try:
++            for seq, (src, dst) in enumerate(self._plan()):
++                # _park 抛错时这一步不会进 journal —— 那时它还没动过任何文件。
++                journal.append({"src": src, "dst": dst,
++                                "backup": _park(dst, seq), "moved": False})
++                fsutil.move(src, dst)
++                journal[-1]["moved"] = True
++        except Exception as exc:
++            _annotate(exc, _rollback(journal))
++            raise
++        _drop_backups(journal)
++        return [step["dst"] for step in journal]
+ 
+     def prune(self):
+-        """删除超出保留份数的轮转文件，返回被删除的名字列表。"""
++        """删除超出保留份数的轮转文件，返回被删除的名字列表（序号从大到小）。
++
++        保留份数按**序号**挑选：序号最小的 ``keep`` 份是最近的，留下；剩下的按
++        序号从大到小删除。不能按文件名的字典序排，否则保留 10 份时会把
++        ``app.log.1`` 删掉、反而留下 ``app.log.11``。
++        """
+         names = self.rotations()
+-        ordered = sorted(names, reverse=True)
++        stale = names[max(self.keep, 0):]
+         removed = []
+-        for name in ordered[self.keep:]:
++        for name in reversed(stale):
+             if fsutil.remove(os.path.join(self.directory, name)):
+                 removed.append(name)
+         return removed
+@@ -67,3 +85,76 @@ class Rotator(object):
+             raise RotationError("nothing to rotate: %s" % self.path)
+         self.prune()
+         return moved
++
++    def _plan(self):
++        """返回搬运计划 ``[(src, dst), ...]``，按执行顺序排列。
++
++        已有轮转按序号从大到小先搬（``.3`` → ``.4``、``.2`` → ``.3`` ……），
++        最后才把当前日志滚成 ``.1``。
++        """
++        plan = []
++        for name in reversed(self.rotations()):
++            index = fsutil.rotation_index(name)
++            src = os.path.join(self.directory, name)
++            plan.append((src, "%s.%d" % (self.path, index + 1)))
++        plan.append((self.path, "%s.1" % self.path))
++        return plan
++
++
++def _park(dst, seq):
++    """把 ``dst`` 上已有的文件挪到一边，返回暂存路径；``dst`` 空着则返回 ``None``。
++
++    按计划搬运时目标序号总是刚被腾空，这里通常什么也不做；只有目标上确实压着
++    别的东西（并发写入落下的残留）时才会生效。先挪开而不是直接覆盖，回滚时才
++    能把目录还原成轮转开始前的样子。
++    """
++    if not os.path.isfile(dst):
++        return None
++    backup = _backup_name(dst, seq)
++    os.replace(dst, backup)
++    return backup
++
++
++def _backup_name(dst, seq):
++    """在 ``dst`` 旁边生成一个当前目录内唯一的暂存名。"""
++    name = "%s%s-%d-%d" % (dst, _UNDO_SUFFIX, os.getpid(), seq)
++    while os.path.lexists(name):
++        seq += 1
++        name = "%s%s-%d-%d" % (dst, _UNDO_SUFFIX, os.getpid(), seq)
++    return name
++
++
++def _rollback(journal):
++    """按相反顺序撤销已经完成的搬运，返回撤销失败的条目描述列表。
++
++    返回空列表表示目录已经回到轮转开始前的状态。
++    """
++    failures = []
++    for step in reversed(journal):
++        try:
++            if step["moved"]:
++                os.replace(step["dst"], step["src"])
++            if step["backup"] is not None:
++                os.replace(step["backup"], step["dst"])
++        except OSError as exc:
++            failures.append("%s -> %s: %s" % (step["dst"], step["src"], exc))
++    return failures
++
++
++def _annotate(exc, failures):
++    """把「回滚没撤干净」挂到原始异常上，但不掩盖它。"""
++    if not failures:
++        return
++    add_note = getattr(exc, "add_note", None)
++    if add_note is None:  # Python < 3.11 没有异常注释
++        return
++    add_note("wrotate: rollback incomplete: %s" % "; ".join(failures))
++
++
++def _drop_backups(journal):
++    """轮转成功后丢掉暂存起来的旧内容：它们已经被这一轮的世代覆盖掉了。"""
++    for step in journal:
++        if step["backup"] is None:
++            continue
++        with contextlib.suppress(OSError):
++            os.remove(step["backup"])

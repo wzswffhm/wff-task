@@ -161,6 +161,12 @@ def main():
     ap.add_argument("--out", help="判分沙箱根目录（默认 <task>/extras/model_runs/_judge）")
     a = ap.parse_args()
 
+    # 与 run_model_validation 同口径：剥离本机注册表的 PYTHONUTF8/PYTHONIOENCODING，
+    # 使判分沙箱（pytest + verifier）与真实 Windows 判分环境一致，避免
+    # 模型标准 text=True 子进程封装在 GBK 输出上被 UTF-8 强制解码污染测量。
+    for _k in ("PYTHONUTF8", "PYTHONIOENCODING"):
+        os.environ.pop(_k, None)
+
     task_dir = Path(a.task).resolve()
     if not (task_dir / "task.toml").is_file():
         print(f"错误: {task_dir} 不是题包目录（缺 task.toml）", file=sys.stderr)

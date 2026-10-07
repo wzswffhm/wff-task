@@ -25,9 +25,9 @@
 ## 功能边界
 
 - **需要支持**
-  - `write_text` / `append_text` / `write_lines` 的落盘编码
+  - `write_text` / `append_text` / `write_lines` 的落盘编码与换行归一化
   - `read_text` / `read_lines` 的解码选择
-  - `utf-8-bom` 编码别名与 `detect_bom`
+  - `utf-8-bom` 编码别名（含大小写与 `-`/`_`/无分隔符变体）与 `detect_bom`
 - **不需要处理**
   - 编码自动探测
   - UTF-16 / UTF-32 的读写
@@ -56,3 +56,9 @@
 4. `encoding="utf-8-bom"` 写出的文件以 UTF-8 BOM 开头。
 
 5. 落盘换行固定为 CRLF。
+
+6. `encoding_for` 的映射语义：`default` / `utf8` / `utf-8` / `None` 固定返回 `"utf-8"`；`utf-8-bom` / `utf-8-sig` 固定返回 `"utf-8-sig"`；别名的大小写与 `-`/`_`/无分隔符写法（如 `UTF_8_BOM`、`utf8bom`、`utf8sig`）归一化后识别，未命中的名称原样透传。
+
+7. 用 `utf-8-bom`（含归一化别名）写出的文件以 `EF BB BF` 开头；用 `"utf-8"`（默认）读回时保留开头的 U+FEFF 字符，用 `"utf-8-sig"` 读回时剥离 BOM。
+
+8. 换行归一化：文本中已有的 CRLF / LF / CR 落盘时一律变成单个 CRLF，不得翻倍（落盘字节里不允许出现 `\r\r\n`）；`write_lines` 逐行落盘与 `append_text` 追加同样遵循该规则；空列表写出的文件为 0 字节；`detect_bom` 对不带 BOM 的文件返回 `None`。

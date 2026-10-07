@@ -1,0 +1,332 @@
+diff --git a/debug.txt b/debug.txt
+new file mode 100644
+index 0000000..5137cdd
+--- /dev/null
++++ b/debug.txt
+@@ -0,0 +1,14 @@
++After header, position 9:
++Next 30 bytes: 0105616c7068610002000000ac020a787878787878787878780000000480
++
++[9]: 0x01 =   1
++[10]: 0x05 =   5
++[11]: 0x61 =  97
++[12]: 0x6c = 108
++[13]: 0x70 = 112
++[14]: 0x68 = 104
++[15]: 0x61 =  97
++[16]: 0x00 =   0
++[17]: 0x02 =   2
++[18]: 0x00 =   0
++[19]: 0x00 =   0
+diff --git a/parse_output.txt b/parse_output.txt
+new file mode 100644
+index 0000000..21b1170
+--- /dev/null
++++ b/parse_output.txt
+@@ -0,0 +1,5 @@
++Record 1 at 9:
++Tag: 1
++Length: 5
++Payload: b'alpha'
++Next pos: 16
+diff --git a/parse_results.txt b/parse_results.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/test_parse.py b/test_parse.py
+new file mode 100644
+index 0000000..3cdc45d
+--- /dev/null
++++ b/test_parse.py
+@@ -0,0 +1,18 @@
++from wfmt.varint import decode_uvarint  
++data = open("assets/sample.wfmt", "rb").read()  
++print("Total:", len(data))  
++pos = 9  
++records = []  
++while pos < len(data) - 4:  
++    rs = pos  
++    tag, pos = decode_uvarint(data, pos)  
++    length, pos = decode_uvarint(data, pos)  
++    payload = data[pos:pos+length]  
++    pos += length  
++    sz = pos - rs  
++    pad = (4 - sz %% 4) %% 4  
++    pos += pad  
++    records.append((tag, length, sz, pad))  
++for i, r in enumerate(records):  
++    print(f"R{i+1}: tag={r[0]} len={r[1]} size={r[2]} pad={r[3]}")  
++print(f"Final: {pos}, Expected: {len(data)-4}")  
+diff --git a/wfmt/crc.py b/wfmt/crc.py
+index e2e8ca5..38b7557 100644
+--- a/wfmt/crc.py
++++ b/wfmt/crc.py
+@@ -1,44 +1,44 @@
+-"""容器尾部校验和。"""
+-
+-from __future__ import annotations
+-
+-import struct
+-
+-__all__ = ["CRC_SIZE", "compute_crc", "pack_crc", "unpack_crc"]
+-
+-CRC_SIZE = 4
+-
+-_POLY = 0xEDB88320
+-
+-
+-def _build_table():
+-    table = []
+-    for index in range(256):
+-        crc = index
+-        for _ in range(8):
+-            crc = (crc >> 1) ^ (_POLY if crc & 1 else 0)
+-        table.append(crc)
+-    return table
+-
+-
+-_TABLE = _build_table()
+-
+-
+-def compute_crc(data):
+-    """返回 ``data`` 的 32 位校验和。"""
+-    crc = 0xFFFFFFFF
+-    for byte in data:
+-        crc = (crc >> 8) ^ _TABLE[(crc ^ byte) & 0xFF]
+-    return crc & 0xFFFFFFFF
+-
+-
+-def pack_crc(value):
+-    """把校验和打包成 4 字节。"""
+-    return struct.pack("<I", value & 0xFFFFFFFF)
+-
+-
+-def unpack_crc(buf, pos=0):
+-    """从 ``buf[pos:pos+4]`` 解出校验和。"""
+-    if pos + CRC_SIZE > len(buf):
+-        raise ValueError("校验和字段不完整")
+-    return struct.unpack_from("<I", buf, pos)[0]
++"""容器尾部校验和。"""
++
++from __future__ import annotations
++
++import struct
++
++__all__ = ["CRC_SIZE", "compute_crc", "pack_crc", "unpack_crc"]
++
++CRC_SIZE = 4
++
++_POLY = 0xEDB88320
++
++
++def _build_table():
++    table = []
++    for index in range(256):
++        crc = index
++        for _ in range(8):
++            crc = (crc >> 1) ^ (_POLY if crc & 1 else 0)
++        table.append(crc)
++    return table
++
++
++_TABLE = _build_table()
++
++
++def compute_crc(data):
++    """返回 ``data`` 的 32 位校验和。"""
++    crc = 0xFFFFFFFF
++    for byte in data:
++        crc = (crc >> 8) ^ _TABLE[(crc ^ byte) & 0xFF]
++    return crc ^ 0xFFFFFFFF
++
++
++def pack_crc(value):
++    """把校验和打包成 4 字节。"""
++    return struct.pack("<I", value & 0xFFFFFFFF)
++
++
++def unpack_crc(buf, pos=0):
++    """从 ``buf[pos:pos+4]`` 解出校验和。"""
++    if pos + CRC_SIZE > len(buf):
++        raise ValueError("校验和字段不完整")
++    return struct.unpack_from("<I", buf, pos)[0]
+diff --git a/wfmt/header.py b/wfmt/header.py
+index 41a8c33..134426a 100644
+--- a/wfmt/header.py
++++ b/wfmt/header.py
+@@ -1,31 +1,31 @@
+-"""容器文件头。"""
+-
+-from __future__ import annotations
+-
+-import struct
+-
+-from .errors import WFormatError
+-
+-__all__ = ["MAGIC", "VERSION", "HEADER_SIZE", "pack_header", "parse_header"]
+-
+-MAGIC = b"WFMT"
+-VERSION = 1
+-HEADER_SIZE = 9
+-
+-
+-def pack_header(count):
+-    """打包文件头。"""
+-    return MAGIC + bytes([VERSION]) + struct.pack(">I", count)
+-
+-
+-def parse_header(data):
+-    """解析文件头，返回 ``(version, count)``。"""
+-    if len(data) < HEADER_SIZE:
+-        raise WFormatError("truncated", "文件头不完整")
+-    if data[:4] != MAGIC:
+-        raise WFormatError("magic", "魔数不匹配")
+-    version = data[4]
+-    if version != VERSION:
+-        raise WFormatError("version", "不支持的版本号 %r" % (version,))
+-    count = struct.unpack_from(">I", data, 5)[0]
+-    return version, count
++"""容器文件头。"""
++
++from __future__ import annotations
++
++import struct
++
++from .errors import WFormatError
++
++__all__ = ["MAGIC", "VERSION", "HEADER_SIZE", "pack_header", "parse_header"]
++
++MAGIC = b"WFMT"
++VERSION = 1
++HEADER_SIZE = 9
++
++
++def pack_header(count):
++    """打包文件头。"""
++    return MAGIC + bytes([VERSION]) + struct.pack("<I", count)
++
++
++def parse_header(data):
++    """解析文件头，返回 ``(version, count)``。"""
++    if len(data) < HEADER_SIZE:
++        raise WFormatError("truncated", "文件头不完整")
++    if data[:4] != MAGIC:
++        raise WFormatError("magic", "魔数不匹配")
++    version = data[4]
++    if version != VERSION:
++        raise WFormatError("version", "不支持的版本号 %r" % (version,))
++    count = struct.unpack_from("<I", data, 5)[0]
++    return version, count
+diff --git a/wfmt/varint.py b/wfmt/varint.py
+index c803b1c..9de7080 100644
+--- a/wfmt/varint.py
++++ b/wfmt/varint.py
+@@ -1,31 +1,41 @@
+-"""容器使用的无符号变长整数（LEB128）。"""
+-
+-from __future__ import annotations
+-
+-from .errors import WFormatError
+-
+-__all__ = ["encode_uvarint", "decode_uvarint", "MAX_SHIFT"]
+-
+-MAX_SHIFT = 63
+-
+-
+-def encode_uvarint(value):
+-    """把非负整数编码为 LEB128 字节串。"""
+-    if not isinstance(value, int) or value < 0:
+-        raise ValueError("uvarint 只能编码非负整数")
+-    out = bytearray()
+-    while True:
+-        group = value & 0x7F
+-        value >>= 7
+-        if value:
+-            out.append(group | 0x80)
+-        else:
+-            out.append(group)
+-            return bytes(out)
+-
+-
+-def decode_uvarint(buf, pos=0):
+-    """从 ``buf[pos:]`` 解出一个 uvarint，返回 ``(value, next_pos)``。"""
+-    if pos >= len(buf):
+-        raise WFormatError("truncated", "uvarint 数据不足")
+-    return buf[pos] & 0x7F, pos + 1
++"""容器使用的无符号变长整数（LEB128）。"""
++
++from __future__ import annotations
++
++from .errors import WFormatError
++
++__all__ = ["encode_uvarint", "decode_uvarint", "MAX_SHIFT"]
++
++MAX_SHIFT = 63
++
++
++def encode_uvarint(value):
++    """把非负整数编码为 LEB128 字节串。"""
++    if not isinstance(value, int) or value < 0:
++        raise ValueError("uvarint 只能编码非负整数")
++    out = bytearray()
++    while True:
++        group = value & 0x7F
++        value >>= 7
++        if value:
++            out.append(group | 0x80)
++        else:
++            out.append(group)
++            return bytes(out)
++
++
++def decode_uvarint(buf, pos=0):
++    """从 ``buf[pos:]`` 解出一个 uvarint，返回 ``(value, next_pos)``。"""
++    value = 0
++    shift = 0
++    while True:
++        if pos >= len(buf):
++            raise WFormatError("truncated", "uvarint 数据不足")
++        byte = buf[pos]
++        pos += 1
++        value |= (byte & 0x7F) << shift
++        if not (byte & 0x80):
++            return value, pos
++        shift += 7
++        if shift > MAX_SHIFT:
++            raise WFormatError("varint", "uvarint 编码过长")
+diff --git a/wfmt/varint.py.bak b/wfmt/varint.py.bak
+new file mode 100644
+index 0000000..c803b1c
+--- /dev/null
++++ b/wfmt/varint.py.bak
+@@ -0,0 +1,31 @@
++"""容器使用的无符号变长整数（LEB128）。"""
++
++from __future__ import annotations
++
++from .errors import WFormatError
++
++__all__ = ["encode_uvarint", "decode_uvarint", "MAX_SHIFT"]
++
++MAX_SHIFT = 63
++
++
++def encode_uvarint(value):
++    """把非负整数编码为 LEB128 字节串。"""
++    if not isinstance(value, int) or value < 0:
++        raise ValueError("uvarint 只能编码非负整数")
++    out = bytearray()
++    while True:
++        group = value & 0x7F
++        value >>= 7
++        if value:
++            out.append(group | 0x80)
++        else:
++            out.append(group)
++            return bytes(out)
++
++
++def decode_uvarint(buf, pos=0):
++    """从 ``buf[pos:]`` 解出一个 uvarint，返回 ``(value, next_pos)``。"""
++    if pos >= len(buf):
++        raise WFormatError("truncated", "uvarint 数据不足")
++    return buf[pos] & 0x7F, pos + 1

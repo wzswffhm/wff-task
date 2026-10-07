@@ -653,6 +653,13 @@ def main():
     if args.agent_max_steps:
         os.environ["HARBOR_WINDOWS_AGENT_MAX_STEPS"] = str(args.agent_max_steps)
 
+    # 平台真态还原：本机注册表可能带 PYTHONUTF8=1，会让模型用标准
+    # text=True 写的子进程封装在 GBK 输出（如 icacls「已成功处理」）上
+    # 抛 UnicodeDecodeError（读线程崩溃返回 None）→ 测量被环境伪影污染。
+    # 真实 Windows 判分环境没有该变量，这里从子进程环境中剥离。
+    for _k in ("PYTHONUTF8", "PYTHONIOENCODING"):
+        os.environ.pop(_k, None)
+
     LAYOUT = args.layout
 
     endpoints = DEFAULT_ENDPOINTS

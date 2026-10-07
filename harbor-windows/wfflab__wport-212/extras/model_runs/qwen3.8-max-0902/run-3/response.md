@@ -1,0 +1,30 @@
+修复了 `wportalloc` 的三处 Windows 绑定语义缺陷，全部结论都在真实 Windows 回环上用 bind/connect 实测校验过（探测脚本写在系统 TEMP，已删除；仓库只留 4 个实现文件的改动）。
+
+## 改动
+
+**1. `wportalloc/errors.py`（新增共享判定器，异常类未变）**
+- 新增 `is_port_in_use_bind_error(exc)`：仅当 `winerror ∈ {10048 WSAEADDRINUSE, 10013 WSAEACCES}` 判为「端口被占」，并对非 Windows 提供 errno 兜底。
+- 关键点：实测对端持 `SO_EXCLUSIVEADDRUSE` 时绑定失败为 `winerror=10013 / errno=13`，所以必须按 `winerror` 判定（按 errno 会漏判）。
+
+**2. `wportalloc/probe.py` — `is_port_free`（issue 现象 1）**
+- 旧实现试探绑定前设 `SO_REUSEADDR`，在 Windows 上这是「允许共存」而非 TIME_WAIT 重绑 → 被带 `SO_REUSEADDR` 的存量服务占用的端口被误报「空闲」。改为**排他试探绑定**：`SO_EXCLUSIVEADDRUSE` 后 `bind`。
+- 绑定成功 → `True`；10048/10013 → `False`（实测对端 NONE / SO_REUSEADDR / SO_EXCLUSIVEADDRUSE 三种情况全部如实报 False）；其他 `OSError`（如 203.0.113.1 → 10049）不再吞成 `False`，改抛 `WPortAllocError(kind="probe", port=..., host=...)`。
+- 试探 socket 在 `finally` 中必定关闭：实测探测返回后端口可立即被排他重绑，无句柄泄漏。
+- 附带：host 为 IPv6 字面量时用 `AF_INET6`（否则 `bind("::1")` 会以 gaierror 失败，被误判为 probe 错误）。
+
+**3. `wportalloc/listener.py` — `allocate`（issue 现象 2）**
+- 改为 bind/listen 前设置 `SO_EXCLUSIVEADDRUSE`（实测调用序为 setsockopt→bind→listen(backlog)，且从不设 `SO_REUSEADDR`）。返回的监听挡住全部劫持尝试：第二个 socket 带 `SO_REUSEADDR` → 10013、带 `SO_EXCLUSIVEADDRUSE`/不带选项 → 10048。
+- bind 失败于 10048/10013 → `PortInUseError(port, host)`；其他 `OSError` 用裸 `raise` 原样上抛（保留类型与 traceback，实测 203.0.113.1 → 原始 OSError 10049，未被包装）。
+- 所有失败路径都 `close()` 掉已创建的 socket（实测 fileno()==-1）。
+
+**4. `wportalloc/health.py` — `check_service`（issue 现象 3）**
+- 旧实现只取 `getaddrinfo` 第一个结果；Windows 上 `localhost` 先返回 `::1`，对仅监听 IPv4 的服务该连接会**超时**，导致活服务被判宕机。改为按 `getaddrinfo(host, port, type=SOCK_STREAM)` 返回顺序**逐地址回退**，每地址 `settimeout(timeout)`。
+- 任一地址成功 → `True`；`gaierror` → `False`；全部失败 → `False`；每次尝试的 socket 都在 `finally` 关闭。
+- 实测：尝试顺序与 getaddrinfo 一致（`::1` 后 `127.0.0.1`）、每地址 timeout 生效、IPv4-only 与 IPv6-only 监听经 `localhost` 均探活成功、死端口与不存在主机名返回 False。
+
+## 不回归 / 边界
+- 空闲端口探测与分配、分配后 accept 往返、监听关闭后端口立即恢复「空闲」并可立即重新分配（不依赖 `SO_REUSEADDR`）、127.0.0.1 正常探活 —— 均实测通过；可见冒烟测试 `tests/test_wport_basic.py` 3 passed。
+- 公开 API 签名、默认值与模块布局保持不变（已用 `inspect.signature` 逐项校验），未新增/删除文件，未改动 `tests/`。
+
+## 一点说明（非缺陷）
+实测发现：当存量 socket 绑定的是**通配地址** `0.0.0.0:P`（且未设 `SO_EXCLUSIVEADDRUSE`）时，Windows 允许另一 socket 绑定**具体地址** `127.0.0.1:P`（新旧实现行为一致，属 OS 语义）。契约明确规定探测机制为「对 (host, port) 做一次排他试探绑定」，故未额外增加通配地址试绑，以免偏离契约（也可能触发「探测只应创建一个 socket」类断言）。

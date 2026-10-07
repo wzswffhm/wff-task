@@ -1,0 +1,619 @@
+diff --git a/winstall/transaction.py b/winstall/transaction.py
+index 61bcb26..a8c33d7 100644
+--- a/winstall/transaction.py
++++ b/winstall/transaction.py
+@@ -2,57 +2,396 @@
+ 
+ 写入采用「同目录临时文件 + 原子替换」：目标位置要么是旧内容，要么是新内容，
+ 不会出现半个文件。
++
++Windows 上目标文件常常正被别的进程打开着，这种替换失败**不该**让整次安装崩掉：
++该文件保持旧内容不动，相对路径记进 :attr:`ApplyResult.deferred` 和清单的
++``pending_replace``；等占用解除后，对同一份计划再执行一次即可完成替换。
++
++无法推迟的失败（目标位置被同名目录占据、源文件缺失……）则让整次事务回滚：
++已覆盖的文件按字节恢复、本次新建的文件删除、清单恢复原样、临时文件清理干净，
++最后抛 :class:`~winstall.errors.ApplyFailed`。
+ """
+ 
++from __future__ import annotations
++
++import errno
+ import os
+ import shutil
++import tempfile
+ from collections import namedtuple
+ 
+-from . import manifest, planner
++from . import layout, manifest, planner
++from .errors import ApplyFailed
+ 
+ ApplyResult = namedtuple("ApplyResult", "operation product version applied deferred")
+ 
+ TMP_SUFFIX = ".winstall-part"
+ 
++WRITE = "write"
++REMOVE = "remove"
++_KINDS = (WRITE, REMOVE)
++
++#: Windows 下「文件正被别的进程使用」的错误码：
++#: ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
++_LOCKED_WINERRORS = frozenset((5, 32, 33))
++
++#: 这些错误说明现场本身不对（目标是目录、源不存在、只读介质……），推迟也没有用
++_STRUCTURAL_ERRNOS = frozenset(value for value in (
++    getattr(errno, "EISDIR", None),
++    getattr(errno, "ENOTDIR", None),
++    getattr(errno, "ENOENT", None),
++    getattr(errno, "EEXIST", None),
++    getattr(errno, "EROFS", None),
++    getattr(errno, "ENOSPC", None),
++    getattr(errno, "EXDEV", None),
++    getattr(errno, "ENOTEMPTY", None),
++    getattr(errno, "ENAMETOOLONG", None),
++) if value is not None)
++
++
++class _Outcome(Exception):
++    """内部使用：一次动作的失败分类，不会逃出 :func:`apply_transaction`。"""
++
++    def __init__(self, message, action=None, cause=None):
++        self.message = message
++        self.action = action
++        self.cause = cause
++        super().__init__(message)
++
++
++class _Deferred(_Outcome):
++    """目标被别的进程占用：推迟到下一次执行，本次事务继续。"""
++
++
++class _Fatal(_Outcome):
++    """无法推迟的失败：本次事务必须整体回滚。"""
++
++
++def _remove_quietly(path):
++    try:
++        os.remove(path)
++    except OSError:
++        pass
++
+ 
+-def _ensure_parent(path):
++def _read_bytes(path):
++    try:
++        with open(path, "rb") as handle:
++            return handle.read()
++    except OSError:
++        return None
++
++
++def _ensure_parent(path, created=None, floor=None):
++    """确保 ``path`` 的父目录存在。
++
++    ``created`` 给出时，把本次**新**建出来、并且位于 ``floor`` 之下的目录
++    （由浅到深）记进去，回滚时好用它把现场收拾干净。载荷目录本身以及它
++    以上的层次不动，免得把产品的骨架拆掉。
++    """
+     parent = os.path.dirname(path)
+-    if parent:
+-        os.makedirs(parent, exist_ok=True)
++    if not parent or os.path.isdir(parent):
++        return
++    missing = []
++    probe = parent
++    while probe and not os.path.isdir(probe):
++        missing.append(probe)
++        upper = os.path.dirname(probe)
++        if upper == probe:
++            break
++        probe = upper
++    os.makedirs(parent, exist_ok=True)
++    if created is None:
++        return
++    for fresh in reversed(missing):
++        if floor is None or layout.normalize_key(fresh).startswith(floor):
++            created.append(fresh)
+ 
+ 
+-def _put_file(source, destination):
+-    """把 ``source`` 放到 ``destination``（原子替换）。"""
++def _drop_created_directories(created):
++    """删掉本次事务在载荷目录里新建、现在又空了的目录（由深到浅）。"""
++    for path in reversed(created or ()):
++        try:
++            os.rmdir(path)
++        except OSError:
++            pass
++
++
++def _force_rmtree(path):
++    """删掉一棵目录树，连只读文件一起。
++
++    快照可能是从只读的载荷文件复制来的；Windows 上那样的文件
++    直接 rmtree 会失败，得先把只读位清掉。
++    """
++    if not path:
++        return
++    for base, dirs, names in os.walk(path, topdown=False):
++        for name in names:
++            target = os.path.join(base, name)
++            try:
++                os.chmod(target, 0o666)
++            except OSError:
++                pass
++            _remove_quietly(target)
++        for name in dirs:
++            try:
++                os.rmdir(os.path.join(base, name))
++            except OSError:
++                pass
++    try:
++        os.rmdir(path)
++    except OSError:
++        pass
++
++
++def _is_locked(exc):
++    """``exc`` 是否属于「文件被别的进程占用」这类**可以推迟**的失败。"""
++    if isinstance(exc, (FileNotFoundError, NotADirectoryError, IsADirectoryError,
++                        FileExistsError)):
++        return False
++    if isinstance(exc, PermissionError):
++        return True
++    if not isinstance(exc, OSError):
++        return False
++    if getattr(exc, "winerror", None) in _LOCKED_WINERRORS:
++        return True
++    if exc.errno in _STRUCTURAL_ERRNOS:
++        return False
++    # 剩下的共享冲突类错误（EACCES / EPERM / EBUSY / ETXTBSY 以及各平台的
++    # 变体）都按「占用」处理：推迟一次，总比毁掉整次安装好。
++    return True
++
++
++def _classify(exc, target):
++    """把一个 :class:`OSError` 归类成可推迟或不可推迟的失败。"""
++    message = "%s: %s" % (target, exc)
++    if _is_locked(exc):
++        return _Deferred(message, cause=exc)
++    return _Fatal(message, cause=exc)
++
++
++def _replace(source, destination):
++    """``source`` → ``destination`` 的原子替换（经由同目录临时文件）。"""
+     temporary = destination + TMP_SUFFIX
+-    shutil.copyfile(source, temporary)
+-    os.replace(temporary, destination)
++    _remove_quietly(temporary)
++    try:
++        shutil.copyfile(source, temporary)
++        os.replace(temporary, destination)
++    except OSError:
++        _remove_quietly(temporary)
++        raise
++
++
++def _put_file(source, destination):
++    """把 ``source`` 放到 ``destination``。
++
++    失败时目标保持原样：要么根本没被碰过（占用），要么由调用方回滚。
++    """
++    if os.path.isdir(destination):
++        # 目标位置被同名目录占据，替换永远不会成功，也就无从推迟。
++        raise _Fatal("destination is occupied by a directory: %s" % (destination,))
++    if os.path.isfile(destination) and not os.access(destination, os.W_OK):
++        # 只读的目标文件在 Windows 上同样替换不掉，只能推迟。
++        raise _Deferred("destination is not writable: %s" % (destination,))
++    try:
++        _replace(source, destination)
++    except OSError as exc:
++        raise _classify(exc, destination)
+ 
+ 
+ def _delete_file(path):
+-    if os.path.isfile(path):
++    """删除一个载荷文件；本来就不在、或者是个目录时什么都不做。"""
++    if not os.path.isfile(path):
++        return
++    if not os.access(path, os.W_OK):
++        raise _Deferred("file is not writable: %s" % (path,))
++    try:
+         os.remove(path)
++    except FileNotFoundError:
++        return
++    except OSError as exc:
++        raise _classify(exc, path)
+ 
+ 
+-def apply_transaction(plan):
+-    """顺序执行 ``plan`` 中的动作，然后更新清单。"""
+-    applied = []
+-    for action in plan.actions:
+-        target = planner.destination(plan, action)
+-        if action.kind == "write":
+-            _ensure_parent(target)
+-            _put_file(action.source, target)
+-        elif action.kind == "remove":
+-            _delete_file(target)
+-        else:
+-            raise ValueError("unknown action: %r" % (action.kind,))
+-        applied.append(action.relpath)
++def _run_action(action, target, created=None, floor=None):
++    if action.kind == WRITE:
++        _ensure_parent(target, created, floor)
++        _put_file(action.source, target)
++    else:
++        _delete_file(target)
++
++
++def _cleanup_temporaries(directory):
++    """清掉载荷目录里残留的临时文件。"""
++    if not directory or not os.path.isdir(directory):
++        return
++    for base, _dirs, names in os.walk(directory):
++        for name in names:
++            if name.endswith(TMP_SUFFIX):
++                _remove_quietly(os.path.join(base, name))
++
++
++class _Backup:
++    """事务开始前、被改动文件的快照。
++
++    失败时用它把**被覆盖**的文件逐字节恢复、把**本次新建**的文件删掉。
++    快照本身放在系统临时目录里，绝不落进载荷目录。
++    """
++
++    def __init__(self):
++        self._entries = []        # [(归一化的目标键, 目标路径, 备份路径 or None)]
++        self._directory = None
++
++    def _workspace(self):
++        if self._directory is None:
++            self._directory = tempfile.mkdtemp(prefix="winstall-rollback-")
++        return self._directory
++
++    def capture(self, target):
++        """记住 ``target`` 当前的内容（若它是一个已存在的文件）。"""
++        key = layout.normalize_key(target)
++        for entry in self._entries:
++            if entry[0] == key:
++                return
++        backup = None
++        if os.path.isfile(target):
++            backup = os.path.join(self._workspace(), "%05d.bak" % len(self._entries))
++            try:
++                shutil.copyfile(target, backup)
++            except OSError as exc:
++                _remove_quietly(backup)
++                raise _classify(exc, target)
++        self._entries.append((key, target, backup))
++
++    def restore(self):
++        """恢复快照；尽力而为，恢复不动的不该挡住 :class:`ApplyFailed`。"""
++        for _key, target, backup in reversed(self._entries):
++            try:
++                if backup is None:
++                    if os.path.isfile(target):
++                        os.remove(target)
++                else:
++                    _ensure_parent(target)
++                    _replace(backup, target)
++            except OSError:
++                pass
++
++    def discard(self):
++        directory, self._directory = self._directory, None
++        _force_rmtree(directory)
++
+ 
++def _restore_manifest(root, raw):
++    """把清单恢复到执行前的字节内容。"""
++    path = manifest.manifest_path(root)
++    if raw is None:
++        _remove_quietly(path)
++        _remove_quietly(path + ".tmp")
++        return
++    temporary = path + ".tmp"
++    try:
++        os.makedirs(root, exist_ok=True)
++        with open(temporary, "wb") as handle:
++            handle.write(raw)
++        os.replace(temporary, path)
++    except OSError:
++        _remove_quietly(temporary)
++
++
++def _sorted_unique(values):
++    seen = set()
++    result = []
++    for value in values:
++        key = layout.relative_key(value)
++        if not key or key in seen:
++            continue
++        seen.add(key)
++        result.append(key)
++    return sorted(result)
++
++
++def _record(plan, pending_replace, kept):
++    """按本次执行的结果更新清单。
++
++    ``pending_replace`` 是被占用而没能替换掉的载荷文件（仍是旧内容），
++    ``kept`` 是被占用而没能删掉的旧文件（仍在盘上，得继续记账）。
++    """
+     data = manifest.read_manifest(plan.root)
+     if plan.operation == planner.INSTALL:
+-        manifest.set_product(data, plan.product, plan.version, plan.files, [])
++        files = _sorted_unique(list(plan.files) + list(kept))
++        manifest.set_product(data, plan.product, plan.version, files, pending_replace)
++    elif kept:
++        entry = manifest.get_product(data, plan.product) or {}
++        version = entry.get("version") or plan.version
++        manifest.set_product(data, plan.product, version, kept, [])
+     else:
+         manifest.drop_product(data, plan.product)
+     manifest.write_manifest(plan.root, data)
+ 
++
++def apply_transaction(plan):
++    """顺序执行 ``plan`` 中的动作，然后更新清单。
++
++    被占用的文件只会被**推迟**（出现在返回值的 ``deferred`` 与清单的
++    ``pending_replace`` 里），其余动作照常执行；无法推迟的失败会把本次事务
++    的改动全部回滚，并抛 :class:`~winstall.errors.ApplyFailed`。
++    """
++    actions = tuple(plan.actions)
++    for action in actions:
++        if action.kind not in _KINDS:
++            raise ValueError("unknown action: %r" % (action.kind,))
++
++    payload = layout.payload_dir(plan.root, plan.product)
++    floor = layout.normalize_key(payload) + os.sep
++    backup = _Backup()
++    manifest_bytes = _read_bytes(manifest.manifest_path(plan.root))
++
++    applied = []
++    deferred = []
++    pending_replace = []      # 写入被推迟 → 等下次替换
++    kept = []                 # 删除被推迟 → 旧文件仍在盘上
++    created_dirs = []         # 本次在载荷目录里新建的目录
++
++    try:
++        try:
++            for action in actions:
++                target = planner.destination(plan, action)
++                outcome = None
++                try:
++                    backup.capture(target)
++                    _run_action(action, target, created_dirs, floor)
++                except _Outcome as failure:
++                    outcome = failure
++                except OSError as exc:
++                    outcome = _classify(exc, target)
++                if outcome is None:
++                    applied.append(action.relpath)
++                    continue
++
++                outcome.action = action
++                if not isinstance(outcome, _Deferred):
++                    raise outcome
++                deferred.append(action.relpath)
++                if action.kind == WRITE:
++                    pending_replace.append(action.relpath)
++                else:
++                    kept.append(action.relpath)
++
++            # 所有动作都处理完了才落清单；清单写不下去，整次事务同样回滚，
++            # 免得盘上是新版本、清单里还记着旧版本。
++            try:
++                _record(plan, pending_replace, kept)
++            except OSError as exc:
++                raise _Fatal("%s: %s" % (manifest.manifest_path(plan.root), exc),
++                             cause=exc)
++        except _Fatal as failure:
++            backup.restore()
++            _drop_created_directories(created_dirs)
++            _restore_manifest(plan.root, manifest_bytes)
++            raise ApplyFailed(failure.action, failure.message) from failure.cause
++    finally:
++        backup.discard()
++        _cleanup_temporaries(payload)
++
+     return ApplyResult(plan.operation, plan.product, plan.version,
+-                       tuple(applied), ())
++                       tuple(applied), tuple(deferred))
+diff --git a/winstall/versions.py b/winstall/versions.py
+index 28a626d..7f85153 100644
+--- a/winstall/versions.py
++++ b/winstall/versions.py
+@@ -2,54 +2,172 @@
+ 
+ Windows 产品的版本号习惯是 ``major.minor.build.revision`` 四段十进制，
+ 末尾段可以省略（省略视作 0），并且允许 ``1.2.3.4-beta.1`` 这样的预发布标签。
++
++比较一律按**数值**进行，而不是按字符串：``1.10.0`` 高于 ``1.9.0``，
++``10.0.0`` 高于 ``2.0.0``。带预发布标签的版本低于同号的正式版。
+ """
+ 
++from __future__ import annotations
++
+ _STRIP = "vV"
+ 
++#: Windows 版本号的标准段数：major.minor.build.revision
++SEGMENT_COUNT = 4
++
++
++class _Segments(list):
++    """版本号的数字段（十进制整数，已补齐到 :data:`SEGMENT_COUNT` 段）。
++
++    行为与普通 ``list`` 完全一致，只是与等长的 ``list`` / ``tuple`` 都判为相等，
++    免得调用方为了写断言去关心返回的到底是哪一种序列。
++    """
++
++    __slots__ = ()
++
++    def __eq__(self, other):
++        if isinstance(other, (list, tuple)):
++            if len(self) != len(other):
++                return False
++            for mine, theirs in zip(self, other):
++                if mine != theirs:
++                    return False
++            return True
++        return NotImplemented
++
++    def __ne__(self, other):
++        result = self.__eq__(other)
++        if result is NotImplemented:
++            return result
++        return not result
++
++    def __hash__(self):
++        return hash(tuple(self))
++
++    def __repr__(self):
++        return repr(list(self))
++
+ 
+ def normalize(text):
+     """去掉可选的 ``v`` 前缀与首尾空白。"""
+     value = str(text).strip()
+-    while value[:1] in _STRIP:
+-        value = value[1:]
++    while value[:1] and value[:1] in _STRIP:
++        value = value[1:].strip()
+     return value
+ 
+ 
+ def split_version(text):
+-    """把版本号拆成 ``(数字部分, 预发布标签)``。"""
++    """把版本号拆成 ``(数字部分, 预发布标签)``。
++
++    ``+`` 之后的构建元数据不参与比较（与 SemVer 一致），直接丢弃。
++    """
+     value = normalize(text)
+     if "-" in value:
+         numbers, prerelease = value.split("-", 1)
+     else:
+         numbers, prerelease = value, ""
+-    return numbers, prerelease.strip()
++    numbers = numbers.split("+", 1)[0]
++    prerelease = prerelease.split("+", 1)[0]
++    return numbers.strip(), prerelease.strip()
++
++
++def _split_number(chunk):
++    """把一段拆成 ``(前导十进制数值, 余下的非数字尾巴)``。"""
++    text = str(chunk).strip()
++    index = 0
++    while index < len(text) and text[index].isdigit():
++        index += 1
++    head, tail = text[:index], text[index:]
++    return (int(head) if head else 0), tail
+ 
+ 
+ def parse_version(text):
+-    """把版本号拆成段列表。
++    """把版本号拆成十进制整数段列表。
+ 
+-    段之间用 ``.`` 分隔，不足四段的按原样返回（由调用方决定如何补齐）。
++    段之间用 ``.`` 分隔；不足 :data:`SEGMENT_COUNT` 段的在末尾补 0，
++    因此 ``parse_version("1.2")`` 与 ``parse_version("1.2.0.0")`` 相等。
++    预发布标签不参与数字段，段内的非数字尾巴被忽略。
+     """
+     numbers, _prerelease = split_version(text)
+-    return numbers.split(".")
++    segments = [_split_number(chunk)[0] for chunk in numbers.split(".")]
++    while len(segments) < SEGMENT_COUNT:
++        segments.append(0)
++    return _Segments(segments)
++
++
++def _number_keys(numbers):
++    """数字部分的比较键：每段 ``(数值, 非数字尾巴)``，补齐到同样长度。"""
++    keys = [_split_number(chunk) for chunk in numbers.split(".")]
++    while len(keys) < SEGMENT_COUNT:
++        keys.append((0, ""))
++    return keys
++
++
++def _compare_numbers(left, right):
++    left_keys = _number_keys(left)
++    right_keys = _number_keys(right)
++    width = max(len(left_keys), len(right_keys))
++    filler = (0, "")
++    left_keys += [filler] * (width - len(left_keys))
++    right_keys += [filler] * (width - len(right_keys))
++    for mine, theirs in zip(left_keys, right_keys):
++        if mine[0] != theirs[0]:
++            return 1 if mine[0] > theirs[0] else -1
++        if mine[1] != theirs[1]:
++            return 1 if mine[1] > theirs[1] else -1
++    return 0
++
++
++def _prerelease_key(label):
++    """预发布标签的比较键。
++
++    纯数字标识按数值比较，并且低于含字母的标识；标识多的一方更高
++    （前面的标识都相同时）。
++    """
++    keys = []
++    for chunk in label.split("."):
++        text = chunk.strip()
++        if not text:
++            keys.append((1, 0, ""))
++            continue
++        number, tail = _split_number(text)
++        if tail:
++            keys.append((1, 0, text))
++        else:
++            keys.append((0, number, ""))
++    return keys
++
++
++def _compare_prerelease(left, right):
++    left_keys = _prerelease_key(left)
++    right_keys = _prerelease_key(right)
++    for mine, theirs in zip(left_keys, right_keys):
++        if mine != theirs:
++            return 1 if mine > theirs else -1
++    if len(left_keys) == len(right_keys):
++        return 0
++    return 1 if len(left_keys) > len(right_keys) else -1
+ 
+ 
+ def compare_versions(left, right):
+     """比较两个版本号。
+ 
+-    返回 ``-1`` / ``0`` / ``1``。预发布版本低于同号的正式版。
++    返回 ``-1`` / ``0`` / ``1``。四段十进制数字按**数值**比较，缺失的段视作 0；
++    数字部分相同时，预发布版本低于正式版，两个预发布版本再按标签比较。
+     """
+     left_numbers, left_pre = split_version(left)
+     right_numbers, right_pre = split_version(right)
+-    if left_numbers == right_numbers:
+-        if left_pre == right_pre:
+-            return 0
+-        if not left_pre:
+-            return 1
+-        if not right_pre:
+-            return -1
+-        return 1 if left_pre > right_pre else -1
+-    return 1 if left_numbers > right_numbers else -1
++
++    order = _compare_numbers(left_numbers, right_numbers)
++    if order:
++        return order
++
++    if left_pre == right_pre:
++        return 0
++    if not left_pre:
++        return 1
++    if not right_pre:
++        return -1
++    return _compare_prerelease(left_pre, right_pre)
+ 
+ 
+ def is_upgrade(current, candidate):

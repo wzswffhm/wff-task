@@ -1,0 +1,675 @@
+diff --git a/wpublish/__init__.py b/wpublish/__init__.py
+index 01f23c2..ad0ed9a 100644
+--- a/wpublish/__init__.py
++++ b/wpublish/__init__.py
+@@ -1,7 +1,8 @@
+ """wpublish —— 把构建产物发布到 Windows 共享目录。
+ 
+ 发布时不仅要复制文件，还要把访问权限一并摆正：共享目录里的内容应当
+-对访问者只读，并且这个限制必须覆盖整个子树，而不只是根目录。
++对访问者只读，并且这个限制必须覆盖整个子树，而不只是根目录——既作用于
++发布时已经存在的条目，也通过继承标志作用于之后新建的条目。
+ """
+ 
+ from .errors import ICaclsError, WPublishError
+@@ -15,8 +16,33 @@ from .icacls import (
+     parse_aces,
+     run,
+ )
+-from .publish import READONLY_SPEC, all_principals, audit, explicit_grants, publish
+-from .rights import READ_RIGHTS, WRITE_RIGHTS, can_read, can_write, effective_rights
++from .principal import (
++    identity_keys,
++    name_to_sid,
++    normalize_principal,
++    same_principal,
++    sid_to_name,
++)
++from .publish import (
++    READONLY_SPEC,
++    WRITE_DENY_SPEC,
++    all_principals,
++    audit,
++    explicit_grants,
++    publish,
++)
++from .rights import (
++    READ_DENY_MASK,
++    READ_MASK,
++    READ_RIGHTS,
++    READ_SPECIFIC_RIGHTS,
++    WRITE_MASK,
++    WRITE_RIGHTS,
++    WRITE_SPECIFIC_RIGHTS,
++    can_read,
++    can_write,
++    effective_rights,
++)
+ 
+ __version__ = "1.9.0"
+ 
+@@ -24,8 +50,15 @@ __all__ = [
+     "Ace",
+     "ICaclsError",
+     "READONLY_SPEC",
++    "READ_DENY_MASK",
++    "READ_MASK",
++    "READ_RIGHTS",
++    "READ_SPECIFIC_RIGHTS",
++    "WRITE_DENY_SPEC",
+     "WPublishError",
++    "WRITE_MASK",
+     "WRITE_RIGHTS",
++    "WRITE_SPECIFIC_RIGHTS",
+     "all_principals",
+     "audit",
+     "can_read",
+@@ -35,9 +68,14 @@ __all__ = [
+     "effective_rights",
+     "explicit_grants",
+     "grant",
++    "identity_keys",
+     "list_aces",
+     "list_explicit_aces",
++    "name_to_sid",
++    "normalize_principal",
+     "parse_aces",
+     "publish",
+     "run",
++    "same_principal",
++    "sid_to_name",
+ ]
+diff --git a/wpublish/icacls.py b/wpublish/icacls.py
+index ed65e1f..3c499b3 100644
+--- a/wpublish/icacls.py
++++ b/wpublish/icacls.py
+@@ -5,6 +5,7 @@ NTFS 的访问控制列表（ACL）由若干访问控制项（ACE）组成，每
+ ``icacls`` 读写它们；这里把它包成可测试的接口。
+ """
+ 
++import os
+ import re
+ import subprocess
+ 
+@@ -13,12 +14,32 @@ from .errors import ICaclsError
+ #: icacls 可执行文件名。
+ ICACLS = "icacls"
+ 
+-#: 只在目录上有意义的继承标志，不参与权限集合。
+-_INHERITANCE_FLAGS = frozenset({"OI", "CI", "IO", "NP"})
++#: 只在目录上有意义的继承标志，不参与权限集合。``I`` 表示该项继承自父级。
++_INHERITANCE_FLAGS = frozenset({"OI", "CI", "IO", "NP", "I"})
+ 
+-_ACE_RE = re.compile(r"^\s*(.+?):((?:\([^)]*\))+)\s*$")
++#: 一条 ACE 行：``主体:(标志...)(权限...)``。
++#:
++#: 查询单个对象时 icacls 会把目标路径回显在**首条** ACE 的行首
++#: （``C:\data BUILTIN\Users:(RX)``），因此主体名要另外剥离。
++_ACE_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<head>.+?):(?P<flags>(?:\([^)]*\))+)[ \t]*$")
+ _TOKEN_RE = re.compile(r"\(([^)]*)\)")
+ 
++#: icacls 输出里的非 ACE 噪声行：进度信息与汇总信息。
++_NOISE_RE = re.compile(
++    r"^\s*(?:processed\s+(?:file|dir)\s*:|successfully\s+processed|failed\s+processing"
++    r"|acl\s+for\b|no\s+mapping\s+between)",
++    re.IGNORECASE,
++)
++
++#: Windows 路径的开头：盘符或 UNC。
++_PATH_HEAD_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
++#: 形如 ``S-1-5-32-546`` 的 SID。
++_SID_HEAD_RE = re.compile(r"^\*?S-\d+(?:-[0-9A-Za-z]+)*$")
++#: ``域\名字`` 形式的主体，其中不含冒号与第二个反斜杠。
++_DOMAIN_HEAD_RE = re.compile(r"^[^\\:/]+\\[^\\:/]+$")
++#: 众所周知的主体名，例如 ``Everyone``、``CREATOR OWNER``。
++_WELL_KNOWN_HEAD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _\-]*$")
++
+ 
+ class Ace(object):
+     """一条访问控制项。"""
+@@ -43,7 +64,7 @@ class Ace(object):
+ def run(path, *args):
+     """对 ``path`` 执行 icacls，返回标准输出。"""
+     cmd = [ICACLS, path] + [str(a) for a in args]
+-    proc = subprocess.run(cmd, capture_output=True, text=True)
++    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+     if proc.returncode != 0:
+         raise ICaclsError(
+             "icacls %s failed with %d: %s"
+@@ -52,19 +73,33 @@ def run(path, *args):
+     return proc.stdout
+ 
+ 
+-def parse_aces(output):
+-    """把 icacls 的输出解析成 :class:`Ace` 列表。"""
++def parse_aces(output, path=None):
++    """把 icacls 的输出解析成 :class:`Ace` 列表。
++
++    ``path`` 是产生这段输出的目标路径，可选。icacls 会把目标路径回显在首条
++    ACE 的行首，给出 ``path`` 就能准确剥掉它，只留下主体名；没有给出时按
++    输出自身的对齐与形状推断。
++    """
++    lines = [line for line in output.splitlines() if not _NOISE_RE.match(line)]
++    prefixes = _path_prefixes(path) if path else ()
++    indent = _continuation_indent(lines)
+     aces = []
+-    for line in output.splitlines():
++    for line in lines:
+         m = _ACE_RE.match(line)
+         if not m:
+             continue
+-        principal = m.group(1).strip()
+-        tokens = [t.strip().upper() for t in _TOKEN_RE.findall(m.group(2))]
++        principal = _principal_of(
++            m.group("head"), prefixes, indent, len(m.group("indent"))
++        )
++        tokens = []
++        for token in _TOKEN_RE.findall(m.group("flags")):
++            # 具体权限写成逗号列表，例如 ``(RD,WD)``，要拆成单个权限字母。
++            tokens.extend(t.strip().upper() for t in token.split(","))
++        tokens = [t for t in tokens if t]
+         deny = "DENY" in tokens
+         inherited = "I" in tokens
+         rights = {
+-            t for t in tokens if t and t not in _INHERITANCE_FLAGS and t not in ("DENY", "I")
++            t for t in tokens if t not in _INHERITANCE_FLAGS and t != "DENY"
+         }
+         if not rights:
+             continue
+@@ -73,22 +108,25 @@ def parse_aces(output):
+ 
+ 
+ def list_aces(path):
+-    """返回 ``path`` 上的全部访问控制项。"""
+-    return parse_aces(run(path))
++    """返回 ``path`` 上的全部访问控制项（含从父级继承来的）。"""
++    return parse_aces(run(path), path)
+ 
+ 
+ def list_explicit_aces(path):
+     """返回 ``path`` 上**显式设置**的访问控制项。
+ 
+-    从父目录继承来的项不算显式设置。
++    从父目录继承来的项不算显式设置：icacls 会给它们打上 ``(I)`` 标记，
++    审计时必须与显式项区分开，否则报告里会凭空多出一堆「显式授予」。
+     """
+-    return list_aces(path)
++    return [ace for ace in list_aces(path) if not ace.inherited]
+ 
+ 
+ def deny(path, principal, spec, recursive=False):
+     """在 ``path`` 上为主体添加一条拒绝项。
+ 
+-    ``spec`` 是 icacls 的权限说明，例如 ``"(OI)(CI)(RX)"``。
++    ``spec`` 是 icacls 的权限说明，例如 ``"(OI)(CI)(W)"``。
++    ``recursive`` 为真时加 ``/T``，把这一项下发到整棵子树；``spec`` 里的
++    继承标志 ``(OI)(CI)`` 则让它继续作用于之后新建的条目。
+     """
+     args = ["/deny", "%s:%s" % (principal, spec)]
+     if recursive:
+@@ -107,3 +145,79 @@ def grant(path, principal, spec, recursive=False):
+ def disable_inheritance(path):
+     """移除 ``path`` 上从父目录继承来的项。"""
+     return run(path, "/inheritance:r")
++
++
++def _path_prefixes(path):
++    """目标路径的各种等价写法，用于剥掉 icacls 回显的行首路径。"""
++    raw = str(path)
++    candidates = [raw]
++    try:
++        candidates.append(os.path.abspath(raw))
++    except (OSError, ValueError):
++        pass
++    prefixes = []
++    for candidate in candidates:
++        normalized = os.path.normpath(candidate)
++        for variant in (normalized, normalized + os.sep, candidate):
++            variant = variant.rstrip()
++            if variant and variant not in prefixes:
++                prefixes.append(variant)
++    # 长的在前，避免较短的前缀抢先匹配。
++    prefixes.sort(key=len, reverse=True)
++    return prefixes
++
++
++def _continuation_indent(lines):
++    """返回后续 ACE 行的缩进列；icacls 用它对齐首行的主体名。"""
++    indents = []
++    for line in lines:
++        m = _ACE_RE.match(line)
++        if not m:
++            continue
++        width = len(m.group("indent"))
++        if width:
++            indents.append(width)
++    return min(indents) if indents else None
++
++
++def _principal_of(head, prefixes, indent, col):
++    """从 ACE 行的行首部分取出主体名，剥掉 icacls 回显的目标路径。"""
++    text = head.strip()
++    lowered = text.lower()
++    for prefix in prefixes:
++        low = prefix.lower()
++        if lowered.startswith(low) and len(text) > len(low) and text[len(low)] in " \t":
++            rest = text[len(low):].strip()
++            if rest:
++                return rest
++    if not _PATH_HEAD_RE.match(text):
++        return text
++    # 真实输出里后续 ACE 行会对齐到首行主体名的起始列。
++    if indent is not None:
++        offset = indent - col
++        if 0 < offset < len(head) and head[offset - 1] in " \t":
++            rest = head[offset:].strip()
++            if rest and _looks_like_principal(rest):
++                return rest
++    return _guess_principal(text)
++
++
++def _looks_like_principal(text):
++    """``text`` 是否像一个安全主体（SID、``域\\名字`` 或众所周知的名字）。"""
++    if not text or ":" in text or "(" in text:
++        return False
++    return bool(
++        _SID_HEAD_RE.match(text)
++        or _DOMAIN_HEAD_RE.match(text)
++        or _WELL_KNOWN_HEAD_RE.match(text)
++    )
++
++
++def _guess_principal(text):
++    """没有路径信息时，按「第一个像主体的片段」切掉前缀路径。"""
++    parts = text.split(" ")
++    for index in range(1, len(parts)):
++        candidate = " ".join(parts[index:])
++        if _looks_like_principal(candidate):
++            return candidate
++    return text
+diff --git a/wpublish/principal.py b/wpublish/principal.py
+new file mode 100644
+index 0000000..e391123
+--- /dev/null
++++ b/wpublish/principal.py
+@@ -0,0 +1,224 @@
++"""安全主体（SID 与名字）的归一化与等价判定。
++
++``icacls`` 的输入与输出用的是两套写法：
++
++* 输入时数字 SID 必须带 ``*`` 前缀，例如 ``*S-1-5-32-546``；
++* 输出时能解析的 SID 会显示成友好名（``BUILTIN\\Guests``），解析不了的
++  则显示成不带星号的 ``S-1-5-32-546``。
++
++判定有效权限时必须把「同一个安全主体的不同写法」认成同一个，否则
++「按 SID 授权、按名字列出」永远对不上号，任何判定都会退化成「查无此人」。
++
++解析只在**本地范围**内进行（不跨域、不跨林）；任何一步失败都退回纯粹的
++字符串比较，因此断网环境、非 Windows 环境同样可以导入并使用本模块。
++"""
++
++import ctypes
++import functools
++import os
++import re
++
++try:  # pragma: no cover - 非 Windows 平台导入失败时退化为字符串比较
++    from ctypes import wintypes
++except Exception:  # pragma: no cover
++    wintypes = None
++
++#: 形如 ``S-1-5-32-546`` 的 SID 字符串（icacls 的输入形式带 ``*`` 前缀）。
++SID_RE = re.compile(r"^\*?S-\d+(?:-[0-9A-Za-z]+)*$")
++
++#: 账号名 / 域名缓冲区大小。
++_MAX_ACCOUNT = 1024
++
++#: SID 的二进制缓冲区大小（远大于 SECURITY_MAX_SID_SIZE = 68）。
++_MAX_SID_BYTES = 256
++
++#: ``_load_api`` 的缓存：``None`` 表示尚未初始化，``False`` 表示不可用。
++_api = None
++
++
++def _load_api():
++    """惰性载入 advapi32 / kernel32；不可用时返回 ``None``。"""
++    global _api
++    if _api is not None:
++        return _api or None
++    try:
++        if os.name != "nt" or wintypes is None:
++            _api = False
++            return None
++        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
++        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++        advapi32.ConvertStringSidToSidW.argtypes = [
++            wintypes.LPCWSTR,
++            ctypes.POINTER(ctypes.c_void_p),
++        ]
++        advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
++
++        advapi32.ConvertSidToStringSidW.argtypes = [
++            ctypes.c_void_p,
++            ctypes.POINTER(ctypes.c_wchar_p),
++        ]
++        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
++
++        advapi32.LookupAccountSidW.argtypes = [
++            wintypes.LPCWSTR,
++            ctypes.c_void_p,
++            wintypes.LPWSTR,
++            ctypes.POINTER(wintypes.DWORD),
++            wintypes.LPWSTR,
++            ctypes.POINTER(wintypes.DWORD),
++            ctypes.POINTER(wintypes.DWORD),
++        ]
++        advapi32.LookupAccountSidW.restype = wintypes.BOOL
++
++        advapi32.LookupAccountNameW.argtypes = [
++            wintypes.LPCWSTR,
++            wintypes.LPCWSTR,
++            ctypes.c_void_p,
++            ctypes.POINTER(wintypes.DWORD),
++            wintypes.LPWSTR,
++            ctypes.POINTER(wintypes.DWORD),
++            ctypes.POINTER(wintypes.DWORD),
++        ]
++        advapi32.LookupAccountNameW.restype = wintypes.BOOL
++
++        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
++        kernel32.LocalFree.restype = ctypes.c_void_p
++
++        _api = (advapi32, kernel32)
++    except Exception:
++        _api = False
++    return _api or None
++
++
++def is_sid(text):
++    """``text`` 是否是 SID 字符串（允许 icacls 输入形式的 ``*`` 前缀）。"""
++    return bool(SID_RE.match(str(text or "").strip()))
++
++
++def normalize_principal(principal):
++    """归一化主体写法：去空白、去掉数字 SID 的 ``*`` 前缀、统一大写。"""
++    text = str(principal or "").strip()
++    if text.startswith("*"):
++        text = text[1:].strip()
++    return text.upper()
++
++
++@functools.lru_cache(maxsize=1024)
++def sid_to_name(sid):
++    """把 ``S-1-5-32-546`` 解析成 ``BUILTIN\\Guests``；失败返回 ``None``。"""
++    text = normalize_principal(sid)
++    api = _load_api()
++    if api is None or not text or not is_sid(text):
++        return None
++    advapi32, kernel32 = api
++    psid = ctypes.c_void_p()
++    try:
++        if not advapi32.ConvertStringSidToSidW(text, ctypes.byref(psid)):
++            return None
++        name = ctypes.create_unicode_buffer(_MAX_ACCOUNT)
++        domain = ctypes.create_unicode_buffer(_MAX_ACCOUNT)
++        name_len = wintypes.DWORD(_MAX_ACCOUNT)
++        domain_len = wintypes.DWORD(_MAX_ACCOUNT)
++        use = wintypes.DWORD(0)
++        ok = advapi32.LookupAccountSidW(
++            None,
++            psid,
++            name,
++            ctypes.byref(name_len),
++            domain,
++            ctypes.byref(domain_len),
++            ctypes.byref(use),
++        )
++        if not ok or not name.value:
++            return None
++        if domain.value:
++            return ("%s\\%s" % (domain.value, name.value)).upper()
++        return name.value.upper()
++    except Exception:
++        return None
++    finally:
++        if psid:
++            try:
++                kernel32.LocalFree(psid)
++            except Exception:
++                pass
++
++
++@functools.lru_cache(maxsize=1024)
++def name_to_sid(name):
++    """把 ``BUILTIN\\Guests`` 解析成 ``S-1-5-32-546``；失败返回 ``None``。"""
++    text = normalize_principal(name)
++    api = _load_api()
++    if api is None or not text or is_sid(text):
++        return None
++    advapi32, kernel32 = api
++    sid = ctypes.create_string_buffer(_MAX_SID_BYTES)
++    sid_len = wintypes.DWORD(_MAX_SID_BYTES)
++    domain = ctypes.create_unicode_buffer(_MAX_ACCOUNT)
++    domain_len = wintypes.DWORD(_MAX_ACCOUNT)
++    use = wintypes.DWORD(0)
++    text_p = ctypes.c_wchar_p()
++    try:
++        ok = advapi32.LookupAccountNameW(
++            None,
++            text,
++            sid,
++            ctypes.byref(sid_len),
++            domain,
++            ctypes.byref(domain_len),
++            ctypes.byref(use),
++        )
++        if not ok:
++            return None
++        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text_p)):
++            return None
++        value = text_p.value
++        return value.upper() if value else None
++    except Exception:
++        return None
++    finally:
++        if text_p.value is not None:
++            try:
++                kernel32.LocalFree(text_p)
++            except Exception:
++                pass
++
++
++@functools.lru_cache(maxsize=1024)
++def identity_keys(principal):
++    """返回 ``principal`` 的全部等价写法（大写），解析失败时只有原写法。"""
++    text = normalize_principal(principal)
++    if not text:
++        return frozenset()
++    keys = {text}
++    try:
++        if is_sid(text):
++            name = sid_to_name(text)
++            if name:
++                keys.add(name)
++        else:
++            sid = name_to_sid(text)
++            if sid:
++                keys.add(sid)
++                name = sid_to_name(sid)
++                if name:
++                    keys.add(name)
++    except Exception:
++        pass
++    return frozenset(keys)
++
++
++def same_principal(left, right):
++    """``left`` 与 ``right`` 是否指向同一个安全主体。
++
++    兼容 icacls 的输入形式（``*S-1-5-32-546``）与输出形式
++    （``BUILTIN\\Guests`` 或 ``S-1-5-32-546``），大小写不敏感。
++    """
++    a = normalize_principal(left)
++    b = normalize_principal(right)
++    if not a or not b:
++        return False
++    if a == b:
++        return True
++    return bool(identity_keys(a) & identity_keys(b))
+diff --git a/wpublish/publish.py b/wpublish/publish.py
+index 94e733c..654eecd 100644
+--- a/wpublish/publish.py
++++ b/wpublish/publish.py
+@@ -1,23 +1,40 @@
+-"""把构建产物发布到共享目录。"""
++"""把构建产物发布到共享目录。
++
++发布 = 复制目录树 + 下发权限，而权限必须覆盖**整棵子树**：
++
++* ``/T``（``recursive=True``）作用于发布时已经存在的目录与文件；
++* 权限说明里的继承标志 ``(OI)(CI)`` 作用于发布之后才新建的条目。
++
++两者缺一不可：只设根目录，子目录与子文件照样能被改写；不带继承标志，
++之后新生成的文件完全不受限制。
++"""
+ 
+ import os
+ import shutil
+ 
+-from .icacls import deny, list_aces, list_explicit_aces
++from .icacls import deny, grant, list_aces, list_explicit_aces
+ from .rights import can_write
+ 
+ #: 只读发布时授给访问者的权限（对象继承 + 容器继承 + 读取执行）。
+ READONLY_SPEC = "(OI)(CI)(RX)"
+ 
++#: 只读发布时拒绝访问者的权限（对象继承 + 容器继承 + 写入）。
++#:
++#: 继承标志让这条拒绝项继续作用于子树里之后新建的条目。
++WRITE_DENY_SPEC = "(OI)(CI)(W)"
++
+ 
+ def publish(src_dir, dst_dir, principal):
+     """把 ``src_dir`` 发布到 ``dst_dir``。
+ 
+-    目标目录会被创建；``principal`` 在整个子树内只读。
++    目标目录会被创建；``principal`` 在整个子树内只读：既能读，又改不动，
++    而且这个限制同时覆盖发布时已存在的条目与之后新建的条目。
+     返回已发布的根目录。
+     """
+     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+-    deny(dst_dir, principal, READONLY_SPEC)
++    # 先授读、再拒写：显式拒绝优先，最终效果就是只读。
++    grant(dst_dir, principal, READONLY_SPEC, recursive=True)
++    deny(dst_dir, principal, WRITE_DENY_SPEC, recursive=True)
+     return dst_dir
+ 
+ 
+@@ -33,7 +50,11 @@ def audit(dst_dir, principal):
+ 
+ 
+ def explicit_grants(path):
+-    """返回 ``path`` 上显式设置的允许项主体集合。"""
++    """返回 ``path`` 上显式设置的允许项主体集合。
++
++    从父目录继承来的项不算显式设置，否则审计报告里会凭空多出一堆
++    「显式授予」条目，运维无法据此判断谁改过权限。
++    """
+     return sorted({a.principal for a in list_explicit_aces(path) if not a.deny})
+ 
+ 
+diff --git a/wpublish/rights.py b/wpublish/rights.py
+index 5caae85..0017299 100644
+--- a/wpublish/rights.py
++++ b/wpublish/rights.py
+@@ -1,10 +1,18 @@
+-"""有效权限判定。
++r"""有效权限判定。
+ 
+ Windows 的访问控制模型里，**显式拒绝优先于允许**：只要有一条拒绝项命中，
+ 该权限就是不予授予，哪怕同时存在允许项。
++
++判定时还要注意两点：
++
++* 拒绝项与允许项都可能是从父目录继承来的，它们同样参与有效权限的计算，
++  因此这里看的是 :func:`wpublish.icacls.list_aces` 而不只是显式项；
++* 同一个安全主体在 icacls 的输入与输出里写法不同（``*S-1-5-32-546`` 与
++  ``BUILTIN\Guests``），比对时用 :func:`wpublish.principal.same_principal`。
+ """
+ 
+ from .icacls import list_aces
++from .principal import same_principal
+ 
+ #: 表示「可写」的权限字母。
+ WRITE_RIGHTS = frozenset({"W", "M", "F"})
+@@ -12,30 +20,59 @@ WRITE_RIGHTS = frozenset({"W", "M", "F"})
+ #: 表示「可读」的权限字母（写与完全控制都隐含读）。
+ READ_RIGHTS = frozenset({"R", "RX", "F", "M", "W"})
+ 
++#: 具体权限（icacls 括号里的逗号列表）中意味着「可写」的那些。
++WRITE_SPECIFIC_RIGHTS = frozenset({"GA", "GW", "WD", "AD", "WEA", "WA"})
++
++#: 具体权限中意味着「可读」的那些。
++READ_SPECIFIC_RIGHTS = frozenset({"GA", "GR", "RD", "REA"})
++
++#: 判定「可写」时真正要看的权限集合。
++WRITE_MASK = frozenset(WRITE_RIGHTS | WRITE_SPECIFIC_RIGHTS)
++
++#: 判定「可读」时真正要看的权限集合。
++READ_MASK = frozenset(READ_RIGHTS | READ_SPECIFIC_RIGHTS)
++
++#: 被拒绝时会挡住「读」的权限集合。
++#:
++#: 单纯拒绝写（``W``、``WD`` 之类）并不影响读取——只读发布正是这么做的，
++#: 所以写权限不算在这里面。
++READ_DENY_MASK = frozenset({"R", "RX", "M", "F", "GR", "GA", "RD", "REA"})
++
+ 
+ def effective_rights(path, principal):
+-    """返回 ``principal`` 在 ``path`` 上被允许与被拒绝的权限集合。"""
++    """返回 ``principal`` 在 ``path`` 上被允许与被拒绝的权限集合。
++
++    继承来的项与显式设置的项都算数：有效权限看的是最终生效的 ACL。
++    """
+     allow = set()
+     deny = set()
+     for ace in list_aces(path):
+-        if ace.principal.upper() != principal.upper():
++        if not same_principal(ace.principal, principal):
+             continue
+         if ace.deny:
+-            deny |= ace.rights
++            deny |= set(ace.rights)
+         else:
+-            allow |= ace.rights
++            allow |= set(ace.rights)
+     return allow, deny
+ 
+ 
+ def can_write(path, principal):
+-    """``principal`` 能否在 ``path`` 上写入。"""
+-    allow, _deny = effective_rights(path, principal)
+-    return bool(allow & WRITE_RIGHTS)
++    """``principal`` 能否在 ``path`` 上写入。
++
++    显式拒绝优先：命中写相关的拒绝项就不予授予，哪怕同时存在允许项。
++    """
++    allow, deny = effective_rights(path, principal)
++    if deny & WRITE_MASK:
++        return False
++    return bool(allow & WRITE_MASK)
+ 
+ 
+ def can_read(path, principal):
+-    """``principal`` 能否在 ``path`` 上读取。"""
++    """``principal`` 能否在 ``path`` 上读取。
++
++    同样是显式拒绝优先，但只有挡住读的拒绝项才算数：拒绝写不影响读取。
++    """
+     allow, deny = effective_rights(path, principal)
+-    if deny & READ_RIGHTS:
++    if deny & READ_DENY_MASK:
+         return False
+-    return bool(allow & READ_RIGHTS)
++    return bool(allow & READ_MASK)

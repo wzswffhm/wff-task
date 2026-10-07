@@ -1,0 +1,146 @@
+diff --git a/wjob/psrun.py b/wjob/psrun.py
+index ac72d44..0a96c5b 100644
+--- a/wjob/psrun.py
++++ b/wjob/psrun.py
+@@ -4,6 +4,16 @@
+ 决定要不要继续。PowerShell 的退出码语义与 bash 不同：**非终止错误不会改变
+ 退出码**，原生命令的退出码也只保存在 ``$LASTEXITCODE`` 里而不会自动成为
+ PowerShell 进程的退出码。要把一个步骤的成败如实带出来，必须显式处理。
++
++本模块用 :func:`wrap_script` 给调用方的脚本套一层很薄的外壳，脚本跑完之后：
++
++* 优先采用原生命令（``.exe``）留在 ``$LASTEXITCODE`` 里的退出码；
++* 没有原生命令退出码、但脚本期间产生过错误记录（``$Error`` 非空）时，
++  返回 :data:`SCRIPT_ERROR_EXIT_CODE`；
++* 一切正常时返回 ``0``。
++
++脚本自己写的 ``exit`` 依旧优先——外壳后缀根本不会执行到。
++PowerShell 的错误流也会被完整采集进 :attr:`PSResult.stderr`，不再被丢弃。
+ """
+ 
+ import os
+@@ -19,6 +29,40 @@ POWERSHELL = "powershell.exe"
+ #: 兜底搜索用的可执行文件名。
+ FALLBACKS = ("pwsh.exe", "powershell")
+ 
++#: 脚本自身出错（``Write-Error``、访问不存在的路径等）但原生命令没有给出
++#: 退出码时使用的退出码。
++SCRIPT_ERROR_EXIT_CODE = 1
++
++#: 采集 PowerShell 输出时使用的编码。
++#:
++#: 外壳会把 ``[Console]::OutputEncoding`` 固定成 UTF-8，输出内容因此不再依赖
++#: 宿主机的代码页；``errors="replace"`` 保证万一设置失败也只是出现替换字符，
++#: 而不会抛 :class:`UnicodeDecodeError`。
++ENCODING = "utf-8"
++
++#: 外壳前缀：固定输出编码，并清空历史错误记录，只统计本次脚本产生的错误。
++#:
++#: 编码设置包在 ``try``/``catch`` 里，因为在没有控制台的宿主环境下它可能失败；
++#: ``$Error.Clear()`` 紧随其后，这样外壳自身不会污染后面的错误计数。
++_PRELUDE = "\n".join(
++    (
++        "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }",
++        "$Error.Clear()",
++    )
++)
++
++#: 外壳后缀：把真实的成败换算成进程退出码。
++_EPILOGUE = "\n".join(
++    (
++        "$__wjob_errors = $Error.Count",
++        "$__wjob_code = $LASTEXITCODE",
++        "if ($null -eq $__wjob_code) { $__wjob_code = 0 }",
++        "if ($__wjob_code -eq 0 -and $__wjob_errors -gt 0) { $__wjob_code = %d }"
++        % SCRIPT_ERROR_EXIT_CODE,
++        "exit ([int]$__wjob_code)",
++    )
++)
++
+ 
+ def find_powershell():
+     """返回可用的 PowerShell 可执行文件路径。"""
+@@ -41,26 +85,70 @@ def _base_argv():
+     ]
+ 
+ 
+-def run_script(script, timeout=None):
+-    """执行一段 PowerShell ``script``，返回 :class:`PSResult`。"""
++def _child_environment():
++    """返回子进程环境：继承当前环境，并关掉 ANSI 颜色以保证日志可读。"""
++    env = dict(os.environ)
++    env.setdefault("NO_COLOR", "1")
++    return env
++
++
++def wrap_script(script):
++    """返回带「退出码外壳」的完整脚本文本。
++
++    调用方的脚本被放进 ``& { ... }`` 里执行：这样既不会改变 ``$LASTEXITCODE``
++    与 ``$Error`` 这些全局状态的可见性，又能让报错信息只指向脚本自己那一行，
++    而不是把整段外壳文本一起打进错误流。
++    """
++    if script is None:
++        script = ""
++    return "%s\n& {\n%s\n}\n%s\n" % (_PRELUDE, script, _EPILOGUE)
++
++
++def quote_path(path):
++    """把 ``path`` 转成可以安全嵌入 PowerShell 的单引号字面量。"""
++    return "'" + str(path).replace("'", "''") + "'"
++
++
++def _invoke(argv, timeout=None):
++    """启动 PowerShell，并把退出码、标准输出与错误流装进 :class:`PSResult`。"""
+     proc = subprocess.run(
+-        _base_argv() + ["-Command", script],
++        argv,
+         capture_output=True,
+-        text=True,
++        encoding=ENCODING,
++        errors="replace",
++        env=_child_environment(),
+         timeout=timeout,
+     )
+-    return PSResult(exit_code=proc.returncode, stdout=proc.stdout, stderr="")
++    return PSResult(
++        exit_code=proc.returncode,
++        stdout=proc.stdout or "",
++        stderr=proc.stderr or "",
++    )
++
++
++def run_script(script, timeout=None):
++    """执行一段 PowerShell ``script``，返回 :class:`PSResult`。
++
++    返回的 ``exit_code`` 如实反映脚本的执行结果：
++
++    * 脚本里原生命令（``.exe``）的非零退出码会被上传，例如
++      ``cmd /c exit 3`` 得到 ``3``；
++    * 脚本里的非终止错误（``Write-Error``、访问不存在的路径等）会得到非零
++      退出码，而不再被吞成 ``0``；
++    * 一切正常时为 ``0``，标准输出不受影响。
++
++    错误流内容保存在 ``result.stderr`` 中。
++    """
++    return _invoke(_base_argv() + ["-Command", wrap_script(script)], timeout=timeout)
+ 
+ 
+ def run_file(path, timeout=None):
+-    """执行一个 ``.ps1`` 文件，返回 :class:`PSResult`。"""
+-    proc = subprocess.run(
+-        _base_argv() + ["-File", path],
+-        capture_output=True,
+-        text=True,
+-        timeout=timeout,
+-    )
+-    return PSResult(exit_code=proc.returncode, stdout=proc.stdout, stderr="")
++    """执行一个 ``.ps1`` 文件，返回 :class:`PSResult`。
++
++    退出码、标准输出与错误流的语义与 :func:`run_script` 完全一致。
++    """
++    body = "& %s" % quote_path(os.path.abspath(path))
++    return _invoke(_base_argv() + ["-Command", wrap_script(body)], timeout=timeout)
+ 
+ 
+ def environment_info():

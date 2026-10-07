@@ -1,0 +1,21 @@
+修复了 `wregconfig` 在 WOW64 注册表视图与配置节删除上的三处缺陷，只改动了包内实现代码（`wregconfig/views.py`、`wregconfig/store.py`），未触碰 tests/，也未留下任何临时文件（__pycache__ 已清理，验证脚本只在系统临时目录/一次性 `python -c` 中执行）。
+
+改动内容：
+
+1. `wregconfig/views.py` — `view_flags()`
+   - 原来只有 `"64"` 返回 `KEY_WOW64_64KEY`，`"32"` 落到 `return 0`，即静默退回进程默认视图（64 位进程 → 64 位视图），导致 32 位程序写下的配置永远读不到、两个视图各写各的。
+   - 现在 `"32"` 返回 `winreg.KEY_WOW64_32KEY`，`"64"` 仍返回 `KEY_WOW64_64KEY`，`"default"` 仍返回 `0`（进程默认视图）。签名、`VIEWS`、`view_description` 均未变；同时更新了模块/函数文档中错误的说明。
+
+2. `wregconfig/store.py` — 视图一致性
+   - `exists()` / `names()` / `read()` / `write()` / `delete()` 都通过 `_open()`/`_create()` 走 `access | self.flags`，修好 `view_flags` 后存在性判定与读写自然落在同一个视图内（`"32"` 视图写入的值在 64/default 视图不可见，反之亦然）。公开签名与异常语义保持不变（缺失值仍抛 `ConfigError`，`read(default=...)` 仍返回默认值）。
+
+3. `wregconfig/store.py` — `delete_tree()`
+   - 原实现是 `winreg.DeleteKey(self.hive, self.path)`：不带 WOW64 标志（清不掉另一个视图的残留），遇到有子键的节直接失败（`RegDeleteKey/RegDeleteKeyEx` 对含子键的键返回 ERROR_ACCESS_DENIED），也没有返回值。
+   - 新实现先用同视图的 `exists()` 判断此前是否存在，再递归 `_delete_subtree()` 删除全部子键（枚举索引 0 + 递归，`ERROR_NO_MORE_ITEMS` 时结束），最后按键删除；返回“该节此前是否存在”（不存在时安静返回 `False`，不抛错）。
+   - 删除时的视图掩码单独处理：`"32"`/`"64"` 用 `winreg.DeleteKeyEx(hive, path, KEY_WOW64_32KEY|KEY_WOW64_64KEY, 0)`（`RegDeleteKeyEx` 只接受单一 WOW64 掩码，不接受 0 或两者同时置位）；`"default"` 仍用 `winreg.DeleteKey`，以保持“进程默认视图”的语义。
+
+验证（在沙箱 x64 Windows + 管理员权限的真实注册表上，全部使用一次性命令）：
+- `view="32"` 写入后可用 `view="32"` 读回；`view="64"`/`default` 读不到；`default` 写入的值 `view="64"` 可读、`view="32"` 不可读；`exists()` 结果为 32=True / 64=False / default=False。
+- 三层子键（`sub\deep\c`）+ 值的配置节：`delete_tree()` 返回 `True`，之后 `exists()` 与子节 `exists()` 均为 `False`，再次 `delete_tree()` 返回 `False`；32 位视图下含残留子键的父节也能被 `delete_tree()` 正确清除（原实现此处会 PermissionError）。
+- 仓库自带测试 `python -m pytest tests/ -q` → 6 passed。
+- `git status` 仅显示 `wregconfig/store.py`、`wregconfig/views.py` 两处修改。

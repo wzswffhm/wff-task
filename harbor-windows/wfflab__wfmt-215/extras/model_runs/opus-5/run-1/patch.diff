@@ -1,0 +1,366 @@
+diff --git a/analyze.py b/analyze.py
+new file mode 100644
+index 0000000..360d061
+--- /dev/null
++++ b/analyze.py
+@@ -0,0 +1,47 @@
++import struct
++import zlib
++
++# Read sample
++data = open('assets/sample.wfmt', 'rb').read()
++print(f'Total length: {len(data)} bytes\n')
++
++# Parse header
++magic = data[0:4]
++version = data[4]
++count_le = struct.unpack('<I', data[5:9])[0]
++count_be = struct.unpack('>I', data[5:9])[0]
++
++print(f'Magic: {magic}')
++print(f'Version: {version}')
++print(f'Count (little-endian): {count_le}')
++print(f'Count (big-endian): {count_be}')
++
++# Check CRC
++body = data[:-4]
++crc_bytes = data[-4:]
++crc_stored = struct.unpack('<I', crc_bytes)[0]
++crc_std = zlib.crc32(body) & 0xFFFFFFFF
++
++print(f'\nLast 4 bytes (CRC): {crc_bytes.hex()}')
++print(f'Stored CRC: 0x{crc_stored:08x}')
++print(f'Standard CRC-32: 0x{crc_std:08x}')
++print(f'Match: {crc_stored == crc_std}')
++
++# Look at records area
++print(f'\nBytes after header:')
++pos = 9
++for i in range(min(80, len(data) - 9)):
++    if i % 16 == 0:
++        print(f'  {pos+i:3d}: ', end='')
++    b = data[pos + i]
++    print(f'{b:02x} ', end='')
++    if (i + 1) % 16 == 0:
++        print()
++if (len(data) - 9) % 16 != 0:
++    print()
++
++# Test varint decoding
++print(f'\nTesting varint at position 9:')
++print(f'  Byte: 0x{data[9]:02x} = {data[9]}')
++print(f'  Has continuation bit: {bool(data[9] & 0x80)}')
++print(f'  Value bits: {data[9] & 0x7f}')
+diff --git a/check_lengths.py b/check_lengths.py
+new file mode 100644
+index 0000000..53f756f
+--- /dev/null
++++ b/check_lengths.py
+@@ -0,0 +1,25 @@
++data = open('assets/sample.wfmt', 'rb').read()
++
++# Look at bytes around position 20
++print('Bytes 20-35:')
++for i in range(20, 36):
++    b = data[i]
++    print(f'{i}: 0x{b:02x} = {b:3d}  bin={b:08b}  varint_bits={b & 0x7F} cont={(b & 0x80) >> 7}')
++
++# Try alternative interpretation: maybe length is 0xac alone (without 0x02)?
++print()
++print('If length at 21 is just 0xac (172) with no multi-byte:')
++print('  Payload would be 22-194')
++print('  Next record would start at 194')
++print()
++
++# Decode 0xac 0x02 as varint
++val = (0xac & 0x7f) | ((0x02 & 0x7f) << 7)
++print(f'0xac 0x02 as varint: {val}')
++
++# Or maybe it's little-endian u16?
++import struct
++len_le = struct.unpack('<H', data[21:23])[0]
++len_be = struct.unpack('>H', data[21:23])[0]
++print(f'If bytes 21-22 are little-endian u16: {len_le}')
++print(f'If bytes 21-22 are big-endian u16: {len_be}')
+diff --git a/debug_test.py b/debug_test.py
+new file mode 100644
+index 0000000..c5b788c
+--- /dev/null
++++ b/debug_test.py
+@@ -0,0 +1,31 @@
++import sys
++sys.path.insert(0, '.')
++import wfmt
++import struct
++
++# Test current implementation
++data = open('assets/sample.wfmt', 'rb').read()
++print('Sample file length:', len(data))
++print('First 30 bytes:', repr(data[:30]))
++print('Last 10 bytes:', repr(data[-10:]))
++
++# Parse header manually
++magic = data[0:4]
++version = data[4]
++count_be = struct.unpack('>I', data[5:9])[0]
++print(f'\nHeader: magic={magic}, version={version}, count={count_be}')
++
++# Try to verify
++result = wfmt.verify(data)
++print('\nverify() result:', result)
++
++# Try to unpack
++try:
++    records = wfmt.unpack(data)
++    print('unpack() succeeded with', len(records), 'records')
++    for i, (tag, payload) in enumerate(records):
++        print(f'  Record {i}: tag={tag}, payload_len={len(payload)}, preview={payload[:20]}')
++except Exception as e:
++    print('unpack() failed:', type(e).__name__, str(e))
++    import traceback
++    traceback.print_exc()
+diff --git a/decode_all.py b/decode_all.py
+new file mode 100644
+index 0000000..5d1b48c
+--- /dev/null
++++ b/decode_all.py
+@@ -0,0 +1,51 @@
++data = open('assets/sample.wfmt', 'rb').read()
++print('File size:', len(data))
++print()
++
++# Manual parse with proper varint
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while True:
++        if pos >= len(data):
++            return None, pos
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if not (byte & 0x80):
++            return result, pos
++        shift += 7
++
++pos = 9
++rec_num = 0
++while pos < len(data) - 4:  # Stop before CRC
++    start_pos = pos
++    tag, pos = decode_varint(data, pos)
++    if tag is None:
++        break
++    length, pos = decode_varint(data, pos)
++    if length is None:
++        break
++    payload_start = pos
++    payload_end = pos + length
++    
++    print(f'Record {rec_num}:')
++    print(f'  Position: {start_pos}')
++    print(f'  Tag: {tag}')
++    print(f'  Length: {length}')
++    print(f'  Payload range: {payload_start}-{payload_end}')
++    if payload_end <= len(data) - 4:
++        payload = data[pos:payload_end]
++        print(f'  Payload preview: {repr(payload[:40])}')
++        pos = payload_end
++    else:
++        print(f'  ERROR: Payload extends past CRC boundary!')
++        break
++    
++    rec_num += 1
++    if rec_num > 10:
++        break
++
++print()
++print(f'Final position: {pos}')
++print(f'CRC position: {len(data) - 4}')
+diff --git a/inspect.py b/inspect.py
+new file mode 100644
+index 0000000..2b5c9c2
+--- /dev/null
++++ b/inspect.py
+@@ -0,0 +1,6 @@
++data = open('assets/sample.wfmt', 'rb').read()
++print('Byte-by-byte inspection around position 15-35:')
++for i in range(14, 35):
++    b = data[i]
++    char = chr(b) if 32 <= b < 127 else '.'
++    print(f'{i:3d}: 0x{b:02x} = {b:3d}  \'{char}\'')
+diff --git a/parse_records.py b/parse_records.py
+new file mode 100644
+index 0000000..0cee8d9
+--- /dev/null
++++ b/parse_records.py
+@@ -0,0 +1,25 @@
++def decode_varint_proper(data, pos):
++    result = 0
++    shift = 0
++    while True:
++        if pos >= len(data):
++            raise ValueError('truncated')
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if not (byte & 0x80):
++            return result, pos
++        shift += 7
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++# Parse records manually
++pos = 9
++for i in range(5):
++    tag, pos = decode_varint_proper(data, pos)
++    length, pos = decode_varint_proper(data, pos)
++    payload = data[pos:pos+length]
++    pos += length
++    print(f'Record {i}: tag={tag}, len={length}, payload={repr(payload[:30])}')
++    
++print(f'\nEnded at position {pos}, file has {len(data)} bytes, CRC starts at {len(data)-4}')
+diff --git a/test_alignment.py b/test_alignment.py
+new file mode 100644
+index 0000000..5691477
+--- /dev/null
++++ b/test_alignment.py
+@@ -0,0 +1,42 @@
++data = open('assets/sample.wfmt', 'rb').read()
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while pos < len(data):
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if not (byte & 0x80):
++            return result, pos
++        shift += 7
++    return None, pos
++
++def align_up(pos, align):
++    return (pos + align - 1) // align * align
++
++# Parse with 4-byte alignment
++pos = 9
++ALIGN = 4
++for i in range(5):
++    print(f'Record {i} at position {pos}:')
++    tag, pos = decode_varint(data, pos)
++    length, pos = decode_varint(data, pos)
++    payload = data[pos:pos+length]
++    pos += length
++    
++    print(f'  Tag: {tag}, Length: {length}')
++    print(f'  Payload: {repr(payload[:40])}')
++    print(f'  End position (before align): {pos}')
++    
++    # Apply alignment
++    aligned_pos = align_up(pos, ALIGN)
++    print(f'  Aligned position: {aligned_pos}')
++    pos = aligned_pos
++    print()
++    
++    if pos >= len(data) - 4:
++        break
++
++print(f'Final position: {pos}')
++print(f'CRC starts at: {len(data) - 4}')
+diff --git a/test_mixed.py b/test_mixed.py
+new file mode 100644
+index 0000000..954b991
+--- /dev/null
++++ b/test_mixed.py
+@@ -0,0 +1,51 @@
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while pos < len(data):
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if not (byte & 0x80):
++            return result, pos
++        shift += 7
++    return None, pos
++
++def align_up(pos, align):
++    return (pos + align - 1) // align * align
++
++# Parse with tag=varint, length=u32 LE
++pos = 9
++ALIGN = 4
++for i in range(6):
++    print(f'Record {i} at position {pos}:')
++    tag, pos = decode_varint(data, pos)
++    if pos + 4 > len(data) - 4:
++        print(f'  Not enough data for length')
++        break
++    length = struct.unpack('<I', data[pos:pos+4])[0]
++    pos += 4
++    
++    if pos + length > len(data) - 4:
++        print(f'  Tag: {tag}, Length: {length} (would overflow!)')
++        break
++        
++    payload = data[pos:pos+length]
++    pos += length
++    
++    print(f'  Tag: {tag}, Length: {length}')
++    print(f'  Payload: {repr(payload[:40])}')
++    
++    # Apply alignment
++    aligned_pos = align_up(pos, ALIGN)
++    print(f'  Position after alignment: {aligned_pos}')
++    pos = aligned_pos
++    print()
++    
++    if pos >= len(data) - 4:
++        break
++
++print(f'Final position: {pos}, CRC at: {len(data) - 4}')
+diff --git a/test_u8.py b/test_u8.py
+new file mode 100644
+index 0000000..2cfd5b3
+--- /dev/null
++++ b/test_u8.py
+@@ -0,0 +1,34 @@
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++# Maybe lengths are encoded as little-endian u32 instead of varint?
++print('Testing if tag+length are each 1 byte:')
++print()
++
++pos = 9
++for i in range(5):
++    print(f'Record {i} at position {pos}:')
++    
++    # Read tag as u8
++    tag = data[pos]
++    pos += 1
++    print(f'  Tag (u8): {tag}')
++    
++    # Read length as u8
++    length = data[pos]
++    pos += 1
++    print(f'  Length (u8): {length}')
++    
++    # Read payload
++    if pos + length <= len(data) - 4:
++        payload = data[pos:pos+length]
++        print(f'  Payload: {repr(payload[:40])}')
++        pos += length
++    else:
++        print(f'  ERROR: Payload would exceed bounds')
++        break
++    print()
++
++print(f'Final position: {pos}')
++print(f'CRC starts at: {len(data) - 4}')

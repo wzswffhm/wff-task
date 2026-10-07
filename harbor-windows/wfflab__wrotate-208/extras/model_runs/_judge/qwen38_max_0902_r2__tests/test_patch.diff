@@ -1,0 +1,131 @@
+diff --git a/tests/test_rotation_semantics.py b/tests/test_rotation_semantics.py
+new file mode 100644
+index 0000000..6b6a398
+--- /dev/null
++++ b/tests/test_rotation_semantics.py
+@@ -0,0 +1,125 @@
++"""序号轮转的 Windows 语义验证。
++
++覆盖三类只在 Windows 文件重命名语义下暴露的问题：目标已存在时重命名会失败、
++轮转必须逐个世代正确接力、以及保留份数必须按序号而不是字典序计算。
++"""
++
++import pytest
++
++from wrotate import Rotator
++from wrotate import fsutil
++
++
++@pytest.fixture()
++def logdir(tmp_path):
++    (tmp_path / "app.log").write_bytes(b"current")
++    return tmp_path
++
++
++# --- 核心回归（base 上失败） ------------------------------------------------
++
++
++def test_rotate_over_existing_rotation_target(logdir):
++    (logdir / "app.log.1").write_bytes(b"one")
++    (logdir / "app.log.2").write_bytes(b"stale-residue")
++
++    Rotator(str(logdir / "app.log")).rotate()
++
++    assert (logdir / "app.log.1").read_bytes() == b"current"
++    assert (logdir / "app.log.2").read_bytes() == b"one"
++    assert (logdir / "app.log.3").read_bytes() == b"stale-residue"
++
++
++def test_rotate_shifts_all_rotations(logdir):
++    for index, payload in ((1, b"a"), (2, b"b"), (3, b"c")):
++        (logdir / ("app.log.%d" % index)).write_bytes(payload)
++
++    Rotator(str(logdir / "app.log")).rotate()
++
++    assert (logdir / "app.log.1").read_bytes() == b"current"
++    assert (logdir / "app.log.2").read_bytes() == b"a"
++    assert (logdir / "app.log.3").read_bytes() == b"b"
++    assert (logdir / "app.log.4").read_bytes() == b"c"
++    assert not (logdir / "app.log").exists()
++
++
++def test_rotate_preserves_every_generation(logdir):
++    for index in range(1, 6):
++        (logdir / ("app.log.%d" % index)).write_bytes(("gen-%d" % index).encode())
++
++    Rotator(str(logdir / "app.log")).rotate()
++
++    for index in range(1, 4):
++        assert (logdir / ("app.log.%d" % (index + 1))).read_bytes() == ("gen-%d" % index).encode()
++
++
++def test_prune_removes_highest_indices(logdir):
++    for index in range(1, 13):
++        (logdir / ("app.log.%d" % index)).write_bytes(b"x")
++
++    Rotator(str(logdir / "app.log"), keep=10).prune()
++
++    remaining = {fsutil.rotation_index(n) for n in Rotator(str(logdir / "app.log")).rotations()}
++    assert remaining == set(range(1, 11)), "expected 1..10 to survive, got %s" % sorted(remaining)
++
++
++def test_prune_with_double_digit_indices_keeps_low_ones(logdir):
++    for index in range(1, 16):
++        (logdir / ("app.log.%d" % index)).write_bytes(b"x")
++
++    removed = Rotator(str(logdir / "app.log"), keep=12).prune()
++
++    assert sorted(fsutil.rotation_index(n) for n in removed) == [13, 14, 15]
++
++
++def test_rotate_after_stale_residue(tmp_path):
++    (tmp_path / "app.log").write_bytes(b"fresh")
++    (tmp_path / "app.log.2").write_bytes(b"orphan")
++
++    Rotator(str(tmp_path / "app.log")).rotate()
++
++    assert (tmp_path / "app.log.1").read_bytes() == b"fresh"
++    assert (tmp_path / "app.log.3").read_bytes() == b"orphan"
++
++
++def test_rotate_and_prune_keeps_the_latest(logdir):
++    for index in range(1, 6):
++        (logdir / ("app.log.%d" % index)).write_bytes(("gen-%d" % index).encode())
++
++    Rotator(str(logdir / "app.log"), keep=3).rotate_and_prune()
++
++    assert (logdir / "app.log.1").read_bytes() == b"current"
++
++
++# --- 回归保护（base 与参考解上都必须通过） ----------------------------------
++
++
++def test_rotate_moves_current_to_one(logdir):
++    Rotator(str(logdir / "app.log")).rotate()
++    assert (logdir / "app.log.1").read_bytes() == b"current"
++    assert not (logdir / "app.log").exists()
++
++
++def test_rotate_without_current_is_noop(tmp_path):
++    assert Rotator(str(tmp_path / "missing.log")).rotate() == []
++
++
++def test_rotations_are_listed_in_ascending_order(logdir):
++    for index in (2, 1, 3):
++        (logdir / ("app.log.%d" % index)).write_bytes(b"x")
++    assert Rotator(str(logdir / "app.log")).rotations() == ["app.log.1", "app.log.2", "app.log.3"]
++
++
++def test_prune_returns_removed_names(logdir):
++    for index in range(1, 6):
++        (logdir / ("app.log.%d" % index)).write_bytes(b"x")
++    removed = Rotator(str(logdir / "app.log"), keep=3).prune()
++    assert len(removed) == 2
++
++
++def test_remove_missing_file_returns_false(tmp_path):
++    assert fsutil.remove(str(tmp_path / "nope")) is False
++
++
++def test_rotation_index_is_parsed():
++    assert fsutil.rotation_index("app.log.12") == 12

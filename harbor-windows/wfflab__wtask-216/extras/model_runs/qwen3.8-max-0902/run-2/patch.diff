@@ -1,0 +1,2254 @@
+diff --git a/scratch_check.py b/scratch_check.py
+new file mode 100644
+index 0000000..0ab59e9
+--- /dev/null
++++ b/scratch_check.py
+@@ -0,0 +1,634 @@
++"""临时自检脚本（提交前删除）。"""
++import calendar
++import random
++import time
++from datetime import datetime, timedelta
++
++from wtask import (
++    Repetition,
++    Task,
++    TaskDefError,
++    Trigger,
++    format_duration,
++    next_runs,
++    parse_duration,
++    parse_task_xml,
++    plan_window,
++    task_to_xml,
++    validate_task,
++)
++from wtask.schedule import HORIZON_DAYS
++
++FAILS = []
++
++
++def check(name, got, want):
++    if got != want:
++        FAILS.append("%s: got %r want %r" % (name, got, want))
++
++
++def expect_error(name, kind, fn):
++    try:
++        fn()
++    except TaskDefError as exc:
++        if exc.kind != kind:
++            FAILS.append("%s: kind=%r want %r (%s)" % (name, exc.kind, kind, exc))
++    except Exception as exc:  # noqa: BLE001
++        FAILS.append("%s: raised %s(%s) want TaskDefError(%s)" % (name, type(exc).__name__, exc, kind))
++    else:
++        FAILS.append("%s: no error, want TaskDefError(%s)" % (name, kind))
++
++
++NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
++
++
++def xml(body, version="1.2", settings=""):
++    return (
++        '<Task version="%s" xmlns="%s"><Triggers>%s</Triggers>%s</Task>'
++        % (version, NS, body, settings)
++    )
++
++
++# ---------------------------------------------------------------- §6 duration
++check("dur.72h", format_duration(parse_duration("PT72H")), "P3D")
++check("dur.2h", format_duration(parse_duration("PT2H")), "PT2H")
++check("dur.90m", format_duration(parse_duration("PT90M")), "PT1H30M")
++check("dur.mix", format_duration(parse_duration("P1DT2H3M4S")), "P1DT2H3M4S")
++check("dur.zero", format_duration(parse_duration("PT0S")), "PT0S")
++check("dur.1d", format_duration(timedelta(days=1)), "P1D")
++check("dur.25h", format_duration(timedelta(hours=25)), "P1DT1H")
++check("dur.p3d", parse_duration("P3D"), timedelta(days=3))
++check("dur.60s", format_duration(timedelta(seconds=60)), "PT1M")
++check("dur.86400", format_duration(timedelta(seconds=86400)), "P1D")
++check("dur.ws", parse_duration("  PT15M  "), timedelta(minutes=15))
++for bad in ("P", "PT", "abc", "P1DT", "PT1.5S", "-P1D", "", "3D", "P1W", "PT-1M", "P1H", "P1D2H"):
++    expect_error("dur.bad[%r]" % bad, "duration", lambda b=bad: parse_duration(b))
++expect_error("dur.neg", "duration", lambda: format_duration(timedelta(hours=-1)))
++expect_error("dur.type", "duration", lambda: parse_duration(5))
++expect_error("dur.fmt.type", "duration", lambda: format_duration("PT1H"))
++# 幂等
++for text in ("P3D", "PT1H30M", "PT0S", "P1DT2H3M4S", "PT45S", "P2DT3H"):
++    check("dur.idem[%s]" % text,
++          format_duration(parse_duration(format_duration(parse_duration(text)))),
++          format_duration(parse_duration(text)))
++
++# ---------------------------------------------------------------- §3.1 daily
++daily3 = parse_task_xml(
++    xml(
++        "<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay><DaysInterval>3</DaysInterval></ScheduleByDay></CalendarTrigger>"
++    )
++)
++check(
++    "daily3.anchor",
++    next_runs(daily3, datetime(2025, 12, 1), 4),
++    [
++        datetime(2026, 1, 1, 8),
++        datetime(2026, 1, 4, 8),
++        datetime(2026, 1, 7, 8),
++        datetime(2026, 1, 10, 8),
++    ],
++)
++check(
++    "daily3.mid",
++    next_runs(daily3, datetime(2026, 1, 2, 0), 2),
++    [datetime(2026, 1, 4, 8), datetime(2026, 1, 7, 8)],
++)
++check("daily3.strict_after", next_runs(daily3, datetime(2026, 1, 1, 8, 0), 1),
++      [datetime(2026, 1, 4, 8)])
++check("daily3.plan", plan_window(daily3, datetime(2025, 12, 31), datetime(2026, 1, 11)),
++      [datetime(2026, 1, 1, 8), datetime(2026, 1, 4, 8), datetime(2026, 1, 7, 8),
++       datetime(2026, 1, 10, 8)])
++expect_error(
++    "daily.range0", "range",
++    lambda: parse_task_xml(
++        xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++            "<ScheduleByDay><DaysInterval>0</DaysInterval></ScheduleByDay></CalendarTrigger>")),
++)
++expect_error(
++    "daily.range366", "range",
++    lambda: parse_task_xml(
++        xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++            "<ScheduleByDay><DaysInterval>366</DaysInterval></ScheduleByDay></CalendarTrigger>")),
++)
++expect_error(
++    "daily.rangeint", "range",
++    lambda: parse_task_xml(
++        xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++            "<ScheduleByDay><DaysInterval>abc</DaysInterval></ScheduleByDay></CalendarTrigger>")),
++)
++d_default = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay/></CalendarTrigger>"))
++check("daily.default", d_default.triggers[0].days_interval, 1)
++check("daily.default.runs", next_runs(d_default, datetime(2026, 1, 1, 9), 2),
++      [datetime(2026, 1, 2, 8), datetime(2026, 1, 3, 8)])
++# 起点在月中：DaysInterval=7 从 2026-01-03 起
++d7 = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-03T05:00:00</StartBoundary>"
++        "<ScheduleByDay><DaysInterval>7</DaysInterval></ScheduleByDay></CalendarTrigger>"))
++check("daily7", next_runs(d7, datetime(2026, 1, 1), 3),
++      [datetime(2026, 1, 3, 5), datetime(2026, 1, 10, 5), datetime(2026, 1, 17, 5)])
++
++# ---------------------------------------------------------------- §3.2 weekly
++weekly2 = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Monday/><Thursday/></DaysOfWeek>"
++        "<WeeksInterval>2</WeeksInterval></ScheduleByWeek></CalendarTrigger>"))
++check("weekly2", next_runs(weekly2, datetime(2025, 12, 1), 6),
++      [datetime(2026, 1, 1, 9), datetime(2026, 1, 12, 9), datetime(2026, 1, 15, 9),
++       datetime(2026, 1, 26, 9), datetime(2026, 1, 29, 9), datetime(2026, 2, 9, 9)])
++weekly1 = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Sunday/></DaysOfWeek></ScheduleByWeek></CalendarTrigger>"))
++check("weekly1.default", next_runs(weekly1, datetime(2026, 1, 1), 3),
++      [datetime(2026, 1, 4, 9), datetime(2026, 1, 11, 9), datetime(2026, 1, 18, 9)])
++check("weekly2.model", weekly2.triggers[0].weeks_interval, 2)
++check("weekly2.dow", weekly2.triggers[0].days_of_week, (1, 4))
++expect_error("weekly.nodays", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek></CalendarTrigger>")))
++expect_error("weekly.emptydays", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek/><WeeksInterval>1</WeeksInterval>"
++        "</ScheduleByWeek></CalendarTrigger>")))
++expect_error("weekly.dupdow", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Monday/><Monday/></DaysOfWeek>"
++        "</ScheduleByWeek></CalendarTrigger>")))
++expect_error("weekly.baddow", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Funday/></DaysOfWeek>"
++        "</ScheduleByWeek></CalendarTrigger>")))
++expect_error("weekly.weeks53", "range", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Monday/></DaysOfWeek><WeeksInterval>53</WeeksInterval>"
++        "</ScheduleByWeek></CalendarTrigger>")))
++expect_error("weekly.weeks0", "range", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Monday/></DaysOfWeek><WeeksInterval>0</WeeksInterval>"
++        "</ScheduleByWeek></CalendarTrigger>")))
++
++# ---------------------------------------------------------------- §3.3 monthly
++monthly = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T07:30:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>15</Day><Day>1</Day></DaysOfMonth>"
++        "<Months><January/><July/></Months></ScheduleByMonth></CalendarTrigger>"))
++check("monthly.sorted", monthly.triggers[0].days_of_month, (1, 15))
++check("monthly.months", monthly.triggers[0].months, (1, 7))
++check("monthly.runs", next_runs(monthly, datetime(2026, 1, 1, 0), 5),
++      [datetime(2026, 1, 1, 7, 30), datetime(2026, 1, 15, 7, 30),
++       datetime(2026, 7, 1, 7, 30), datetime(2026, 7, 15, 7, 30),
++       datetime(2027, 1, 1, 7, 30)])
++check("monthly.onlymonths",
++      sorted({m.month for m in next_runs(monthly, datetime(2026, 1, 1), 20)}), [1, 7])
++feb30 = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>30</Day></DaysOfMonth>"
++        "<Months><February/><March/></Months></ScheduleByMonth></CalendarTrigger>"))
++check("feb30", next_runs(feb30, datetime(2026, 1, 1), 2),
++      [datetime(2026, 3, 30), datetime(2027, 3, 30)])
++expect_error("monthly.day32", "range", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>32</Day></DaysOfMonth>"
++        "<Months><January/></Months></ScheduleByMonth></CalendarTrigger>")))
++expect_error("monthly.day0", "range", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>0</Day></DaysOfMonth>"
++        "<Months><January/></Months></ScheduleByMonth></CalendarTrigger>")))
++expect_error("monthly.emptydays", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth/><Months><January/></Months>"
++        "</ScheduleByMonth></CalendarTrigger>")))
++expect_error("monthly.nomonths", "schema", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>1</Day></DaysOfMonth>"
++        "</ScheduleByMonth></CalendarTrigger>")))
++expect_error("monthly.emptymonths", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>1</Day></DaysOfMonth><Months/>"
++        "</ScheduleByMonth></CalendarTrigger>")))
++expect_error("monthly.badmonth", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>1</Day></DaysOfMonth><Months><Januar/></Months>"
++        "</ScheduleByMonth></CalendarTrigger>")))
++
++# ------------------------------------------------------- §3.4 monthly_dow
++mdw = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>5</Week></Weeks>"
++        "<DaysOfWeek><Friday/></DaysOfWeek><Months><February/></Months>"
++        "</ScheduleByMonthDayOfWeek></CalendarTrigger>"))
++
++
++def last_week_fridays(year_from, year_to):
++    """独立实现：Week=5 -> 该月最后一个日历周里的周五。"""
++    out = []
++    for year in range(year_from, year_to + 1):
++        dim = calendar.monthrange(year, 2)[1]
++        weeks = (dim + 6) // 7
++        for day in range(1, dim + 1):
++            if (day - 1) // 7 + 1 == weeks and calendar.weekday(year, 2, day) == 4:
++                out.append(datetime(year, 2, day, 6))
++    return out
++
++
++want = [m for m in last_week_fridays(2026, 2035)
++        if m > datetime(2026, 1, 1)
++        and m <= datetime(2026, 1, 1) + timedelta(days=HORIZON_DAYS)]
++check("mdw.feb.last", next_runs(mdw, datetime(2026, 1, 1), 10), want[:10])
++print("mdw feb-last fridays:", want[:4])
++
++mdw13 = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>1</Week><Week>3</Week></Weeks>"
++        "<DaysOfWeek><Friday/></DaysOfWeek><Months><January/></Months>"
++        "</ScheduleByMonthDayOfWeek></CalendarTrigger>"))
++check("mdw.13", next_runs(mdw13, datetime(2026, 1, 1), 4),
++      [datetime(2026, 1, 2, 6), datetime(2026, 1, 16, 6),
++       datetime(2027, 1, 1, 6), datetime(2027, 1, 15, 6)])
++# 5 周月份（2026-01 有 31 天）：Week=5 -> 29-31 日
++mdw5 = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>5</Week></Weeks>"
++        "<DaysOfWeek><Saturday/></DaysOfWeek><Months><January/><August/></Months>"
++        "</ScheduleByMonthDayOfWeek></CalendarTrigger>"))
++check("mdw.5", next_runs(mdw5, datetime(2026, 1, 1), 4),
++      [datetime(2026, 1, 31, 6), datetime(2026, 8, 29, 6),
++       datetime(2027, 1, 30, 6), datetime(2028, 1, 29, 6)])
++expect_error("mdow.week6", "range", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>6</Week></Weeks>"
++        "<DaysOfWeek><Friday/></DaysOfWeek><Months><January/></Months>"
++        "</ScheduleByMonthDayOfWeek></CalendarTrigger>")))
++expect_error("mdow.week0", "range", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>0</Week></Weeks>"
++        "<DaysOfWeek><Friday/></DaysOfWeek><Months><January/></Months>"
++        "</ScheduleByMonthDayOfWeek></CalendarTrigger>")))
++expect_error("mdow.emptyweeks", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks/><DaysOfWeek><Friday/></DaysOfWeek>"
++        "<Months><January/></Months></ScheduleByMonthDayOfWeek></CalendarTrigger>")))
++expect_error("mdow.noweeks", "schema", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><DaysOfWeek><Friday/></DaysOfWeek>"
++        "<Months><January/></Months></ScheduleByMonthDayOfWeek></CalendarTrigger>")))
++expect_error("mdow.nodow", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T06:00:00</StartBoundary>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>1</Week></Weeks>"
++        "<Months><January/></Months></ScheduleByMonthDayOfWeek></CalendarTrigger>")))
++
++# ---------------------------------------------------------------- §4/§5 边界
++bounded = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<EndBoundary>2026-01-05T08:00:00</EndBoundary>"
++        "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"))
++check("endboundary", next_runs(bounded, datetime(2025, 12, 1), 10),
++      [datetime(2026, 1, 1, 8), datetime(2026, 1, 2, 8), datetime(2026, 1, 3, 8),
++       datetime(2026, 1, 4, 8), datetime(2026, 1, 5, 8)])
++check("endboundary.plan", plan_window(bounded, datetime(2026, 1, 1), datetime(2026, 2, 1)),
++      [datetime(2026, 1, 1, 8), datetime(2026, 1, 2, 8), datetime(2026, 1, 3, 8),
++       datetime(2026, 1, 4, 8), datetime(2026, 1, 5, 8)])
++rep = parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>PT30M</Interval><Duration>PT1H</Duration></Repetition>"
++        "</TimeTrigger>"))
++check("rep.count", next_runs(rep, datetime(2026, 1, 1), 10),
++      [datetime(2026, 3, 1, 8), datetime(2026, 3, 1, 8, 30)])
++rep_end = parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<EndBoundary>2026-03-01T08:30:00</EndBoundary>"
++        "<Repetition><Interval>PT15M</Interval><Duration>P1D</Duration></Repetition>"
++        "</TimeTrigger>"))
++check("rep.endboundary", next_runs(rep_end, datetime(2026, 1, 1), 10),
++      [datetime(2026, 3, 1, 8), datetime(2026, 3, 1, 8, 15), datetime(2026, 3, 1, 8, 30)])
++rep_daily = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<EndBoundary>2026-03-03T12:00:00</EndBoundary>"
++        "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>"
++        "<Repetition><Interval>PT6H</Interval><Duration>PT12H</Duration></Repetition>"
++        "</CalendarTrigger>"))
++check("rep.daily.end", next_runs(rep_daily, datetime(2026, 2, 1), 20),
++      [datetime(2026, 3, 1, 8), datetime(2026, 3, 1, 14), datetime(2026, 3, 2, 8),
++       datetime(2026, 3, 2, 14), datetime(2026, 3, 3, 8)])
++rep_nodur = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>"
++        "<Repetition><Interval>PT12H</Interval></Repetition></CalendarTrigger>"))
++check("rep.noduration", next_runs(rep_nodur, datetime(2026, 1, 1, 1), 4),
++      [datetime(2026, 1, 1, 12), datetime(2026, 1, 2, 0),
++       datetime(2026, 1, 2, 12), datetime(2026, 1, 3, 0)])
++expect_error("rep.zerointerval", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>PT0S</Interval></Repetition></TimeTrigger>")))
++expect_error("rep.nointerval", "schema", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Duration>PT1H</Duration></Repetition></TimeTrigger>")))
++expect_error("rep.badduration", "duration", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>PT30M</Interval><Duration>1H</Duration></Repetition>"
++        "</TimeTrigger>")))
++expect_error("rep.badinterval", "duration", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>30M</Interval></Repetition></TimeTrigger>")))
++expect_error("rep.unknownchild", "trigger", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>PT30M</Interval><Foo/></Repetition></TimeTrigger>")))
++expect_error("rep.badbool", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>PT30M</Interval><StopAtDurationEnd>maybe</StopAtDurationEnd>"
++        "</Repetition></TimeTrigger>")))
++sade = parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-03-01T08:00:00</StartBoundary>"
++        "<Repetition><Interval>PT30M</Interval><Duration>PT1H</Duration>"
++        "<StopAtDurationEnd>true</StopAtDurationEnd></Repetition></TimeTrigger>"))
++check("rep.stop", sade.triggers[0].repetition.stop_at_duration_end, True)
++check("rep.stop.runs", next_runs(sade, datetime(2026, 1, 1), 5),
++      [datetime(2026, 3, 1, 8), datetime(2026, 3, 1, 8, 30)])
++check("rep.model", sade.triggers[0].repetition,
++      Repetition(interval=timedelta(minutes=30), duration=timedelta(hours=1),
++                 stop_at_duration_end=True))
++
++# ---------------------------------------------------------------- §8 启用开关
++disabled_task = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay/></CalendarTrigger>",
++        settings="<Settings><Enabled>false</Enabled></Settings>"))
++check("task.disabled", next_runs(disabled_task, datetime(2026, 1, 1), 5), [])
++check("task.disabled.window",
++      plan_window(disabled_task, datetime(2026, 1, 1), datetime(2026, 2, 1)), [])
++check("task.disabled.flag", disabled_task.enabled, False)
++two = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<Enabled>false</Enabled><ScheduleByDay/></CalendarTrigger>"
++        "<CalendarTrigger><StartBoundary>2026-01-01T09:00:00</StartBoundary>"
++        "<ScheduleByDay/></CalendarTrigger>"))
++check("trigger.disabled", next_runs(two, datetime(2026, 1, 1), 3),
++      [datetime(2026, 1, 1, 9), datetime(2026, 1, 2, 9), datetime(2026, 1, 3, 9)])
++check("trigger.disabled.plan",
++      plan_window(two, datetime(2026, 1, 1, 0), datetime(2026, 1, 2, 0)),
++      [datetime(2026, 1, 1, 9)])
++dup = parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay/></CalendarTrigger>"
++        "<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay/></CalendarTrigger>"))
++check("dedupe", next_runs(dup, datetime(2026, 1, 1), 3),
++      [datetime(2026, 1, 1, 8), datetime(2026, 1, 2, 8), datetime(2026, 1, 3, 8)])
++check("dedupe.count", len(next_runs(dup, datetime(2026, 1, 1), 7)), 7)
++check("count0", next_runs(dup, datetime(2026, 1, 1), 0), [])
++check("count_neg", next_runs(dup, datetime(2026, 1, 1), -3), [])
++pw = parse_task_xml(xml(
++    "<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++    "<ScheduleByDay/></CalendarTrigger>"))
++check("plan.window", plan_window(pw, datetime(2026, 1, 1, 8), datetime(2026, 1, 4, 8)),
++      [datetime(2026, 1, 2, 8), datetime(2026, 1, 3, 8), datetime(2026, 1, 4, 8)])
++check("plan.window.empty", plan_window(pw, datetime(2026, 1, 4), datetime(2026, 1, 1)), [])
++check("plan.window.rep",
++      plan_window(rep, datetime(2026, 3, 1, 7), datetime(2026, 3, 1, 9)),
++      [datetime(2026, 3, 1, 8), datetime(2026, 3, 1, 8, 30)])
++# TimeTrigger 一次性
++once = parse_task_xml(xml(
++    "<TimeTrigger><StartBoundary>2026-04-01T12:00:00</StartBoundary></TimeTrigger>"))
++check("once", next_runs(once, datetime(2026, 1, 1), 5), [datetime(2026, 4, 1, 12)])
++check("once.past", next_runs(once, datetime(2026, 5, 1), 5), [])
++check("once.type", once.triggers[0].type, "time")
++
++# ---------------------------------------------------------------- §9 错误
++expect_error("err.xml", "xml", lambda: parse_task_xml("<Task><"))
++expect_error("err.xml2", "xml", lambda: parse_task_xml("not xml at all"))
++expect_error("err.root", "schema", lambda: parse_task_xml("<NotTask/>"))
++expect_error("err.version", "version", lambda: parse_task_xml(xml("<TimeTrigger/>", version="2.0")))
++expect_error("err.noversion", "version",
++             lambda: parse_task_xml('<Task xmlns="%s"><Triggers/></Task>' % NS))
++expect_error("err.v11", "version", lambda: parse_task_xml(xml(
++    "<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++    version="1.1")))
++expect_error("err.emptytriggers", "structure",
++             lambda: parse_task_xml(xml("", version="1.0")))
++check("version.10", parse_task_xml(xml(
++    "<TimeTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary></TimeTrigger>",
++    version="1.0")).version, "1.0")
++expect_error("err.notriggers", "structure",
++             lambda: parse_task_xml('<Task version="1.2" xmlns="%s"/>' % NS))
++expect_error("err.unknowntrigger", "trigger", lambda: parse_task_xml(
++    xml("<BootTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary></BootTrigger>")))
++expect_error("err.unknownchild", "trigger", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary><Foo/></TimeTrigger>")))
++expect_error("err.scheduleintime", "trigger", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay/></TimeTrigger>")))
++expect_error("err.noschedule", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary></CalendarTrigger>")))
++expect_error("err.twoschedules", "trigger", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<ScheduleByDay/><ScheduleByWeek><DaysOfWeek><Monday/></DaysOfWeek></ScheduleByWeek>"
++        "</CalendarTrigger>")))
++expect_error("err.nostart", "schema", lambda: parse_task_xml(
++    xml("<TimeTrigger><Enabled>true</Enabled></TimeTrigger>")))
++expect_error("err.dupstart", "schema", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<StartBoundary>2026-01-02T00:00:00</StartBoundary></TimeTrigger>")))
++expect_error("err.dupsettings", "schema", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++        settings="<Settings/><Settings/>")))
++expect_error("err.duptriggers", "schema", lambda: parse_task_xml(
++    '<Task version="1.2" xmlns="%s"><Triggers>'
++    '<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>'
++    '</Triggers><Triggers><TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>'
++    '</TimeTrigger></Triggers></Task>' % NS))
++expect_error("err.baddate", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-13-45T99:00:00</StartBoundary></TimeTrigger>")))
++expect_error("err.baddate2", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>not-a-date</StartBoundary></TimeTrigger>")))
++expect_error("err.baddate3", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01 08:00:00</StartBoundary></TimeTrigger>")))
++expect_error("err.badend", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<EndBoundary>nope</EndBoundary></TimeTrigger>")))
++expect_error("err.badbool", "range", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<Enabled>yes</Enabled></TimeTrigger>")))
++expect_error("err.endbeforestart", "structure", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-05T00:00:00</StartBoundary>"
++        "<EndBoundary>2026-01-01T00:00:00</EndBoundary></TimeTrigger>")))
++expect_error("err.endbeforestart.cal", "structure", lambda: parse_task_xml(
++    xml("<CalendarTrigger><StartBoundary>2026-01-05T00:00:00</StartBoundary>"
++        "<EndBoundary>2026-01-01T00:00:00</EndBoundary><ScheduleByDay/></CalendarTrigger>")))
++expect_error("err.badduration", "duration", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++        settings="<Settings><ExecutionTimeLimit>PT2X</ExecutionTimeLimit></Settings>")))
++expect_error("err.baddelay", "duration", lambda: parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++        settings="<Settings><RandomDelay>5M</RandomDelay></Settings>")))
++expect_error("err.type", "xml", lambda: parse_task_xml(None))
++# 布尔文本 1 / 0 / TRUE 均可
++check("bool.1", parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<Enabled>0</Enabled></TimeTrigger>")).triggers[0].enabled, False)
++check("bool.TRUE", parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<Enabled>TRUE</Enabled></TimeTrigger>")).triggers[0].enabled, True)
++check("bool.false", parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "<Enabled>False</Enabled></TimeTrigger>")).triggers[0].enabled, False)
++check("bool.default", parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
++        "</TimeTrigger>")).triggers[0].enabled, True)
++# 忽略根下其它元素
++check("ignore.extra", parse_task_xml(
++    '<Task version="1.2" xmlns="%s"><RegistrationInfo><Author>x</Author></RegistrationInfo>'
++    '<Triggers><TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>'
++    '</Triggers><Actions><Exec><Command>c</Command></Exec></Actions></Task>' % NS
++).triggers[0].start, datetime(2026, 1, 1))
++check("ignore.extra.xml", "<Actions>" in task_to_xml(parse_task_xml(
++    '<Task version="1.2" xmlns="%s"><Triggers><TimeTrigger>'
++    '<StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger></Triggers>'
++    '<Actions/></Task>' % NS)), False)
++
++# ---------------------------------------------------------------- §1 Settings
++lim = parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++        settings="<Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>"
++                 "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"
++                 "<RandomDelay>PT5M</RandomDelay></Settings>"))
++check("settings.limit0", lim.execution_time_limit, None)
++check("settings.policy", lim.multiple_instances, "Parallel")
++check("settings.delay", lim.random_delay, timedelta(minutes=5))
++lim2 = parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++        settings="<Settings><ExecutionTimeLimit>PT72H</ExecutionTimeLimit></Settings>"))
++check("settings.limit72", lim2.execution_time_limit, timedelta(days=3))
++default_task = parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>"))
++check("settings.defaults.limit", default_task.execution_time_limit, None)
++check("settings.defaults.delay", default_task.random_delay, timedelta(0))
++check("settings.defaults.policy", default_task.multiple_instances, "IgnoreNew")
++check("settings.defaults.enabled", default_task.enabled, True)
++check("settings.extraignored", parse_task_xml(
++    xml("<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>",
++        settings="<Settings><Priority>7</Priority><Enabled>true</Enabled></Settings>")
++).enabled, True)
++
++# ---------------------------------------------------------------- §7 序列化
++full = parse_task_xml(
++    xml(
++        "<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++        "<EndBoundary>2027-01-01T08:00:00</EndBoundary><Enabled>false</Enabled>"
++        "<ScheduleByMonthDayOfWeek><Weeks><Week>3</Week><Week>1</Week></Weeks>"
++        "<DaysOfWeek><Friday/><Monday/></DaysOfWeek>"
++        "<Months><July/><January/></Months></ScheduleByMonthDayOfWeek>"
++        "<Repetition><Interval>PT90M</Interval><Duration>PT72H</Duration>"
++        "<StopAtDurationEnd>true</StopAtDurationEnd></Repetition></CalendarTrigger>",
++        settings="<Settings><MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>"
++                 "<Enabled>false</Enabled><ExecutionTimeLimit>PT72H</ExecutionTimeLimit>"
++                 "<RandomDelay>PT0S</RandomDelay></Settings>",
++    )
++)
++text = task_to_xml(full)
++again = parse_task_xml(text)
++check("roundtrip.eq", again, full)
++check("roundtrip.idem", task_to_xml(again), text)
++check("order.start_end", text.index("<StartBoundary>") < text.index("<EndBoundary>"), True)
++check("order.end_enabled", text.index("<EndBoundary>") < text.index("<Enabled>false"), True)
++check("order.enabled_sched", text.index("<Enabled>false") < text.index("<ScheduleBy"), True)
++check("order.sched_rep", text.index("<ScheduleBy") < text.index("<Repetition>"), True)
++check("canon.interval", "<Interval>PT1H30M</Interval>" in text, True)
++check("canon.duration", "<Duration>P3D</Duration>" in text, True)
++check("canon.limit", "<ExecutionTimeLimit>P3D</ExecutionTimeLimit>" in text, True)
++check("omit.randomdelay", "<RandomDelay>" in text, False)
++check("week.order", text.index("<Week>1</Week>") < text.index("<Week>3</Week>"), True)
++check("dow.order", text.index("<Monday/>") < text.index("<Friday/>"), True)
++check("month.order", text.index("<January/>") < text.index("<July/>"), True)
++check("triggers.before.settings", text.index("</Triggers>") < text.index("<Settings>"), True)
++minimal = parse_task_xml(xml(
++    "<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++    "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"))
++mtext = task_to_xml(minimal)
++check("omit.enabled", "<Enabled>" in mtext, False)
++check("omit.endboundary", "<EndBoundary>" in mtext, False)
++check("omit.stop", "<StopAtDurationEnd>" in mtext, False)
++check("omit.limit", "<ExecutionTimeLimit>" in mtext, False)
++off = parse_task_xml(xml(
++    "<CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++    "<ScheduleByDay/></CalendarTrigger>",
++    settings="<Settings><Enabled>false</Enabled></Settings>"))
++check("write.enabled", "<Enabled>false</Enabled>" in task_to_xml(off), True)
++# 所有日程类型的回写 / 幂等
++samples = [
++    xml("<CalendarTrigger><StartBoundary>2026-02-03T04:05:06</StartBoundary>"
++        "<ScheduleByDay><DaysInterval>10</DaysInterval></ScheduleByDay></CalendarTrigger>"),
++    xml("<CalendarTrigger><StartBoundary>2026-02-03T04:05:06</StartBoundary>"
++        "<ScheduleByWeek><DaysOfWeek><Saturday/><Sunday/><Monday/></DaysOfWeek>"
++        "<WeeksInterval>3</WeeksInterval></ScheduleByWeek></CalendarTrigger>"),
++    xml("<CalendarTrigger><StartBoundary>2026-02-03T04:05:06</StartBoundary>"
++        "<ScheduleByMonth><DaysOfMonth><Day>31</Day><Day>2</Day></DaysOfMonth>"
++        "<Months><December/><February/><March/></Months></ScheduleByMonth>"
++        "</CalendarTrigger>"),
++    xml("<TimeTrigger><StartBoundary>2026-02-03T04:05:06</StartBoundary>"
++        "<EndBoundary>2026-02-09T04:05:06</EndBoundary>"
++        "<Repetition><Interval>P1DT2H3M4S</Interval><Duration>P7D</Duration>"
++        "<StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"),
++]
++for i, sample in enumerate(samples):
++    t = parse_task_xml(sample)
++    a = task_to_xml(t)
++    b = parse_task_xml(a)
++    check("sample%d.eq" % i, b, t)
++    check("sample%d.idem" % i, task_to_xml(b), a)
++    check("sample%d.runs" % i, next_runs(b, datetime(2026, 1, 1), 6),
++          next_runs(t, datetime(2026, 1, 1), 6))
++
++# validate_task
++check("validate.ok", validate_task(full), full)
++expect_error("validate.endstart", "structure", lambda: validate_task(
++    Task(version="1.2", triggers=(Trigger(type="time", start=datetime(2026, 1, 2),
++                                          end=datetime(2026, 1, 1)),))))
++expect_error("validate.empty", "structure", lambda: validate_task(Task(version="1.2", triggers=())))
++expect_error("validate.range", "range", lambda: validate_task(
++    Task(version="1.2", triggers=(Trigger(type="daily", start=datetime(2026, 1, 1),
++                                          days_interval=400),))))
++expect_error("validate.badtype", "trigger", lambda: validate_task(
++    Task(version="1.2", triggers=(Trigger(type="boot", start=datetime(2026, 1, 1)),))))
++expect_error("validate.dow", "trigger", lambda: validate_task(
++    Task(version="1.2", triggers=(Trigger(type="weekly", start=datetime(2026, 1, 1)),))))
++
++# 模型便捷方法
++check("model.next_runs", minimal.next_runs(datetime(2026, 1, 1, 9), 1), [datetime(2026, 1, 2, 8)])
++check("model.plan_window", minimal.plan_window(datetime(2026, 1, 1), datetime(2026, 1, 3, 9)),
++      [datetime(2026, 1, 1, 8), datetime(2026, 1, 2, 8), datetime(2026, 1, 3, 8)])
++check("model.to_xml", minimal.to_xml(), task_to_xml(minimal))
++
++# ---------------------------------------------------------------- 性能
++t0 = time.time()
++big = parse_task_xml(xml(
++    "<CalendarTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary>"
++    "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>"
++    "<Repetition><Interval>PT1M</Interval></Repetition></CalendarTrigger>"))
++res = next_runs(big, datetime(2026, 5, 5, 5, 5), 5)
++elapsed = time.time() - t0
++check("perf.unlimited", res, [datetime(2026, 5, 5, 5, 6), datetime(2026, 5, 5, 5, 7),
++                              datetime(2026, 5, 5, 5, 8), datetime(2026, 5, 5, 5, 9),
++                              datetime(2026, 5, 5, 5, 10)])
++print("next_runs(unlimited, from 2000): %.3fs" % elapsed)
++check("perf.unlimited.fast", elapsed < 2.0, True)
++t0 = time.time()
++pw2 = plan_window(big, datetime(2026, 5, 5), datetime(2026, 5, 5, 2))
++elapsed = time.time() - t0
++check("perf.plan", len(pw2), 120)
++print("plan_window(2h of 1min runs): %.3fs" % elapsed)
++check("perf.plan.fast", elapsed < 2.0, True)
++t0 = time.time()
++pw3 = plan_window(big, datetime(2026, 5, 5), datetime(2026, 5, 20))
++elapsed = time.time() - t0
++print("plan_window(15 days of 1min runs):", len(pw3), "%.3fs" % elapsed)
++check("perf.plan2.fast", elapsed < 5.0, True)
++
++print()
++if FAILS:
++    print("FAILED %d" % len(FAILS))
++    for f in FAILS[:40]:
++        print(" -", f)
++else:
++    print("ALL CHECKS PASSED")
+diff --git a/scratch_edge.py b/scratch_edge.py
+new file mode 100644
+index 0000000..f59e280
+--- /dev/null
++++ b/scratch_edge.py
+@@ -0,0 +1,46 @@
++import io
++from datetime import datetime
++
++from wtask import TaskDefError, next_runs, parse_task_xml, task_to_xml
++
++BODY = (
++    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
++    "<Triggers><CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++    "<ScheduleByDay><DaysInterval>2</DaysInterval></ScheduleByDay></CalendarTrigger>"
++    "</Triggers></Task>"
++)
++
++cases = {
++    "plain str": BODY,
++    "decl utf8 str": '<?xml version="1.0" encoding="UTF-8"?>' + BODY,
++    "decl noenc str": '<?xml version="1.0"?>' + BODY,
++    "bytes utf8": BODY.encode("utf-8"),
++    "bytes decl utf8": ('<?xml version="1.0" encoding="UTF-8"?>' + BODY).encode("utf-8"),
++    "bytes utf16": ('<?xml version="1.0" encoding="UTF-16"?>' + BODY).encode("utf-16"),
++    "str decl utf16": '<?xml version="1.0" encoding="UTF-16"?>' + BODY,
++    "comment in triggers": BODY.replace(
++        "<Triggers>", "<Triggers><!-- hi -->", 1
++    ),
++    "bad xml": "<Task><",
++    "empty": "",
++}
++for name, value in cases.items():
++    try:
++        task = parse_task_xml(value)
++        print("%-22s OK  runs=%s" % (name, next_runs(task, datetime(2026, 1, 1), 2)))
++    except TaskDefError as exc:
++        print("%-22s TaskDefError(%s): %s" % (name, exc.kind, exc.message))
++    except Exception as exc:  # noqa: BLE001
++        print("%-22s !!! %s: %s" % (name, type(exc).__name__, exc))
++
++# 中文/非 ASCII 内容（作者字段被忽略，但必须能解析）
++uni = BODY.replace("<Triggers>", "<Triggers>", 1)
++uni = ('<?xml version="1.0" encoding="UTF-8"?><Task version="1.2">'
++       "<RegistrationInfo><Author>值班</Author></RegistrationInfo>"
++       "<Triggers><CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary>"
++       "<ScheduleByDay/></CalendarTrigger></Triggers></Task>")
++t = parse_task_xml(uni.encode("utf-8"))
++print("unicode bytes:", t.version, next_runs(t, datetime(2026, 1, 1), 1))
++t2 = parse_task_xml(uni)
++print("unicode str  :", t2.version, next_runs(t2, datetime(2026, 1, 1), 1))
++print(task_to_xml(t2))
+diff --git a/scratch_patch.py b/scratch_patch.py
+new file mode 100644
+index 0000000..36ea127
+--- /dev/null
++++ b/scratch_patch.py
+@@ -0,0 +1,32 @@
++import io
++
++p = "wtask/xmlio.py"
++s = io.open(p, encoding="utf-8").read()
++
++old = '''    try:
++        root = ET.fromstring(text)
++    except ET.ParseError as exc:
++        raise TaskDefError("xml", str(exc))
++    except ValueError as exc:
++        # 例如「带 encoding 声明的 unicode 字符串」这类解析层错误。
++        raise TaskDefError("xml", str(exc))
++'''
++
++new = '''    try:
++        root = ET.fromstring(text)
++    except ET.ParseError as exc:
++        raise TaskDefError("xml", str(exc))
++    except ValueError:
++        # str 里带 encoding 声明时 ElementTree 会拒绝，改用字节流再试一次。
++        try:
++            root = ET.fromstring(text.encode("utf-8"))
++        except Exception as exc:
++            raise TaskDefError("xml", str(exc))
++    except Exception as exc:
++        raise TaskDefError("xml", str(exc))
++'''
++
++assert old in s, "anchor not found"
++s = s.replace(old, new, 1)
++io.open(p, "w", encoding="utf-8").write(s)
++print("patched xmlio")
+diff --git a/scratch_random.py b/scratch_random.py
+new file mode 100644
+index 0000000..f9e1d7f
+--- /dev/null
++++ b/scratch_random.py
+@@ -0,0 +1,131 @@
++"""临时随机对照自检（提交前删除）。"""
++import calendar
++import random
++from datetime import datetime, timedelta
++
++from wtask import Repetition, Task, Trigger, next_runs, plan_window
++from wtask.schedule import HORIZON_DAYS
++
++FAILS = []
++
++
++def naive_runs(trigger, after, scan_end, run_cap=None):
++    """朴素参考实现：逐日逐 k 枚举。"""
++    out = set()
++    start = trigger.start
++    day = start.date()
++    tod = start.time()
++    while day <= scan_end:
++        match = False
++        if trigger.type == "daily":
++            match = (day - start.date()).days % trigger.days_interval == 0
++        elif trigger.type == "weekly":
++            wd = (day.weekday() + 1) % 7
++            if wd in trigger.days_of_week:
++                w0 = day - timedelta(days=day.weekday())
++                w1 = start.date() - timedelta(days=start.date().weekday())
++                match = ((w0 - w1).days // 7) % trigger.weeks_interval == 0
++        elif trigger.type == "monthly":
++            match = day.month in trigger.months and day.day in trigger.days_of_month
++        elif trigger.type == "monthly_dow":
++            dim = calendar.monthrange(day.year, day.month)[1]
++            last = (dim + 6) // 7
++            idx = (day.day - 1) // 7 + 1
++            idxs = {last if w == 5 else w for w in trigger.weeks_of_month}
++            match = (day.month in trigger.months
++                     and (day.weekday() + 1) % 7 in trigger.days_of_week
++                     and idx in idxs)
++        elif trigger.type == "time":
++            match = day == start.date()
++        if match:
++            moment = datetime.combine(day, tod)
++            if moment >= start and (trigger.end is None or moment <= trigger.end):
++                rep = trigger.repetition
++                k = 0
++                while True:
++                    if rep is None:
++                        out.add(moment)
++                        break
++                    off = rep.interval * k
++                    if rep.duration is not None and off >= rep.duration:
++                        break
++                    run = moment + off
++                    if trigger.end is not None and run > trigger.end:
++                        break
++                    if run_cap is not None and run > run_cap:
++                        break
++                    out.add(run)
++                    k += 1
++        day += timedelta(days=1)
++    return sorted(m for m in out if m > after)
++
++
++random.seed(20260101)
++for case in range(400):
++    start = datetime(2026, 1, 1) + timedelta(days=random.randint(0, 40),
++                                             hours=random.randint(0, 23),
++                                             minutes=random.choice([0, 15, 30, 45]))
++    kind = random.choice(["daily", "weekly", "monthly", "monthly_dow", "time"])
++    kwargs = {"type": kind, "start": start}
++    if kind == "daily":
++        kwargs["days_interval"] = random.choice([1, 2, 3, 7, 30])
++    elif kind == "weekly":
++        kwargs["weeks_interval"] = random.choice([1, 2, 3, 4])
++        kwargs["days_of_week"] = tuple(sorted(random.sample(range(7), random.randint(1, 3))))
++    elif kind == "monthly":
++        kwargs["days_of_month"] = tuple(sorted(random.sample(range(1, 32), random.randint(1, 4))))
++        kwargs["months"] = tuple(sorted(random.sample(range(1, 13), random.randint(1, 5))))
++    elif kind == "monthly_dow":
++        kwargs["weeks_of_month"] = tuple(sorted(random.sample(range(1, 6), random.randint(1, 3))))
++        kwargs["days_of_week"] = tuple(sorted(random.sample(range(7), random.randint(1, 3))))
++        kwargs["months"] = tuple(sorted(random.sample(range(1, 13), random.randint(1, 5))))
++    if random.random() < 0.4:
++        end = start + timedelta(days=random.randint(0, 60), hours=random.randint(0, 20))
++        if end >= start:
++            kwargs["end"] = end
++    if random.random() < 0.5:
++        if random.random() < 0.3:
++            dur = None
++            interval = timedelta(hours=random.choice([6, 12, 24, 48]))
++        else:
++            dur = timedelta(minutes=random.choice([30, 60, 180, 720, 1440]))
++            interval = timedelta(minutes=random.choice([5, 15, 30, 60, 360]))
++        kwargs["repetition"] = Repetition(interval=interval, duration=dur)
++    trig = Trigger(**kwargs)
++    task = Task(version="1.2", triggers=(trig,))
++    after = start + timedelta(days=random.randint(-5, 20), hours=random.randint(0, 23))
++
++    # plan_window：完全对照
++    limit = after + timedelta(days=random.randint(1, 40), hours=random.randint(0, 23))
++    got = plan_window(task, after, limit)
++    want = [m for m in naive_runs(trig, after, limit.date(), run_cap=limit) if m <= limit]
++    if got != want:
++        FAILS.append("plan#%d %s after=%s limit=%s\n   got=%r\n  want=%r"
++                     % (case, kwargs, after, limit, got[:10], want[:10]))
++
++    # next_runs：前缀对照（naive 只枚举到 horizon+30 天）
++    cap = after + timedelta(days=HORIZON_DAYS + 30)
++    nr = next_runs(task, after, 5)
++    ref = [m for m in naive_runs(trig, after, after.date() + timedelta(days=HORIZON_DAYS),
++                                 run_cap=cap)][:5]
++    n = min(len(nr), len(ref))
++    if nr[:n] != ref[:n] or (len(ref) >= 5 and len(nr) != 5):
++        FAILS.append("next#%d %s after=%s\n   got=%r\n  want=%r"
++                     % (case, kwargs, after, nr, ref))
++
++    # 两个触发器：合并去重
++    trig2 = Trigger(type="daily", start=start + timedelta(hours=1), days_interval=7)
++    task2 = Task(version="1.2", triggers=(trig, trig2))
++    got2 = plan_window(task2, after, limit)
++    want2 = sorted(set(want) | {m for m in naive_runs(trig2, after, limit.date(), run_cap=limit)
++                                if m <= limit})
++    if got2 != want2:
++        FAILS.append("merge#%d %s\n   got=%r\n  want=%r" % (case, kwargs, got2[:6], want2[:6]))
++
++print("cases done")
++if FAILS:
++    print("FAILED %d" % len(FAILS))
++    for f in FAILS[:10]:
++        print(" -", f)
++else:
++    print("ALL RANDOM CHECKS PASSED")
+diff --git a/wtask/duration.py b/wtask/duration.py
+index 3df99a7..cff1af4 100644
+--- a/wtask/duration.py
++++ b/wtask/duration.py
+@@ -1,7 +1,15 @@
+ """wtask.duration —— ISO-8601 时长（Task Scheduler 风格）的解析与规范化。
+ 
+ 接受的文本形如 ``P3D`` / ``PT72H`` / ``P1DT2H3M4S`` / ``PT0S``。
+-秒以外的部分必须是整数（本题不支持小数秒）。
++秒以外的部分必须是整数（本实现不支持小数秒）。
++
++规范形式见 ``docs/TASKSCHEMA.md`` §6：
++
++1. 先把总秒数分解成「天 / 时 / 分 / 秒」；
++2. 只写非零分量；时分秒全为 0 时省略整个 ``T`` 段；
++3. 零时长写作 ``PT0S``。
++
++例：``PT72H`` -> ``P3D``；``PT90M`` -> ``PT1H30M``；``P1DT2H3M4S`` 不变。
+ """
+ 
+ import re
+@@ -9,11 +17,16 @@ from datetime import timedelta
+ 
+ from .errors import TaskDefError
+ 
++__all__ = ["parse_duration", "format_duration"]
++
+ _DUR_RE = re.compile(
+     r"^P(?:(?P<d>\d+)D)?"
+     r"(?:T(?:(?P<h>\d+)H)?(?:(?P<m>\d+)M)?(?:(?P<s>\d+)S)?)?$"
+ )
+ 
++_SECONDS_PER_HOUR = 3600
++_SECONDS_PER_DAY = 86400
++
+ 
+ def parse_duration(text):
+     """把 ISO-8601 时长文本解析为 ``datetime.timedelta``。
+@@ -28,35 +41,49 @@ def parse_duration(text):
+     m = _DUR_RE.match(raw)
+     if m is None:
+         raise TaskDefError("duration", "invalid ISO-8601 duration: %r" % (text,))
+-    if raw in ("P", "PT"):
++    parts = m.groupdict()
++    if not any(value is not None for value in parts.values()):
+         raise TaskDefError("duration", "duration has no components: %r" % (text,))
++    if "T" in raw and not any(parts[key] is not None for key in ("h", "m", "s")):
++        raise TaskDefError("duration", "duration has an empty time part: %r" % (text,))
+     return timedelta(
+-        days=int(m.group("d") or 0),
+-        hours=int(m.group("h") or 0),
+-        minutes=int(m.group("m") or 0),
+-        seconds=int(m.group("s") or 0),
++        days=int(parts["d"] or 0),
++        hours=int(parts["h"] or 0),
++        minutes=int(parts["m"] or 0),
++        seconds=int(parts["s"] or 0),
+     )
+ 
+ 
+ def format_duration(value):
+-    """把 ``timedelta`` 写成 ISO-8601 文本。
++    """把 ``timedelta`` 写成**规范**的 ISO-8601 时长文本。
+ 
+-    只写非零分量，零时长写作 ``PT0S``。
++    只写非零分量；时分秒全为 0 时省略整个 ``T`` 段；零时长写作 ``PT0S``。
+     """
+     if not isinstance(value, timedelta):
+-        raise TaskDefError("duration", "format_duration expects timedelta")
+-    total = int(value.total_seconds())
++        raise TaskDefError(
++            "duration", "format_duration expects timedelta, got %r" % (value,)
++        )
++    # 用整数运算，避免 total_seconds() 的浮点误差。
++    total = value.days * _SECONDS_PER_DAY + value.seconds
+     if total < 0:
+         raise TaskDefError("duration", "negative duration is not representable")
+     if total == 0:
+         return "PT0S"
+-    hours, rem = divmod(total, 3600)
+-    minutes, seconds = divmod(rem, 60)
+-    out = "PT"
++
++    days, remainder = divmod(total, _SECONDS_PER_DAY)
++    hours, remainder = divmod(remainder, _SECONDS_PER_HOUR)
++    minutes, seconds = divmod(remainder, 60)
++
++    out = ""
++    if days:
++        out += "P%dD" % days
++    time_part = ""
+     if hours:
+-        out += "%dH" % hours
++        time_part += "%dH" % hours
+     if minutes:
+-        out += "%dM" % minutes
++        time_part += "%dM" % minutes
+     if seconds:
+-        out += "%dS" % seconds
++        time_part += "%dS" % seconds
++    if time_part:
++        out += ("P" if not out else "") + "T" + time_part
+     return out
+diff --git a/wtask/schedule.py b/wtask/schedule.py
+index 52abc47..88beee5 100644
+--- a/wtask/schedule.py
++++ b/wtask/schedule.py
+@@ -2,19 +2,42 @@
+ 
+ 本模块只做「给定任务与起始时刻，算出接下来的若干次运行时刻」这件事。
+ 所有计算都在**本地 naive 时间**上进行（不涉及时区与夏令时）。
++
++语义以 ``docs/TASKSCHEMA.md`` §3 - §5、§8 为准：
++
++* 四种日程的主出现日（每日任务锚定在 ``StartBoundary`` 的日期上）；
++* 主出现时刻取 ``StartBoundary`` 的时分秒，且必须 ``>= StartBoundary``；
++* ``EndBoundary`` 之后的时刻不再触发（重复产生的时刻同样受约束）；
++* ``Repetition`` 在主出现 ``T`` 之后产生 ``T + k*Interval``，只保留满足
++  ``k*Interval < Duration`` 的那些（``Duration`` 缺省表示不限时长）；
++* 任务被禁用时不产生任何时刻，单个触发器被禁用时跳过该触发器。
+ """
+ 
+ import calendar
++import heapq
+ from datetime import datetime, timedelta
+ 
+ from .errors import TaskDefError
+ 
++__all__ = [
++    "HORIZON_DAYS",
++    "PLAN_HARD_LIMIT",
++    "next_runs",
++    "plan_window",
++    "validate_task",
++]
++
+ #: 主出现扫描的最大跨度（天）。超出该跨度的任务定义视为不可调度。
+ HORIZON_DAYS = 800
+ 
+ #: ``plan_window`` 一次最多枚举多少次运行。
+ PLAN_HARD_LIMIT = 20000
+ 
++#: 合法的触发器 ``type``
++TRIGGER_TYPES = ("time", "daily", "weekly", "monthly", "monthly_dow")
++
++_ZERO = timedelta(0)
++
+ 
+ # ------------------------------------------------------------------ 日历工具
+ 
+@@ -25,13 +48,16 @@ def _weekday_index(day):
+ 
+ 
+ def _week_start(day):
+-    """返回 ``day`` 所在周的周一。"""
++    """返回 ``day`` 所在周的周一（周按周一起始划分）。"""
+     return day - timedelta(days=day.weekday())
+ 
+ 
+ def _week_index(day):
+-    """返回 ``day`` 在本月内的周序号（1 起）。"""
+-    return day.day // 7 + 1
++    """返回 ``day`` 在本月内的日历周序号（1 起，按日号划分）。
++
++    1-7 日为第 1 周，8-14 日为第 2 周，……，29 日及以后为第 5 周。
++    """
++    return (day.day - 1) // 7 + 1
+ 
+ 
+ def _weeks_in_month(day):
+@@ -43,77 +69,183 @@ def _weeks_in_month(day):
+ def _match_week(day, wanted):
+     """``<Week>`` 匹配。
+ 
+-    1..4 表示第 n 周；**5 表示该月的最后一周**（可能是第 4 周，例如 2 月）。
++    1..4 表示第 n 周；**5 表示该月的最后一周**（在只有 4 个日历周的月份里
++    —— 例如平年 2 月 —— 匹配的是第 4 周）。
+     """
+     index = _week_index(day)
+-    for w in wanted:
+-        if index == w:
++    last = _weeks_in_month(day)
++    for week in wanted:
++        if week == 5:
++            if index == last:
++                return True
++        elif index == week:
+             return True
+     return False
+ 
+ 
+ def _day_matches(trigger, day):
+     """``day`` 这一天是否是这个触发器的一个主出现日（不看时刻）。"""
+-    if trigger.type == "daily":
+-        return day.day % trigger.days_interval == 0
++    kind = trigger.type
++
++    if kind == "daily":
++        interval = trigger.days_interval
++        if not 1 <= interval <= 365:
++            raise TaskDefError("range", "DaysInterval %r out of 1..365" % (interval,))
++        # 锚点是 StartBoundary 的日期，而不是「当月的日号」。
++        return (day - trigger.start.date()).days % interval == 0
+ 
+-    if trigger.type == "weekly":
+-        return _weekday_index(day) in trigger.days_of_week
++    if kind == "weekly":
++        if _weekday_index(day) not in trigger.days_of_week:
++            return False
++        interval = trigger.weeks_interval
++        if not 1 <= interval <= 52:
++            raise TaskDefError("range", "WeeksInterval %r out of 1..52" % (interval,))
++        if interval == 1:
++            return True
++        # 从 StartBoundary 所在的周（周一）算起，周序号差必须是 interval 的整数倍。
++        weeks = (_week_start(day) - _week_start(trigger.start.date())).days // 7
++        return weeks % interval == 0
+ 
+-    if trigger.type == "monthly":
++    if kind == "monthly":
++        if trigger.months and day.month not in trigger.months:
++            return False
+         return day.day in trigger.days_of_month
+ 
+-    if trigger.type == "monthly_dow":
++    if kind == "monthly_dow":
+         if trigger.months and day.month not in trigger.months:
+             return False
+         if _weekday_index(day) not in trigger.days_of_week:
+             return False
+         return _match_week(day, trigger.weeks_of_month)
+ 
+-    if trigger.type == "time":
++    if kind == "time":
+         return day == trigger.start.date()
+ 
+-    raise TaskDefError("trigger", "unknown trigger type: %r" % (trigger.type,))
++    raise TaskDefError("trigger", "unknown trigger type: %r" % (kind,))
+ 
+ 
+ # ------------------------------------------------------------------ 出现时刻
+ 
+ 
+-def _primary_occurrences(trigger, after):
+-    """产出主出现时刻（升序，含早于 ``after`` 的，供重复展开使用）。"""
+-    out = []
+-    day = trigger.start.date()
++def _scan_floor(trigger, after):
++    """日扫描的起始日期：早于它的日号不可能产生 ``> after`` 的运行时刻。"""
++    start_day = trigger.start.date()
++    rep = trigger.repetition
++    if rep is None:
++        floor = after.date()
++    elif rep.duration is None:
++        # 不限时长的重复：任何历史主出现都会一直重复下去。
++        return start_day
++    elif rep.interval > _ZERO:
++        floor = (after - rep.duration).date()
++    else:
++        floor = after.date()
++    return start_day if floor < start_day else floor
++
++
++def _primary_occurrences(trigger, after, last_day=None):
++    """按升序惰性产出主出现时刻（含早于 ``after`` 的，供重复展开使用）。"""
++    tod = trigger.start.time()
++    day = _scan_floor(trigger, after)
+     stop = after.date() + timedelta(days=HORIZON_DAYS)
++    if last_day is not None and last_day < stop:
++        stop = last_day
+     if trigger.end is not None and trigger.end.date() < stop:
+         stop = trigger.end.date()
+-    tod = trigger.start.time()
+     while day <= stop:
+         if _day_matches(trigger, day):
+             moment = datetime.combine(day, tod)
+             if moment >= trigger.start:
+                 if trigger.end is not None and moment > trigger.end:
+-                    break
+-                out.append(moment)
++                    return
++                yield moment
+         day += timedelta(days=1)
+-    return out
+ 
+ 
+-def _expand(trigger, occurrence, after, count):
+-    """把一次主出现展开为若干次实际运行（含 ``<Repetition>``）。"""
++def _first_run(trigger, occurrence, after):
++    """该主出现产生的、**严格晚于** ``after`` 的第一次运行。
++
++    返回 ``(k, moment)``；若不存在则返回 ``None``。
++    """
+     rep = trigger.repetition
+-    if rep is None:
+-        return [occurrence] if occurrence > after else []
++    if rep is None or rep.interval <= _ZERO:
++        return (0, occurrence) if occurrence > after else None
++
++    interval = rep.interval
++    if occurrence > after:
++        step = 0
++    else:
++        step = (after - occurrence) // interval + 1
++    if rep.duration is not None and step * interval >= rep.duration:
++        return None
++    return step, occurrence + step * interval
++
+ 
++def _runs_for_trigger(trigger, after, count, until=None):
++    """单个触发器在 ``after`` 之后（且不超过 ``until``）的运行时刻。
++
++    结果升序、去重，最多 ``count`` 个。
++    """
++    if count <= 0:
++        return []
++
++    rep = trigger.repetition
++    repeating = rep is not None and rep.interval > _ZERO
++    # EndBoundary 同样约束重复产生的时刻。
++    bound = until
++    if trigger.end is not None and (bound is None or trigger.end < bound):
++        bound = trigger.end
++    last_day = bound.date() if bound is not None else None
++
++    occurrences = _primary_occurrences(trigger, after, last_day)
++    pending = next(occurrences, None)
++    heap = []
++    sequence = 0
+     runs = []
+-    step = 0
+-    while len(runs) < count and step < 100000:
+-        offset = rep.interval * step
+-        if rep.duration is not None and offset > rep.duration:
++    seen = set()
++
++    # 「不限时长」的重复里，相位相同（相差 Interval 的整数倍）的主出现会产生
++    # 完全被覆盖的运行序列，跳过它们只是性能优化，不影响结果。
++    unlimited = repeating and rep.duration is None
++    base = None
++    phases = set()
++
++    while True:
++        # 主出现按时间递增；任何首元素不晚于当前堆顶的主出现都必须先入堆，
++        # 这样才能保证产出严格升序。
++        while pending is not None and (not heap or pending <= heap[0][0]):
++            first = _first_run(trigger, pending, after)
++            sequence += 1
++            if first is not None:
++                if not unlimited:
++                    heapq.heappush(heap, (first[1], sequence, first[0]))
++                else:
++                    if base is None:
++                        base = pending
++                    phase = (pending - base) % rep.interval
++                    if phase not in phases:
++                        phases.add(phase)
++                        heapq.heappush(heap, (first[1], sequence, first[0]))
++            pending = next(occurrences, None)
++
++        if not heap:
+             break
+-        moment = occurrence + offset
+-        if moment > after:
++
++        moment, index, step = heapq.heappop(heap)
++        if bound is not None and moment > bound:
++            break  # 堆里剩下的只会更晚
++        if moment > after and moment not in seen:
++            seen.add(moment)
+             runs.append(moment)
+-        step += 1
++            if len(runs) >= count:
++                break
++        if repeating:
++            next_step = step + 1
++            if rep.duration is None or next_step * rep.interval < rep.duration:
++                candidate = moment + rep.interval
++                if bound is None or candidate <= bound:
++                    heapq.heappush(heap, (candidate, index, next_step))
++
+     return runs
+ 
+ 
+@@ -127,33 +259,130 @@ def next_runs(task, after, count):
+     * 触发器被禁用（``trigger.enabled`` 为假）时跳过该触发器；
+     * 返回的时刻**严格大于** ``after``；不足 ``count`` 次时返回实际数量。
+     """
+-    if not task.enabled:
++    try:
++        count = int(count)
++    except (TypeError, ValueError):
+         return []
+     if count <= 0:
+         return []
++    if not task.enabled:
++        return []
+ 
+-    moments = set()
++    moments = []
+     for trigger in task.triggers:
+-        for occurrence in _primary_occurrences(trigger, after):
+-            moments.update(_expand(trigger, occurrence, after, count))
++        if not trigger.enabled:
++            continue
++        moments.extend(_runs_for_trigger(trigger, after, count))
+ 
+-    return sorted(moments)[:count]
++    return sorted(set(moments))[:count]
+ 
+ 
+ def plan_window(task, start, end):
+     """返回位于 ``(start, end]`` 区间内的全部运行时刻（升序、去重）。"""
+     if end < start:
+         return []
+-    return [m for m in next_runs(task, start, PLAN_HARD_LIMIT) if m <= end]
++    if not task.enabled:
++        return []
++
++    moments = []
++    for trigger in task.triggers:
++        if not trigger.enabled:
++            continue
++        moments.extend(_runs_for_trigger(trigger, start, PLAN_HARD_LIMIT, until=end))
++
++    return sorted(set(moments))[:PLAN_HARD_LIMIT]
+ 
+ 
+ def validate_task(task):
+-    """跨字段一致性校验；不一致时抛 ``TaskDefError``。"""
+-    for trigger in task.triggers:
+-        if trigger.end is not None and trigger.end < trigger.start:
+-            raise TaskDefError(
+-                "structure",
+-                "EndBoundary %s is earlier than StartBoundary %s"
+-                % (trigger.end.isoformat(), trigger.start.isoformat()),
+-            )
++    """跨字段一致性校验；不一致时抛 ``TaskDefError``。
++
++    校验通过的 ``task`` 原样返回。
++    """
++    triggers = tuple(task.triggers or ())
++    if not triggers:
++        raise TaskDefError("structure", "task has no triggers")
++
++    for trigger in triggers:
++        kind = trigger.type
++        if kind not in TRIGGER_TYPES:
++            raise TaskDefError("trigger", "unknown trigger type: %r" % (kind,))
++        if not isinstance(trigger.start, datetime):
++            raise TaskDefError("range", "StartBoundary must be a datetime")
++        if trigger.end is not None:
++            if not isinstance(trigger.end, datetime):
++                raise TaskDefError("range", "EndBoundary must be a datetime")
++            if trigger.end < trigger.start:
++                raise TaskDefError(
++                    "structure",
++                    "EndBoundary %s is earlier than StartBoundary %s"
++                    % (trigger.end.isoformat(), trigger.start.isoformat()),
++                )
++
++        if kind == "daily":
++            if not 1 <= trigger.days_interval <= 365:
++                raise TaskDefError(
++                    "range", "DaysInterval %r out of 1..365" % (trigger.days_interval,)
++                )
++        elif kind == "weekly":
++            if not 1 <= trigger.weeks_interval <= 52:
++                raise TaskDefError(
++                    "range", "WeeksInterval %r out of 1..52" % (trigger.weeks_interval,)
++                )
++            _validate_weekdays(trigger.days_of_week)
++        elif kind == "monthly":
++            if not trigger.days_of_month:
++                raise TaskDefError("trigger", "<DaysOfMonth> is empty")
++            for value in trigger.days_of_month:
++                if not 1 <= value <= 31:
++                    raise TaskDefError("range", "Day %r out of 1..31" % (value,))
++            _validate_months(trigger.months)
++        elif kind == "monthly_dow":
++            if not trigger.weeks_of_month:
++                raise TaskDefError("trigger", "<Weeks> is empty")
++            for value in trigger.weeks_of_month:
++                if not 1 <= value <= 5:
++                    raise TaskDefError("range", "Week %r out of 1..5" % (value,))
++            _validate_weekdays(trigger.days_of_week)
++            _validate_months(trigger.months)
++
++        rep = trigger.repetition
++        if rep is not None:
++            if not isinstance(rep.interval, timedelta) or rep.interval <= _ZERO:
++                raise TaskDefError(
++                    "range", "repetition <Interval> must be a positive duration"
++                )
++            if rep.duration is not None and rep.duration <= _ZERO:
++                raise TaskDefError(
++                    "range", "repetition <Duration> must be a positive duration"
++                )
++
++    limit = task.execution_time_limit
++    if limit is not None and (not isinstance(limit, timedelta) or limit < _ZERO):
++        raise TaskDefError("duration", "invalid <ExecutionTimeLimit>")
++    delay = task.random_delay
++    if delay is not None and (not isinstance(delay, timedelta) or delay < _ZERO):
++        raise TaskDefError("duration", "invalid <RandomDelay>")
++
+     return task
++
++
++def _validate_weekdays(days_of_week):
++    days = tuple(days_of_week or ())
++    if not days:
++        raise TaskDefError("trigger", "<DaysOfWeek> is empty")
++    for value in days:
++        if not 0 <= value <= 6:
++            raise TaskDefError("trigger", "unknown weekday %r" % (value,))
++    if len(set(days)) != len(days):
++        raise TaskDefError("trigger", "duplicate weekday in <DaysOfWeek>")
++
++
++def _validate_months(months):
++    values = tuple(months or ())
++    if not values:
++        raise TaskDefError("trigger", "<Months> is empty")
++    for value in values:
++        if not 1 <= value <= 12:
++            raise TaskDefError("range", "month %r out of 1..12" % (value,))
++    if len(set(values)) != len(values):
++        raise TaskDefError("trigger", "duplicate month in <Months>")
+diff --git a/wtask/xmlio.py b/wtask/xmlio.py
+index d0076c2..e2e85d5 100644
+--- a/wtask/xmlio.py
++++ b/wtask/xmlio.py
+@@ -1,392 +1,461 @@
+-"""wtask.xmlio —— 任务 XML 的解析与规范化序列化。"""
+-
+-import xml.etree.ElementTree as ET
+-from datetime import datetime, timedelta
+-
+-from .duration import format_duration, parse_duration
+-from .errors import TaskDefError
+-from .model import MONTH_NAMES, WEEKDAY_NAMES, Repetition, Task, Trigger
+-from .schedule import validate_task
+-
+-#: 受支持的 ``version`` 属性
+-SUPPORTED_VERSIONS = ("1.0", "1.2")
+-
+-#: 默认命名空间（序列化时写回）
+-NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+-
+-DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+-
+-_DEFAULT_MULTIPLE_INSTANCES = "IgnoreNew"
+-
+-_TRIGGER_TAGS = ("CalendarTrigger", "TimeTrigger")
+-_SCHEDULE_TAGS = (
+-    "ScheduleByDay",
+-    "ScheduleByWeek",
+-    "ScheduleByMonth",
+-    "ScheduleByMonthDayOfWeek",
+-)
+-_CALENDAR_ALLOWED = ("StartBoundary", "EndBoundary", "Enabled", "Repetition") + _SCHEDULE_TAGS
+-_TIME_ALLOWED = ("StartBoundary", "EndBoundary", "Enabled", "Repetition")
+-
+-
+-# ------------------------------------------------------------------ 解析工具
+-
+-
+-def _tag(element):
+-    """去掉命名空间前缀，返回本地标签名。"""
+-    tag = element.tag
+-    return tag.split("}", 1)[1] if "}" in tag else tag
+-
+-
+-def _children(element, name):
+-    return [child for child in element if _tag(child) == name]
+-
+-
+-def _one(element, name):
+-    found = _children(element, name)
+-    if len(found) > 1:
+-        raise TaskDefError("schema", "duplicate <%s>" % name)
+-    return found[0] if found else None
+-
+-
+-def _text(element, name, required=False):
+-    child = _one(element, name)
+-    if child is None:
+-        if required:
+-            raise TaskDefError("schema", "missing required <%s>" % name)
+-        return None
+-    return (child.text or "").strip()
+-
+-
+-def _parse_datetime(text, name):
+-    try:
+-        return datetime.strptime(text, DATETIME_FORMAT)
+-    except (TypeError, ValueError):
+-        raise TaskDefError("range", "invalid datetime in <%s>: %r" % (name, text))
+-
+-
+-def _parse_bool(text, name):
+-    value = (text or "").strip().lower()
+-    if value in ("true", "1"):
+-        return True
+-    if value in ("false", "0"):
+-        return False
+-    raise TaskDefError("range", "invalid boolean in <%s>: %r" % (name, text))
+-
+-
+-def _parse_int(text, name):
+-    try:
+-        return int((text or "").strip())
+-    except (TypeError, ValueError):
+-        raise TaskDefError("range", "invalid integer in <%s>: %r" % (name, text))
+-
+-
+-def _check_children(element, allowed, where):
+-    for child in element:
+-        if _tag(child) not in allowed:
+-            raise TaskDefError("trigger", "unexpected <%s> inside <%s>" % (_tag(child), where))
+-
+-
+-def _parse_weekdays(element, name):
+-    """解析 ``<DaysOfWeek><Monday/>…</DaysOfWeek>``；缺失时返回 ``None``。"""
+-    holder = _one(element, name)
+-    if holder is None:
+-        return None
+-    days = []
+-    for child in holder:
+-        local = _tag(child)
+-        if local not in WEEKDAY_NAMES:
+-            raise TaskDefError("trigger", "unknown weekday <%s>" % local)
+-        days.append(WEEKDAY_NAMES.index(local))
+-    if not days:
+-        raise TaskDefError("trigger", "<%s> is empty" % name)
+-    if len(set(days)) != len(days):
+-        raise TaskDefError("trigger", "duplicate weekday in <%s>" % name)
+-    return tuple(sorted(days))
+-
+-
+-def _parse_months(element):
+-    holder = _one(element, "Months")
+-    if holder is None:
+-        raise TaskDefError("schema", "missing required <Months>")
+-    months = []
+-    for child in holder:
+-        local = _tag(child)
+-        if local not in MONTH_NAMES:
+-            raise TaskDefError("trigger", "unknown month <%s>" % local)
+-        months.append(MONTH_NAMES.index(local) + 1)
+-    if not months:
+-        raise TaskDefError("trigger", "<Months> is empty")
+-    if len(set(months)) != len(months):
+-        raise TaskDefError("trigger", "duplicate month in <Months>")
+-    return tuple(sorted(months))
+-
+-
+-def _parse_repetition(holder):
+-    element = _one(holder, "Repetition")
+-    if element is None:
+-        return None
+-    interval_text = _text(element, "Interval", required=True)
+-    interval = parse_duration(interval_text)
+-    if interval <= timedelta(0):
+-        raise TaskDefError("range", "repetition <Interval> must be positive")
+-    duration_text = _text(element, "Duration")
+-    duration = parse_duration(duration_text) if duration_text is not None else None
+-    if duration is not None and duration <= timedelta(0):
+-        raise TaskDefError("range", "repetition <Duration> must be positive")
+-    stop_text = _text(element, "StopAtDurationEnd")
+-    stop = _parse_bool(stop_text, "StopAtDurationEnd") if stop_text is not None else False
+-    return Repetition(interval=interval, duration=duration, stop_at_duration_end=stop)
+-
+-
+-def _parse_calendar(element):
+-    allowed = _CALENDAR_ALLOWED
+-    _check_children(element, allowed, "CalendarTrigger")
+-
+-    start = _parse_datetime(_text(element, "StartBoundary", required=True), "StartBoundary")
+-    end_text = _text(element, "EndBoundary")
+-    end = _parse_datetime(end_text, "EndBoundary") if end_text is not None else None
+-    enabled_text = _text(element, "Enabled")
+-    enabled = _parse_bool(enabled_text, "Enabled") if enabled_text is not None else True
+-    repetition = _parse_repetition(element)
+-
+-    schedules = [child for child in element if _tag(child) in _SCHEDULE_TAGS]
+-    if not schedules:
+-        raise TaskDefError("trigger", "<CalendarTrigger> requires exactly one schedule")
+-    if len(schedules) > 1:
+-        raise TaskDefError(
+-            "trigger", "<CalendarTrigger> has %d schedules, expected 1" % len(schedules)
+-        )
+-    schedule = schedules[0]
+-    kind = _tag(schedule)
+-
+-    if kind == "ScheduleByDay":
+-        _check_children(schedule, ("DaysInterval",), "ScheduleByDay")
+-        interval_text = _text(schedule, "DaysInterval")
+-        days_interval = _parse_int(interval_text, "DaysInterval") if interval_text else 1
+-        return Trigger(
+-            type="daily", start=start, end=end, enabled=enabled,
+-            days_interval=days_interval, repetition=repetition,
+-        )
+-
+-    if kind == "ScheduleByWeek":
+-        _check_children(schedule, ("DaysOfWeek", "WeeksInterval"), "ScheduleByWeek")
+-        days_of_week = _parse_weekdays(schedule, "DaysOfWeek")
+-        if days_of_week is None:
+-            raise TaskDefError("trigger", "<ScheduleByWeek> requires <DaysOfWeek>")
+-        weeks_text = _text(schedule, "WeeksInterval")
+-        weeks_interval = _parse_int(weeks_text, "WeeksInterval") if weeks_text else 1
+-        if not 1 <= weeks_interval <= 52:
+-            raise TaskDefError("range", "WeeksInterval out of 1..52")
+-        return Trigger(
+-            type="weekly", start=start, end=end, enabled=enabled,
+-            weeks_interval=weeks_interval, days_of_week=days_of_week,
+-            repetition=repetition,
+-        )
+-
+-    if kind == "ScheduleByMonth":
+-        _check_children(schedule, ("DaysOfMonth", "Months"), "ScheduleByMonth")
+-        holder = _one(schedule, "DaysOfMonth")
+-        if holder is None:
+-            raise TaskDefError("schema", "missing required <DaysOfMonth>")
+-        days_of_month = tuple(sorted(_parse_int(child.text, "Day") for child in holder))
+-        if not days_of_month:
+-            raise TaskDefError("trigger", "<DaysOfMonth> is empty")
+-        for value in days_of_month:
+-            if not 1 <= value <= 31:
+-                raise TaskDefError("range", "Day %d out of 1..31" % value)
+-        return Trigger(
+-            type="monthly", start=start, end=end, enabled=enabled,
+-            days_of_month=days_of_month, months=_parse_months(schedule),
+-            repetition=repetition,
+-        )
+-
+-    # ScheduleByMonthDayOfWeek
+-    _check_children(schedule, ("Weeks", "DaysOfWeek", "Months"), "ScheduleByMonthDayOfWeek")
+-    holder = _one(schedule, "Weeks")
+-    if holder is None:
+-        raise TaskDefError("schema", "missing required <Weeks>")
+-    weeks_of_month = tuple(sorted(_parse_int(child.text, "Week") for child in holder))
+-    if not weeks_of_month:
+-        raise TaskDefError("trigger", "<Weeks> is empty")
+-    for value in weeks_of_month:
+-        if not 1 <= value <= 5:
+-            raise TaskDefError("range", "Week %d out of 1..5" % value)
+-    days_of_week = _parse_weekdays(schedule, "DaysOfWeek")
+-    if days_of_week is None:
+-        raise TaskDefError("trigger", "<ScheduleByMonthDayOfWeek> requires <DaysOfWeek>")
+-    return Trigger(
+-        type="monthly_dow", start=start, end=end, enabled=enabled,
+-        days_of_week=days_of_week, weeks_of_month=weeks_of_month,
+-        months=_parse_months(schedule), repetition=repetition,
+-    )
+-
+-
+-def _parse_time(element):
+-    _check_children(element, _TIME_ALLOWED, "TimeTrigger")
+-    start = _parse_datetime(_text(element, "StartBoundary", required=True), "StartBoundary")
+-    end_text = _text(element, "EndBoundary")
+-    end = _parse_datetime(end_text, "EndBoundary") if end_text is not None else None
+-    enabled_text = _text(element, "Enabled")
+-    enabled = _parse_bool(enabled_text, "Enabled") if enabled_text is not None else True
+-    return Trigger(
+-        type="time", start=start, end=end, enabled=enabled,
+-        repetition=_parse_repetition(element),
+-    )
+-
+-
+-# ------------------------------------------------------------------ 公共 API
+-
+-
+-def parse_task_xml(text):
+-    """把任务 XML 解析为 :class:`~wtask.model.Task`。"""
+-    if not isinstance(text, (str, bytes)):
+-        raise TaskDefError("xml", "text must be str or bytes")
+-    try:
+-        root = ET.fromstring(text)
+-    except ET.ParseError as exc:
+-        raise TaskDefError("xml", str(exc))
+-
+-    if _tag(root) != "Task":
+-        raise TaskDefError("schema", "root element must be <Task>")
+-
+-    version = (root.get("version") or "").strip()
+-
+-    holders = _children(root, "Triggers")
+-    if not holders:
+-        raise TaskDefError("structure", "missing <Triggers>")
+-    if len(holders) > 1:
+-        raise TaskDefError("schema", "duplicate <Triggers>")
+-
+-    triggers = []
+-    for child in holders[0]:
+-        local = _tag(child)
+-        if local == "CalendarTrigger":
+-            triggers.append(_parse_calendar(child))
+-        elif local == "TimeTrigger":
+-            triggers.append(_parse_time(child))
+-        else:
+-            continue
+-    if not triggers:
+-        raise TaskDefError("structure", "<Triggers> is empty")
+-
+-    fields = {"version": version, "triggers": tuple(triggers)}
+-    settings = _one(root, "Settings")
+-    if settings is not None:
+-        enabled_text = _text(settings, "Enabled")
+-        if enabled_text is not None:
+-            fields["enabled"] = _parse_bool(enabled_text, "Enabled")
+-        limit_text = _text(settings, "ExecutionTimeLimit")
+-        if limit_text is not None:
+-            fields["execution_time_limit"] = parse_duration(limit_text)
+-        policy = _text(settings, "MultipleInstancesPolicy")
+-        if policy:
+-            fields["multiple_instances"] = policy
+-        delay_text = _text(settings, "RandomDelay")
+-        if delay_text is not None:
+-            fields["random_delay"] = parse_duration(delay_text)
+-
+-    task = Task(**fields)
+-    validate_task(task)
+-    return task
+-
+-
+-def _format_datetime(value):
+-    return value.strftime(DATETIME_FORMAT)
+-
+-
+-def _weekday_elements(days):
+-    return "".join("<%s/>" % WEEKDAY_NAMES[day] for day in days)
+-
+-
+-def _month_elements(months):
+-    return "".join("<%s/>" % MONTH_NAMES[month - 1] for month in months)
+-
+-
+-def _trigger_xml(trigger, indent):
+-    pad = " " * indent
+-    inner = " " * (indent + 2)
+-    name = "TimeTrigger" if trigger.type == "time" else "CalendarTrigger"
+-    lines = [pad + "<%s>" % name]
+-    lines.append(inner + "<StartBoundary>%s</StartBoundary>" % _format_datetime(trigger.start))
+-    if trigger.end is not None:
+-        lines.append(inner + "<EndBoundary>%s</EndBoundary>" % _format_datetime(trigger.end))
+-    if not trigger.enabled:
+-        lines.append(inner + "<Enabled>false</Enabled>")
+-
+-    if trigger.type == "daily":
+-        lines.append(inner + "<ScheduleByDay>")
+-        lines.append(inner + "  <DaysInterval>%d</DaysInterval>" % trigger.days_interval)
+-        lines.append(inner + "</ScheduleByDay>")
+-    elif trigger.type == "weekly":
+-        lines.append(inner + "<ScheduleByWeek>")
+-        lines.append(
+-            inner + "  <DaysOfWeek>" + _weekday_elements(trigger.days_of_week) + "</DaysOfWeek>"
+-        )
+-        lines.append(inner + "  <WeeksInterval>%d</WeeksInterval>" % trigger.weeks_interval)
+-        lines.append(inner + "</ScheduleByWeek>")
+-    elif trigger.type == "monthly":
+-        lines.append(inner + "<ScheduleByMonth>")
+-        lines.append(
+-            inner + "  <DaysOfMonth>"
+-            + "".join("<Day>%d</Day>" % day for day in trigger.days_of_month)
+-            + "</DaysOfMonth>"
+-        )
+-        lines.append(inner + "  <Months>" + _month_elements(trigger.months) + "</Months>")
+-        lines.append(inner + "</ScheduleByMonth>")
+-    elif trigger.type == "monthly_dow":
+-        lines.append(inner + "<ScheduleByMonthDayOfWeek>")
+-        lines.append(
+-            inner + "  <Weeks>"
+-            + "".join("<Week>%d</Week>" % week for week in trigger.weeks_of_month)
+-            + "</Weeks>"
+-        )
+-        lines.append(
+-            inner + "  <DaysOfWeek>" + _weekday_elements(trigger.days_of_week) + "</DaysOfWeek>"
+-        )
+-        lines.append(inner + "  <Months>" + _month_elements(trigger.months) + "</Months>")
+-        lines.append(inner + "</ScheduleByMonthDayOfWeek>")
+-
+-    repetition = trigger.repetition
+-    if repetition is not None:
+-        lines.append(inner + "<Repetition>")
+-        lines.append(inner + "  <Interval>%s</Interval>" % format_duration(repetition.interval))
+-        if repetition.duration is not None:
+-            lines.append(
+-                inner + "  <Duration>%s</Duration>" % format_duration(repetition.duration)
+-            )
+-        if repetition.stop_at_duration_end:
+-            lines.append(inner + "  <StopAtDurationEnd>true</StopAtDurationEnd>")
+-        lines.append(inner + "</Repetition>")
+-
+-    lines.append(pad + "</%s>" % name)
+-    return lines
+-
+-
+-def task_to_xml(task):
+-    """把 :class:`~wtask.model.Task` 规范化为 XML 文本。
+-
+-    规范化规则见 ``docs/TASKSCHEMA.md`` §7：元素与属性顺序固定、缺省值省略、
+-    日期时间写作 ``YYYY-MM-DDTHH:MM:SS``、时长写成规范形式。
+-    """
+-    lines = ['<Task version="%s" xmlns="%s">' % (task.version, NS)]
+-    lines.append("  <Triggers>")
+-    for trigger in task.triggers:
+-        lines.extend(_trigger_xml(trigger, 4))
+-    lines.append("  </Triggers>")
+-    lines.append("  <Settings>")
+-    lines.append(
+-        "    <MultipleInstancesPolicy>%s</MultipleInstancesPolicy>" % task.multiple_instances
+-    )
+-    if not task.enabled:
+-        lines.append("    <Enabled>false</Enabled>")
+-    if task.execution_time_limit is not None:
+-        lines.append(
+-            "    <ExecutionTimeLimit>%s</ExecutionTimeLimit>"
+-            % format_duration(task.execution_time_limit)
+-        )
+-    if task.random_delay:
+-        lines.append("    <RandomDelay>%s</RandomDelay>" % format_duration(task.random_delay))
+-    lines.append("  </Settings>")
+-    lines.append("</Task>")
+-    return "\n".join(lines) + "\n"
++"""wtask.xmlio —— 任务 XML 的解析与规范化序列化。
++
++解析与回写的规则以 ``docs/TASKSCHEMA.md`` §1、§2、§7、§9 为准：
++
++* 根元素必须是 ``<Task>``，``version`` 只接受 ``1.0`` / ``1.2``；
++* ``<Triggers>`` 必须存在且非空，其中只允许 ``<CalendarTrigger>`` 与
++  ``<TimeTrigger>``；
++* 根下其它元素（``<RegistrationInfo>``、``<Actions>`` …）一律忽略；
++* 所有结构 / 取值问题都抛 :class:`~wtask.errors.TaskDefError`，``kind`` 见 §9。
++"""
++
++import xml.etree.ElementTree as ET
++from datetime import datetime, timedelta
++
++from .duration import format_duration, parse_duration
++from .errors import TaskDefError
++from .model import MONTH_NAMES, WEEKDAY_NAMES, Repetition, Task, Trigger
++from .schedule import validate_task
++
++__all__ = ["NS", "SUPPORTED_VERSIONS", "parse_task_xml", "task_to_xml"]
++
++#: 受支持的 ``version`` 属性
++SUPPORTED_VERSIONS = ("1.0", "1.2")
++
++#: 默认命名空间（序列化时写回）
++NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
++
++DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
++
++_DEFAULT_MULTIPLE_INSTANCES = "IgnoreNew"
++
++_TRIGGER_TAGS = ("CalendarTrigger", "TimeTrigger")
++_SCHEDULE_TAGS = (
++    "ScheduleByDay",
++    "ScheduleByWeek",
++    "ScheduleByMonth",
++    "ScheduleByMonthDayOfWeek",
++)
++_COMMON_TRIGGER_CHILDREN = ("StartBoundary", "EndBoundary", "Enabled", "Repetition")
++_CALENDAR_ALLOWED = _COMMON_TRIGGER_CHILDREN + _SCHEDULE_TAGS
++_TIME_ALLOWED = _COMMON_TRIGGER_CHILDREN
++_REPETITION_ALLOWED = ("Interval", "Duration", "StopAtDurationEnd")
++
++_ZERO = timedelta(0)
++
++
++# ------------------------------------------------------------------ 解析工具
++
++
++def _tag(element):
++    """去掉命名空间前缀，返回本地标签名（注释 / 处理指令返回空串）。"""
++    tag = element.tag
++    if not isinstance(tag, str):
++        return ""
++    return tag.split("}", 1)[1] if "}" in tag else tag
++
++
++def _children(element, name):
++    return [child for child in element if _tag(child) == name]
++
++
++def _one(element, name):
++    found = _children(element, name)
++    if len(found) > 1:
++        raise TaskDefError("schema", "duplicate <%s>" % name)
++    return found[0] if found else None
++
++
++def _text(element, name, required=False):
++    child = _one(element, name)
++    if child is None:
++        if required:
++            raise TaskDefError("schema", "missing required <%s>" % name)
++        return None
++    return (child.text or "").strip()
++
++
++def _parse_datetime(text, name):
++    try:
++        return datetime.strptime(text, DATETIME_FORMAT)
++    except (TypeError, ValueError):
++        raise TaskDefError("range", "invalid datetime in <%s>: %r" % (name, text))
++
++
++def _parse_bool(text, name):
++    value = (text or "").strip().lower()
++    if value in ("true", "1"):
++        return True
++    if value in ("false", "0"):
++        return False
++    raise TaskDefError("range", "invalid boolean in <%s>: %r" % (name, text))
++
++
++def _parse_int(text, name):
++    try:
++        return int((text or "").strip())
++    except (TypeError, ValueError):
++        raise TaskDefError("range", "invalid integer in <%s>: %r" % (name, text))
++
++
++def _check_children(element, allowed, where):
++    for child in element:
++        local = _tag(child)
++        if not local:  # 注释 / 处理指令
++            continue
++        if local not in allowed:
++            raise TaskDefError(
++                "trigger", "unexpected <%s> inside <%s>" % (local, where)
++            )
++
++
++def _parse_weekdays(element, name):
++    """解析 ``<DaysOfWeek><Monday/>…</DaysOfWeek>``；缺失时返回 ``None``。"""
++    holder = _one(element, name)
++    if holder is None:
++        return None
++    days = []
++    for child in holder:
++        local = _tag(child)
++        if not local:
++            continue
++        if local not in WEEKDAY_NAMES:
++            raise TaskDefError("trigger", "unknown weekday <%s>" % local)
++        days.append(WEEKDAY_NAMES.index(local))
++    if not days:
++        raise TaskDefError("trigger", "<%s> is empty" % name)
++    if len(set(days)) != len(days):
++        raise TaskDefError("trigger", "duplicate weekday in <%s>" % name)
++    return tuple(sorted(days))
++
++
++def _parse_months(element):
++    holder = _one(element, "Months")
++    if holder is None:
++        raise TaskDefError("schema", "missing required <Months>")
++    months = []
++    for child in holder:
++        local = _tag(child)
++        if not local:
++            continue
++        if local not in MONTH_NAMES:
++            raise TaskDefError("trigger", "unknown month <%s>" % local)
++        months.append(MONTH_NAMES.index(local) + 1)
++    if not months:
++        raise TaskDefError("trigger", "<Months> is empty")
++    if len(set(months)) != len(months):
++        raise TaskDefError("trigger", "duplicate month in <Months>")
++    return tuple(sorted(months))
++
++
++def _parse_repetition(holder):
++    element = _one(holder, "Repetition")
++    if element is None:
++        return None
++    _check_children(element, _REPETITION_ALLOWED, "Repetition")
++    interval_text = _text(element, "Interval", required=True)
++    interval = parse_duration(interval_text)
++    if interval <= _ZERO:
++        raise TaskDefError("range", "repetition <Interval> must be positive")
++    duration_text = _text(element, "Duration")
++    duration = parse_duration(duration_text) if duration_text is not None else None
++    if duration is not None and duration <= _ZERO:
++        raise TaskDefError("range", "repetition <Duration> must be positive")
++    stop_text = _text(element, "StopAtDurationEnd")
++    stop = _parse_bool(stop_text, "StopAtDurationEnd") if stop_text is not None else False
++    return Repetition(interval=interval, duration=duration, stop_at_duration_end=stop)
++
++
++def _parse_boundaries(element):
++    """解析 ``StartBoundary`` / ``EndBoundary`` / ``Enabled`` 三项公共子元素。"""
++    start = _parse_datetime(_text(element, "StartBoundary", required=True), "StartBoundary")
++    end_text = _text(element, "EndBoundary")
++    end = _parse_datetime(end_text, "EndBoundary") if end_text is not None else None
++    enabled_text = _text(element, "Enabled")
++    enabled = _parse_bool(enabled_text, "Enabled") if enabled_text is not None else True
++    return start, end, enabled
++
++
++def _parse_calendar(element):
++    _check_children(element, _CALENDAR_ALLOWED, "CalendarTrigger")
++
++    start, end, enabled = _parse_boundaries(element)
++    repetition = _parse_repetition(element)
++
++    schedules = [child for child in element if _tag(child) in _SCHEDULE_TAGS]
++    if not schedules:
++        raise TaskDefError("trigger", "<CalendarTrigger> requires exactly one schedule")
++    if len(schedules) > 1:
++        raise TaskDefError(
++            "trigger", "<CalendarTrigger> has %d schedules, expected 1" % len(schedules)
++        )
++    schedule = schedules[0]
++    kind = _tag(schedule)
++
++    if kind == "ScheduleByDay":
++        _check_children(schedule, ("DaysInterval",), "ScheduleByDay")
++        interval_text = _text(schedule, "DaysInterval")
++        days_interval = _parse_int(interval_text, "DaysInterval") if interval_text else 1
++        if not 1 <= days_interval <= 365:
++            raise TaskDefError("range", "DaysInterval %d out of 1..365" % days_interval)
++        return Trigger(
++            type="daily", start=start, end=end, enabled=enabled,
++            days_interval=days_interval, repetition=repetition,
++        )
++
++    if kind == "ScheduleByWeek":
++        _check_children(schedule, ("DaysOfWeek", "WeeksInterval"), "ScheduleByWeek")
++        days_of_week = _parse_weekdays(schedule, "DaysOfWeek")
++        if days_of_week is None:
++            raise TaskDefError("trigger", "<ScheduleByWeek> requires <DaysOfWeek>")
++        weeks_text = _text(schedule, "WeeksInterval")
++        weeks_interval = _parse_int(weeks_text, "WeeksInterval") if weeks_text else 1
++        if not 1 <= weeks_interval <= 52:
++            raise TaskDefError("range", "WeeksInterval %d out of 1..52" % weeks_interval)
++        return Trigger(
++            type="weekly", start=start, end=end, enabled=enabled,
++            weeks_interval=weeks_interval, days_of_week=days_of_week,
++            repetition=repetition,
++        )
++
++    if kind == "ScheduleByMonth":
++        _check_children(schedule, ("DaysOfMonth", "Months"), "ScheduleByMonth")
++        holder = _one(schedule, "DaysOfMonth")
++        if holder is None:
++            raise TaskDefError("schema", "missing required <DaysOfMonth>")
++        _check_children(holder, ("Day",), "DaysOfMonth")
++        days_of_month = tuple(
++            sorted(_parse_int(child.text, "Day") for child in _children(holder, "Day"))
++        )
++        if not days_of_month:
++            raise TaskDefError("trigger", "<DaysOfMonth> is empty")
++        for value in days_of_month:
++            if not 1 <= value <= 31:
++                raise TaskDefError("range", "Day %d out of 1..31" % value)
++        return Trigger(
++            type="monthly", start=start, end=end, enabled=enabled,
++            days_of_month=days_of_month, months=_parse_months(schedule),
++            repetition=repetition,
++        )
++
++    # ScheduleByMonthDayOfWeek
++    _check_children(schedule, ("Weeks", "DaysOfWeek", "Months"), "ScheduleByMonthDayOfWeek")
++    holder = _one(schedule, "Weeks")
++    if holder is None:
++        raise TaskDefError("schema", "missing required <Weeks>")
++    _check_children(holder, ("Week",), "Weeks")
++    weeks_of_month = tuple(
++        sorted(_parse_int(child.text, "Week") for child in _children(holder, "Week"))
++    )
++    if not weeks_of_month:
++        raise TaskDefError("trigger", "<Weeks> is empty")
++    for value in weeks_of_month:
++        if not 1 <= value <= 5:
++            raise TaskDefError("range", "Week %d out of 1..5" % value)
++    days_of_week = _parse_weekdays(schedule, "DaysOfWeek")
++    if days_of_week is None:
++        raise TaskDefError("trigger", "<ScheduleByMonthDayOfWeek> requires <DaysOfWeek>")
++    return Trigger(
++        type="monthly_dow", start=start, end=end, enabled=enabled,
++        days_of_week=days_of_week, weeks_of_month=weeks_of_month,
++        months=_parse_months(schedule), repetition=repetition,
++    )
++
++
++def _parse_time(element):
++    _check_children(element, _TIME_ALLOWED, "TimeTrigger")
++    start, end, enabled = _parse_boundaries(element)
++    return Trigger(
++        type="time", start=start, end=end, enabled=enabled,
++        repetition=_parse_repetition(element),
++    )
++
++
++def _parse_trigger(element):
++    local = _tag(element)
++    if local == "CalendarTrigger":
++        return _parse_calendar(element)
++    if local == "TimeTrigger":
++        return _parse_time(element)
++    raise TaskDefError("trigger", "unknown trigger element <%s>" % (local,))
++
++
++def _parse_settings(element):
++    """解析 ``<Settings>``；规格里没有定义的子元素一律忽略。"""
++    fields = {}
++    policy = _text(element, "MultipleInstancesPolicy")
++    if policy is not None:
++        fields["multiple_instances"] = policy
++    enabled_text = _text(element, "Enabled")
++    if enabled_text is not None:
++        fields["enabled"] = _parse_bool(enabled_text, "Enabled")
++    limit_text = _text(element, "ExecutionTimeLimit")
++    if limit_text is not None:
++        limit = parse_duration(limit_text)
++        # <ExecutionTimeLimit>PT0S</ExecutionTimeLimit> 表示「不限时长」。
++        fields["execution_time_limit"] = None if limit == _ZERO else limit
++    delay_text = _text(element, "RandomDelay")
++    if delay_text is not None:
++        fields["random_delay"] = parse_duration(delay_text)
++    return fields
++
++
++# ------------------------------------------------------------------ 公共 API
++
++
++def parse_task_xml(text):
++    """把任务 XML 解析为 :class:`~wtask.model.Task`。"""
++    if not isinstance(text, (str, bytes)):
++        raise TaskDefError("xml", "text must be str or bytes")
++    try:
++        root = ET.fromstring(text)
++    except ET.ParseError as exc:
++        raise TaskDefError("xml", str(exc))
++    except ValueError:
++        # str 里带 encoding 声明时 ElementTree 会拒绝，改用字节流再试一次。
++        try:
++            root = ET.fromstring(text.encode("utf-8"))
++        except Exception as exc:
++            raise TaskDefError("xml", str(exc))
++    except Exception as exc:
++        raise TaskDefError("xml", str(exc))
++
++    if root is None or _tag(root) != "Task":
++        raise TaskDefError("schema", "root element must be <Task>")
++
++    version = (root.get("version") or "").strip()
++    if version not in SUPPORTED_VERSIONS:
++        raise TaskDefError(
++            "version",
++            "unsupported task version %r (expected one of %s)"
++            % (version, ", ".join(SUPPORTED_VERSIONS)),
++        )
++
++    holders = _children(root, "Triggers")
++    if not holders:
++        raise TaskDefError("structure", "missing <Triggers>")
++    if len(holders) > 1:
++        raise TaskDefError("schema", "duplicate <Triggers>")
++
++    triggers = []
++    for child in holders[0]:
++        if not _tag(child):  # 注释 / 处理指令
++            continue
++        triggers.append(_parse_trigger(child))
++    if not triggers:
++        raise TaskDefError("structure", "<Triggers> is empty")
++
++    fields = {"version": version, "triggers": tuple(triggers)}
++
++    settings = _one(root, "Settings")
++    if settings is not None:
++        fields.update(_parse_settings(settings))
++
++    task = Task(**fields)
++    validate_task(task)
++    return task
++
++
++def _format_datetime(value):
++    return value.strftime(DATETIME_FORMAT)
++
++
++def _weekday_elements(days):
++    return "".join("<%s/>" % WEEKDAY_NAMES[day] for day in sorted(days))
++
++
++def _month_elements(months):
++    return "".join("<%s/>" % MONTH_NAMES[month - 1] for month in sorted(months))
++
++
++def _trigger_xml(trigger, indent):
++    pad = " " * indent
++    inner = " " * (indent + 2)
++    name = "TimeTrigger" if trigger.type == "time" else "CalendarTrigger"
++    lines = [pad + "<%s>" % name]
++    lines.append(inner + "<StartBoundary>%s</StartBoundary>" % _format_datetime(trigger.start))
++    if trigger.end is not None:
++        lines.append(inner + "<EndBoundary>%s</EndBoundary>" % _format_datetime(trigger.end))
++    if not trigger.enabled:
++        lines.append(inner + "<Enabled>false</Enabled>")
++
++    if trigger.type == "daily":
++        lines.append(inner + "<ScheduleByDay>")
++        lines.append(inner + "  <DaysInterval>%d</DaysInterval>" % trigger.days_interval)
++        lines.append(inner + "</ScheduleByDay>")
++    elif trigger.type == "weekly":
++        lines.append(inner + "<ScheduleByWeek>")
++        lines.append(
++            inner + "  <DaysOfWeek>" + _weekday_elements(trigger.days_of_week) + "</DaysOfWeek>"
++        )
++        lines.append(inner + "  <WeeksInterval>%d</WeeksInterval>" % trigger.weeks_interval)
++        lines.append(inner + "</ScheduleByWeek>")
++    elif trigger.type == "monthly":
++        lines.append(inner + "<ScheduleByMonth>")
++        lines.append(
++            inner + "  <DaysOfMonth>"
++            + "".join(
++                "<Day>%d</Day>" % day for day in sorted(trigger.days_of_month)
++            )
++            + "</DaysOfMonth>"
++        )
++        lines.append(inner + "  <Months>" + _month_elements(trigger.months) + "</Months>")
++        lines.append(inner + "</ScheduleByMonth>")
++    elif trigger.type == "monthly_dow":
++        lines.append(inner + "<ScheduleByMonthDayOfWeek>")
++        lines.append(
++            inner + "  <Weeks>"
++            + "".join(
++                "<Week>%d</Week>" % week for week in sorted(trigger.weeks_of_month)
++            )
++            + "</Weeks>"
++        )
++        lines.append(
++            inner + "  <DaysOfWeek>" + _weekday_elements(trigger.days_of_week) + "</DaysOfWeek>"
++        )
++        lines.append(inner + "  <Months>" + _month_elements(trigger.months) + "</Months>")
++        lines.append(inner + "</ScheduleByMonthDayOfWeek>")
++    elif trigger.type != "time":
++        raise TaskDefError("trigger", "unknown trigger type: %r" % (trigger.type,))
++
++    repetition = trigger.repetition
++    if repetition is not None:
++        lines.append(inner + "<Repetition>")
++        lines.append(inner + "  <Interval>%s</Interval>" % format_duration(repetition.interval))
++        if repetition.duration is not None:
++            lines.append(
++                inner + "  <Duration>%s</Duration>" % format_duration(repetition.duration)
++            )
++        if repetition.stop_at_duration_end:
++            lines.append(inner + "  <StopAtDurationEnd>true</StopAtDurationEnd>")
++        lines.append(inner + "</Repetition>")
++
++    lines.append(pad + "</%s>" % name)
++    return lines
++
++
++def task_to_xml(task):
++    """把 :class:`~wtask.model.Task` 规范化为 XML 文本。
++
++    规范化规则见 ``docs/TASKSCHEMA.md`` §7：元素与属性顺序固定、缺省值省略、
++    日期时间写作 ``YYYY-MM-DDTHH:MM:SS``、时长写成规范形式。
++    """
++    lines = ['<Task version="%s" xmlns="%s">' % (task.version, NS)]
++    lines.append("  <Triggers>")
++    for trigger in task.triggers:
++        lines.extend(_trigger_xml(trigger, 4))
++    lines.append("  </Triggers>")
++    lines.append("  <Settings>")
++    lines.append(
++        "    <MultipleInstancesPolicy>%s</MultipleInstancesPolicy>" % task.multiple_instances
++    )
++    if not task.enabled:
++        lines.append("    <Enabled>false</Enabled>")
++    limit = task.execution_time_limit
++    if limit is not None and limit != _ZERO:
++        lines.append("    <ExecutionTimeLimit>%s</ExecutionTimeLimit>" % format_duration(limit))
++    if task.random_delay:
++        lines.append("    <RandomDelay>%s</RandomDelay>" % format_duration(task.random_delay))
++    lines.append("  </Settings>")
++    lines.append("</Task>")
++    return "\n".join(lines) + "\n"

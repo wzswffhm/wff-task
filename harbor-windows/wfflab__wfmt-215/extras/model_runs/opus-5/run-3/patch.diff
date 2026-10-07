@@ -1,0 +1,164 @@
+diff --git a/wfmt/codec.py b/wfmt/codec.py
+index bf20fd2..8bebf89 100644
+--- a/wfmt/codec.py
++++ b/wfmt/codec.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from .crc import CRC_SIZE, compute_crc, pack_crc
++from .crc import CRC_SIZE, compute_crc, pack_crc, unpack_crc
+ from .errors import WFormatError
+ from .header import HEADER_SIZE, parse_header, pack_header
+ from .varint import decode_uvarint, encode_uvarint
+@@ -21,19 +21,35 @@ ALIGN = 4
+ 
+ 
+ def encode_record(tag, payload):
+-    """把一条记录编码成容器内的字节串。"""
++    """把一条记录编码成容器内的字节串（含填充）。"""
+     if isinstance(payload, str):
+         payload = payload.encode("utf-8")
+-    return encode_uvarint(tag) + encode_uvarint(len(payload)) + bytes(payload)
++    
++    tag_bytes = encode_uvarint(tag)
++    len_bytes = encode_uvarint(len(payload))
++    record = tag_bytes + len_bytes + bytes(payload)
++    
++    # 计算填充
++    padding = (ALIGN - (len(record) % ALIGN)) % ALIGN
++    return record + b'\x00' * padding
+ 
+ 
+ def decode_record(data, pos=0):
+-    """从 ``data[pos:]`` 解出一条记录，返回 ``(tag, payload, next_pos)``。"""
++    """从 ``data[pos:]`` 解出一条记录（含填充），返回 ``(tag, payload, next_pos)``。"""
++    start = pos
+     tag, pos = decode_uvarint(data, pos)
+     length, pos = decode_uvarint(data, pos)
+     if pos + length > len(data):
+         raise WFormatError("truncated", "记录载荷不完整")
+-    return tag, bytes(data[pos:pos + length]), pos + length
++    payload = bytes(data[pos:pos + length])
++    pos += length
++    
++    # 计算并跳过填充
++    record_len = pos - start
++    padding = (ALIGN - (record_len % ALIGN)) % ALIGN
++    pos += padding
++    
++    return tag, payload, pos
+ 
+ 
+ def pack(records):
+@@ -41,24 +57,40 @@ def pack(records):
+     items = [(t, p.encode("utf-8") if isinstance(p, str) else bytes(p)) for t, p in records]
+     head = pack_header(len(items))
+     body = b"".join(encode_record(t, p) for t, p in items)
+-    return head + body + pack_crc(compute_crc(head + body))
++    crc = compute_crc(head + body)
++    return head + body + pack_crc(crc)
+ 
+ 
+ def unpack(data):
+     """解析完整容器，返回 ``[(tag, payload), ...]``。"""
+-    _version, count = parse_header(data)
+     if len(data) < HEADER_SIZE + CRC_SIZE:
+         raise WFormatError("truncated", "容器缺少尾部校验和")
++    
++    _version, count = parse_header(data)
++    
+     if count > len(data):
+         raise WFormatError("structure", "记录数超出容器长度")
++    
++    # Verify checksum
+     end = len(data) - CRC_SIZE
++    expected_crc = unpack_crc(data, end)
++    actual_crc = compute_crc(data[:end])
++    if actual_crc != expected_crc:
++        raise WFormatError("checksum", "尾部校验和不匹配")
++    
+     records = []
+     pos = HEADER_SIZE
+     for _ in range(count):
+-        tag, payload, pos = decode_record(data[:end], pos)
++        if pos >= end:
++            raise WFormatError("truncated", "记录数据提前结束")
++        tag, payload, pos = decode_record(data, pos)
++        if pos > end:
++            raise WFormatError("truncated", "记录越界")
+         records.append((tag, payload))
++    
+     if pos != end:
+         raise WFormatError("structure", "记录数与容器长度不一致")
++    
+     return records
+ 
+ 
+diff --git a/wfmt/crc.py b/wfmt/crc.py
+index e2e8ca5..fb1ece7 100644
+--- a/wfmt/crc.py
++++ b/wfmt/crc.py
+@@ -25,11 +25,11 @@ _TABLE = _build_table()
+ 
+ 
+ def compute_crc(data):
+-    """返回 ``data`` 的 32 位校验和。"""
++    """返回 ``data`` 的 32 位校验和（标准 CRC-32）。"""
+     crc = 0xFFFFFFFF
+     for byte in data:
+         crc = (crc >> 8) ^ _TABLE[(crc ^ byte) & 0xFF]
+-    return crc & 0xFFFFFFFF
++    return crc ^ 0xFFFFFFFF
+ 
+ 
+ def pack_crc(value):
+diff --git a/wfmt/header.py b/wfmt/header.py
+index 41a8c33..e6437b2 100644
+--- a/wfmt/header.py
++++ b/wfmt/header.py
+@@ -15,7 +15,7 @@ HEADER_SIZE = 9
+ 
+ def pack_header(count):
+     """打包文件头。"""
+-    return MAGIC + bytes([VERSION]) + struct.pack(">I", count)
++    return MAGIC + bytes([VERSION]) + struct.pack("<I", count)
+ 
+ 
+ def parse_header(data):
+@@ -27,5 +27,5 @@ def parse_header(data):
+     version = data[4]
+     if version != VERSION:
+         raise WFormatError("version", "不支持的版本号 %r" % (version,))
+-    count = struct.unpack_from(">I", data, 5)[0]
++    count = struct.unpack_from("<I", data, 5)[0]
+     return version, count
+diff --git a/wfmt/varint.py b/wfmt/varint.py
+index c803b1c..d8aa644 100644
+--- a/wfmt/varint.py
++++ b/wfmt/varint.py
+@@ -28,4 +28,23 @@ def decode_uvarint(buf, pos=0):
+     """从 ``buf[pos:]`` 解出一个 uvarint，返回 ``(value, next_pos)``。"""
+     if pos >= len(buf):
+         raise WFormatError("truncated", "uvarint 数据不足")
+-    return buf[pos] & 0x7F, pos + 1
++    
++    result = 0
++    shift = 0
++    
++    while True:
++        if pos >= len(buf):
++            raise WFormatError("truncated", "uvarint 数据不足")
++        
++        byte = buf[pos]
++        pos += 1
++        
++        if shift > MAX_SHIFT:
++            raise WFormatError("varint", "uvarint 过长")
++        
++        result |= (byte & 0x7F) << shift
++        
++        if not (byte & 0x80):
++            return result, pos
++        
++        shift += 7

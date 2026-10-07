@@ -8,10 +8,12 @@
   - name 与 id 相同；description 必须带交付物路径清单（"Deliverables to inspect:"）
   - Critically Important（weight = 10）>= 2 条；内容质量维度正分占比 >= 30%
   - [judge] 段固定值
+  - 设计态 rubrics.json 里每个 gradient 条目的 levels 键必须恰为比例键 {0, 0.25, 0.5, 0.75, 1}
+    （绝不是判官侧整数 5/4/3/2/1；后者会被 package validator / preflight 判 FAIL）
 
 用法:
     python3 check_rubrics.py <题包目录>/tests/rubrics.toml
-维度取自同题包根目录的 rubrics.json（可选；缺失时跳过占比检查）。
+维度与设计态 levels 取自同题包根目录的 rubrics.json（可选；缺失时跳过对应检查）。
 """
 import sys, json, tomllib, pathlib
 
@@ -25,14 +27,35 @@ def main(argv):
     crit = d.get('criterion', [])
     errs, warns = [], []
 
+    GRADIENT_KEYS = {'0', '0.25', '0.5', '0.75', '1'}
     dim_map = {}
+    grad_ok = []
     jp = p.parent.parent / 'rubrics.json'
     if jp.is_file():
         try:
-            for c in json.loads(jp.read_text(encoding='utf-8')).get('criteria', []):
+            _jd = json.loads(jp.read_text(encoding='utf-8'))
+            # rubrics.json 顶层 key：返修后为 items（验收口径），旧版为 criteria；两者兼容
+            for c in (_jd.get('items') or _jd.get('criteria') or []):
                 dim_map[c['id']] = c.get('dimension', '')
+                # 设计态 gradient 的 levels 键必须为比例键 {0,0.25,0.5,0.75,1}；
+                # 判官侧整数 5/4/3/2/1 只出现在 tests/rubrics.toml 的 description 锚点里。
+                if str(c.get('type', '')).lower() == 'gradient':
+                    lv = c.get('levels')
+                    if not isinstance(lv, dict):
+                        errs.append(f"{c['id']}: 设计态 rubrics.json 的 gradient 必须写 levels 对象"
+                                    f"（键为比例键 1/0.75/0.5/0.25/0），实际为 {type(lv).__name__}")
+                    else:
+                        ks = {str(k) for k in lv}
+                        if ks != GRADIENT_KEYS:
+                            errs.append(f"{c['id']}: gradient levels 键 {sorted(ks)} 非法，"
+                                        f"必须恰为 {sorted(GRADIENT_KEYS)}（比例键，"
+                                        f"不是判官侧整数 5/4/3/2/1）")
+                        else:
+                            grad_ok.append(c['id'])
+                elif c.get('levels') not in (None, {}, []):
+                    warns.append(f"{c['id']}: 非 gradient 条目不应写 levels")
         except Exception as e:
-            warns.append(f'rubrics.json 解析失败，跳过维度检查: {e}')
+            warns.append(f'rubrics.json 解析失败，跳过维度/levels 检查: {e}')
 
     j = d.get('judge', {})
     for k, v in [('judge', 'claude-code'), ('prompt_template', 'prompt.md'),
@@ -84,6 +107,8 @@ def main(argv):
     print(f'criteria 条数: {len(crit)}  (正向 {npos} / 负向 {nneg})')
     print(f'正向 S_max: {total_pos:.1f} | Critically Important(10.0): {crit10} 条 | 内容质量正分占比: {share:.1%}')
     print(f'负向条目: {[c["id"] for c in crit if c.get("negate")]}')
+    if grad_ok:
+        print(f'设计态 gradient levels 比例键校验通过: {grad_ok}')
     for w_ in warns:
         print('  ! warn:', w_)
     for e in errs:

@@ -206,7 +206,7 @@ opus_pass_sum = 15               # 条件 2：15 > 12 → 通过区分度
 
 | key | `max_tokens` | `request_timeout` | 备注 |
 |---|---|---|---|
-| qwen3.8-max | 65536 | 900 | 给不足会在长上下文下被 thinking 吃光预算，末步正文为空 → INVALID |
+| qwen3.8-max | 65536 | **300** | ⚠️ **推理模型**：大改动量题上 thinking 会吃光**时间**预算（65536 tok ≈ 1150 s > 900 s → 请求永不返回）。**建议配 `thinking:{type:"disabled"}`**，详见 §7.10 |
 | opus-5 | 16000 | 默认 | ebondai 官方给的 baseURL 带 `/v1`，这里**必须去掉** |
 | glm-5.3 | 65536 | 1800 | **绝不要传 `thinking` 字段**（enabled → 强制深度推理吃光预算；disabled → 400） |
 | kimi-k3 | 32000 | — | 可传 `thinking.type=disabled` 关闭思考，更快更稳 |
@@ -376,6 +376,159 @@ python scripts/list_processes.py --kill-tree <PID>     # 精确杀掉一棵树
 回归验证脚本：`python scripts/verify_cmd_timeout_fix.py`
 （A 段证明旧实现 45s 不返回；B 段证明新实现 10.6s 返回且无遗留后代；C 段证明普通命令无回归）。
 
+### 7.10 Qwen 端点：thinking 会吃光**时间**预算（2026-10-07 实证）
+
+**症状**：QWEN 在 agent 循环里**长时间零进展** —— 日志停在某轮之后，连续
+`!! model call attempt N failed: TimeoutError: The read operation timed out`；
+每次重试白等满 `request_timeout`（900 s），7 次重试 ≈105 min 后才整轮 `agent.status=error` 被剔除。
+**重试同一 payload 同样爆炸**，不会自愈。
+
+**三步定性**（探测脚本模板见 `scripts/qwen_probe.py`）：
+
+| 探测 | 期望读数 | 含义 |
+|---|---|---|
+| 短请求 ×1 | 200 / ~1.5 s | 端点存活 |
+| **3 并发 + ~84K tokens 长输入** | 全 200 / 8–11 s | 并发与长上下文**无恙** |
+| **带 `tools` + `max_tokens=65536` 的 agent 风格请求** | **卡死 >120 s** | 复现故障 |
+| 同上，`max_tokens=8192` | `stop_reason=max_tokens`，`blocks=['thinking']` | ★ 全部 token 烧在思考，**零 text / 零 tool_use** |
+| 同上，加 `thinking:{type:"disabled"}` | **~2.9 s**，`stop_reason=tool_use` | ★ 关闭即恢复 |
+
+**根因**：`qwen3.8-max-0902` 是**推理模型**。「重写大代码量」类题（如 wfmt-215 要重写 5 个模块的
+Python 包）会让它每轮进入超长 thinking；65536 tok @≈57 tok/s ≈ **1150 s > 900 s 超时** → 请求永不返回。
+**改动量小的题**（217 的 PowerShell 模块）thinking 短，故同一参数从不触发 —— 是
+「任务改动量 × 推理模型 thinking 长度」的耦合，不是端点故障。
+
+**处置**：给该模型加 `thinking: {type: "disabled"}`
+（runner 侧即 `QWEN_EXTRA_JSON={"thinking":{"type":"disabled"}}`），并把 `request_timeout` 降到 **300**。
+实证效果：同一请求由卡死 → **2.9 s 返回正确 `tool_use`**；分片跑到 turn 13 的耗时由 56 min → **≈24 s**。
+
+> 关闭 reasoning **不触碰题面 / rubric / 判分逻辑**，故 task_version、epoch、controls 均无需变更；
+> 已在别的 epoch 收口的题（如 217）**不必重跑**。
+
+> ⚠️ `thinking.disabled` 的支持性**按端点而异**：本项 aliyun `apps/anthropic` 端点**接受**；
+> 方舟（ark）的 GLM 传 disabled 会 **400**（见 §7.1 备注）。
+
+### 7.11 计划任务 `-Execute` 必须写绝对路径（2026-10-07 实证）
+
+用 `Register-ScheduledTask` 托管长耗时分片时，`-Execute` 写裸名 `powershell.exe` 会失败：
+任务计划的**最小 PATH** 找不到它 → `LastTaskResult = 2147942402`（`0x80070002` 文件未找到），
+任务显示 `State=Ready` 却**从不执行、不写任何日志**（极易误判为"脚本没跑"）。
+
+```powershell
+# 正确
+$ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -ExecutionPolicy Bypass -File `"<script>`" -Tag ... "
+```
+
+> 同源坑（§7.9 已记）：在 5.1 子进程里裸写 `powershell.exe` 同样 `CommandNotFoundException`。
+> **凡由 Task Scheduler / 子进程拉起的 PowerShell，一律用绝对路径。**
+
+---
+
+### 7.12 「单轮大输出」撞传输层超时（2026-10-07 实证，**通用**）
+
+**症状**：某个模型（此处 Opus 5 @ `4router.net`）在 agent 跑到第 6–9 轮后，
+**连续 7 次 `TimeoutError: The read operation timed out`**，整轮被判 `agent.status=error` 而**被汇总剔除**
+（不是 0 分，是**不计分**）→ `model_counts_complete=false` → 门禁挂。
+
+**排除项（都实测过，全绿，别浪费时间）**：端点宕机（小请求 10 s）、大 payload（≈40K tokens 输入 33 s）、
+代理（直连/代理同速）、多轮上下文（6 轮递增对话 2.6→28 s）、工具 schema、`max_tokens=64000`。
+
+**真因**：runner 是**非流式**调用（`urlopen(...)` → `response.read()`），超时按「单次 recv 无数据」计算。
+若题目要求**单轮整包重写**（多文件），模型的 thinking + 输出可达 **2 万+ tokens**；
+实测该端点吞吐 **≈63 tok/s**（14 614 output tokens → **230.5 s**）→ 一旦跨过 `REQUEST_TIMEOUT`（当时 300 s）
+即整包丢弃；**重试发送逐字节相同的 payload → 必然同样超时**，7 次重试全灭。
+
+> 自证方法：`尝试次数 × REQUEST_TIMEOUT + Σ退避 == 该轮墙钟耗时`（本例 `5×300 + 165 = 20:49`，与日志末行吻合）。
+
+**判定口诀**：**「小请求秒回、长输出必挂、同 payload 反复挂」→ 传输层超时，不是端点坏、不是题太难。**
+
+**修复（按性价比排序）**：
+1. **抬 `REQUEST_TIMEOUT`**：按 `max_tokens / 端点吞吐(≈60 tok/s) × 2` 取，例 `64000/60×2 ≈ 2100 s`，
+   实用值 **1200 s**（本例）。改 `*_REQUEST_TIMEOUT` 属传输层，**不动 task_version / rubric / epoch**。
+2. 若模型支持（如 Qwen），优先 `EXTRA_JSON={"thinking":{"type":"disabled"}}` 压制 thinking（§7.10）。
+3. 出题侧规避：单轮改动量别设计成"一次重写 5+ 个模块"，或明确要求**一次一个文件**。
+
+> **★ 后续修正（2026-10-07 21:20，勿再照抄第 1 条）**：把 `4router.net` 的 `OPUS_REQUEST_TIMEOUT`
+> 抬到 **1200 s 后仍然失败** —— 该轮 `attempt 1` 恰好耗满 1200 s 才报错（20:57:43 起跑 →
+> 21:22:13 记 `attempt 1 failed`），说明**该端点在长输出形态下无解**，抬超时只是把单次等待
+> 从 300 s 拉长到 1200 s（更慢地失败）。**"抬超时"仅在端点本身健康、只是慢时有效**；
+> 若抬到 2× 仍撞墙，应判定**端点不适配该负载**，直接换端点（本例换 `api.ebondai.com` 并按
+> §7.13 收敛 `max_tokens` 后跑通）。**先做 §7.13 的交叉实验定量，再决定是抬超时还是换端点。**
+
+**排障顺序（照做，勿跳）**：① 短请求探活 → ② 长输出测吞吐（`output_tokens / 秒`）→ ③ 算
+`预估最长单轮 tokens / 吞吐` 与 `REQUEST_TIMEOUT` 比大小 → ④ 不足则抬超时 → ⑤ 重跑，别再调难度/turn。
+
+### 7.13 网关「非流式响应时长硬墙」与 `max_tokens` 收敛（2026-10-07 实证，**通用**）
+
+**症状**：`api.ebondai.com` 上**非流式**请求**固定 126 s 整**报 `HTTP 502 Bad Gateway`，
+与小请求秒回（3.7 s）形成鲜明对比。抬 `REQUEST_TIMEOUT` **无用**（墙在网关侧，不在客户端）。
+
+**定性交叉实验**（同一 key / 同一 model，逐项单变量）：
+
+| 用例 | 结果 |
+|---|---|
+| `max_tokens=8192` + 短回复（PONG） | OK **4.0 s**，out=5 |
+| `max_tokens=64000` + 短回复 | OK **6.3 s**，out=5 |
+| `max_tokens=8192` + 写 200 行代码 | OK **102.0 s**，out=8192，`stop=max_tokens` |
+| `max_tokens=32000` + 写 200 行代码 | OK **117.4 s**，out=9723，`stop=end_turn` |
+| `max_tokens=64000` + 写 200/400 行 | **FAIL 126.1 / 127.0 s → 502** |
+| `max_tokens=8192` + `thinking:{"type":"disabled"}` | OK 101.8 s，输出**逐 token 与基线相同** |
+
+**结论**：
+1. 吞吐 **≈ 80 tok/s**；**非流式安全区 ≈ 9 500 output tokens ≈ 120 s**，越过即 126 s 被网关切断。
+2. **`max_tokens` 越大越危险** —— 它是"放任模型写多久"的闸门，不是无害上限。设成 64000 等于
+   允许模型一直写到撞墙；设成 8192 则模型到点即停（`stop=max_tokens`），**反而安全**。
+   → **`max_tokens` 应按「单轮真实最大输出 × 1.2」取，而不是按端点上限取。**
+3. 该端点 `claude-opus-5` **无 thinking**（开/关输出逐 token 相同），故无需 `EXTRA_JSON` 压制。
+4. `REQUEST_TIMEOUT` 应**略高于网关墙**（例 180 s）：让网关的 502 先返回并被 runner 捕获快速重试，
+   而不是本地空等到 1200 s。
+
+**流式可绕过硬墙**（实测）：同端口 `"stream": true` 请求，900 行输出 → **OK 639.9 s**
+（首字节 97.3 s，2.2 MB）。即 126 s 是「**非流式响应总时长**」限制，不是端点能力上限。
+若题目确实需要单轮超大输出，可在 runner 侧改流式；否则优先按第 2 条收敛 `max_tokens`。
+
+**★ UA 陷阱（同源）**：该端点前挂 Cloudflare，`python-urllib` 默认 UA 被拦 →
+`HTTP 403 error code: 1010`（**不是**鉴权失败，别误判为 key 无效）。
+所有自研探测脚本必须带 `User-Agent: Mozilla/5.0`；curl 默认 UA 不受影响，
+故「curl 通、python 不通」时先查 UA。
+
+**排障口诀（先在端点侧定量，再动 runner）**：短请求探活 → 固定时长 502 即"网关硬墙" →
+做 `max_tokens × 输出长度` 交叉实验定安全区 → 收敛 `max_tokens` → `REQUEST_TIMEOUT` 设墙值 + 50%。
+
+### 7.14 流式是「单轮大输出」的正解（2026-10-07 定论，**替代 §7.12 第 1 条**）
+
+§7.12/§7.13 的"抬超时 / 收敛 `max_tokens`"都是**绕**，本节的**流式改造是正解**，已在 `wfflab__wfmt-215` 打通。
+
+**做法**：`runner.py` 已内置流式。`call()` 里 `stream = bool(cfg["stream"])`，为真则 body 带
+`"stream": True` + `headers["accept"]="text/event-stream"`，走 `_read_stream()`；
+**SSE 解析**：逐行取 `data:` → `json.loads` → 按 `type` 归并
+（`content_block_start` 建块、`text_delta` 拼文本、**`input_json_delta` 拼 tool_use 的 partial_json 并在
+`content_block_stop` 一次 `json.loads`**、`message_delta` 取 `stop_reason`/`usage`），
+返回结构与非流式**逐字节兼容**，agent 主循环零改动。开启方式：`.env.local` 加 `<ALIAS>_STREAM=1`。
+
+**为什么它是正解**：流式下"单次 recv 无数据"永不发生（字节持续到达），**既绕开客户端 `REQUEST_TIMEOUT`，
+又绕开网关的"非流式响应总时长"硬墙**（§7.13 的 126 s 只针对非流式）。
+
+**4router.net + 流式实测（`_probe4r.py`，全绿）**：
+
+| 用例 | 结果 |
+|---|---|
+| 非流式小请求 | OK 2.3 s，PONG |
+| 非流式 + tool_use | OK 2.7 s |
+| **流式 + tool_use** | OK（SSE 事件流正常） |
+| **流式 + `max_tokens=32000` 大输出** | OK **167.9 s / 289 KB**（无余额/墙钟问题） |
+
+> ★ **§7.12「4router 长输出无解」的结论作废**：当时是**非流式**调用；同一端点在**流式**下完全可用。
+> 换端点前**先开流式**，别再把健康端点评为"不适配"。同理 §7.13 的 ebond 126 s 墙，流式可绕过
+> （但 ebond 该 key 后来**余额耗尽 403 INSUFFICIENT_BALANCE**，属账户问题，与流式无关）。
+
+**结局佐证（215 资格门禁）**：OPUS×3 流式 @4router → `[1,1,0]=2`，QWEN `[0,0,0]`、GLM `[1]`、KIMI `[0]`
+→ `qualified=true`；此前非流式 @4router 恒 `agent.status=error` 被剔除。
+
+**新排障顺序（取代 §7.12 第五节）**：① 短请求探活 → ② **直接开 `<ALIAS>_STREAM=1` 重跑** →
+③ 仍失败再测吞吐/抬超时/禁 thinking → ④ 最后才考虑换端点。**`agent.status=error` 先怀疑传输层，别先怀疑难度。**
+
 ---
 
 ## 八、多模型自检
@@ -395,3 +548,37 @@ python scripts/list_processes.py --kill-tree <PID>     # 精确杀掉一棵树
 [ ] 运行记录与证据字段齐全
 [ ] 正式分已由平台 harness 回填（非脚本伪造）
 ```
+
+---
+
+## 九、离线复评：改完 `tests/**` 后免重跑（2026-10-06 实证）
+
+**要解决的问题**：按交付规范 `qualification-gates.md` §Repair semantics，任何题面变更（instruction / workspace / environment / test / rubric / judge / Golden）都会 **invalidate 之前的 controls 与模型得分**，必须开新 epoch **重跑整套**（QWEN×3 + OPUS×3 + GLM×1 + KIMI×1 + controls 3+3，实测量级数小时）。于是"只改一处检查、想知道效果"的代价极高，容易退化成凭猜测改题面。
+
+**关键事实**：本地 runner 带 `-KeepWork` 时（`run.ps1` / `run_matrix.ps1` 均传该开关），**模型在容器内改完的 workspace 会落盘**：
+
+```text
+<runner>/work/<run_id>/case/environment/workspace/WReparse/   # 模型改完之后的实现
+<runner>/work/<run_id>/view/environment/                      # 候选可见视图（仅 instruction.md + environment）
+```
+
+`case/` 是完整任务树（instruction.md + task.toml + source.json + environment/ + tests/ + solution/ + results/）。
+**判据**：文件体积明显大于原始 candidate，例如 `PathSemantics.ps1` 3414 → 4166 字节。
+
+**离线复评流程**（全程用临时副本，**绝不碰原题包**）：
+
+1. `Copy-Item -Recurse` 把**当前**题包（含新 tests）复制到临时目录；
+2. 用 `work/<run_id>/case/environment/workspace/WReparse` 以 `robocopy /MIR` 覆盖 `environment/workspace/WReparse`；
+3. 跑 `<tmp>/environment/run.ps1 -TaskRoot <tmp>`（**必须用 `powershell.exe` 5.1 绝对路径**，见下）；
+4. 读 `<tmp>/results/result.json` 的 `verdict`、`results/checks.json` 的逐项状态，即可算出新口径得分。
+
+**可信度已验证**：新口径下"原检查项"的通过/失败与当时**容器实跑逐项吻合**，包括"agent 死在上游超时、从未改代码"那轮，复评得到与原始 candidate 一致的失败集。
+
+**用法边界**：离线复评只用于**预判**（值不值得付重跑成本、要不要换题），**不能替代**规范要求的容器 controls / 模型矩阵证据 —— 正式资格判定仍须真实重跑，并在证据里标明 epoch。
+
+**本机跑 Windows 题的三个硬要求**：
+
+- `powershell.exe` 必须用绝对路径 `$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`。在 5.1 子进程里裸写 `powershell.exe` 会 `CommandNotFoundException`（PATH 解析问题，实测踩过）。
+- 经 PowerShell 工具执行时**看不到 stdout**，一律 `& <exe> ... *> <file>` 重定向后再读文件。
+- fixture 需要 junction / 符号链接 / 硬链接：管理员权限 + `cmd /c mklink /D` 即可（junction 与硬链接本就不需提权）；`prepare.ps1` 会先清理重建，可反复跑。
+

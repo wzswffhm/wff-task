@@ -1,0 +1,155 @@
+diff --git a/tests/test_wport_semantics.py b/tests/test_wport_semantics.py
+new file mode 100644
+index 0000000..fe32d8b
+--- /dev/null
++++ b/tests/test_wport_semantics.py
+@@ -0,0 +1,149 @@
++"""wportalloc 的 Windows 端口语义回归测试（隐藏测试）。
++
++被测语义全部来自 instruction.md 的验收标准：
++- 探测 / 分配必须用 SO_EXCLUSIVEADDRUSE，不得与 SO_REUSEADDR 监听共存或误报空闲；
++- 绑定失败只把 WSAEADDRINUSE(10048) / WSAEACCES(10013) 视为「端口被占」；
++- check_service 按 getaddrinfo 顺序逐地址回退（Windows 上 localhost 先 ::1）。
++"""
++
++import socket
++
++import pytest
++
++from wportalloc import (
++    PortInUseError,
++    WPortAllocError,
++    allocate,
++    check_service,
++    is_port_free,
++)
++
++TEST_NET_HOST = "203.0.113.1"  # TEST-NET-3，本机不可能持有
++BAD_HOST = "no-such-host-wfflab.invalid"
++
++
++def _listener(opts=()):
++    """在 127.0.0.1 的临时端口上创建监听 socket，返回 (socket, port)。"""
++    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    for opt in opts:
++        s.setsockopt(socket.SOL_SOCKET, opt, 1)
++    s.bind(("127.0.0.1", 0))
++    s.listen(1)
++    return s, s.getsockname()[1]
++
++
++def _ephemeral_port():
++    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    s.bind(("127.0.0.1", 0))
++    port = s.getsockname()[1]
++    s.close()
++    return port
++
++
++# --------------------------------------------------------------- 独占语义
++
++def test_probe_reports_busy_when_listener_uses_reuseaddr():
++    """存量服务持有 SO_REUSEADDR 时，探测必须报「被占」而不是误报空闲。"""
++    svc, port = _listener((socket.SO_REUSEADDR,))
++    try:
++        assert is_port_free(port) is False
++    finally:
++        svc.close()
++
++
++def test_allocate_on_held_port_raises_port_in_use_error():
++    """端口被持有 SO_REUSEADDR 的存量服务占用时，分配必须报 PortInUseError。"""
++    svc, port = _listener((socket.SO_REUSEADDR,))
++    try:
++        with pytest.raises(PortInUseError):
++            allocate(port)
++    finally:
++        svc.close()
++
++
++def test_allocated_listener_cannot_be_hijacked_by_reuseaddr():
++    """allocate 返回的监听必须不可被第二个 SO_REUSEADDR socket 再绑（防劫持）。"""
++    sock = allocate(0)
++    port = sock.getsockname()[1]
++    thief = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    thief.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    try:
++        with pytest.raises(OSError):
++            thief.bind(("127.0.0.1", port))
++    finally:
++        thief.close()
++        sock.close()
++
++
++# --------------------------------------------------------------- 错误码契约
++
++def test_probe_wraps_unexpected_bind_errors():
++    """非「端口被占」的绑定错误（如 WSAEADDRNOTAVAIL）必须抛 WPortAllocError(kind="probe")。"""
++    with pytest.raises(WPortAllocError) as excinfo:
++        is_port_free(0, host=TEST_NET_HOST)
++    assert excinfo.value.kind == "probe"
++
++
++def test_check_service_false_when_host_unresolvable():
++    """getaddrinfo 失败（主机名不存在）视为服务不可达，返回 False 而非抛错。"""
++    assert check_service(BAD_HOST, 8080, timeout=0.5) is False
++
++
++# --------------------------------------------------------------- 地址族回退
++
++def test_check_service_falls_back_across_address_families():
++    """localhost 先解析为 ::1，对仅 IPv4 的服务必须逐地址回退探活。"""
++    svc, port = _listener()  # 仅 IPv4
++    try:
++        assert check_service("localhost", port, timeout=0.5) is True
++    finally:
++        svc.close()
++
++
++# --------------------------------------------------------------- 不回归
++
++def test_probe_free_port_returns_true():
++    port = _ephemeral_port()
++    assert is_port_free(port) is True
++
++
++def test_probe_reports_busy_on_plain_listener():
++    svc, port = _listener()
++    try:
++        assert is_port_free(port) is False
++    finally:
++        svc.close()
++
++
++def test_port_free_again_after_release():
++    sock = allocate(0)
++    port = sock.getsockname()[1]
++    sock.close()
++    assert is_port_free(port) is True
++
++
++def test_allocated_listener_accepts_connections():
++    sock = allocate(0)
++    port = sock.getsockname()[1]
++    try:
++        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        client.settimeout(2)
++        client.connect(("127.0.0.1", port))
++        conn, _ = sock.accept()
++        conn.close()
++        client.close()
++    finally:
++        sock.close()
++
++
++def test_check_service_true_for_ipv4_direct():
++    svc, port = _listener()
++    try:
++        assert check_service("127.0.0.1", port, timeout=1.0) is True
++    finally:
++        svc.close()
++
++
++def test_check_service_false_when_nothing_listens():
++    port = _ephemeral_port()
++    assert check_service("127.0.0.1", port, timeout=0.5) is False

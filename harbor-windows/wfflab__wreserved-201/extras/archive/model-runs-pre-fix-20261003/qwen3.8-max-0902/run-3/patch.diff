@@ -1,0 +1,186 @@
+diff --git a/wsafename/rules.py b/wsafename/rules.py
+index c480514..2bec525 100644
+--- a/wsafename/rules.py
++++ b/wsafename/rules.py
+@@ -21,14 +21,43 @@ MAX_SEGMENT_LENGTH = 255
+ TRAILING_CHARS = " ."
+ 
+ 
++def base_name(name):
++    """返回 ``name`` 在 Win32 意义上的基名：第一个点之前的那一段。
++
++    Win32 判定保留设备名时只看这一段，所以 ``CON.txt`` 的基名是 ``CON``，
++    而 ``console.txt`` 的基名是 ``console``。首尾空白同样会被 Windows 丢弃，
++    这里一并去掉。
++    """
++    return name.split(".", 1)[0].strip()
++
++
+ def has_illegal_chars(name):
+     """``name`` 中是否含 Win32 非法字符。"""
+     return any(ch in ILLEGAL_CHARS for ch in name)
+ 
+ 
++def has_trailing_chars(name):
++    """``name`` 是否以 Windows 会静默丢弃的字符（点或空格）结尾。
++
++    这类名称请求的条目与磁盘上真正落下的条目并不一致（``report.`` 会写成
++    ``report``），因此不能直接拿来使用。
++    """
++    return bool(name) and name[-1] in TRAILING_CHARS
++
++
++def strip_trailing_chars(name):
++    """去掉 ``name`` 尾部所有会被 Windows 丢弃的点与空格。"""
++    return name.rstrip(TRAILING_CHARS)
++
++
+ def is_reserved(name):
+-    """``name`` 是否是 Windows 保留设备名。"""
+-    return name.strip().upper() in RESERVED_BASE_NAMES
++    """``name`` 是否是 Windows 保留设备名。
++
++    按 Win32 规则只看第一个点之前的那一段：``CON``、``CON.txt``、
++    ``con.tar.gz`` 都是保留名；``console.txt``、``mycon``、``com10.log``
++    这类只是含有保留字片段、基名并不保留的名称不是。
++    """
++    return base_name(name).upper() in RESERVED_BASE_NAMES
+ 
+ 
+ def is_valid(name):
+@@ -39,4 +68,6 @@ def is_valid(name):
+         return False
+     if has_illegal_chars(name):
+         return False
++    if has_trailing_chars(name):
++        return False
+     return not is_reserved(name)
+diff --git a/wsafename/sanitize.py b/wsafename/sanitize.py
+index 400d136..7be3ca7 100644
+--- a/wsafename/sanitize.py
++++ b/wsafename/sanitize.py
+@@ -1,7 +1,12 @@
+ """把用户提供的名称转换成可以安全落盘的名称。"""
+ 
+ from .errors import InvalidNameError
+-from .rules import ILLEGAL_CHARS, MAX_SEGMENT_LENGTH
++from .rules import (
++    ILLEGAL_CHARS,
++    MAX_SEGMENT_LENGTH,
++    is_reserved,
++    strip_trailing_chars,
++)
+ 
+ #: 替换非法字符时使用的字符。
+ REPLACEMENT = "_"
+@@ -14,23 +19,37 @@ def sanitize(name, replacement=REPLACEMENT):
+ 
+     1. 去掉首尾空白
+     2. 把非法字符替换为 ``replacement``
+-    3. 截断到 :data:`wsafename.rules.MAX_SEGMENT_LENGTH`
++    3. 去掉尾部的点与空格——Windows 会在解析路径时静默丢弃它们，留着会让
++       ``report.`` 与 ``report`` 变成两个指向同一个磁盘条目的名称
++    4. 截断到 :data:`wsafename.rules.MAX_SEGMENT_LENGTH`，并再次去掉截断后
++       重新暴露出来的尾部点与空格
+ 
+     返回净化后的名称。``name`` 不是字符串时抛 ``TypeError``；
+-    净化结果不可用时抛 :class:`InvalidNameError`。
++    净化结果不可用时抛 :class:`InvalidNameError`，包括净化后不再剩下可用
++    字符（如 ``"..."``、纯空白输入）以及落在 Win32 保留设备名上
++    （如 ``CON.txt``、``lpt1.log``）两种情况——不会把底层的 ``OSError``
++    透传给调用方。
+     """
+     if not isinstance(name, str):
+         raise TypeError("name must be str, got %s" % type(name).__name__)
+ 
+     cleaned = name.strip()
+ 
+-    out = [replacement if ch in ILLEGAL_CHARS else ch for ch in cleaned]
+-    cleaned = "".join(out)
++    cleaned = "".join(replacement if ch in ILLEGAL_CHARS else ch for ch in cleaned)
++
++    # replacement 本身也可能是空白字符，替换完再去一次首尾空白，
++    # 保证结果始终是一个非空、且首尾没有空白的名称。
++    cleaned = strip_trailing_chars(cleaned.strip())
+ 
+     if len(cleaned) > MAX_SEGMENT_LENGTH:
+-        cleaned = cleaned[:MAX_SEGMENT_LENGTH]
++        cleaned = strip_trailing_chars(cleaned[:MAX_SEGMENT_LENGTH])
+ 
+     if not cleaned:
+         raise InvalidNameError("name is empty after sanitizing: %r" % (name,))
+ 
++    if is_reserved(cleaned):
++        raise InvalidNameError(
++            "%r sanitizes to the reserved Windows device name %r" % (name, cleaned)
++        )
++
+     return cleaned
+diff --git a/wsafename/store.py b/wsafename/store.py
+index 32b0767..afe81eb 100644
+--- a/wsafename/store.py
++++ b/wsafename/store.py
+@@ -12,6 +12,11 @@ class FileStore:
+ 
+     ``root`` 不存在时会被创建。同一个存储实例会记住已经写入过的名称，
+     :meth:`list_names` 按写入顺序返回它们。
++
++    名称一律先经过 :func:`~wsafename.sanitize.sanitize` 净化：保留设备名与
++    净化后不剩下字符的名称会抛 :class:`InvalidNameError`，而 ``report.`` 与
++    ``report`` 会落到同一个磁盘条目上，因此在 :meth:`list_names` 里也只出现
++    一次。
+     """
+ 
+     def __init__(self, root):
+@@ -25,9 +30,22 @@ class FileStore:
+         """返回 ``name`` 在本存储中使用的落盘名称。"""
+         return _sanitize(name)
+ 
++    def _resolve(self, name):
++        """返回 ``(落盘名称, 绝对路径)``；名称不可用时抛 ``InvalidNameError``。
++
++        这里只做名称层面的校验，不碰磁盘，因此校验失败时不会在 ``root``
++        里留下任何条目。
++        """
++        target = self.sanitize(name)
++
++        if not is_valid(target):
++            raise InvalidNameError("%r is not usable on Windows" % (target,))
++
++        return target, os.path.join(self.root, target)
++
+     def target_path(self, name):
+         """返回 ``name`` 对应的绝对路径（不检查该条目是否存在）。"""
+-        return os.path.join(self.root, self.sanitize(name))
++        return self._resolve(name)[1]
+ 
+     # -- 读写 ---------------------------------------------------------------
+ 
+@@ -40,12 +58,9 @@ class FileStore:
+         if not isinstance(data, (bytes, bytearray)):
+             raise TypeError("data must be bytes-like")
+ 
+-        target = self.sanitize(name)
+-
+-        if not is_valid(target):
+-            raise InvalidNameError("%r is not usable on Windows" % (target,))
++        target, path = self._resolve(name)
+ 
+-        with open(os.path.join(self.root, target), "wb") as fh:
++        with open(path, "wb") as fh:
+             fh.write(bytes(data))
+ 
+         if target not in self._names:
+@@ -63,11 +78,10 @@ class FileStore:
+ 
+     def delete(self, name):
+         """删除 ``name`` 对应的条目；条目不存在时返回 ``False``。"""
+-        path = self.target_path(name)
++        target, path = self._resolve(name)
+         if not os.path.isfile(path):
+             return False
+         os.remove(path)
+-        target = self.sanitize(name)
+         if target in self._names:
+             self._names.remove(target)
+         return True

@@ -1,0 +1,24 @@
+修复了 wsafename 在 Windows 目标文件系统上的三类缺陷，仅改动 `wsafename/` 包内实现，未触碰 tests/。
+
+**1. `wsafename/rules.py` —— 保留设备名按 Win32 规则判定**
+- 新增 `reserved_base_name(name)`：取**第一个点之前**那一段，去首尾空白后大写（Win32 实际使用的判定串）。
+- `is_reserved()` 改为用该基名比对 `RESERVED_BASE_NAMES`：`CON`、`CON.txt`、`con.tar.gz`、`NUL.log`、`lpt1.tar.gz` 均判为保留；`console.txt`、`mycon`、`com10.log`、`lpt10` 正常放行。保留名集合本身（COM1–9 / LPT1–9 等）未变，公开签名未变。
+- 新增 `has_stripped_tail(name)` 并在 `is_valid()` 中启用：以 Windows 会静默丢弃的点/空格结尾（含 `report.`、`...`）的名称不能「原样直接使用」，返回 False。`is_valid` 对空白名、超长名、非法字符的既有判定顺序与语义保持不变。
+
+**2. `wsafename/sanitize.py` —— 落盘名确定化 + 退化名明确拒绝**
+- 在替换非法字符之后、截断之前 `rstrip(TRAILING_CHARS)`（复用 rules 中已有常量），使 `sanitize("report.") == "report"`，与 `report` 得到同一落盘名。
+- 截断到 `MAX_SEGMENT_LENGTH` 后可能重新暴露尾部点/空格（如 `'a'*254 + '.' + 'b'*20`），因此再 rstrip 一次，保证结果幂等且不超限。
+- 结果为空时仍抛 `InvalidNameError`：`"..."`、`"."`、`".."`、纯空白输入现在都在净化阶段被拒，底层 `OSError` 不再透传给调用方；`sanitize` 的签名、`TypeError` 行为与「转换后返回」的语义未改变（保留名仍由 `is_valid`/`save` 负责拒绝，保持原有分层）。
+
+**3. `wsafename/store.py` —— save 的拒绝原因更明确**
+- `save()` 在打开文件之前完成校验（原有顺序），保留名走 `is_reserved` 分支抛 `InvalidNameError("... is a reserved Windows device name")`，其余不可用名沿用原消息；因此拒绝时目标目录不会留下任何条目。
+- 补充文档字符串说明该保证。`load` / `delete` / `exists` / `list_names` / `target_path` 签名与语义未变，但因 `target_path` 会调用 `sanitize`，退化名（`"..."`）同样抛 `InvalidNameError` 而非 `OSError`。
+
+**验证**（在真实 Windows 沙箱，win32 / nt）：
+- 仓库自带 `tests/test_safename_basic.py` 8 项全通过。
+- 验收 1：`save('CON.txt'/'NUL.log'/'lpt1.tar.gz'/'con'/'PRN.doc'/'aux'/'COM1.dat')` 全部抛 `InvalidNameError`，`os.listdir(root) == []`、`list_names() == []`。
+- 验收 2：`sanitize('report.') == 'report'`；连写 `report`、`report.`、`report   ` 后 `list_names() == ['report']`，磁盘仅一个条目，`target_path` 一致，`exists('report.') is True`。
+- 验收 3：`save('...')`（以及 `'.'`、`'..'`、纯空白）抛 `InvalidNameError`。
+- 验收 4：`console.txt`、`mycon`、`com10.log`、`lpt11.bin`、`CONSOLE.tar.gz`、`a:b*c?.txt` 均可 save/load 往返。
+- 另验：`sanitize` 幂等、非 str 仍抛 `TypeError`、255 长度上限生效、异常继承关系不变。
+- 未引入任何第三方依赖（仅标准库 `os`），断网可运行；工作区无遗留临时文件。

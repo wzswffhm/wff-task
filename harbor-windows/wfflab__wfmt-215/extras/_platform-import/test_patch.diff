@@ -1,0 +1,190 @@
+diff --git a/tests/test_wfmt_semantics.py b/tests/test_wfmt_semantics.py
+new file mode 100644
+index 0000000..78a04a5
+--- /dev/null
++++ b/tests/test_wfmt_semantics.py
+@@ -0,0 +1,184 @@
++"""wfmt 的容器格式回归测试（隐藏测试）。
++
++被测语义全部来自 instruction.md 的验收标准：
++
++- 以 ``assets/sample.wfmt`` 为唯一权威（逐字节往返、记录语义、校验和变体）；
++- 校验和必须是通用 32 位 CRC 变体（用标准测试向量钉死）；
++- 结构 / 完整性问题的错误分类（``WFormatError.kind``）；
++- ``iter_records`` 必须流式，不得整体读取。
++"""
++
++import os
++
++import pytest
++
++from wfmt import WFormatError, compute_crc, iter_records, pack, unpack, verify
++
++ASSETS = os.path.join(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"
++)
++SAMPLE_PATH = os.path.join(ASSETS, "sample.wfmt")
++EMPTY_PATH = os.path.join(ASSETS, "sample_empty.wfmt")
++
++EXPECTED = [
++    (1, b"alpha"),
++    (2, b""),
++    (300, b"x" * 10),
++    (4, bytes(range(256))),
++    (70000, b"z"),
++]
++
++
++def _load(path):
++    with open(path, "rb") as handle:
++        return handle.read()
++
++
++@pytest.fixture(scope="module")
++def sample():
++    return _load(SAMPLE_PATH)
++
++
++@pytest.fixture(scope="module")
++def empty_sample():
++    return _load(EMPTY_PATH)
++
++
++# --------------------------------------------------------------- A. 样本兼容
++
++def test_sample_verifies(sample, empty_sample):
++    assert verify(sample) is True
++    assert verify(empty_sample) is True
++
++
++def test_sample_roundtrip_is_byte_identical(sample, empty_sample):
++    assert pack(unpack(sample)) == sample
++    assert pack(unpack(empty_sample)) == empty_sample
++
++
++def test_sample_records_match_expected(sample):
++    assert unpack(sample) == EXPECTED
++
++
++# --------------------------------------------------------------- C. 校验和
++
++def test_crc_matches_standard_check_value():
++    # CRC-32/ISO-HDLC 的标准测试向量
++    assert compute_crc(b"") == 0x00000000
++    assert compute_crc(b"a") == 0xE8B7BE43
++    assert compute_crc(b"123456789") == 0xCBF43926
++
++
++def test_tampered_content_is_rejected(sample):
++    blob = bytearray(sample)
++    blob[12] ^= 0x01  # 落在第一条记录的 payload 内
++    tampered = bytes(blob)
++    assert verify(tampered) is False
++    with pytest.raises(WFormatError) as excinfo:
++        unpack(tampered)
++    assert excinfo.value.kind == "checksum"
++
++
++def test_checksum_covers_header_and_records():
++    records = [(1, b"alpha"), (2, b""), (7, b"y" * 33)]
++    blob = pack(records)
++    assert verify(blob) is True
++    # 改文件头里的版本字节之外的位置也必须被校验和发现
++    blob2 = bytearray(blob)
++    blob2[-5] ^= 0x80  # 尾部校验和之前的一个字节
++    assert verify(bytes(blob2)) is False
++
++
++# --------------------------------------------------------------- D. 错误分类
++
++def test_truncated_container_is_reported_as_truncated(sample):
++    cut = sample[:-3]
++    assert verify(cut) is False
++    with pytest.raises(WFormatError) as excinfo:
++        unpack(cut)
++    assert excinfo.value.kind == "truncated"
++
++
++def test_truncated_stream_is_reported_as_truncated(sample):
++    import io
++
++    with pytest.raises(WFormatError) as excinfo:
++        list(iter_records(io.BytesIO(sample[:-3])))
++    assert excinfo.value.kind == "truncated"
++
++
++def test_bad_magic_is_reported_as_magic(sample):
++    blob = b"XXXX" + sample[4:]
++    assert verify(blob) is False
++    with pytest.raises(WFormatError) as excinfo:
++        unpack(blob)
++    assert excinfo.value.kind == "magic"
++
++
++def test_verify_never_raises():
++    for blob in (b"", b"W", b"WFMT", b"WFMT\x01\x00\x00", b"WFMT\x01" + b"\x00" * 20):
++        assert verify(blob) is False
++
++
++# --------------------------------------------------------------- E. 流式读取
++
++class GuardedReader:
++    """一次只允许用固定大小的 read(n) 取数据的伪文件对象。"""
++
++    def __init__(self, data):
++        self._data = data
++        self._pos = 0
++        self.max_request = 0
++        self.bytes_read = 0
++        self.calls = 0
++
++    def read(self, size=-1):
++        if size is None or size < 0:
++            raise AssertionError("iter_records 不得一次性读取全部数据")
++        self.calls += 1
++        self.max_request = max(self.max_request, size)
++        chunk = self._data[self._pos:self._pos + size]
++        self._pos += len(chunk)
++        self.bytes_read += len(chunk)
++        return chunk
++
++
++def test_iter_records_is_streaming():
++    records = [(index % 7 + 1, bytes([index % 256]) * 256) for index in range(4000)]
++    blob = pack(records)
++    assert len(blob) > 900_000
++    reader = GuardedReader(blob)
++    stream = iter_records(reader)
++    tag, payload = next(stream)
++    assert (tag, payload) == (1, b"\x00" * 256)
++    assert reader.max_request <= 8192
++    assert reader.bytes_read < len(blob) // 4
++
++
++# --------------------------------------------------------------- F. 不回归
++
++def test_self_roundtrip_small_records():
++    records = [(1, b"alpha"), (2, b"beta")]
++    blob = pack(records)
++    assert unpack(blob) == records
++    assert verify(blob) is True
++
++
++def test_empty_payload_roundtrip():
++    records = [(9, b"")]
++    blob = pack(records)
++    assert unpack(blob) == records
++
++
++def test_pack_verify_agrees_for_generated_data():
++    records = [(i, bytes([i]) * i) for i in range(1, 6)]
++    assert verify(pack(records)) is True
++
++
++def test_read_all_matches_unpack():
++    from wfmt import read_all
++    import io
++
++    records = [(3, b"abc"), (4, b"d" * 9)]
++    blob = pack(records)
++    assert read_all(io.BytesIO(blob)) == unpack(blob)

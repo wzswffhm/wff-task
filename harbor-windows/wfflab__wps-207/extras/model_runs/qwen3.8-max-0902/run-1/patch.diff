@@ -1,0 +1,207 @@
+diff --git a/wjob/psrun.py b/wjob/psrun.py
+index ac72d44..4028c36 100644
+--- a/wjob/psrun.py
++++ b/wjob/psrun.py
+@@ -4,11 +4,26 @@
+ 决定要不要继续。PowerShell 的退出码语义与 bash 不同：**非终止错误不会改变
+ 退出码**，原生命令的退出码也只保存在 ``$LASTEXITCODE`` 里而不会自动成为
+ PowerShell 进程的退出码。要把一个步骤的成败如实带出来，必须显式处理。
++
++本模块给用户代码套上一层很薄的包装脚本：
++
++* 进入时记下 ``$Error`` 里已有的错误条数，退出时只要多了新条目，就说明脚本
++  自身出过错（``Write-Error``、访问不存在的路径等非终止错误都会被记录）；
++* 原生命令（``.exe``）留下的 ``$LASTEXITCODE`` 非 0 时原样上传，
++  ``cmd /c exit 3`` 就会得到 3；
++* 包装脚本最后显式 ``exit``，把上面算出的退出码变成 PowerShell 进程的退出码；
++* 标准输出与错误流分别采集，失败时的错误信息不会被丢弃。
++
++包装脚本通过 ``-Command`` 作为一个独立参数传给 PowerShell（不经过 shell，
++因此不必担心引号被二次解析）；用户代码放在 ``& { ... }`` 里执行，这样以
++``param()`` 开头的脚本依然合法。
+ """
+ 
++import locale
+ import os
+ import shutil
+ import subprocess
++import tempfile
+ 
+ from .errors import PowerShellError
+ from .result import PSResult
+@@ -19,6 +34,30 @@ POWERSHELL = "powershell.exe"
+ #: 兜底搜索用的可执行文件名。
+ FALLBACKS = ("pwsh.exe", "powershell")
+ 
++#: 脚本自身出错（非终止错误或未处理的终止错误）时使用的退出码。
++ERROR_EXIT_CODE = 1
++
++#: 命令行长度上限。``CreateProcess`` 最多接受 32767 个字符，这里留出余量；
++#: 超过上限的脚本改用临时 ``.ps1`` 文件执行。
++MAX_COMMAND_LENGTH = 30000
++
++#: 包装脚本的开头：记下执行前已经存在的错误条数。
++_PRELUDE = "$__wjobErrorBase = $Error.Count"
++
++#: 包装脚本的结尾：把 ``$LASTEXITCODE`` / 新增错误翻译成进程退出码。
++_EPILOGUE = "\n".join(
++    (
++        "$__wjobLastExit = $LASTEXITCODE",
++        "$__wjobExitCode = 0",
++        "if (($null -ne $__wjobLastExit) -and ($__wjobLastExit -ne 0)) {",
++        "    $__wjobExitCode = [int]$__wjobLastExit",
++        "} elseif (($Error.Count - $__wjobErrorBase) -gt 0) {",
++        "    $__wjobExitCode = %d" % ERROR_EXIT_CODE,
++        "}",
++        "exit $__wjobExitCode",
++    )
++)
++
+ 
+ def find_powershell():
+     """返回可用的 PowerShell 可执行文件路径。"""
+@@ -29,9 +68,26 @@ def find_powershell():
+         found = shutil.which(name)
+         if found:
+             return found
++    # PATH 里不一定包含 Windows PowerShell 的目录，最后再看默认安装位置。
++    found = _well_known_powershell()
++    if found:
++        return found
+     raise PowerShellError("no PowerShell executable found on PATH")
+ 
+ 
++def _well_known_powershell():
++    """返回 Windows PowerShell 的默认安装路径，找不到时返回 ``None``。"""
++    root = os.environ.get("SystemRoot") or os.environ.get("windir")
++    if not root:
++        return None
++    candidate = os.path.join(
++        root, "System32", "WindowsPowerShell", "v1.0", POWERSHELL
++    )
++    if os.path.isfile(candidate):
++        return candidate
++    return None
++
++
+ def _base_argv():
+     return [
+         find_powershell(),
+@@ -41,26 +97,101 @@ def _base_argv():
+     ]
+ 
+ 
+-def run_script(script, timeout=None):
+-    """执行一段 PowerShell ``script``，返回 :class:`PSResult`。"""
+-    proc = subprocess.run(
+-        _base_argv() + ["-Command", script],
+-        capture_output=True,
+-        text=True,
+-        timeout=timeout,
++def _ps_literal(value):
++    """把 ``value`` 转成 PowerShell 的单引号字符串字面量。"""
++    return "'" + str(value).replace("'", "''") + "'"
++
++
++def _wrap(body):
++    """把 ``body`` 包进一段能如实汇报退出码的脚本。"""
++    text = ("" if body is None else str(body)).strip("\n")
++    return "\n".join((_PRELUDE, "& {", text, "}", _EPILOGUE)) + "\n"
++
++
++def _decode(data):
++    """把 PowerShell 的原始输出解码成文本。
++
++    PowerShell 写进管道的字节可能是 UTF-8，也可能是控制台代码页，这里先按
++    UTF-8 严格解码，失败再退回本地代码页，绝不因为解码问题抛异常。
++    """
++    if not data:
++        return ""
++    try:
++        return data.decode("utf-8")
++    except UnicodeDecodeError:
++        pass
++    encoding = locale.getpreferredencoding(False) or "mbcs"
++    try:
++        return data.decode(encoding, "replace")
++    except LookupError:
++        return data.decode("utf-8", "replace")
++
++
++def _run(argv, timeout):
++    """启动 PowerShell 并把结果封装成 :class:`PSResult`。"""
++    proc = subprocess.run(argv, capture_output=True, timeout=timeout)
++    return PSResult(
++        exit_code=proc.returncode,
++        stdout=_decode(proc.stdout),
++        stderr=_decode(proc.stderr),
+     )
+-    return PSResult(exit_code=proc.returncode, stdout=proc.stdout, stderr="")
++
++
++def _command_line_length(argv):
++    """粗略估算 ``argv`` 拼成命令行后的长度。"""
++    return sum(len(arg) + 3 for arg in argv)
++
++
++def _invoke(script_text, timeout):
++    """执行一段已经包装好的 PowerShell 代码。"""
++    argv = _base_argv() + ["-Command", script_text]
++    if _command_line_length(argv) <= MAX_COMMAND_LENGTH:
++        return _run(argv, timeout)
++    # 脚本太长放不进命令行，落成临时 .ps1 再执行。
++    return _invoke_file(script_text, timeout)
++
++
++def _invoke_file(script_text, timeout):
++    """把包装脚本写入临时 ``.ps1`` 文件后执行。"""
++    handle, path = tempfile.mkstemp(prefix="wjob-", suffix=".ps1")
++    try:
++        # 统一成 CRLF：先归一化，避免把已有的 \r\n 变成 \r\r\n。
++        text = script_text.replace("\r\n", "\n").replace("\n", "\r\n")
++        with os.fdopen(handle, "w", encoding="utf-8-sig", newline="") as stream:
++            stream.write(text)
++        return _run(_base_argv() + ["-File", path], timeout)
++    finally:
++        try:
++            os.remove(path)
++        except OSError:
++            pass
++
++
++def run_script(script, timeout=None):
++    """执行一段 PowerShell ``script``，返回 :class:`PSResult`。
++
++    ``PSResult.exit_code`` 如实反映这一步的成败：
++
++    * 脚本里原生命令（``.exe``）的非零退出码会被原样上传；
++    * 脚本自身产生的错误（``Write-Error``、访问不存在的路径等）会得到
++      :data:`ERROR_EXIT_CODE`；
++    * 脚本里显式的 ``exit N`` 仍然优先，退出码就是 ``N``；
++    * 一切正常时退出码为 0。
++
++    标准输出在 ``PSResult.stdout``，错误流在 ``PSResult.stderr``，两者都不会
++    被丢弃。
++    """
++    return _invoke(_wrap(script), timeout)
+ 
+ 
+ def run_file(path, timeout=None):
+-    """执行一个 ``.ps1`` 文件，返回 :class:`PSResult`。"""
+-    proc = subprocess.run(
+-        _base_argv() + ["-File", path],
+-        capture_output=True,
+-        text=True,
+-        timeout=timeout,
+-    )
+-    return PSResult(exit_code=proc.returncode, stdout=proc.stdout, stderr="")
++    """执行一个 ``.ps1`` 文件，返回 :class:`PSResult`。
++
++    退出码与错误流的语义与 :func:`run_script` 完全一致；文件里的
++    ``$PSScriptRoot`` / ``$PSCommandPath`` 照常可用。
++    """
++    target = os.path.abspath(path)
++    return _invoke(_wrap("& " + _ps_literal(target)), timeout)
+ 
+ 
+ def environment_info():

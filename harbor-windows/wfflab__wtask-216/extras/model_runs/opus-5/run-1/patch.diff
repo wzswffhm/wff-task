@@ -1,0 +1,555 @@
+diff --git a/verify_all.py b/verify_all.py
+new file mode 100644
+index 0000000..59cb167
+--- /dev/null
++++ b/verify_all.py
+@@ -0,0 +1,250 @@
++"""综合验证脚本，测试所有修复的问题"""
++from datetime import datetime, timedelta
++import wtask
++from wtask.errors import TaskDefError
++
++print("=" * 60)
++print("wtask 综合验证")
++print("=" * 60)
++
++# 1. 每日任务相位锚定
++print("\n1. 每日任务相位（DaysInterval=3，起点 2026-01-01）")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByDay><DaysInterval>3</DaysInterval></ScheduleByDay>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 5)
++print(f"   结果: {[r.strftime('%m/%d') for r in runs]}")
++assert [r.day for r in runs] == [1, 4, 7, 10, 13], "每日任务相位错误"
++print("   ✓ PASS")
++
++# 2. 每周任务 WeeksInterval
++print("\n2. 每周任务 WeeksInterval=2")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-05T08:00:00</StartBoundary>
++      <ScheduleByWeek>
++        <DaysOfWeek><Monday/></DaysOfWeek>
++        <WeeksInterval>2</WeeksInterval>
++      </ScheduleByWeek>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2026, 1, 4), 4)
++expected_dates = [(1, 5), (1, 19), (2, 2), (2, 16)]
++actual_dates = [(r.month, r.day) for r in runs]
++print(f"   结果: {actual_dates}")
++assert actual_dates == expected_dates, "WeeksInterval 未生效"
++print("   ✓ PASS")
++
++# 3. 月度任务的 Months 过滤
++print("\n3. 月度任务 Months 过滤（仅1月和7月）")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByMonth>
++        <DaysOfMonth><Day>15</Day></DaysOfMonth>
++        <Months><January/><July/></Months>
++      </ScheduleByMonth>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 5)
++print(f"   结果: {[(r.month, r.day) for r in runs]}")
++assert all(r.month in [1, 7] for r in runs), "Months 过滤失效"
++assert all(r.day == 15 for r in runs), "日期不正确"
++print("   ✓ PASS")
++
++# 4. Week=5 语义（最后一周）
++print("\n4. Week=5 在只有4周的月份（2026年2月）")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByMonthDayOfWeek>
++        <Weeks><Week>5</Week></Weeks>
++        <DaysOfWeek><Monday/></DaysOfWeek>
++        <Months><February/></Months>
++      </ScheduleByMonthDayOfWeek>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 3)
++print(f"   结果: {[r.strftime('%Y-%m-%d') for r in runs]}")
++assert len(runs) >= 1, "Week=5 在2月未触发"
++assert runs[0].month == 2 and runs[0].year == 2026, "未触发2月"
++print("   ✓ PASS")
++
++# 5. 重复次数（k×Interval < Duration）
++print("\n5. 重复次数（Interval=PT30M, Duration=PT1H）")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++      <Repetition>
++        <Interval>PT30M</Interval>
++        <Duration>PT1H</Duration>
++      </Repetition>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 5)
++# 第一天应该只有 08:00 和 08:30
++day1 = [r for r in runs if r.date() == datetime(2026, 1, 1).date()]
++print(f"   第一天: {[r.strftime('%H:%M') for r in day1]}")
++assert len(day1) == 2, f"第一天应该触发2次，实际{len(day1)}次"
++assert day1[0].hour == 8 and day1[0].minute == 0, "第一次应该是08:00"
++assert day1[1].hour == 8 and day1[1].minute == 30, "第二次应该是08:30"
++print("   ✓ PASS")
++
++# 6. 重复受 EndBoundary 约束
++print("\n6. 重复受 EndBoundary 约束")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <EndBoundary>2026-01-01T08:45:00</EndBoundary>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++      <Repetition>
++        <Interval>PT30M</Interval>
++        <Duration>PT2H</Duration>
++      </Repetition>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 10)
++print(f"   结果: {[r.strftime('%Y-%m-%d %H:%M') for r in runs]}")
++assert len(runs) == 2, f"应该只触发2次，实际{len(runs)}次"
++assert all(r <= datetime(2026, 1, 1, 8, 45) for r in runs), "超过 EndBoundary"
++print("   ✓ PASS")
++
++# 7. 禁用的触发器
++print("\n7. 禁用的触发器")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <Enabled>false</Enabled>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++    </CalendarTrigger>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T09:00:00</StartBoundary>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++    </CalendarTrigger>
++  </Triggers>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 3)
++print(f"   结果: {[r.strftime('%H:%M') for r in runs]}")
++assert all(r.hour == 9 for r in runs), "禁用的触发器仍在触发"
++print("   ✓ PASS")
++
++# 8. 时长规范化
++print("\n8. 时长规范化")
++tests = [
++    (timedelta(hours=72), "P3D"),
++    (timedelta(minutes=90), "PT1H30M"),
++    (timedelta(days=1, hours=2, minutes=3, seconds=4), "P1DT2H3M4S"),
++    (timedelta(0), "PT0S"),
++    (timedelta(hours=2), "PT2H"),
++]
++for td, expected in tests:
++    result = wtask.format_duration(td)
++    print(f"   {td} -> {result} (expected {expected})")
++    assert result == expected, f"时长格式错误: {result} != {expected}"
++print("   ✓ PASS")
++
++# 9. 错误分类
++print("\n9. 错误分类")
++tests = [
++    ('<Task version="2.0" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary><ScheduleByDay/></CalendarTrigger></Triggers></Task>', 'version'),
++    ('<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><CalendarTrigger><StartBoundary>2026-01-01T08:00:00</StartBoundary><ScheduleByDay><DaysInterval>400</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers></Task>', 'range'),
++    ('<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><BootTrigger/></Triggers></Task>', 'trigger'),
++    ('<Task><Triggers>', 'xml'),
++]
++for xml_text, expected_kind in tests:
++    try:
++        wtask.parse_task_xml(xml_text)
++        assert False, f"应该抛出 {expected_kind} 错误"
++    except TaskDefError as e:
++        print(f"   {expected_kind}: {e.kind}")
++        assert e.kind == expected_kind, f"错误类型不对: {e.kind} != {expected_kind}"
++print("   ✓ PASS")
++
++# 10. PT0S 表示不限
++print("\n10. PT0S 表示不限")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++    </CalendarTrigger>
++  </Triggers>
++  <Settings>
++    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
++  </Settings>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++print(f"   execution_time_limit: {task.execution_time_limit}")
++assert task.execution_time_limit is None, "PT0S 应该解析为 None"
++xml_out = wtask.task_to_xml(task)
++assert 'ExecutionTimeLimit' not in xml_out, "PT0S 应该在输出中省略"
++print("   ✓ PASS")
++
++# 11. 任务禁用时返回空列表
++print("\n11. 任务禁用时返回空列表")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++    </CalendarTrigger>
++  </Triggers>
++  <Settings>
++    <Enabled>false</Enabled>
++  </Settings>
++</Task>'''
++task = wtask.parse_task_xml(xml)
++runs = task.next_runs(datetime(2025, 12, 31), 3)
++print(f"   结果: {runs}")
++assert runs == [], "任务禁用时应返回空列表"
++print("   ✓ PASS")
++
++# 12. 幂等性
++print("\n12. 规范化序列化幂等性")
++xml = '''<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <Triggers>
++    <CalendarTrigger>
++      <StartBoundary>2026-01-01T08:00:00</StartBoundary>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++    </CalendarTrigger>
++  </Triggers>
++  <Settings>
++    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
++  </Settings>
++</Task>'''
++task1 = wtask.parse_task_xml(xml)
++xml_out = wtask.task_to_xml(task1)
++task2 = wtask.parse_task_xml(xml_out)
++xml_out2 = wtask.task_to_xml(task2)
++print(f"   第一次序列化 == 第二次序列化: {xml_out == xml_out2}")
++assert task1 == task2, "解析后的任务应该相等"
++assert xml_out == xml_out2, "序列化应该幂等"
++print("   ✓ PASS")
++
++print("\n" + "=" * 60)
++print("所有测试通过！✓")
++print("=" * 60)
+diff --git a/wtask/duration.py b/wtask/duration.py
+index 3df99a7..b25cb56 100644
+--- a/wtask/duration.py
++++ b/wtask/duration.py
+@@ -42,6 +42,7 @@ def format_duration(value):
+     """把 ``timedelta`` 写成 ISO-8601 文本。
+ 
+     只写非零分量，零时长写作 ``PT0S``。
++    规范形式：先提取天数，再提取时/分/秒。
+     """
+     if not isinstance(value, timedelta):
+         raise TaskDefError("duration", "format_duration expects timedelta")
+@@ -50,13 +51,31 @@ def format_duration(value):
+         raise TaskDefError("duration", "negative duration is not representable")
+     if total == 0:
+         return "PT0S"
+-    hours, rem = divmod(total, 3600)
++    
++    # 先提取天数
++    days, remainder = divmod(total, 86400)
++    hours, rem = divmod(remainder, 3600)
+     minutes, seconds = divmod(rem, 60)
+-    out = "PT"
++    
++    parts = []
++    if days:
++        parts.append("P%dD" % days)
++    else:
++        parts.append("P")
++    
++    time_parts = []
+     if hours:
+-        out += "%dH" % hours
++        time_parts.append("%dH" % hours)
+     if minutes:
+-        out += "%dM" % minutes
++        time_parts.append("%dM" % minutes)
+     if seconds:
+-        out += "%dS" % seconds
+-    return out
++        time_parts.append("%dS" % seconds)
++    
++    if time_parts:
++        parts.append("T" + "".join(time_parts))
++    
++    result = "".join(parts)
++    # 如果只有 P，说明只有天数，直接返回
++    if result == "P":
++        return "PT0S"
++    return result
+diff --git a/wtask/schedule.py b/wtask/schedule.py
+index 52abc47..b5f5232 100644
+--- a/wtask/schedule.py
++++ b/wtask/schedule.py
+@@ -29,25 +29,40 @@ def _week_start(day):
+     return day - timedelta(days=day.weekday())
+ 
+ 
+-def _week_index(day):
+-    """返回 ``day`` 在本月内的周序号（1 起）。"""
+-    return day.day // 7 + 1
++def _week_number(day):
++    """返回 ``day`` 从某个起点算起的周序号（周一起始）。"""
++    # ISO 周：从1970-01-05（周一）开始算
++    epoch_monday = datetime(1970, 1, 5).date()
++    return (day - epoch_monday).days // 7
+ 
+ 
+-def _weeks_in_month(day):
+-    """返回 ``day`` 所在月份共有多少个「日历周」（4 或 5）。"""
++def _day_week_in_month(day):
++    """返回 ``day`` 在本月内的周序号（1..5），按日号划分：
++    1-7 日=第1周，8-14=第2周，15-21=第3周，22-28=第4周，29-31=第5周。
++    """
++    return (day.day - 1) // 7 + 1
++
++
++def _last_week_in_month(day):
++    """返回 ``day`` 所在月份的最后一周序号（4 或 5）。"""
+     days_in_month = calendar.monthrange(day.year, day.month)[1]
+-    return (days_in_month + 6) // 7
++    return (days_in_month - 1) // 7 + 1
+ 
+ 
+ def _match_week(day, wanted):
+     """``<Week>`` 匹配。
+ 
+-    1..4 表示第 n 周；**5 表示该月的最后一周**（可能是第 4 周，例如 2 月）。
++    1..4 表示第 n 周；**5 表示该月的最后一周**（可能是第 4 周，例如平年 2 月）。
+     """
+-    index = _week_index(day)
++    week_in_month = _day_week_in_month(day)
++    last_week = _last_week_in_month(day)
++    
+     for w in wanted:
+-        if index == w:
++        if w == 5:
++            # Week=5 表示最后一周
++            if week_in_month == last_week:
++                return True
++        elif week_in_month == w:
+             return True
+     return False
+ 
+@@ -55,19 +70,33 @@ def _match_week(day, wanted):
+ def _day_matches(trigger, day):
+     """``day`` 这一天是否是这个触发器的一个主出现日（不看时刻）。"""
+     if trigger.type == "daily":
+-        return day.day % trigger.days_interval == 0
++        # 锚点是 StartBoundary 的日期
++        delta = (day - trigger.start.date()).days
++        return delta >= 0 and delta % trigger.days_interval == 0
+ 
+     if trigger.type == "weekly":
+-        return _weekday_index(day) in trigger.days_of_week
++        # 检查是否在指定星期
++        if _weekday_index(day) not in trigger.days_of_week:
++            return False
++        # 检查周间隔
++        start_week = _week_number(trigger.start.date())
++        current_week = _week_number(day)
++        return (current_week - start_week) % trigger.weeks_interval == 0
+ 
+     if trigger.type == "monthly":
++        # 必须月份和日号都匹配
++        if day.month not in trigger.months:
++            return False
+         return day.day in trigger.days_of_month
+ 
+     if trigger.type == "monthly_dow":
+-        if trigger.months and day.month not in trigger.months:
++        # 必须月份匹配
++        if day.month not in trigger.months:
+             return False
++        # 必须星期匹配
+         if _weekday_index(day) not in trigger.days_of_week:
+             return False
++        # 必须周序号匹配
+         return _match_week(day, trigger.weeks_of_month)
+ 
+     if trigger.type == "time":
+@@ -98,7 +127,7 @@ def _primary_occurrences(trigger, after):
+     return out
+ 
+ 
+-def _expand(trigger, occurrence, after, count):
++def _expand(trigger, occurrence, after):
+     """把一次主出现展开为若干次实际运行（含 ``<Repetition>``）。"""
+     rep = trigger.repetition
+     if rep is None:
+@@ -106,11 +135,15 @@ def _expand(trigger, occurrence, after, count):
+ 
+     runs = []
+     step = 0
+-    while len(runs) < count and step < 100000:
++    while step < 100000:
+         offset = rep.interval * step
+-        if rep.duration is not None and offset > rep.duration:
++        # k×Interval < Duration：只保留偏移量严格小于 Duration 的
++        if rep.duration is not None and offset >= rep.duration:
+             break
+         moment = occurrence + offset
++        # 重复产生的时刻同样受 EndBoundary 约束
++        if trigger.end is not None and moment > trigger.end:
++            break
+         if moment > after:
+             runs.append(moment)
+         step += 1
+@@ -134,8 +167,11 @@ def next_runs(task, after, count):
+ 
+     moments = set()
+     for trigger in task.triggers:
++        # 跳过被禁用的触发器
++        if not trigger.enabled:
++            continue
+         for occurrence in _primary_occurrences(trigger, after):
+-            moments.update(_expand(trigger, occurrence, after, count))
++            moments.update(_expand(trigger, occurrence, after))
+ 
+     return sorted(moments)[:count]
+ 
+diff --git a/wtask/xmlio.py b/wtask/xmlio.py
+index d0076c2..69b8a2d 100644
+--- a/wtask/xmlio.py
++++ b/wtask/xmlio.py
+@@ -164,6 +164,8 @@ def _parse_calendar(element):
+         _check_children(schedule, ("DaysInterval",), "ScheduleByDay")
+         interval_text = _text(schedule, "DaysInterval")
+         days_interval = _parse_int(interval_text, "DaysInterval") if interval_text else 1
++        if not 1 <= days_interval <= 365:
++            raise TaskDefError("range", "DaysInterval %d out of 1..365" % days_interval)
+         return Trigger(
+             type="daily", start=start, end=end, enabled=enabled,
+             days_interval=days_interval, repetition=repetition,
+@@ -177,7 +179,7 @@ def _parse_calendar(element):
+         weeks_text = _text(schedule, "WeeksInterval")
+         weeks_interval = _parse_int(weeks_text, "WeeksInterval") if weeks_text else 1
+         if not 1 <= weeks_interval <= 52:
+-            raise TaskDefError("range", "WeeksInterval out of 1..52")
++            raise TaskDefError("range", "WeeksInterval %d out of 1..52" % weeks_interval)
+         return Trigger(
+             type="weekly", start=start, end=end, enabled=enabled,
+             weeks_interval=weeks_interval, days_of_week=days_of_week,
+@@ -189,15 +191,17 @@ def _parse_calendar(element):
+         holder = _one(schedule, "DaysOfMonth")
+         if holder is None:
+             raise TaskDefError("schema", "missing required <DaysOfMonth>")
+-        days_of_month = tuple(sorted(_parse_int(child.text, "Day") for child in holder))
++        days_of_month = []
++        for child in holder:
++            day_val = _parse_int(child.text, "Day")
++            if not 1 <= day_val <= 31:
++                raise TaskDefError("range", "Day %d out of 1..31" % day_val)
++            days_of_month.append(day_val)
+         if not days_of_month:
+             raise TaskDefError("trigger", "<DaysOfMonth> is empty")
+-        for value in days_of_month:
+-            if not 1 <= value <= 31:
+-                raise TaskDefError("range", "Day %d out of 1..31" % value)
+         return Trigger(
+             type="monthly", start=start, end=end, enabled=enabled,
+-            days_of_month=days_of_month, months=_parse_months(schedule),
++            days_of_month=tuple(sorted(days_of_month)), months=_parse_months(schedule),
+             repetition=repetition,
+         )
+ 
+@@ -206,18 +210,20 @@ def _parse_calendar(element):
+     holder = _one(schedule, "Weeks")
+     if holder is None:
+         raise TaskDefError("schema", "missing required <Weeks>")
+-    weeks_of_month = tuple(sorted(_parse_int(child.text, "Week") for child in holder))
++    weeks_of_month = []
++    for child in holder:
++        week_val = _parse_int(child.text, "Week")
++        if not 1 <= week_val <= 5:
++            raise TaskDefError("range", "Week %d out of 1..5" % week_val)
++        weeks_of_month.append(week_val)
+     if not weeks_of_month:
+         raise TaskDefError("trigger", "<Weeks> is empty")
+-    for value in weeks_of_month:
+-        if not 1 <= value <= 5:
+-            raise TaskDefError("range", "Week %d out of 1..5" % value)
+     days_of_week = _parse_weekdays(schedule, "DaysOfWeek")
+     if days_of_week is None:
+         raise TaskDefError("trigger", "<ScheduleByMonthDayOfWeek> requires <DaysOfWeek>")
+     return Trigger(
+         type="monthly_dow", start=start, end=end, enabled=enabled,
+-        days_of_week=days_of_week, weeks_of_month=weeks_of_month,
++        days_of_week=days_of_week, weeks_of_month=tuple(sorted(weeks_of_month)),
+         months=_parse_months(schedule), repetition=repetition,
+     )
+ 
+@@ -251,6 +257,8 @@ def parse_task_xml(text):
+         raise TaskDefError("schema", "root element must be <Task>")
+ 
+     version = (root.get("version") or "").strip()
++    if version not in SUPPORTED_VERSIONS:
++        raise TaskDefError("version", "unsupported version: %r" % version)
+ 
+     holders = _children(root, "Triggers")
+     if not holders:
+@@ -266,7 +274,7 @@ def parse_task_xml(text):
+         elif local == "TimeTrigger":
+             triggers.append(_parse_time(child))
+         else:
+-            continue
++            raise TaskDefError("trigger", "unknown trigger type: <%s>" % local)
+     if not triggers:
+         raise TaskDefError("structure", "<Triggers> is empty")
+ 
+@@ -278,7 +286,12 @@ def parse_task_xml(text):
+             fields["enabled"] = _parse_bool(enabled_text, "Enabled")
+         limit_text = _text(settings, "ExecutionTimeLimit")
+         if limit_text is not None:
+-            fields["execution_time_limit"] = parse_duration(limit_text)
++            limit = parse_duration(limit_text)
++            # PT0S 表示不限时长
++            if limit == timedelta(0):
++                fields["execution_time_limit"] = None
++            else:
++                fields["execution_time_limit"] = limit
+         policy = _text(settings, "MultipleInstancesPolicy")
+         if policy:
+             fields["multiple_instances"] = policy
+@@ -380,12 +393,13 @@ def task_to_xml(task):
+     )
+     if not task.enabled:
+         lines.append("    <Enabled>false</Enabled>")
++    # ExecutionTimeLimit：None 表示不限，应省略；或写作 PT0S
+     if task.execution_time_limit is not None:
+         lines.append(
+             "    <ExecutionTimeLimit>%s</ExecutionTimeLimit>"
+             % format_duration(task.execution_time_limit)
+         )
+-    if task.random_delay:
++    if task.random_delay and task.random_delay > timedelta(0):
+         lines.append("    <RandomDelay>%s</RandomDelay>" % format_duration(task.random_delay))
+     lines.append("  </Settings>")
+     lines.append("</Task>")

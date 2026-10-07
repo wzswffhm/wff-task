@@ -1,0 +1,200 @@
+diff --git a/tests/test_wpipe_semantics.py b/tests/test_wpipe_semantics.py
+new file mode 100644
+index 0000000..3903b81
+--- /dev/null
++++ b/tests/test_wpipe_semantics.py
+@@ -0,0 +1,194 @@
++"""winpipe 的 Windows 命名管道语义回归测试（隐藏测试）。
++
++被测语义全部来自 instruction.md 的验收标准：
++
++- 客户端先行连接时 ConnectNamedPipe 返回 FALSE + ERROR_PIPE_CONNECTED(535)，
++  必须视为握手成功；
++- 实例全忙时客户端必须按预算 WaitNamedPipe 重试，超时抛 PipeBusyError；
++- 字节模式 + 4 字节小端长度前缀分帧：粘包要拆、半包要拼；
++- 非法管道名抛 WPipeError(kind="name")；
++- 对端关闭后 read_frame() 返回 None。
++"""
++
++import struct
++import threading
++import time
++import uuid
++
++import pytest
++
++from winpipe import PipeBusyError, PipeClient, PipeServer, WPipeError
++
++
++def _name():
++    return "wff_wpipe_%s" % uuid.uuid4().hex[:10]
++
++
++def frame(payload):
++    """测试侧独立的长度前缀打包（与应用层实现无关）。"""
++    return struct.pack("<I", len(payload)) + payload
++
++
++def _handshake(name, instances=1):
++    """服务端先进入等待，客户端随后连接（ConnectNamedPipe 正常返回 TRUE）。"""
++    server = PipeServer(name, instances=instances)
++    server.create_instance()
++    thread = threading.Thread(target=server.accept, daemon=True)
++    thread.start()
++    time.sleep(0.2)
++    client = PipeClient(name)
++    client.connect()
++    thread.join(3)
++    return server, client
++
++
++# ------------------------------------------------------------------ 握手语义
++def test_accept_succeeds_when_client_connects_first():
++    """客户端先行完成连接时，accept() 必须成功（ERROR_PIPE_CONNECTED）。"""
++    name = _name()
++    server = PipeServer(name, instances=1)
++    server.create_instance()
++    client = PipeClient(name)
++    client.connect()
++    try:
++        assert server.accept() is True
++    finally:
++        server.close()
++        client.close()
++
++
++def test_client_waits_when_all_instances_busy():
++    """实例被占满时，按预算等待后抛 PipeBusyError（而不是立刻失败）。"""
++    name = _name()
++    server, client1 = _handshake(name, instances=1)
++    client2 = PipeClient(name, timeout_ms=400)
++    started = time.monotonic()
++    try:
++        with pytest.raises(PipeBusyError):
++            client2.connect()
++        elapsed = time.monotonic() - started
++        assert elapsed >= 0.3
++        assert elapsed < 5
++    finally:
++        server.close()
++        client1.close()
++        client2.close()
++
++
++# ------------------------------------------------------------------ 分帧语义
++def test_frames_are_delivered_one_by_one():
++    """连续发送多条消息，接收端必须逐条还原。"""
++    server, client = _handshake(_name())
++    try:
++        client.send(b"alpha")
++        client.send(b"beta")
++        client.send(b"gamma")
++        assert server.read_frame() == b"alpha"
++        assert server.read_frame() == b"beta"
++        assert server.read_frame() == b"gamma"
++    finally:
++        server.close()
++        client.close()
++
++
++def test_coalesced_frames_are_split():
++    """多个帧在一次底层写入中粘连到达时必须拆开。"""
++    server, client = _handshake(_name())
++    try:
++        client.send_bytes(frame(b"one") + frame(b"two"))
++        assert server.read_frame() == b"one"
++        assert server.read_frame() == b"two"
++    finally:
++        server.close()
++        client.close()
++
++
++def test_fragmented_frame_is_reassembled():
++    """一个帧被拆成多次底层写入到达时必须拼装完整。"""
++    server, client = _handshake(_name())
++    raw = frame(b"hello")
++    try:
++        client.send_bytes(raw[:3])
++        client.send_bytes(raw[3:])
++        assert server.read_frame() == b"hello"
++    finally:
++        server.close()
++        client.close()
++
++
++# ------------------------------------------------------------------ 错误语义
++def test_invalid_name_is_rejected():
++    """非法管道名必须抛 WPipeError(kind="name")。"""
++    for bad in ("bad/name", "bad\\name", "", "bad\x01name"):
++        with pytest.raises(WPipeError) as excinfo:
++            PipeServer(bad, instances=1).create_instance()
++        assert excinfo.value.kind == "name", "name=%r" % (bad,)
++
++
++def test_read_frame_returns_none_after_peer_closes():
++    """对端断开后 read_frame() 返回 None，而不是抛异常。"""
++    server, client = _handshake(_name())
++    try:
++        client.close()
++        time.sleep(0.2)
++        assert server.read_frame() is None
++    finally:
++        server.close()
++
++
++# ------------------------------------------------------------------ 不回归
++def test_raw_roundtrip_client_to_server():
++    server, client = _handshake(_name())
++    try:
++        client.send_bytes(b"ping")
++        assert server.read_raw() == b"ping"
++    finally:
++        server.close()
++        client.close()
++
++
++def test_raw_large_payload():
++    """超过缓冲区的原始负载必须完整往返。"""
++    server, client = _handshake(_name())
++    data = b"A" * 9000
++    chunks = []
++
++    def reader():
++        total = 0
++        while total < len(data):
++            chunk = server.read_raw()
++            if not chunk:
++                break
++            chunks.append(chunk)
++            total += len(chunk)
++
++    thread = threading.Thread(target=reader, daemon=True)
++    thread.start()
++    try:
++        client.send_bytes(data)
++        thread.join(5)
++        assert b"".join(chunks) == data
++    finally:
++        server.close()
++        client.close()
++
++
++def test_raw_roundtrip_server_to_client():
++    server, client = _handshake(_name())
++    try:
++        server.write_raw(b"pong")
++        assert client.recv_raw() == b"pong"
++    finally:
++        server.close()
++        client.close()
++
++
++def test_close_is_idempotent():
++    name = _name()
++    server = PipeServer(name, instances=1)
++    server.create_instance()
++    server.close()
++    server.close()
++    client = PipeClient(name)
++    client.close()
++    client.close()
