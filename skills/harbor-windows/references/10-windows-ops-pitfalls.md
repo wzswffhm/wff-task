@@ -66,3 +66,19 @@ Start-ScheduledTask -TaskName oh-<tag>
 - **写日志勿用会把输出文件本身匹配进去的通配符**（`-Filter "*wfo2*"` 读自己 → 78 MB 膨胀）。
 - **本机跑题**：管理员 + PS，绝对路径 `$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`；
   **PowerShell 工具不回 stdout → 一律 `*> file` 再 Read**。
+
+## 6 交付落盘与飞书写回（表锁）坑
+
+**单题交付产物（5 件，与 217 同构）**：`README.md` + `evidence/oracle_nop_controls.png`
+（oracle/nop截图）+ `evidence/score_summary.png`（分数截图）+ `evidence/model_runs_summary_*.json`
+（权威读数）+ 四件套 ZIP（作业压缩包，ZIP 根 = task-id，含 `task.toml`/`instruction.md`/`environment/`/
+`tests/`，**不含 `solution/`**）。手工交付入口建议再附 `instruction.md`（供粘贴「提示词」字段）与字段对照表。
+
+- **★ 飞书写回 `permission_denied`（code `800020812`）= 表被锁**：不是 token 失效。
+  `base +base-get` 看 `is_advanced: true`；**读得到、建行/传附件被拒**。对应群公告「18:00 后可能锁表
+  （仅可阅读）」。处置：**先 `record-list` 确认未产生脏记录**（避免重复），再改走"桌面交付 + 手动上传指引"，
+  等解锁或换有写权限账号补写。**不要用"新建"试探可写性**（会产生脏行）。
+- **★ 桌面/个人目录受 `safe-delete` 保护**：`rm` / `Remove-Item` 优先走回收站；回收失败即
+  `SAFE_DELETE_FAIL_CLOSED` **拒绝回退删除**；被其它进程占用的文件**无法覆盖**（`PermissionError: [Errno 13]`）。
+  → 交付产物一律**新建 / 解压**到桌面，**不做覆盖删除**；需要"重建"时就换个新文件名。
+- **交付物哈希自检**：落盘后对 4 件核心产物 `sha256sum`，逐一比对 `README.md` 里声明的 SHA256。
