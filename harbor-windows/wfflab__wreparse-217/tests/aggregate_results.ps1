@@ -40,8 +40,11 @@ foreach ($item in @($rubric.items)) {
     $missing = New-Object System.Collections.ArrayList
     $failed = New-Object System.Collections.ArrayList
     foreach ($id in @($item.test_ids)) {
-        if (-not $statusById.ContainsKey([string]$id)) { [void]$missing.Add([string]$id) }
-        elseif ($statusById[[string]$id] -ne 'PASS') { [void]$failed.Add([string]$id) }
+        # rubric test_ids carry the f2p or p2p protocol prefix required by the
+        # reviewer contract, while the raw check ids are bare; strip it first.
+        $bareId = ([string]$id) -replace '^(f2p|p2p)-', ''
+        if (-not $statusById.ContainsKey($bareId)) { [void]$missing.Add($bareId) }
+        elseif ($statusById[$bareId] -ne 'PASS') { [void]$failed.Add($bareId) }
     }
     $passed = ($missing.Count -eq 0 -and $failed.Count -eq 0)
     if ($passed) { $weightedScore += [double]$item.weight } else { $allPassed = $false }
@@ -65,13 +68,49 @@ else {
     $reason = "Unsatisfied rubric items: $($names -join ', ')"
 }
 
+# ---- Reviewer aggregate-v1 contract (bundled QC checker) --------------------
+# cases cover every testcase declared by the rubric; a terminal status other than
+# PASS or FAIL counts as invalid, and any invalid>0 makes run_validity=INVALID
+# (incomplete evidence / infrastructure failure is never a legitimate 0).
+# NOTE: keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less files as
+# ANSI, and multi-byte comments can swallow the following newline.
+$cases = New-Object System.Collections.ArrayList
+$invalidTotal = 0
+foreach ($item in @($rubric.items)) {
+    foreach ($id in @($item.test_ids)) {
+        $bareId = ([string]$id) -replace '^(f2p|p2p)-', ''
+        $st = ''
+        if ($statusById.ContainsKey($bareId)) { $st = [string]$statusById[$bareId] }
+        if ($st -ne 'PASS' -and $st -ne 'FAIL') { $invalidTotal++ }
+        [void]$cases.Add([pscustomobject][ordered]@{
+                test_id = [string]$id
+                passed  = ($st -eq 'PASS')
+            })
+    }
+}
+$casesArray = @($cases.ToArray())
+$casesTotal = $casesArray.Count
+$casesPassed = @($casesArray | Where-Object { $_.passed }).Count
+$casesFailed = $casesTotal - $casesPassed
+$runValidity = if ($casesTotal -gt 0 -and $invalidTotal -eq 0) { 'VALID' } else { 'INVALID' }
+$formalScore = if ($casesTotal -gt 0 -and $casesPassed -eq $casesTotal) { 1 } else { 0 }
+
 $result = [pscustomobject][ordered]@{
-    task_id      = [string]$checks.task_id
-    task_version = [string]$checks.task_version
-    mode         = $null
-    verdict      = $score
-    reason       = $reason
-    test         = [pscustomobject][ordered]@{
+    schema_version = 'aggregate-v1'
+    run_validity   = $runValidity
+    task_id        = [string]$checks.task_id
+    task_version   = [string]$checks.task_version
+    total          = $casesTotal
+    passed         = $casesPassed
+    failed         = $casesFailed
+    invalid        = $invalidTotal
+    formal_score   = $formalScore
+    cases          = $casesArray
+    required       = @($casesArray | ForEach-Object { $_.test_id })
+    mode           = $null
+    verdict        = $score
+    reason         = $reason
+    test           = [pscustomobject][ordered]@{
         report = [pscustomobject][ordered]@{
             status       = 'VALID'
             score        = $score

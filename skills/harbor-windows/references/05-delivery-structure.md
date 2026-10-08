@@ -12,12 +12,16 @@ delivery-<batch>-<version>/
 │   └── <task-id>.json
 ├── outside_harbor-assets/              # 沿用现有提交结构：题目与执行资产
 │   ├── .ap-tools/                      # 暂沿用；最终归属待多团队确认
-│   └── <task-id>/                      # 必须整理成冻结 Schema 的标准 Harbor Task
-│       ├── task.toml
-│       ├── instruction.md
-│       ├── environment/
-│       ├── solution/
-│       └── tests/
+│   ├── <task-id>/                      # 必须整理成冻结 Schema 的标准 Harbor Task
+│   │   ├── task.toml
+│   │   ├── instruction.md
+│   │   ├── environment/
+│   │   ├── solution/
+│   │   └── tests/
+│   └── jobs/                           # ★ 作业记录：每次跑分一个 <job-id>/
+│       └── <job-id>/
+│           ├── agent/                  #   模型侧（控制组不经过 agent）
+│           └── verifier/               #   判分侧
 └── delivery-extras/                    # 暂定新目录名：题外强制交付材料
     ├── batch_manifest.csv
     ├── knowledge_tree_coverage_report.csv
@@ -83,6 +87,51 @@ delivery-<batch>-<version>/
 - 但必须：**版本锁定、有 Hash、来源合法**，且不泄漏 Solution 或隐藏验收内容
 - **大文件不能仅因"属于资产"就全部移到题外**，否则破坏题目的离线可复现性
 
+### 2.5 `jobs/` 作业记录
+
+平台交付结构要求 `outside_harbor-assets/jobs/`：**每次跑分作业一个 `<job-id>/`，
+内含 `agent/`（模型侧）与 `verifier/`（判分侧）**。
+
+| 规则 | 说明 |
+|---|---|
+| 作业 ID | 本机 runner 的 `run_id`，与资格汇总逐条一一对应；不得重复、不得事后回填 |
+| 控制组 | `no-change` / `golden` 不经过 agent，`agent/` 只登记"控制组无轨迹"这一事实 |
+| 剔除轮 | 上游 provider/网关故障（`agent_status ∈ {error, no_tool_call}`）**保留但不计分**，标记 `excluded` 并写明原因——这是资格门禁的剔除依据，不得伪装成 0 分 |
+| 禁入内容 | `solution/`、答案、隐藏用例、凭据；打包前做一次凭据模式扫描 |
+| 仓库内位置 | 先落 `<task-id>/jobs/`（一题一目录、可单独打包）；组装交付批次包时移到 `outside_harbor-assets/` 下与 `<task-id>/` **平级** |
+| 工具 | `scripts/build_jobs.py` 由资格汇总（`model_runs_summary_*.json`）生成 `jobs/`；`scripts/build_required_testcases.py` 生成 `tests/required_testcases.json`；`scripts/package_task_zip.py` 打交付 ZIP（含 `solution/`、`source.json`、`jobs/`，仅排除 `extras/` 与缓存） |
+
+### 2.6 甲方 QC（`windows-harbor-qc`）必备件 —— 交付前必查
+
+甲方质检工具 `run_qc.py` 的静态检查**先于**动态 Oracle/NOP 执行；静态不过直接 `FAIL` 并退出 1，
+**不会进入**动态验证。其 checklist 第 1 节要求的必备件：
+
+| 必备件 | 说明 |
+|---|---|
+| `task.toml` / `source.json` / `instruction.md` | `source.json` 需含 `task_id`，并尽量含 `source_type` / `license` / `lineage` / `authorization`（缺失至少是 warning） |
+| `environment/` 七件 | `adapter.toml`、`Dockerfile`、`prepare.ps1`、`validate_environment.ps1`、`run.ps1`、`restore.ps1`、`cleanup.ps1` |
+| `tests/` 六件 | `test.ps1`、`run_tests.ps1`、`aggregate_results.ps1`、`judge.toml`、`rubric.json`、**`required_testcases.json`** |
+| `solution/` | **必须交付**：`README.md` + `solve.ps1` 或 `solve.bat` |
+| `tests/required_testcases.json` | 非空列表，每项 `{"id", "group": "F2P"\|"P2P"}`，**必须同时含 F2P 与 P2P**，id 不得重复 |
+
+> ⚠️ **不得**因为"普通 Agent 不应看到参考解"就把 `solution/` 从组织方题包里删掉 ——
+> checklist 原文明确禁止，删了必判 `missing top-level solution`。
+
+**已知误报（截至 2026-10-08，需与甲方对齐）**：`run_qc.py` 扫描题包内所有 `.ps1/.psm1/.bat/.cmd`
+里形如路径的字符串，只在 `task/`、`task/tests/`、`task/environment/` 三处找文件，找不到即报
+`referenced files are missing`。以下三类**必然误报**：
+
+| 类型 | 例子 | 真实位置 |
+|---|---|---|
+| workspace 内相对路径 | `Audit.ps1`（`Join-Path $moduleRoot 'Audit.ps1'`）、`assets\sample.wfmt`、`wfmt\__init__.py`、`tests\test_wfmt_basic.py` | `environment/workspace/**`（真实存在） |
+| solution 内相对路径 | `reference\wfmt`（`Join-Path $PSScriptRoot 'reference\wfmt'`） | `solution/**`（真实存在） |
+| 运行期产物 / 系统路径 | `checks.json`、`pytest-results.json`、`results\result.json`、`data\sample.bin`、`beta\zeta.txt`、`WReparseTrail\Sub`、`dev/null`、`Python312\python.exe` | 输出路径 / 运行期构造 / 系统路径 |
+
+**不要**为消除这些误报去改写模块引用或测试写法（违反 checklist 第 7 条"不得改写测试以消除失败"）；
+正确做法是请甲方把解析范围扩到 `environment/workspace/`、`solution/`，并忽略运行时输出与系统路径。
+另：`extras/model_runs/_judge/**` 内是历史判分沙箱副本，会额外引入误报，**不得**进交付 ZIP。
+| 缺口声明 | 原始 `agent.log` / `test.log` / `checks.json` 在 runner 的 `runs/`（被 `.gitignore` 忽略）；若未留存，只允许重建**可核对的最小记录**并在 `jobs/README.md` 显式声明缺口，**不得伪造轨迹** |
+
 ---
 
 ## 三、伴随交付物最低覆盖（8 项）
@@ -139,6 +188,12 @@ delivery-<batch>-<version>/
 
 - [ ] `outside_harbor/` 与 `outside_harbor-assets/` 引用**同一身份三元组**
 - [ ] Task 目录内**无**自定义必需字段
+- [ ] `outside_harbor-assets/jobs/` 存在；每个 `<job-id>/` 同时含 `agent/` 与 `verifier/`，
+      作业 ID 与资格汇总一一对应、无重复
+- [ ] `jobs/` 内剔除轮已标 `excluded` 并写明原因；无 `solution/`、答案、隐藏用例、凭据
+- [ ] 交付 ZIP **含** `source.json`、`solution/`（`README.md` + `solve.ps1`/`solve.bat`）、
+      `tests/required_testcases.json`（含 F2P 与 P2P）、`jobs/`；**不含** `extras/`、`*.pyc`
+- [ ] 已用甲方 `windows-harbor-qc` 的 `run_qc.py` 跑过静态检查，除已知误报外无 error
 - [ ] `delivery-extras/tasks/<task-id>/` 六个子项齐全（metadata/evidence/model_runs/testcase_mapping/quality_review/remediation）
 - [ ] 批次级 7 个汇总文件齐全
 - [ ] `checksums.sha256` 覆盖全部交付物

@@ -32,14 +32,24 @@ harbor-windows/
     ├── solution/oracle.patch        # │
     ├── tests/                       # ┘  test.ps1 / grade.py / swelive_spec.json / test_patch.diff
     ├── platform_import.json         # 平台导入 JSON（原 outside_harbor/<task-id>.json）
-    └── extras/                      # 题级伴随材料（原 delivery-extras/tasks/<task-id>/）
-        ├── metadata/                #   source_and_license / labels / lineage_and_contamination / manifest
-        ├── evidence/                #   no_change / golden / clean_room / negative_and_equivalent_controls / cleanup_and_restore
-        ├── model_runs/              #   qwen3.8-max-0902 / opus-5 / glm-5.3 / kimi-k3
-        ├── testcase_mapping.csv
-        ├── quality_review.md
-        └── remediation_and_retest.md
+    ├── extras/                      # 题级伴随材料（原 delivery-extras/tasks/<task-id>/）
+    │   ├── metadata/                #   source_and_license / labels / lineage_and_contamination / manifest
+    │   ├── evidence/                #   no_change / golden / clean_room / negative_and_equivalent_controls / cleanup_and_restore
+    │   ├── model_runs/              #   qwen3.8-max-0902 / opus-5 / glm-5.3 / kimi-k3
+    │   ├── testcase_mapping.csv
+    │   ├── quality_review.md
+    │   └── remediation_and_retest.md
+    └── jobs/                        # 作业记录：每次跑分一个 <job-id>/{agent,verifier}
+        ├── README.md                #   来源、口径、缺口声明
+        ├── _index/                  #   jobs_index.csv + 资格汇总副本
+        └── <job-id>/                #   job.json + agent/run.json + verifier/result.json
 ```
+
+> **`jobs/`（作业记录）**：按平台交付结构，`jobs/` 与 `<task-id>/` 平级；仓库内先落
+> `<task-id>/jobs/`，组装批次包时平级上移。由 `skills/harbor-windows/scripts/build_jobs.py`
+> 从资格汇总（`model_runs_summary_*.json`）生成；交付 ZIP 由 `package_task_zip.py` 打出（含 `jobs/`）。
+> 原始 `agent.log` / `test.log` 位于被 `.gitignore` 忽略的 runner `runs/`，未留存时只做
+> **可核对的最小重建**并显式声明缺口，不得伪造轨迹。
 
 ## 题包清单（9 题）
 

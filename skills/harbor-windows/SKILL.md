@@ -212,6 +212,10 @@ python scripts/validate_package.py --package <题包根目录> --schema-version 
 - Git Tag/Release + 环境 Digest + 批次清单**可相互定位**
 - **Git 冻结版本为唯一来源**（不再以聊天附件/多个压缩包作为主版本传递）
 - 生成 `checksums.sha256`
+- 由资格汇总生成 `jobs/`：`scripts/build_jobs.py`（每次跑分一个 `<job-id>/{agent,verifier}`）
+- 生成甲方 QC 必备的 `tests/required_testcases.json`：`scripts/build_required_testcases.py`
+- 对齐甲方 QC 报告协议 aggregate-v1（rubric `test_ids` 需 `f2p-`/`p2p-` 前缀）：`scripts/align_report_protocol.py`
+- 打交付 ZIP：`scripts/package_task_zip.py`（**必须含 `solution/`、`source.json`、`jobs/`**；仅排除 `extras/` 与缓存，缺必备件即拒发）
 - 交付结构见 `references/05-delivery-structure.md`
 
 ---
@@ -231,6 +235,11 @@ outside_harbor-assets/<task-id>/
 
 **平台导入**（每题）：`outside_harbor/<task-id>.json`
 （仅用于平台导入，**不等于**标准 Harbor Task；须与题包本体绑定同一身份三元组）
+
+**作业记录**（`outside_harbor-assets/jobs/`，与 `<task-id>/` **平级**）：
+每次跑分一个 `<job-id>/`，内含 `agent/`（模型侧）+ `verifier/`（判分侧）；
+作业 ID = runner 的 `run_id`，与资格汇总一一对应。由 `scripts/build_jobs.py` 生成。
+仓库内先落 `<task-id>/jobs/`（一题一目录），组装批次包时平级上移。
 
 **伴随材料**（`delivery-extras/`，**缺则不得验收**）：
 批次级汇总文件 + `tasks/<task-id>/` 下的 metadata / evidence / model_runs / testcase_mapping / quality_review / remediation
@@ -253,6 +262,7 @@ outside_harbor-assets/<task-id>/
 | 8 | 测试绑定 Golden 私有函数名/调用顺序 | 只验公共契约与可观察行为，接受等价实现 |
 | 9 | 大文件全挪出题包 | 离线依赖/fixture 保留在 `environment/` 或 `tests/` 允许位置，保离线可复现 |
 | 10 | `.ap-tools` 或含 Oracle 的 `harbor/` 进 Agent 可见环境 | 两者均**不得进入** Agent 可见环境或评测镜像 |
+| 11 | 交付 ZIP 缺 `jobs/`，或把上游故障轮记成 0 分 | `jobs/<job-id>/{agent,verifier}` 必须齐全；故障轮标 `excluded` 并写明原因；原始轨迹未留存时**显式声明缺口，不得伪造** |
 
 ---
 
@@ -285,13 +295,18 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `references/09-gz-package-analysis.md` | 对 `Windows_SWE_d70d30df` 27 题现包的实测分析 |
 | `scripts/validate_package.py` | 题包结构与身份一致性校验（实测 27 题包可用） |
 | `scripts/build_delivery_extras.py` | 批量生成 delivery-extras 骨架 |
+| `scripts/build_jobs.py` | **由资格汇总生成 `jobs/<job-id>/{agent,verifier}`**（故障轮保留并标 `excluded`；含凭据扫描） |
+| `scripts/build_required_testcases.py` | **生成甲方 QC 必备的 `tests/required_testcases.json`**（F2P/P2P 依据取自 candidate/golden 对照或 `swelive_spec.json`） |
+| `scripts/align_report_protocol.py` | **对齐甲方 QC 报告协议 aggregate-v1**：rubric `test_ids` 加 `f2p-`/`p2p-` 前缀、重建清单、同步 `judge.toml` 的 `source_sha256` |
+| `scripts/package_task_zip.py` | **打交付 ZIP**：含 `solution/`、`source.json`、`tests/`、`jobs/`；仅排除 `extras/` 与缓存，缺必备件即拒发 |
+| `scripts/hash_package.py` | 身份三元组 `task_hash` 的计算与四处回写（公式只含 instruction / test_patch / oracle_patch / Dockerfile） |
 | `scripts/run_model_validation.py` | **4 模型自动化验证 + 区分度准入计算** |
 | `scripts/model_endpoints.template.json` | 模型端点与凭据配置模板 |
-| `scripts/README.md` | 三个脚本的完整用法说明 |
+| `scripts/README.md` | 六个脚本的完整用法说明 |
 | `assets/harbor-skeleton/` | 标准 Harbor 五件套骨架（含可直接复用的 grade.py / test.ps1 / Dockerfile） |
 | `assets/metadata-templates/` | 伴随材料 JSON 模板（source_and_license / labels / lineage / manifest） |
 
-## 快速上手（四条命令）
+## 快速上手（六条命令）
 
 ```bash
 SKILL=<skill目录>
@@ -315,7 +330,16 @@ python "$SKILL/scripts/run_model_validation.py" \
 # 4) 出包前校验（PASS/FAIL/FLAG）
 python "$SKILL/scripts/validate_package.py" \
     --package <题包根目录> --schema-version 1.3 --json validate-report.json
+
+# 5) 由资格汇总生成 jobs/（每次跑分一个 job；故障轮保留并标 excluded）
+python "$SKILL/scripts/build_jobs.py" \
+    --task-dir <题包目录> --summary <model_runs_summary_*.json>
+
+# 6) 打交付 ZIP（含 jobs/，自动排除 solution/ 与凭据），并逐文件核对
+python "$SKILL/scripts/package_task_zip.py" \
+    --task-dir <题包目录> --out-dir <出包目录> --verify
 ```
 
 > 校验退出码：`0` 全过（可能含 FLAG）／`1` 存在 FAIL（不满足验收）／`2` 参数错误。
 > 模型验证退出码：`0` 无明确失败／`1` 存在 INVALID 或区分度不通过。
+> `build_jobs.py` 命中疑似凭据 exit=2；`package_task_zip.py` 检出禁入内容或核对不符 exit=2。
