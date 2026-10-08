@@ -14,8 +14,8 @@ wff-task/
 │   ├── feishu-gsb.toml    # 公用：飞书配置
 │   ├── task-registry.json # 公用：题目登记表
 │   ├── tools/             # 公用：跨题复用的构建/登记脚本
-│   ├── upstream/          # 公用：上游源码缓存（diskcache/huey/...）
-│   ├── Benchmark/         # 公用：第三方基准数据集（上游副本）
+│   ├── upstream/          # 公用：上游源码缓存（已移出 Git，本地保留）
+│   ├── Benchmark/         # 公用：第三方基准数据集（已移出 Git，本地保留）
 │   ├── feishu-records/    # 公用：飞书知识库记录快照
 │   ├── _env-records/      # 公用：环境探测与安装/取证记录
 │   ├── work/<题号>/        # 每题独立的工作区（中间产物）
@@ -23,11 +23,15 @@ wff-task/
 ├── deliverables/          # ★ 解析材料产出区（<日期>_<材料名>/，材料名保持原拼写）
 ├── harbor-16/             # 题包类型目录：harbor-16 skill 产物（内部 RL 题包）
 ├── harbor-sota/           # 题包类型目录：harbor-sota skill 产物（外发供应商题包）
-├── harbor-windows/        # 题包类型目录：harbor-windows skill 产物（Windows 专项 Coding Bench，9 题平铺）
+├── harbor-weakness/       # 题包类型目录：harbor-weakness skill 产物（金融弱点题包）
+├── harbor-rl/             # 题包类型目录：harbor-rl skill 产物（RL 数据生产，尚未出题）
+├── harbor-windows/        # 题包类型目录：harbor-windows skill 产物（Windows 专项 Coding Bench）
 └── skills/                # ★ 唯一的 skill 目录
     ├── OBM/               # OBM 生产全流程（含 subskills）
     ├── harbor-16/         # Harbor 内部 RL 出题
     ├── harbor-sota/       # 外发评测题包生产
+    ├── harbor-rl/         # RL 数据生产
+    ├── harbor-weakness/   # 金融弱点题包生产
     ├── harbor-work/       # 龙猫-阿里 A/B 标注
     ├── caveman/           # 精简输出模式
     ├── wff-workspace-discipline/  # 落盘纪律（约束产物位置）
@@ -55,13 +59,15 @@ wff-task/
 | 候选题（尚未立项） | `work/candidates/` | 仅有 `scene-profile.json` 的题目 |
 | 解析材料的产出 | `deliverables/<日期>_<材料名>/` | `deliverables/2026-09-29_windwos-第二版/` |
 
-`harbor-16/`、`harbor-sota/`、`harbor-windows/`、`OBM/` 均为**题包类型目录**：类型目录根部**只放公用**配置/脚本/缓存，单个题包各自独立子目录，互不污染。后续新增题包类型时同此组织，并在此登记。
+`harbor-16/`、`harbor-sota/`、`harbor-weakness/`、`harbor-rl/`、`harbor-windows/`、`OBM/` 均为**题包类型目录**：类型目录根部**只放公用**配置/脚本/缓存，单个题包各自独立子目录，互不污染。后续新增题包类型时同此组织，并在此登记。
+
+类型目录内保留两类下划线前缀的**非题包目录**：`_index/`（跨题索引与汇总）、`_reference/`（外部参考包解压归档，如甲方质检工具、供应商样例包）。
 
 ### 根目录洁净规则（强制）
 
 **以下条目只允许存在一个**：`README.md`、`.gitignore`、`deliverables/`、`skills/`。
 
-**题包类型目录可扩展**，当前已有：`OBM/`、`harbor-16/`、`harbor-sota/`、`harbor-windows/`。新增类型目录须先经确认并登记于本节与上方目录树。
+**题包类型目录可扩展**，当前已有：`OBM/`、`harbor-16/`、`harbor-sota/`、`harbor-weakness/`、`harbor-rl/`、`harbor-windows/`。新增类型目录须先经确认并登记于本节与上方目录树。
 
 - **禁止**在根目录直接创建任何文件（报告、脚本、临时文件）。
 - **禁止**根级备份/临时目录（`X.backup-*`、`X-2/`、`tmp/`）。
@@ -87,6 +93,11 @@ wff-task/
 git add -A && git commit -m "描述改动" && git push
 ```
 
+> ⚠️ **多任务并行时不要用 `git add -A`**：工作区经常同时存在其他任务正在进行的改动
+> （例如运行中的判分任务产物、别人正在编辑的题包），`git add -A` 会把它们一并提交。
+> 请按路径精确暂存：`git add <本次涉及的具体目录…>`，提交前用
+> `git diff --cached --name-status` 核对范围。
+
 ## 各 skill 说明
 
 各 skill 的使用方法见其自身目录内的 `SKILL.md` 与 `README.md`：
@@ -105,4 +116,8 @@ git add -A && git commit -m "描述改动" && git push
 - **harbor-windows 题包**：跑 `python skills/harbor-windows/scripts/validate_package.py --package harbor-windows`，
   须满足五件套齐全 + required F2P/P2P 二值判分 + `<task-id>/extras/` 与 `_index/` 齐全 + 镜像 Digest 另存；
   模型区分度用 `python skills/harbor-windows/scripts/run_model_validation.py --layout flat` 自动化验证
-  （**9 个题包平铺于 `harbor-windows/` 下，无批次层**）
+  （题包平铺于 `harbor-windows/` 下，无批次层；当前仅保留已过资格门禁的
+  `wfflab__wreparse-217`、`wfflab__wfmt-215`）
+- **甲方质检（windows-harbor-qc）**：参考包已归档在 `harbor-windows/_reference/windows-harbor-qc/`，
+  用法 `python <该目录>/scripts/run_qc.py --input <题包目录或ZIP> --out <空目录>`：先做静态检查
+  （必备件 / 身份一致性 / aggregate-v1 报告协议），通过后才会在 **Windows 容器**里跑 Oracle / NOP 动态门禁
