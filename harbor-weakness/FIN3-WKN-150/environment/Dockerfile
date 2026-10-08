@@ -19,21 +19,9 @@ RUN command -v claude >/dev/null 2>&1 \
     && claude --version
 
 # ③ pip 安装 rewardkit + 判官读交付物所需的解析库（官方 pypi.org）
-#    鲁棒性加固（2026-10-08）：某些网络下直连 pypi.org 会出现传输损坏，pip 因
-#    "下载内容与 index 声明的 hash 不符" 直接中止构建（THESE PACKAGES DO NOT MATCH
-#    THE HASHES FROM THE REQUIREMENTS FILE），且该失败模式 pip 自身不会重试。
-#    故提高下载重试与超时，并在整条命令失败后原样重试（最多 3 次），确保构建不因
-#    网络抖动而失败。安装的包集合与版本与加固前完全一致，不改变任务环境语义。
-RUN ok=0; \
-    for i in 1 2 3; do \
-      pip install --no-cache-dir --retries 10 --timeout 120 \
+RUN pip install --no-cache-dir \
         "harbor-rewardkit[all]==0.1.7" markitdown \
-        openpyxl pandas python-docx pypdf python-pptx PyYAML chardet matplotlib \
-      && ok=1 && break; \
-      echo "[build] pip 安装第 $i 次失败（多为下载传输损坏），10s 后原样重试"; \
-      sleep 10; \
-    done; \
-    [ "$ok" = "1" ]
+        openpyxl pandas python-docx pypdf python-pptx PyYAML chardet matplotlib
 
 # ④ 任务执行侧依赖（本题未使用额外依赖，requirements.txt 为空文件）
 COPY requirements.txt /tmp/requirements.txt

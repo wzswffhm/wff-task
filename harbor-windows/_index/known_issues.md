@@ -1,5 +1,28 @@
 # known_issues —— harbor-windows 题包目录
 
+> ## 范围声明（2026-10-08）
+>
+> 本目录当前**只交付 2 个题包**：`wfflab__wfmt-215`、`wfflab__wreparse-217`。
+> 下表 K1–K20 是**完整仓库（9 / 16 题）阶段**的记录，多数条目不适用于本目录实物，
+> 保留作为过程证据。逐条适用性对照如下：
+>
+> | 条目 | 是否适用本目录 2 题 | 说明 |
+> |---|---|---|
+> | K1 镜像 digest 未回填 | **部分适用** | 两题已有本机 Image ID（见 `EXTERNAL_IMAGES.json`）；registry RepoDigest 待 push 后回填 |
+> | K2 对照验证未执行 | **不适用** | 两题 no-change ×3 = 0.0、Golden ×3 = 1.0 已完成（本地 runner 与 Harbor 双口径） |
+> | K3 多模型记录为空 | **不适用** | 两题四模型记录完整，区分度已达标（见 `model_validation_report.md`） |
+> | K4 本机物理机执行 | 已消除 | 控制与门禁均在 Windows 容器内完成 |
+> | K5 不依赖 harbor-rewardkit | 适用 | 两题均为自包含判分脚本 |
+> | K6 依赖 Windows 默认语义 | 适用 | 两题均依赖大小写不敏感 NTFS / `PATHEXT` / en-US 代码页 |
+> | K7 模型端点注意事项 | 适用 | 含 GLM 不可传 `thinking` 字段等 |
+> | K8 base README 描述契约 | 适用 | 两题 `workspace` 内文档与 `instruction.md` 同源 |
+> | K9 构造代码而非真实 Issue | 适用 | 两题 `source.json` 均如实声明构造来源 |
+> | K10–K17、K20 其他题目的整改/替换 | **不适用** | 涉及 `wsync-142` / `wencoding-206` / `wproc-209` / `wtask-216` 等不在本目录的题 |
+> | K18 8.2 区分度根因 | **适用（历史）** | 结论针对当时端点配置；本目录两题在其 `qualification_epoch` 下已达成 Opus > Qwen，故不再阻塞，但端点健康度需持续关注 |
+> | K19 提分假设已被排除 | 适用（经验） | 其中涉及 `wfmt-215`，结论仍然有效 |
+>
+> 另见 `_index/CHANGELOG.md` 的 2026-10-08 条目。
+
 | # | 级别 | 问题 | 影响范围 | 处置建议 |
 |---|---|---|---|---|
 | K1 | 阻塞验收 | 10 个镜像均未构建，`image_digest` 为空（当前 `PENDING_BUILD`） | 无法满足规范 5.5「另存不可变 Digest」 | 在 Windows 构建机对 10 题分别执行 `docker build` 后回填 `_index/EXTERNAL_IMAGES.json` 与各题 `extras/metadata/manifest.json` |
@@ -25,9 +48,12 @@
 | K19 | 重要经验 | **已排除的三种「提分」假设（全部实测反效果或无效）**：① 加倍 agent 回合预算（`--agent-max-steps 80`）→ Opus 在 wfmt-215 由 12/15 降到 9/15，行为退化为命令空转（46–60 次 `run_command`、0–3 次 `write_file`）；② 在 system prompt 中显式鼓励并行工具调用 → 并行度确实从 1.2 升到 1.9 工具/回合，但 wsync-142 通过数由 19–22/24 腰斩到 9/24（改动已回滚）；③ 加大难度：Opus 失败比 Qwen 更早更猛，加大难度只会把「持平」变成「Qwen 胜」 | 避免后续重复试错 | 端点修复前不要再在出题侧找解 |
 | K20 | 提示 | `wfflab__wtask-216`（本次新建，Windows 计划任务调度语义引擎）结构完整、可复现：no-change ×3 = 0.0、Golden ×3 = 1.0（均 VALID）、Qwen/Opus/GLM/Kimi 全 1.0；`validate_package.py` PASS=393 / FAIL=1（缺 delivery-extras）。**8.2 判定为 FAIL（Opus 3.0 vs Qwen 3.0，同分且非 0）**，属难度不足（薄题），同样卡在 K18 | 该题不参与本轮交付，但可在端点修复后直接复用 | 若端点恢复且需要对上「非满分」的 Qwen，可优先复用 `wfmt-215`(Qwen 2.0) / `wproc-209` / `winstall-210` |
 
-## 题号对照
+## 题号对照（本目录 2 题）
 
-`wfflab__wproc-209`（**替换 wsync-142，本轮交付**）、
-`wfflab__wreserved-201`、`wfflab__wads-202`、`wfflab__wacl-203`、
-`wfflab__wpathext-204`、`wfflab__wreg-205`、`wfflab__wencoding-206`、`wfflab__wps-207`、
-`wfflab__wrotate-208`；`wfflab__wsync-142`（已 replaced，封存）
+- `wfflab__wfmt-215` —— 编码与区域（二进制容器格式，近似映射）｜L4｜required **8 F2P + 7 P2P = 15**
+- `wfflab__wreparse-217` —— 文件系统与路径（NTFS 重解析点）｜L3｜required **13 F2P + 11 P2P = 24**
+
+> 历史材料中出现的 `wsync-142`、`wreserved-201`、`wads-202`、`wacl-203`、`wpathext-204`、
+> `wreg-205`、`wencoding-206`、`wps-207`、`wrotate-208`、`wproc-209`、`winstall-210`、
+> `wstamp-211`、`wtask-216` 属于完整仓库的其他题包，不在本目录交付范围内。
+> 题目实体与 F2P/P2P 计数以 `_index/tasks_index.csv` 与各题 `tests/required_testcases.json` 为准。

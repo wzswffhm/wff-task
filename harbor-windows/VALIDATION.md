@@ -4,8 +4,11 @@
 > 第八章（多模型验证）、第十/十一章（验收与一致性）。
 > 对应 skill `harbor-windows` 的 `references/06-acceptance-gates.md` 与 `references/08-model-validation.md`。
 >
-> **本目录为平铺布局**：9 个题包各自独立成 `<task-id>/` 子目录，无批次层；
+> **本目录为平铺布局**：题包各自独立成 `<task-id>/` 子目录，无批次层；
 > 跨题汇总在 `_index/`。下文路径均以 `harbor-windows/` 为基准。
+>
+> **范围（2026-10-08）**：本目录当前实际交付 **2 个题包** —— `wfflab__wfmt-215`、`wfflab__wreparse-217`。
+> 本文原按完整仓库 9 题编写，已按实物对齐；文中出现的其他 task_id 仅作流程示例。
 
 ---
 
@@ -84,20 +87,32 @@ L3 的脚本只是**模型调用层**，它不产出正式分——正式分必�
 
 ---
 
-## 四、判分链路（`tests/test.ps1` → `tests/grade.py`）
+## 四、判分链路（`tests/test.ps1`）
 
 题包内判分是**全有或全无的二值评分**：required F2P + P2P 全过 = **1**，否则 = **0**，异常 = **INVALID**。
 
-`test.ps1` 的执行顺序：
+本目录两题的**实际**实现如下（不是旧骨架的 `grade.py` + `test_patch.diff` 路线）：
 
 | 步 | 动作 | 失败时 |
 |---|---|---|
-| 1 | 校验工作区身份（`task_id` / base commit） | `===SWELIVE_INVALID ...===`，exit 2 |
-| 2 | 校验并应用隐藏测试补丁 `tests/test_patch.diff` | `swelive_invalid test_patch_apply_failed`，exit 2 |
-| 3 | 环境预检 `python -c "import pytest, wsync"` | `swelive_invalid prepared_environment_missing`，exit 2 |
-| 4 | 跑 `pytest --json-report` 产出 `reports/pytest-results.json` | 报告缺失 → INVALID |
-| 5 | 把原始日志按 `===SWELIVE_LOG_BEGIN/END===` 包裹输出 | — |
-| 6 | 调用 `grade.py` 解析日志并生成 reward 产物 | reward 缺失/畸形 → INVALID |
+| 1 | `test.ps1` 解析参数（`-TaskRoot` / `-WorkspaceRoot` / `-OutputPath`），缺省时回退到题包内相对路径 | — |
+| 2 | 调用 `run_tests.ps1` 逐条执行行为检查，产出 `checks.json`（每条 `test_id` + `PASS`/`FAIL`） | 执行故障 → `===SWELIVE_INVALID checks_execution_failed===`，exit 2 |
+| 3 | 调用 `aggregate_results.ps1`，按 `rubric.json` 的 `items[].test_ids` 聚合 | — |
+| 4 | 写出 `results/result.json`（aggregate-v1：`schema_version` / `run_validity` / `total` / `passed` / `failed` / `invalid` / `formal_score` / `cases`） | — |
+| 5 | **Harbor 分支**：检测到 `%SystemDrive%\logs` 存在时，把 report 与 reward 三件套（`report.json` / `reward.txt` / `reward.json` / `reward-details.json`）写入 `logs\verifier\` | — |
+| 6 | stdout 输出 `===SWELIVE_GRADE score=N===`；INVALID 走 `===SWELIVE_INVALID <reason>===` 并 exit 2 | — |
+
+**两条易错点**：
+- 判分只认 `rubric.json` 声明的 `test_ids`，因此 `required_testcases.json` 与 `rubric.json` 必须严格对应
+  （215 = 15 条：8 F2P + 7 P2P；217 = 24 条：13 F2P + 11 P2P）；
+- **INVALID 与 0 分严格区分**：环境、Runner、权限、依赖或 Verifier 缺陷**不得**被记成模型 0 分（一票否决第 8 条）。
+
+### 标准 Harbor 入口（2026-10-08 新增）
+
+Windows 容器只发现 `.bat` 入口（`WINDOWS_EXTENSIONS = ['.bat']`），故每题的
+`tests/test.bat`、`solution/solve.bat` 仅委托对应的 `.ps1`，并在调用时把
+`-TaskRoot` 指向盘根（使 `tests/` 落到 `C:\tests`）、`-WorkspaceRoot` 指向 `C:\testbed`（镜像内工作区）。
+217 另有夹具准备需求，由 `tests/test.bat` 在夹具缺失时先调用 `tests/prepare.ps1`。
 
 **两条易错点（已在骨架修正）**：
 - pytest 退出码 **1 = 存在测试失败 = 候选的合法 0 分**，只有 `> 1`（编译/收集失败）才是候选级故障 → 判据用 `$testRc -gt 1`，不能用 `-ne 0`；
@@ -201,19 +216,22 @@ python skills/harbor-windows/scripts/run_model_validation.py \
 
 ---
 
-## 六、当前进度（9 题）
+## 六、当前进度（2 题）
+
+> **范围声明（2026-10-08）**：本节原按完整仓库 9 题编写，现按本目录实际交付的 2 题重写。
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| L1 结构校验 | ✅ 通过 | `PASS=256 FAIL=0 FLAG=0`，退出码 0（平铺模式，9 题全覆盖；459 条 checksums 复算一致） |
-| B1–B5（`wfflab__wsync-142`） | ✅ 通过 | no-change ×3 均 0；Golden ×3 均 1；4 个反例均 0；等价实现得 1；干净重建复验一致 |
-| B1–B5（其余 8 题） | ⏳ **未执行** | 按要求「先不跑测试」，只完成题目构造（base repo / 隐藏测试 / 参考解 / 交付结构）与静态校验 |
-| **镜像 Digest** | ⏳ **待补** | 9 个镜像均未构建，`image_digest = PENDING_BUILD`（未伪造） |
-| **L3 多模型区分度** | ⏳ **待补** | 按要求暂未执行；Opus 端点凭据亦未提供 |
+| L1 结构校验 | ✅ 通过 | 按 2 题范围复算：`_index/checksums.sha256`（515 条）与实物一致。`_index/validate-report.json` 仍为旧 9 题范围产物，正式验收前需重算 |
+| B1–B5（`wfflab__wfmt-215`） | ✅ 通过 | no-change ×3 均 0；Golden ×3 均 1（本地 runner 与 Harbor 双口径） |
+| B1–B5（`wfflab__wreparse-217`） | ✅ 通过 | 同上；Harbor 口径 Oracle ×3 = `VALID/1`、NOP ×3 = `VALID/0` |
+| **标准 Harbor 加载与构建** | ✅ 通过 | `Task.is_valid_dir()` = `True`；`harbor run --path <题包>` 单题直跑；镜像由 `environment/Dockerfile` 自行构建（215 另经 `docker build --no-cache` 全新构建验证） |
+| **镜像 Digest** | ⏳ **部分待补** | 两题已有本机 Image ID（见 `_index/EXTERNAL_IMAGES.json`）；registry RepoDigest 待 push 后回填 |
+| **L3 多模型区分度** | ✅ 通过 | 215：Opus 2.0 > Qwen 0.0；217：Opus 3.0 > Qwen 2.0（四模型记录完整，见 `_index/model_validation_report.md`） |
 
-> 缺口与整改建议见 `_index/known_issues.md`（K1–K9）与 `_index/validation_report.md`。
-> `wfflab__wsync-142` 的证据（原始日志、`report.json`、reward 产物）归档于
-> `wfflab__wsync-142/extras/evidence/`。
+> 缺口与整改建议见 `_index/known_issues.md`（含 K1–K20 的逐条适用性对照）与 `_index/validation_report.md`。
+> 各题证据归档于 `<task-id>/jobs/`，含从本地 runner 存储回填的真实 `agent.log` / `checks.json` / `test.log` / `stderr.log`
+> （`test_log_sha256` 对账：215 = 16/16、217 = 17/17）。
 
 ---
 

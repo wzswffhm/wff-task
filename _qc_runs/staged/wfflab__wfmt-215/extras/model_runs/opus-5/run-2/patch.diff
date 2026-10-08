@@ -1,0 +1,621 @@
+diff --git a/analysis.txt b/analysis.txt
+new file mode 100644
+index 0000000..045217e
+--- /dev/null
++++ b/analysis.txt
+@@ -0,0 +1,29 @@
++File length: 309
++Magic: b'WFMT'
++Version: 1
++Count bytes: 05000000
++Count (LE): 5
++Count (BE): 83886080
++
++Attempting to parse 5 records:
++  Record 0 at position 9:
++    tag=1, length=5
++    payload (first 50 bytes): b'alpha'
++
++  Record 1 at position 16:
++    tag=0, length=2
++    payload (first 50 bytes): b'\x00\x00'
++
++  Record 2 at position 20:
++    tag=0, length=300
++    payload (first 50 bytes): b'\nxxxxxxxxxx\x00\x00\x00\x04\x80\x02\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f '
++
++  Record 3 at position 323:
++  ERROR: index out of range
++  Position when failed: 323
++
++Body ends at position: 323
++File length: 309
++Expected checksum at: 305
++Checksum bytes: eac713f2
++Match: False
+diff --git a/analyze2.py b/analyze2.py
+new file mode 100644
+index 0000000..edbea34
+--- /dev/null
++++ b/analyze2.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++out = open('analysis.txt', 'w')
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while True:
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if (byte & 0x80) == 0:
++            return result, pos
++        shift += 7
++
++out.write(f'File length: {len(data)}\n')
++out.write(f'Magic: {data[0:4]}\n')
++out.write(f'Version: {data[4]}\n')
++out.write(f'Count bytes: {data[5:9].hex()}\n')
++out.write(f'Count (LE): {struct.unpack("<I", data[5:9])[0]}\n')
++out.write(f'Count (BE): {struct.unpack(">I", data[5:9])[0]}\n')
++out.write('\n')
++
++# Try parsing with little-endian count
++count = struct.unpack('<I', data[5:9])[0]
++out.write(f'Attempting to parse {count} records:\n')
++pos = 9
++records = []
++
++try:
++    for i in range(count):
++        out.write(f'  Record {i} at position {pos}:\n')
++        tag, pos = decode_varint(data, pos)
++        length, pos = decode_varint(data, pos)
++        payload = data[pos:pos+length]
++        pos += length
++        records.append((tag, payload))
++        out.write(f'    tag={tag}, length={length}\n')
++        out.write(f'    payload (first 50 bytes): {payload[:50]}\n')
++        out.write('\n')
++except Exception as e:
++    out.write(f'  ERROR: {e}\n')
++    out.write(f'  Position when failed: {pos}\n')
++
++out.write(f'\nBody ends at position: {pos}\n')
++out.write(f'File length: {len(data)}\n')
++out.write(f'Expected checksum at: {len(data) - 4}\n')
++out.write(f'Checksum bytes: {data[-4:].hex()}\n')
++out.write(f'Match: {pos == len(data) - 4}\n')
++
++out.close()
++print('Analysis written to analysis.txt')
+diff --git a/analyze3.py b/analyze3.py
+new file mode 100644
+index 0000000..b8f246d
+--- /dev/null
++++ b/analyze3.py
+@@ -0,0 +1,56 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++print('=== Manual byte-by-byte analysis ===')
++print(f'Total file length: {len(data)}')
++print()
++
++print('Header:')
++print(f'  0-3: {data[0:4]} = {data[0:4].decode("ascii")}')
++print(f'  4: {data[4]} = version')
++print(f'  5-8: {data[5:9].hex()} = count')
++print(f'    as LE u32: {struct.unpack("<I", data[5:9])[0]}')
++print(f'    as BE u32: {struct.unpack(">I", data[5:9])[0]}')
++print()
++
++print('Records (assuming LE count = 5):')
++print()
++
++# Record 0
++print('Record 0 at position 9:')
++print(f'  byte 9: {data[9]:02x} = tag (if varint)')
++print(f'  byte 10: {data[10]:02x} = length (if varint)')  
++print(f'  bytes 11-15: {data[11:16]} = payload')
++print()
++
++# Record 1  
++print('Record 1 at position 16:')
++print(f'  byte 16: {data[16]:02x} = tag')
++print(f'  byte 17: {data[17]:02x} = length')
++print(f'  bytes 18-19: {data[18:20].hex()} = payload')
++print()
++
++# Record 2
++print('Record 2 at position 20:')
++print(f'  byte 20: {data[20]:02x} = tag')
++print(f'  byte 21: {data[21]:02x} = {data[21]:08b}b (has high bit: {data[21] & 0x80 != 0})')
++print(f'  byte 22: {data[22]:02x} = {data[22]:08b}b (has high bit: {data[22] & 0x80 != 0})')
++print(f'  IF varint length: {(data[21] & 0x7f) | ((data[22] & 0x7f) << 7)} = too long!')
++print(f'  IF fixed LE u16 at 21-22: {struct.unpack("<H", data[21:23])[0]}')
++print(f'  IF fixed LE u32 at 21-24: {struct.unpack("<I", data[21:25])[0]}')
++print()
++
++# Maybe tag and length are both u32?
++print('Trying: tag=u32, length=u32 format')
++pos = 9
++for i in range(3):
++    if pos + 8 > len(data) - 4:
++        break
++    tag = struct.unpack('<I', data[pos:pos+4])[0]
++    length = struct.unpack('<I', data[pos+4:pos+8])[0]
++    print(f'Record {i}: tag={tag}, length={length}')
++    pos += 8 + length
++print(f'Would end at position: {pos}')
++print(f'Checksum starts at: {len(data) - 4}')
+diff --git a/analyze_empty.py b/analyze_empty.py
+new file mode 100644
+index 0000000..875d532
+--- /dev/null
++++ b/analyze_empty.py
+@@ -0,0 +1,32 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample_empty.wfmt', 'rb').read()
++print('Empty sample:')
++print('Length:', len(data))
++print('Hex:', data.hex())
++print()
++print('Header:')
++print('  Magic:', data[0:4])
++print('  Version:', data[4])
++print('  Count (LE):', struct.unpack('<I', data[5:9])[0])
++print()
++print('Body length:', len(data[9:-4]))
++print('Checksum:', data[-4:].hex())
++print()
++
++# Compute CRC-32 with final XOR
++body = data[:-4]
++crc = 0xFFFFFFFF
++poly = 0xEDB88320
++for byte in body:
++    crc ^= byte
++    for _ in range(8):
++        if crc & 1:
++            crc = (crc >> 1) ^ poly
++        else:
++            crc >>= 1
++final = crc ^ 0xFFFFFFFF
++
++print('Computed CRC (with XOR):', struct.pack('<I', final).hex())
++print('Match:', struct.pack('<I', final) == data[-4:])
+diff --git a/analyze_sample.py b/analyze_sample.py
+new file mode 100644
+index 0000000..a1caf0d
+--- /dev/null
++++ b/analyze_sample.py
+@@ -0,0 +1,76 @@
++#!/usr/bin/env python3
++"""临时分析脚本：解析真实样本文件。"""
++
++import struct
++import sys
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while True:
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if (byte & 0x80) == 0:
++            return result, pos
++        shift += 7
++
++# Header
++sys.stdout.write(f'Magic: {data[0:4]}\n')
++sys.stdout.write(f'Version: {data[4]}\n')
++count_le = struct.unpack('<I', data[5:9])[0]
++count_be = struct.unpack('>I', data[5:9])[0]
++sys.stdout.write(f'Count (LE): {count_le}\n')
++sys.stdout.write(f'Count (BE): {count_be}\n')
++sys.stdout.write('\n')
++
++# Records
++pos = 9
++count = count_le
++sys.stdout.write(f'Parsing {count} records:\n')
++for i in range(count):
++    tag, pos = decode_varint(data, pos)
++    length, pos = decode_varint(data, pos)
++    payload = data[pos:pos+length]
++    pos += length
++    sys.stdout.write(f'  R{i}: tag={tag} len={length} payload={payload[:30]}\n')
++
++sys.stdout.write(f'\nBody ends at: {pos}\n')
++sys.stdout.write(f'File length: {len(data)}\n')
++sys.stdout.write(f'Checksum: {data[-4:].hex()}\n')
++
++# Verify CRC
++body = data[:pos]
++sys.stdout.write(f'\nComputing CRC over {len(body)} bytes...\n')
++
++# Standard CRC-32 (same as binascii.crc32)
++crc = 0xFFFFFFFF
++poly = 0xEDB88320
++for byte in body:
++    crc ^= byte
++    for _ in range(8):
++        if crc & 1:
++            crc = (crc >> 1) ^ poly
++        else:
++            crc >>= 1
++
++final_crc = crc ^ 0xFFFFFFFF
++sys.stdout.write(f'CRC (with final XOR): {hex(final_crc)}\n')
++sys.stdout.write(f'Expected: {data[-4:].hex()}\n')
++sys.stdout.write(f'Match: {struct.pack("<I", final_crc) == data[-4:]}\n')
++
++# Also test without final XOR
++crc2 = 0xFFFFFFFF
++for byte in body:
++    crc2 ^= byte
++    for _ in range(8):
++        if crc2 & 1:
++            crc2 = (crc2 >> 1) ^ poly
++        else:
++            crc2 >>= 1
++sys.stdout.write(f'CRC (no final XOR): {hex(crc2)}\n')
++sys.stdout.write(f'Match without XOR: {struct.pack("<I", crc2) == data[-4:]}\n')
++
++sys.stdout.flush()
+diff --git a/hexdump.py b/hexdump.py
+new file mode 100644
+index 0000000..89131e9
+--- /dev/null
++++ b/hexdump.py
+@@ -0,0 +1,13 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++print('Position | Hex')
++print('-' * 60)
++for i in range(0, min(100, len(data)), 16):
++    hex_str = ' '.join(f'{b:02x}' for b in data[i:i+16])
++    print(f'{i:3d}      | {hex_str}')
++
++print('...')
++print(f'{len(data)-20:3d}      | {" ".join(f"{b:02x}" for b in data[-20:])}')
+diff --git a/parse_real.py b/parse_real.py
+new file mode 100644
+index 0000000..3a65c14
+--- /dev/null
++++ b/parse_real.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while pos < len(data):
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if (byte & 0x80) == 0:
++            return result, pos
++        shift += 7
++        if shift > 63:
++            raise ValueError('varint overflow')
++    raise ValueError('truncated')
++
++print('File length:', len(data))
++print('Checksum starts at:', len(data) - 4)
++print()
++
++# Parse until we hit the checksum
++pos = 9
++end = len(data) - 4
++records = []
++
++print('Parsing records with varint:')
++record_num = 0
++while pos < end:
++    print(f'\nRecord {record_num} at position {pos}:')
++    try:
++        tag_start = pos
++        tag, pos = decode_varint(data, pos)
++        print(f'  tag={tag} (bytes: {data[tag_start:pos].hex()})')
++        
++        len_start = pos
++        length, pos = decode_varint(data, pos)
++        print(f'  length={length} (bytes: {data[len_start:pos].hex()})')
++        
++        if pos + length > end:
++            print(f'  ERROR: payload would extend to {pos+length}, but body ends at {end}')
++            break
++            
++        payload = data[pos:pos+length]
++        pos += length
++        records.append((tag, payload))
++        print(f'  payload ({length} bytes): {payload[:50]}')
++        print(f'  next position: {pos}')
++        record_num += 1
++    except Exception as e:
++        print(f'  ERROR: {e}')
++        break
++
++print(f'\nParsed {len(records)} records')
++print(f'Final position: {pos}')
++print(f'Expected end: {end}')
++print(f'Match: {pos == end}')
++
++# Verify CRC
++if pos == end:
++    body = data[:end]
++    crc = 0xFFFFFFFF
++    poly = 0xEDB88320
++    for byte in body:
++        crc ^= byte
++        for _ in range(8):
++            if crc & 1:
++                crc = (crc >> 1) ^ poly
++            else:
++                crc >>= 1
++    computed = crc ^ 0xFFFFFFFF
++    expected = struct.unpack('<I', data[-4:])[0]
++    print(f'\nCRC computed: {computed:08x}')
++    print(f'CRC expected: {expected:08x}')
++    print(f'CRC match: {computed == expected}')
+diff --git a/parse_u16.py b/parse_u16.py
+new file mode 100644
+index 0000000..4c9b92e
+--- /dev/null
++++ b/parse_u16.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while pos < len(data):
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if (byte & 0x80) == 0:
++            return result, pos
++        shift += 7
++    raise ValueError('truncated')
++
++print('Testing: tag=varint, length=u16 LE')
++pos = 9
++end = len(data) - 4
++count = 5
++
++for i in range(count):
++    print(f'\nRecord {i} at position {pos}:')
++    tag, pos = decode_varint(data, pos)
++    if pos + 2 > len(data):
++        print('  ERROR: not enough bytes for length')
++        break
++    length = struct.unpack('<H', data[pos:pos+2])[0]
++    pos += 2
++    print(f'  tag={tag}, length={length}')
++    if pos + length > end:
++        print(f'  ERROR: payload extends beyond body end')
++        break
++    payload = data[pos:pos+length]
++    pos += length
++    print(f'  payload: {payload[:50]}')
++
++print(f'\nFinal position: {pos}')
++print(f'Expected: {end}')
++print(f'Match: {pos == end}')
++
++if pos == end:
++    body = data[:end]
++    crc = 0xFFFFFFFF
++    poly = 0xEDB88320
++    for byte in body:
++        crc ^= byte
++        for _ in range(8):
++            if crc & 1:
++                crc = (crc >> 1) ^ poly
++            else:
++                crc >>= 1
++    computed = crc ^ 0xFFFFFFFF
++    expected = struct.unpack('<I', data[-4:])[0]
++    print(f'\nCRC computed: {computed:08x}')
++    print(f'CRC expected: {expected:08x}')
++    print(f'Match: {computed == expected}')
+diff --git a/parse_u32.py b/parse_u32.py
+new file mode 100644
+index 0000000..d760886
+--- /dev/null
++++ b/parse_u32.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++def decode_varint(data, pos):
++    result = 0
++    shift = 0
++    while pos < len(data):
++        byte = data[pos]
++        pos += 1
++        result |= (byte & 0x7F) << shift
++        if (byte & 0x80) == 0:
++            return result, pos
++        shift += 7
++    raise ValueError('truncated')
++
++print('Testing: tag=varint, length=u32 LE')
++pos = 9
++end = len(data) - 4
++count = 5
++
++for i in range(count):
++    print(f'\nRecord {i} at position {pos}:')
++    tag, pos = decode_varint(data, pos)
++    if pos + 4 > len(data):
++        print('  ERROR: not enough bytes for length')
++        break
++    length = struct.unpack('<I', data[pos:pos+4])[0]
++    pos += 4
++    print(f'  tag={tag}, length={length}')
++    if pos + length > end:
++        print(f'  ERROR: payload extends beyond body end (would be at {pos+length})')
++        break
++    payload = data[pos:pos+length]
++    pos += length
++    print(f'  payload ({length} bytes): {payload[:50]}')
++
++print(f'\nFinal position: {pos}')
++print(f'Expected: {end}')
++print(f'Match: {pos == end}')
++
++if pos == end:
++    body = data[:end]
++    crc = 0xFFFFFFFF
++    poly = 0xEDB88320
++    for byte in body:
++        crc ^= byte
++        for _ in range(8):
++            if crc & 1:
++                crc = (crc >> 1) ^ poly
++            else:
++                crc >>= 1
++    computed = crc ^ 0xFFFFFFFF
++    expected = struct.unpack('<I', data[-4:])[0]
++    print(f'\nCRC computed: {computed:08x}')
++    print(f'CRC expected: {expected:08x}')
++    print(f'Match: {computed == expected}')
+diff --git a/test_formats.py b/test_formats.py
+new file mode 100644
+index 0000000..4be6334
+--- /dev/null
++++ b/test_formats.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++print('=== Testing different record format hypotheses ===')
++print(f'File length: {len(data)}')
++print(f'Checksum starts at: {len(data) - 4}')
++print()
++
++# Hypothesis 1: tag=u8, length=u32 LE
++print('Hypothesis 1: tag=u8, length=u32 LE')
++pos = 9
++count = 5
++try:
++    for i in range(count):
++        tag = data[pos]
++        length = struct.unpack('<I', data[pos+1:pos+5])[0]
++        payload = data[pos+5:pos+5+length]
++        print(f'  R{i}: tag={tag}, len={length}, payload_preview={payload[:20]}')
++        pos += 5 + length
++    print(f'  Ends at: {pos}, expected: {len(data)-4}, match: {pos == len(data)-4}')
++except Exception as e:
++    print(f'  FAILED: {e}')
++print()
++
++# Hypothesis 2: tag=u16 LE, length=u16 LE  
++print('Hypothesis 2: tag=u16 LE, length=u16 LE')
++pos = 9
++try:
++    for i in range(count):
++        tag = struct.unpack('<H', data[pos:pos+2])[0]
++        length = struct.unpack('<H', data[pos+2:pos+4])[0]
++        payload = data[pos+4:pos+4+length]
++        print(f'  R{i}: tag={tag}, len={length}, payload_preview={payload[:20]}')
++        pos += 4 + length
++    print(f'  Ends at: {pos}, expected: {len(data)-4}, match: {pos == len(data)-4}')
++except Exception as e:
++    print(f'  FAILED: {e}')
++print()
++
++# Hypothesis 3: tag=u32 LE, length=u32 LE
++print('Hypothesis 3: tag=u32 LE, length=u32 LE')
++pos = 9
++try:
++    for i in range(count):
++        tag = struct.unpack('<I', data[pos:pos+4])[0]
++        length = struct.unpack('<I', data[pos+4:pos+8])[0]
++        payload = data[pos+8:pos+8+length]
++        print(f'  R{i}: tag={tag}, len={length}, payload_preview={payload[:20]}')
++        pos += 8 + length
++    print(f'  Ends at: {pos}, expected: {len(data)-4}, match: {pos == len(data)-4}')
++except Exception as e:
++    print(f'  FAILED: {e}')
+diff --git a/test_u8.py b/test_u8.py
+new file mode 100644
+index 0000000..9cc2299
+--- /dev/null
++++ b/test_u8.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++import struct
++
++data = open('assets/sample.wfmt', 'rb').read()
++
++print('Detailed byte analysis:')
++print()
++print('Record 0 at pos 9:')
++print('  bytes:', data[9:16].hex())
++print('  tag=0x01, len=0x05, payload=', data[11:16])
++print()
++
++print('Record 1 at pos 16:')
++print('  bytes:', data[16:20].hex())
++print('  tag=0x00, len=0x02, payload=', data[18:20].hex())
++print()
++
++print('Record 2 at pos 20:')
++print('  bytes 20-30:', data[20:30].hex())
++print('  byte 20 (tag?):', hex(data[20]))
++print('  byte 21:', hex(data[21]), '=', bin(data[21]))
++print('  byte 22:', hex(data[22]))
++print()
++
++# Maybe length is single byte and 0xac means something else?
++# Or maybe the format changed and it's tag=u8, length=u8?
++print('Testing: tag=u8, length=u8')
++pos = 9
++end = len(data) - 4
++count = 5
++
++for i in range(min(count, 10)):
++    if pos >= end:
++        print(f'Reached end at position {pos}')
++        break
++    print(f'Record {i} at pos {pos}:')
++    tag = data[pos]
++    length = data[pos+1]
++    print(f'  tag={tag}, length={length}')
++    if pos + 2 + length > end:
++        print(f'  ERROR: would extend to {pos + 2 + length}')
++        break
++    payload = data[pos+2:pos+2+length]
++    print(f'  payload: {payload[:50]}')
++    pos += 2 + length
++
++print()
++print(f'Final position: {pos}, expected: {end}, match: {pos == end}')

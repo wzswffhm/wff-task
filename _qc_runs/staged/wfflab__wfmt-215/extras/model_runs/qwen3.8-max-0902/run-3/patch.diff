@@ -1,0 +1,660 @@
+diff --git a/wfmt/codec.py b/wfmt/codec.py
+index bf20fd2..6206ea1 100644
+--- a/wfmt/codec.py
++++ b/wfmt/codec.py
+@@ -1,14 +1,36 @@
+-"""记录编解码与容器整体读写。"""
++"""记录编解码与容器整体读写。
++
++容器布局（以 ``assets/`` 下的样本为准）::
++
++    +----------------+---------------------------+-----------+
++    | 文件头(9 字节) | 记录区（count 条记录）    | CRC-32(4) |
++    +----------------+---------------------------+-----------+
++
++每条记录::
++
++    +---------+----------------+-----------------+----------+
++    | tag     | length         | payload         | padding  |
++    +---------+----------------+-----------------+----------+
++
++- ``tag``：uvarint（LEB128），非负整数
++- ``length``：uvarint，等于 payload 的字节数（0 合法）
++- ``padding``：``0x00`` 填充，把**整条记录**（tag + length + payload）补齐到
++  :data:`ALIGN` 的整数倍；本身已对齐时不填充
++
++尾部 4 字节是小端存放的标准 CRC-32，校验范围是它之前的全部字节
++（文件头 + 记录区，含对齐填充）。
++"""
+ 
+ from __future__ import annotations
+ 
+-from .crc import CRC_SIZE, compute_crc, pack_crc
++from .crc import CRC_SIZE, compute_crc, pack_crc, unpack_crc
+ from .errors import WFormatError
+-from .header import HEADER_SIZE, parse_header, pack_header
++from .header import HEADER_SIZE, pack_header, parse_header
+ from .varint import decode_uvarint, encode_uvarint
+ 
+ __all__ = [
+     "ALIGN",
++    "align_padding",
+     "encode_record",
+     "decode_record",
+     "pack",
+@@ -16,49 +38,108 @@ __all__ = [
+     "verify",
+ ]
+ 
+-#: 记录对齐粒度。
++#: 记录对齐粒度：每条记录编码后的长度都要补齐到它的整数倍。
+ ALIGN = 4
+ 
+ 
+-def encode_record(tag, payload):
+-    """把一条记录编码成容器内的字节串。"""
++def _as_bytes(payload):
++    """把各种载荷写法统一成 :class:`bytes`。"""
++    if isinstance(payload, bytes):
++        return payload
+     if isinstance(payload, str):
+-        payload = payload.encode("utf-8")
+-    return encode_uvarint(tag) + encode_uvarint(len(payload)) + bytes(payload)
++        return payload.encode("utf-8")
++    return bytes(payload)
++
++
++def _as_view(data):
++    """把容器数据统一成一维、按字节的 :class:`memoryview`（零拷贝）。"""
++    if isinstance(data, memoryview):
++        view = data
++    else:
++        try:
++            view = memoryview(data)
++        except TypeError as exc:
++            raise WFormatError(
++                "structure",
++                "容器数据必须是字节缓冲，得到 %s" % (type(data).__name__,),
++            ) from exc
++    if view.ndim != 1 or view.format != "B":
++        try:
++            view = view.cast("B")
++        except (TypeError, ValueError, NotImplementedError) as exc:
++            raise WFormatError("structure", "容器数据必须是一维字节缓冲") from exc
++    return view
++
++
++def align_padding(size, align=ALIGN):
++    """返回把 ``size`` 字节补齐到 ``align`` 整数倍所需的填充字节数。"""
++    if align <= 1:
++        return 0
++    return (-size) % align
++
++
++def encode_record(tag, payload):
++    """把一条记录编码成容器内的字节串（含尾部对齐填充）。"""
++    payload = _as_bytes(payload)
++    body = encode_uvarint(tag) + encode_uvarint(len(payload)) + payload
++    return body + b"\x00" * align_padding(len(body))
+ 
+ 
+ def decode_record(data, pos=0):
+-    """从 ``data[pos:]`` 解出一条记录，返回 ``(tag, payload, next_pos)``。"""
++    """从 ``data[pos:]`` 解出一条记录，返回 ``(tag, payload, next_pos)``。
++
++    ``next_pos`` 指向下一条记录的起点，即已经跳过了本条记录尾部的对齐填充。
++    """
++    start = pos
+     tag, pos = decode_uvarint(data, pos)
+     length, pos = decode_uvarint(data, pos)
+-    if pos + length > len(data):
++    if length > len(data) - pos:
+         raise WFormatError("truncated", "记录载荷不完整")
+-    return tag, bytes(data[pos:pos + length]), pos + length
++    payload = bytes(data[pos:pos + length])
++    pos += length
++    stop = pos + align_padding(pos - start)
++    if stop > len(data):
++        raise WFormatError("truncated", "记录对齐填充不完整")
++    return tag, payload, stop
+ 
+ 
+ def pack(records):
+     """把 ``(tag, payload)`` 序列打包成完整的容器字节串。"""
+-    items = [(t, p.encode("utf-8") if isinstance(p, str) else bytes(p)) for t, p in records]
++    items = [(tag, _as_bytes(payload)) for tag, payload in records]
+     head = pack_header(len(items))
+-    body = b"".join(encode_record(t, p) for t, p in items)
+-    return head + body + pack_crc(compute_crc(head + body))
++    body = b"".join(encode_record(tag, payload) for tag, payload in items)
++    blob = head + body
++    return blob + pack_crc(compute_crc(blob))
+ 
+ 
+ def unpack(data):
+-    """解析完整容器，返回 ``[(tag, payload), ...]``。"""
+-    _version, count = parse_header(data)
+-    if len(data) < HEADER_SIZE + CRC_SIZE:
++    """解析完整容器，返回 ``[(tag, payload), ...]``。
++
++    任何结构或完整性问题都抛 :class:`~wfmt.errors.WFormatError`，
++    ``kind`` 取值见模块文档（``magic`` / ``version`` / ``truncated`` /
++    ``structure`` / ``varint`` / ``checksum``）。
++    """
++    view = _as_view(data)
++    total = len(view)
++
++    _version, count = parse_header(view)
++    if total < HEADER_SIZE + CRC_SIZE:
+         raise WFormatError("truncated", "容器缺少尾部校验和")
+-    if count > len(data):
++    if count > total:
+         raise WFormatError("structure", "记录数超出容器长度")
+-    end = len(data) - CRC_SIZE
++
++    end = total - CRC_SIZE
++    body = view[:end]
+     records = []
+     pos = HEADER_SIZE
+     for _ in range(count):
+-        tag, payload, pos = decode_record(data[:end], pos)
++        tag, payload, pos = decode_record(body, pos)
+         records.append((tag, payload))
+     if pos != end:
+         raise WFormatError("structure", "记录数与容器长度不一致")
++
++    if compute_crc(view[:end]) != unpack_crc(view, end):
++        raise WFormatError("checksum", "尾部校验和不匹配")
+     return records
+ 
+ 
+diff --git a/wfmt/crc.py b/wfmt/crc.py
+index e2e8ca5..03fa46c 100644
+--- a/wfmt/crc.py
++++ b/wfmt/crc.py
+@@ -1,14 +1,49 @@
+-"""容器尾部校验和。"""
++"""容器尾部校验和。
++
++使用的是**标准 CRC-32**（ISO-HDLC / zlib 变体）：
++
++- 多项式 ``0x04C11DB7``（反射形式 ``0xEDB88320``）
++- 初值 ``0xFFFFFFFF``
++- 最终异或 ``0xFFFFFFFF``
++- 校验范围：文件头 + 全部记录（含对齐填充），即除尾部 4 字节以外的所有内容
++- 存放方式：小端 u32
++
++自检值：``compute_crc(b"123456789") == 0xCBF43926``。
++"""
+ 
+ from __future__ import annotations
+ 
+ import struct
+ 
+-__all__ = ["CRC_SIZE", "compute_crc", "pack_crc", "unpack_crc"]
++try:  # pragma: no cover - zlib 在 CPython 中总是可用
++    import zlib
++except ImportError:  # pragma: no cover
++    zlib = None
++
++from .errors import WFormatError
++
++__all__ = [
++    "CRC_SIZE",
++    "CRC_POLY",
++    "CRC_INIT",
++    "CRC_XOROUT",
++    "CRC_CHECK",
++    "compute_crc",
++    "update_crc",
++    "pack_crc",
++    "unpack_crc",
++]
+ 
+ CRC_SIZE = 4
+ 
+-_POLY = 0xEDB88320
++#: 反射形式的 CRC-32 多项式。
++CRC_POLY = 0xEDB88320
++#: 寄存器初值。
++CRC_INIT = 0xFFFFFFFF
++#: 最终异或值。
++CRC_XOROUT = 0xFFFFFFFF
++#: 标准自检值：``compute_crc(b"123456789")``。
++CRC_CHECK = 0xCBF43926
+ 
+ 
+ def _build_table():
+@@ -16,7 +51,7 @@ def _build_table():
+     for index in range(256):
+         crc = index
+         for _ in range(8):
+-            crc = (crc >> 1) ^ (_POLY if crc & 1 else 0)
++            crc = (crc >> 1) ^ (CRC_POLY if crc & 1 else 0)
+         table.append(crc)
+     return table
+ 
+@@ -24,21 +59,38 @@ def _build_table():
+ _TABLE = _build_table()
+ 
+ 
+-def compute_crc(data):
+-    """返回 ``data`` 的 32 位校验和。"""
+-    crc = 0xFFFFFFFF
++def _advance(state, data):
++    """推进「尚未做最终异或」的 CRC 寄存器状态。"""
++    if zlib is not None:
++        # zlib.crc32 的入参/返回值都是已做最终异或的公开 CRC 值。
++        return (zlib.crc32(data, state ^ CRC_XOROUT) ^ CRC_XOROUT) & 0xFFFFFFFF
++    table = _TABLE
+     for byte in data:
+-        crc = (crc >> 8) ^ _TABLE[(crc ^ byte) & 0xFF]
+-    return crc & 0xFFFFFFFF
++        state = (state >> 8) ^ table[(state ^ byte) & 0xFF]
++    return state & 0xFFFFFFFF
++
++
++def compute_crc(data):
++    """返回 ``data`` 的 32 位校验和（标准 CRC-32）。"""
++    return _advance(CRC_INIT, data) ^ CRC_XOROUT
++
++
++def update_crc(data, crc=0):
++    """增量计算：``crc`` 是上一段数据的 :func:`compute_crc` 结果。
++
++    第一段传 ``0``（缺省值），即 ``update_crc(data) == compute_crc(data)``；
++    分段喂入的结果与一次性计算完全一致，流式读取时用它避免缓存整份数据。
++    """
++    return _advance(crc ^ CRC_XOROUT, data) ^ CRC_XOROUT
+ 
+ 
+ def pack_crc(value):
+-    """把校验和打包成 4 字节。"""
++    """把校验和打包成 4 字节（小端）。"""
+     return struct.pack("<I", value & 0xFFFFFFFF)
+ 
+ 
+ def unpack_crc(buf, pos=0):
+-    """从 ``buf[pos:pos+4]`` 解出校验和。"""
+-    if pos + CRC_SIZE > len(buf):
+-        raise ValueError("校验和字段不完整")
++    """从 ``buf[pos:pos+4]`` 解出校验和（小端）。"""
++    if pos < 0 or pos + CRC_SIZE > len(buf):
++        raise WFormatError("truncated", "校验和字段不完整")
+     return struct.unpack_from("<I", buf, pos)[0]
+diff --git a/wfmt/errors.py b/wfmt/errors.py
+index 53ce43a..d5721ac 100644
+--- a/wfmt/errors.py
++++ b/wfmt/errors.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-__all__ = ["WFormatError"]
++__all__ = ["WFormatError", "WFormatValueError"]
+ 
+ 
+ class WFormatError(Exception):
+@@ -10,8 +10,8 @@ class WFormatError(Exception):
+ 
+     参数
+     ----
+-    kind    错误类别字符串（如 ``"magic"`` / ``"checksum"`` / ``"truncated"``
+-            / ``"varint"`` / ``"structure"``）。
++    kind    错误类别字符串（如 ``"magic"`` / ``"version"`` / ``"truncated"``
++            / ``"structure"`` / ``"varint"`` / ``"checksum"``）。
+     message 人类可读描述；缺省时使用 ``kind``。
+     """
+ 
+@@ -19,3 +19,15 @@ class WFormatError(Exception):
+         self.kind = kind
+         self.details = details
+         super().__init__(message or str(kind))
++
++    def __repr__(self):  # pragma: no cover - 便于调试
++        return "%s(%r, %r)" % (type(self).__name__, self.kind, str(self))
++
++
++class WFormatValueError(WFormatError, ValueError):
++    """编码端（写入方向）的取值错误。
++
++    它同时是 :class:`WFormatError`（带 ``kind``）与 :class:`ValueError`，
++    因此调用方既可以按 ``ValueError`` 捕获，也可以按 ``WFormatError``
++    捕获并检查 ``kind``。
++    """
+diff --git a/wfmt/header.py b/wfmt/header.py
+index 41a8c33..ae4cc6a 100644
+--- a/wfmt/header.py
++++ b/wfmt/header.py
+@@ -1,31 +1,50 @@
+-"""容器文件头。"""
++"""容器文件头。
++
++真实布局（以 ``assets/`` 下的样本为准）::
++
++    偏移  长度  含义
++    0     4     魔数 b"WFMT"
++    4     1     版本号（当前为 1）
++    5     4     记录条数，**小端** u32
++
++共 9 字节。
++"""
+ 
+ from __future__ import annotations
+ 
+ import struct
+ 
+-from .errors import WFormatError
++from .errors import WFormatError, WFormatValueError
+ 
+-__all__ = ["MAGIC", "VERSION", "HEADER_SIZE", "pack_header", "parse_header"]
++__all__ = ["MAGIC", "VERSION", "HEADER_SIZE", "MAGIC_SIZE", "COUNT_MAX",
++           "pack_header", "parse_header"]
+ 
+ MAGIC = b"WFMT"
+ VERSION = 1
++MAGIC_SIZE = len(MAGIC)
+ HEADER_SIZE = 9
++COUNT_MAX = 0xFFFFFFFF
++
++_COUNT = struct.Struct("<I")
+ 
+ 
+ def pack_header(count):
+-    """打包文件头。"""
+-    return MAGIC + bytes([VERSION]) + struct.pack(">I", count)
++    """打包文件头，返回 9 字节。"""
++    try:
++        packed = _COUNT.pack(count)
++    except (struct.error, TypeError) as exc:
++        raise WFormatValueError("structure", "记录条数非法：%r" % (count,)) from exc
++    return MAGIC + bytes([VERSION]) + packed
+ 
+ 
+ def parse_header(data):
+     """解析文件头，返回 ``(version, count)``。"""
+     if len(data) < HEADER_SIZE:
+         raise WFormatError("truncated", "文件头不完整")
+-    if data[:4] != MAGIC:
++    if bytes(data[:MAGIC_SIZE]) != MAGIC:
+         raise WFormatError("magic", "魔数不匹配")
+-    version = data[4]
++    version = data[MAGIC_SIZE]
+     if version != VERSION:
+         raise WFormatError("version", "不支持的版本号 %r" % (version,))
+-    count = struct.unpack_from(">I", data, 5)[0]
++    count = _COUNT.unpack_from(data, MAGIC_SIZE + 1)[0]
+     return version, count
+diff --git a/wfmt/stream.py b/wfmt/stream.py
+index 4ccb902..aee89b1 100644
+--- a/wfmt/stream.py
++++ b/wfmt/stream.py
+@@ -1,33 +1,181 @@
+-"""容器的读取入口。"""
++"""容器的流式读取入口。
++
++:func:`iter_records` 是**惰性**的：它只用固定大小的 ``read(n)``（``n`` 为正
++整数、且不超过 :data:`CHUNK_SIZE`）向文件对象取数据，绝不会调用无参的
++``read()`` / ``read(-1)``，因此几百 MB 的容器也不会被整体读进内存。
++
++校验和是**边读边算**的（见 :func:`wfmt.crc.update_crc`），产出完最后一条
++记录之后还会读取尾部 4 字节做比对，不一致时抛
++``WFormatError(kind="checksum")``。
++"""
+ 
+ from __future__ import annotations
+ 
+-from .codec import decode_record
+-from .crc import CRC_SIZE
++from .codec import ALIGN, align_padding
++from .crc import CRC_SIZE, pack_crc, unpack_crc, update_crc
+ from .errors import WFormatError
+ from .header import HEADER_SIZE, parse_header
++from .varint import MAX_SHIFT, decode_uvarint
+ 
+ __all__ = ["CHUNK_SIZE", "iter_records", "read_all"]
+ 
+ #: 单次从底层文件对象请求的最大字节数。
+ CHUNK_SIZE = 4096
+ 
++#: 一个 uvarint 最多占用的字节数（64 位、7 位一组）。
++_MAX_VARINT_BYTES = MAX_SHIFT // 7 + 2
++
++
++class _ChunkedReader(object):
++    """只用定长 ``read(n)`` 取数据的缓冲读取器，同时增量维护 CRC-32。"""
++
++    def __init__(self, fileobj, chunk_size=CHUNK_SIZE):
++        read = getattr(fileobj, "read", None)
++        if not callable(read):
++            raise WFormatError("structure", "iter_records 需要带 read() 的文件对象")
++        chunk_size = int(chunk_size)
++        self._read = read
++        self._chunk = chunk_size if chunk_size > 0 else CHUNK_SIZE
++        self._buf = bytearray()
++        self._pos = 0
++        self._eof = False
++        self._consumed = 0
++        self._crc = 0
++
++    # -- 状态 ----------------------------------------------------------
++    @property
++    def consumed(self):
++        """已经消费（并计入校验和）的字节数。"""
++        return self._consumed
++
++    @property
++    def seen(self):
++        """已从文件对象取到的字节总数；到达 EOF 后即为容器总长度。"""
++        return self._consumed + self._available
++
++    @property
++    def exhausted(self):
++        """底层文件对象是否已经读到 EOF。"""
++        return self._eof
++
++    @property
++    def crc(self):
++        """到目前为止已消费数据的 CRC-32。"""
++        return self._crc
++
++    @property
++    def _available(self):
++        return len(self._buf) - self._pos
++
++    # -- 底层取数据 ----------------------------------------------------
++    def _fill(self, need):
++        """尽量让缓冲区里可消费的字节数达到 ``need``，返回实际可用字节数。
++
++        每次只向文件对象请求 ``min(还差的字节数, CHUNK_SIZE)``，
++        因此既不会无参 ``read()``，也不会一次性把容器吞进内存。
++        """
++        while self._available < need and not self._eof:
++            want = need - self._available
++            if want > self._chunk:
++                want = self._chunk
++            chunk = self._read(want)
++            if chunk is None:
++                raise WFormatError("structure", "文件对象 read() 返回 None")
++            if not chunk:
++                self._eof = True
++                break
++            self._buf.extend(chunk)
++        return self._available
++
++    def _compact(self):
++        if self._pos:
++            del self._buf[:self._pos]
++            self._pos = 0
++
++    def take(self, size, what="数据", checksummed=True):
++        """消费 ``size`` 个字节并返回它们；不足则抛 ``truncated``。"""
++        if size < 0:
++            raise WFormatError("structure", "读取长度为负：%r" % (size,))
++        if size == 0:
++            return b""
++        if self._fill(size) < size:
++            raise WFormatError(
++                "truncated",
++                "%s不完整：还差 %d 字节" % (what, size - self._available),
++            )
++        chunk = bytes(self._buf[self._pos:self._pos + size])
++        self._pos += size
++        self._consumed += size
++        if checksummed:
++            self._crc = update_crc(chunk, self._crc)
++        self._compact()
++        return chunk
++
++    def peek(self, size=1):
++        """偷看至多 ``size`` 个字节，不消费、不计入校验和。"""
++        self._fill(size)
++        stop = self._pos + min(size, self._available)
++        return bytes(self._buf[self._pos:stop])
++
++    def uvarint(self, what="变长整数"):
++        """流式解出一个 uvarint，语义与 :func:`wfmt.varint.decode_uvarint` 一致。"""
++        buf = bytearray()
++        while len(buf) <= _MAX_VARINT_BYTES:
++            buf += self.take(1, what)
++            try:
++                value, _next = decode_uvarint(buf, 0)
++            except WFormatError as exc:
++                if exc.kind == "truncated":
++                    continue
++                raise
++            return value
++        raise WFormatError("varint", "%s编码非法：超出 64 位取值范围" % (what,))
++
++    # -- 记录 ----------------------------------------------------------
++    def record(self):
++        """读出一条记录，返回 ``(tag, payload)``，并跳过尾部对齐填充。"""
++        start = self._consumed
++        tag = self.uvarint("tag")
++        length = self.uvarint("记录长度")
++        payload = self.take(length, "记录载荷")
++        padding = align_padding(self._consumed - start, ALIGN)
++        if padding:
++            self.take(padding, "记录对齐填充")
++        return tag, payload
++
++    # -- 收尾 ----------------------------------------------------------
++    def finish(self):
++        """校验尾部 CRC；之后若还有多余数据则视为结构错误。"""
++        trailer = self.take(CRC_SIZE, "尾部校验和", checksummed=False)
++        if self.peek(1):
++            raise WFormatError("structure", "校验和之后还有多余数据")
++        if self._crc != unpack_crc(trailer):
++            raise WFormatError(
++                "checksum",
++                "尾部校验和不匹配：文件中是 %s，实际算出 %s"
++                % (trailer.hex(), pack_crc(self._crc).hex()),
++            )
++
+ 
+ def iter_records(fileobj):
+-    """产出容器中的 ``(tag, payload)``。"""
+-    data = fileobj.read()
+-    if len(data) < HEADER_SIZE + CRC_SIZE:
+-        raise ValueError("容器长度不足")
+-    _version, count = parse_header(data)
+-    end = len(data) - CRC_SIZE
+-    pos = HEADER_SIZE
++    """惰性产出容器中的 ``(tag, payload)``，最后校验尾部校验和。
++
++    只使用固定大小的 ``read(n)`` 向 ``fileobj`` 取数据，不会把整个容器读进
++    内存；产出完最后一条记录之后仍会读取并校验尾部 4 字节校验和。
++    """
++    reader = _ChunkedReader(fileobj)
++    _version, count = parse_header(reader.take(HEADER_SIZE, "文件头"))
+     for _ in range(count):
+-        if pos >= end:
+-            raise ValueError("容器数据提前结束")
+-        tag, payload, pos = decode_record(data, pos)
+-        if pos > end:
+-            raise ValueError("记录越界")
+-        yield tag, payload
++        try:
++            record = reader.record()
++        except WFormatError as exc:
++            # 数据读完了却还没凑够 count 条记录：若 count 本身就超过了容器
++            # 总长度，那是头部与正文自相矛盾（structure），否则是截断。
++            if exc.kind == "truncated" and reader.exhausted and count > reader.seen:
++                raise WFormatError("structure", "记录数超出容器长度") from exc
++            raise
++        yield record
++    reader.finish()
+ 
+ 
+ def read_all(fileobj):
+diff --git a/wfmt/varint.py b/wfmt/varint.py
+index c803b1c..83573c2 100644
+--- a/wfmt/varint.py
++++ b/wfmt/varint.py
+@@ -1,18 +1,30 @@
+-"""容器使用的无符号变长整数（LEB128）。"""
++"""容器使用的无符号变长整数（LEB128）。
++
++编码规则与真实样本一致：小端基-128（LEB128），每个字节的低 7 位是数据、
++最高位是「后面还有字节」的续位。最多 10 个字节，取值范围 ``0 .. 2**64-1``。
++"""
+ 
+ from __future__ import annotations
+ 
+-from .errors import WFormatError
++from .errors import WFormatError, WFormatValueError
+ 
+-__all__ = ["encode_uvarint", "decode_uvarint", "MAX_SHIFT"]
++__all__ = ["encode_uvarint", "decode_uvarint", "MAX_SHIFT", "MAX_VALUE"]
+ 
++#: 最后一个数据字节所在的移位量（第 10 个字节，shift == 63）。
+ MAX_SHIFT = 63
+ 
++#: 可表示的最大取值。
++MAX_VALUE = (1 << (MAX_SHIFT + 1)) - 1
++
+ 
+ def encode_uvarint(value):
+     """把非负整数编码为 LEB128 字节串。"""
+-    if not isinstance(value, int) or value < 0:
+-        raise ValueError("uvarint 只能编码非负整数")
++    if not isinstance(value, int):
++        raise WFormatValueError("varint", "uvarint 只能编码整数，得到 %r" % (value,))
++    if value < 0:
++        raise WFormatValueError("varint", "uvarint 只能编码非负整数")
++    if value > MAX_VALUE:
++        raise WFormatValueError("varint", "uvarint 超出 64 位取值范围：%d" % (value,))
+     out = bytearray()
+     while True:
+         group = value & 0x7F
+@@ -25,7 +37,26 @@ def encode_uvarint(value):
+ 
+ 
+ def decode_uvarint(buf, pos=0):
+-    """从 ``buf[pos:]`` 解出一个 uvarint，返回 ``(value, next_pos)``。"""
+-    if pos >= len(buf):
+-        raise WFormatError("truncated", "uvarint 数据不足")
+-    return buf[pos] & 0x7F, pos + 1
++    """从 ``buf[pos:]`` 解出一个 uvarint，返回 ``(value, next_pos)``。
++
++    数据不足以读完一个完整的 uvarint 时抛 ``WFormatError(kind="truncated")``；
++    编码非法（超过 10 个字节，或数值溢出 64 位）时抛
++    ``WFormatError(kind="varint")``。
++    """
++    size = len(buf)
++    if pos < 0:
++        raise WFormatError("varint", "uvarint 起始偏移非法：%r" % (pos,))
++    result = 0
++    shift = 0
++    while True:
++        if pos >= size:
++            raise WFormatError("truncated", "uvarint 数据不足")
++        byte = buf[pos]
++        pos += 1
++        group = byte & 0x7F
++        if shift > MAX_SHIFT or (shift == MAX_SHIFT and group > 1):
++            raise WFormatError("varint", "uvarint 编码非法：超出 64 位取值范围")
++        result |= group << shift
++        if not byte & 0x80:
++            return result, pos
++        shift += 7

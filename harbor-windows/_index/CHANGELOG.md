@@ -1,5 +1,69 @@
 # CHANGELOG —— harbor-windows 题包目录
 
+## [范围对齐 + 标准 Harbor 兼容] - 2026-10-08
+
+### 变更原因
+
+1. **目录材料与实物不符**：`README.md` 与 `_index/` 按完整仓库的 9 / 16 题范围编写，
+   而本目录实物只有 2 个题包（`wfflab__wfmt-215`、`wfflab__wreparse-217`），
+   且原 9 题清单中**没有**这两题。
+2. **题包不满足标准 Harbor CLI 契约**：缺 `[task].name`、缺 `[environment].os/workdir`、
+   缺 Windows `.bat` 入口，导致 `Task.is_valid_dir()` 为假，`harbor run --path <题包>` 报 `0 tasks`。
+
+### 变更内容（题包侧）
+
+两题统一：
+
+- `task.toml`：`[task]` 增加 `name = "wfflab/<name>"`；`[environment]` 增加 `os = "windows"`、
+  `workdir = "C:\\testbed"`；**不设** `[environment].docker_image`，由 Harbor 构建
+  `environment/Dockerfile`。顶层 `docker_image`、`[metadata]`、`[agent]`、`[verifier]`、
+  `[task] id/setup/test/golden`、`[policy]` 原样保留，本地 runner 不受影响。
+- 新增 `solution/solve.bat`、`tests/test.bat`：Windows 容器只发现 `.bat` 入口，二者仅委托对应 `.ps1`。
+- `solution/solve.ps1` 增加**可选**参数 `-WorkspaceRoot`：不传时行为与整改前完全一致。
+
+215 专属：无（Dockerfile 已有 `COPY workspace/ → C:/testbed/`）。
+
+217 专属：
+
+- `environment/Dockerfile` 追加 `COPY ["workspace/", "C:/testbed/"]`（原仅 `FROM`/`WORKDIR`/`CMD`，依赖本地 runner 挂载）。
+- 新增 `tests/prepare.ps1`（夹具构建器实现迁入）；`environment/prepare.ps1` 改为**转发**到该文件，
+  以承接标准 Harbor 缺失的 prepare 阶段，同时保持本地 runner 的调用路径不变。
+
+### 变更内容（目录材料侧）
+
+- `README.md`：题包清单由 9 题改为实际 2 题；新增「范围声明」与「标准 Harbor 兼容」章节；
+  重写单题结构树、校验说明与 `task_hash` 规则。
+- `_index/tasks_index.csv`：2 题；`task_hash` 改用可复现的**题包定义树哈希**（规则见 README「校验」）。
+- `_index/model_summary.csv`、`model_validation_summary.json`、`model_validation_report.md`：
+  按 2 题重建；数值取自各题 `jobs/_index/qualification_summary.json` 与
+  `jobs/<run_id>/verifier/checks.json`（逐条 `PASS` 计数）。
+- `_index/validation_report.md`、`knowledge_tree_coverage_report.csv`：按 2 题重写（覆盖 12 方向中的 2 个）。
+- `_index/EXTERNAL_IMAGES.json`：由 10 个题包改为 2 题；记录本机 Image ID 与基础镜像 ID。
+- `_index/known_issues.md`：新增范围声明与 K1–K20 逐条适用性对照；题号对照改为本目录 2 题。
+- `_index/checksums.sha256`：按 2 题范围重算（515 个文件，含 `jobs/`）。
+
+### 未重算（需注意）
+
+- `_index/validate-report.json` 仍是**旧 9 题范围**的产物（生成它的
+  `skills/harbor-windows/scripts/validate_package.py` 未随本目录交付），其中 `PASS=256` 等计数
+  对应旧范围；正式验收前须在当前 2 题范围重新生成。
+
+### 已验证（真实 Windows 容器）
+
+- `Task.is_valid_dir()` 两题均为 `True`；`harbor run --path <题包目录>` **单题直跑**成功。
+- 镜像由 Harbor 从 `environment/Dockerfile` 构建；215 另经 `docker build --no-cache` 全新构建（11 步）通过。
+- 默认环境（**零扩展**）`--agent oracle` → `Reward 1`。
+- 控制与门禁：Oracle ×3 = `VALID/1`、NOP ×3 = `VALID/0`（两题），共 12 条 Harbor 运行记录写入 `jobs/`。
+- `jobs/` 历史记录的真实原始件（`agent.log` / `checks.json` / `test.log` / `stderr.log`）已回填，
+  并以 `test_log_sha256` 逐条对账：215 = 16/16、217 = 17/17 全部匹配。
+
+### 已知遗留（工具侧，非题包侧）
+
+甲方质检包 `windows-harbor-qc` 的静态引用扫描会把脚本/注释中的路径字面量判为「引用缺失文件」
+（连注释都算），且静态失败会硬短路动态门禁；其 `markdown_report` 另存在
+`task['static']` 键路径不匹配导致的 `KeyError`。详见
+`deliverables/2026-10-08_harbor-windows-整改/README.md` 第八节与最小复现脚本。
+
 ## [wfflab__wsync-142 → wfflab__wproc-209 替换] - 2026-10-01
 
 ### 变更原因（区分度方向不成立）
