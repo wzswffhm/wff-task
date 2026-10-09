@@ -47,6 +47,17 @@ New-Item -ItemType Directory -Path (Join-Path (Join-Path $scanRoot 'docs') 'nest
 New-Item -ItemType Directory -Path (Join-Path $scanRoot 'data') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $scanRoot 'beta') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $scanRoot 'empty') -Force | Out-Null
+
+# A deliberately deep chain (8 levels) so that depth bookkeeping, the default
+# -MaxDepth budget and full enumeration can all be asserted on one structure.
+$deepCursor = $scanRoot
+for ($i = 1; $i -le 8; $i++) {
+    $deepCursor = Join-Path $deepCursor ('level' + $i)
+    New-Item -ItemType Directory -Path $deepCursor -Force | Out-Null
+}
+Set-Content -LiteralPath (Join-Path $deepCursor 'deepest.txt') -Value 'deepest' -NoNewline -Encoding ASCII
+# A second file one level above the tip, so depth counts are not trivially one.
+Set-Content -LiteralPath (Join-Path (Split-Path -Parent $deepCursor) 'level8.txt') -Value 'tip' -NoNewline -Encoding ASCII
 New-Item -ItemType Directory -Path $outsideRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $prefixSibling -Force | Out-Null
 

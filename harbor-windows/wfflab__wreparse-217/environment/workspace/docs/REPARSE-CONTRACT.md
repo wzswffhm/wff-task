@@ -1,7 +1,14 @@
-# WReparse 行为契约（权威规格）
+# WReparse 行为契约（正式规格）
 
-> 本文件是 `WReparse` 模块的**唯一权威行为规格**。`instruction.md`、`environment/**`
-> 与 `tests/**` 都围绕本契约表达同一份意图；三者出现分歧时以本文件为准。
+> 本文件规定 `WReparse` 模块的**语义**，`tests/**` 的契约一致性检查与本文件对齐。
+>
+> **本文件不给出实现规则。** §3–§7 只提供**实测得到的行为样例**（在真机
+> Windows 11 + NTFS + Windows PowerShell 5.1 上跑出的真实输出），
+> 期望的字段、类型、次序、深度与错误码**须由你从这些样例自行归纳**，
+> 并与 `../assets/observed-provider-facts.json` 的实测事实交叉印证。
+> 两者冲突时以实测事实为准。
+>
+> 同目录下的 `REPARSE-CONTRACT.draft.md` 是更早的草稿，来源与校准状态未知。
 
 ## 1. 背景
 
@@ -12,158 +19,258 @@
 
 历史事故的根因集中在两类：一类是遍历器悄悄跟随了 reparse point，越出扫描根目录读到了
 无关数据；另一类是登记结果依赖枚举顺序或宿主区域设置，同一棵树在两台机器上产出不同的
-报告，导致下游比对全部失效。本契约把这两类行为钉死。
+报告，导致下游比对全部失效。本契约把这两类行为钉死——**但钉法是给出观测样例，而非规则**。
 
-## 2. 公共 API
+## 2. 公共 API（骨架，不得更改）
 
 模块必须导出且仅导出以下函数（名字与参数名逐字一致）：
 
-| 函数 | 说明 |
+| 函数 | 参数 |
 | --- | --- |
-| `Get-WReparseReport` | `-Root <string>`（必填）、`-MaxDepth <int>`（默认 32）、`-Follow`（开关，默认关）→ 返回报告对象 |
-| `ConvertTo-WReparseJson` | `-Report <object>`（必填）→ 返回该报告的 JSON 字符串 |
-| `Get-WReparseSchemaVersion` | 无参数 → 返回 `wreparse/1.0` |
-| `Test-WReparseWithinRoot` | `-Path <string>`、`-Root <string>` → 返回该路径是否落在根目录**之内**（含根本身） |
-| `Get-WReparseCanonicalPath` | `-Path <string>` → 返回规范化后的绝对路径 |
-| `Resolve-WReparseLinkTarget` | `-LinkFullPath <string>`、`-RawTarget <string>` → 返回解析后的绝对目标路径，无法解析时返回 `$null` |
+| `Get-WReparseReport` | `-Root <string>`（必填）、`-MaxDepth <int>`（默认 32）、`-Follow`（开关，默认关） |
+| `ConvertTo-WReparseJson` | `-Report <object>`（必填） |
+| `Get-WReparseSchemaVersion` | 无参数 |
+| `Test-WReparseWithinRoot` | `-Path <string>`、`-Root <string>` |
+| `Get-WReparseCanonicalPath` | `-Path <string>` |
+| `Resolve-WReparseLinkTarget` | `-LinkFullPath <string>`、`-RawTarget <string>` |
 
-## 3. 报告数据模型
+> 该表是**唯一**允许直接照抄的定义：它是接口签名，不含任何行为规则。
 
-`Get-WReparseReport` 返回一个对象，字段顺序固定为：
+## 3. 报告结构样例
+
+### 3.1 顶层字段顺序（实测）
 
 ```
-SchemaVersion : string      # 恒为 'wreparse/1.0'
-Root          : string      # 规范化后的扫描根绝对路径
-Records       : object[]    # 见 3.1，始终是数组（空时是空数组，不是 $null）
-Errors        : object[]    # 见 3.2，始终是数组
-Stats         : object      # 见 3.3
+SchemaVersion / Root / Records / Errors / Stats
 ```
 
-### 3.1 Record
+`Get-WReparseSchemaVersion` 的返回值实测为 `wreparse/1.0`。
 
-| 字段 | 类型 | 含义 |
+### 3.2 一条普通目录条目（实测）
+
+```json
+{
+  "RelativePath": "beta",
+  "Kind": "Directory",
+  "ReparseKind": null,
+  "Target": null,
+  "ResolvedTarget": null,
+  "InScope": false,
+  "Depth": 1,
+  "Size": 0
+}
+```
+
+### 3.3 一条普通文件条目（实测，`beta.txt` 为 4 字节）
+
+```json
+{
+  "RelativePath": "beta.txt",
+  "Kind": "File",
+  "ReparseKind": null,
+  "Target": null,
+  "ResolvedTarget": null,
+  "InScope": false,
+  "Depth": 1,
+  "Size": 4
+}
+```
+
+### 3.4 重解析点条目（实测，同一棵树上的八条）
+
+```
+link-dangling  ReparsePoint  SymbolicLink  Target="missing-target"   ResolvedTarget="C:\wreparse-fixture\scanroot\missing-target"  InScope=true   Depth=1  Size=0
+link-file      ReparsePoint  SymbolicLink  Target="plain.txt"        ResolvedTarget="C:\wreparse-fixture\scanroot\plain.txt"      InScope=true   Depth=1  Size=0
+link-in        ReparsePoint  Junction      Target="C:\wreparse-fixture\scanroot\docs"   ResolvedTarget="C:\wreparse-fixture\scanroot\docs"    InScope=true   Depth=1  Size=0
+link-loop      ReparsePoint  Junction      Target="C:\wreparse-fixture\scanroot"        ResolvedTarget="C:\wreparse-fixture\scanroot"         InScope=true   Depth=1  Size=0
+link-out       ReparsePoint  Junction      Target="C:\wreparse-fixture\outside"         ResolvedTarget="C:\wreparse-fixture\outside"          InScope=false  Depth=1  Size=0
+link-prefix    ReparsePoint  Junction      Target="C:\wreparse-fixture\scanroot-extra"  ResolvedTarget="C:\wreparse-fixture\scanroot-extra"   InScope=false  Depth=1  Size=0
+link-rel       ReparsePoint  SymbolicLink  Target="docs"             ResolvedTarget="C:\wreparse-fixture\scanroot\docs"          InScope=true   Depth=1  Size=0
+link-twin      ReparsePoint  Junction      Target="C:\wreparse-fixture\scanroot\docs"   ResolvedTarget="C:\wreparse-fixture\scanroot\docs"    InScope=true   Depth=1  Size=0
+```
+
+另有 `hardlink.txt`（由 `New-Item -ItemType HardLink` 创建）在同一棵树中被登记为
+`Kind="File"`、`ReparseKind=null`、`Size=4`、`Depth=1`。
+
+### 3.5 Stats 与错误集合（实测，同一次未给 `-Follow` 的扫描）
+
+```json
+{ "Directories": 5, "Files": 10, "ReparsePoints": 8, "Skipped": 8, "Errors": 0 }
+```
+
+### 3.6 空树的完整序列化输出（实测）
+
+```json
+{
+    "SchemaVersion":  "wreparse/1.0",
+    "Root":  "C:\\...\\empty-dir",
+    "Records":  [ ],
+    "Errors":  [ ],
+    "Stats":  {
+                  "Directories":  0,
+                  "Files":  0,
+                  "ReparsePoints":  0,
+                  "Skipped":  0,
+                  "Errors":  0
+              }
+}
+```
+
+## 4. 遍历与深度样例
+
+### 4.1 未给 `-Follow`（实测）
+
+- 8 个重解析点全部登记、全部未进入（`Skipped: 8`），`Errors` 为空；
+- 与扫描根只共享名字前缀的兄弟目录 `scanroot-extra\other.txt` **不出现**在 `Records` 中。
+
+### 4.2 给了 `-Follow`（实测，同一棵树）
+
+```json
+{ "Directories": 8, "Files": 18, "ReparsePoints": 8, "Skipped": 0, "Errors": 2 }
+```
+
+`Errors` 恰为两条：
+
+```json
+{"RelativePath": "link-dangling", "Code": "broken_target", "Message": "The reparse target does not exist."}
+{"RelativePath": "link-loop",     "Code": "cycle",         "Message": "The reparse target is an ancestor already visited on this branch."}
+```
+
+### 4.3 经链接进入后的条目命名（实测）
+
+```
+link-in\nested                 Depth=2  Size=0
+link-in\readme.txt             Depth=2  Size=6
+link-in\nested\deep.txt        Depth=3  Size=4
+link-out\secret.txt            Depth=2  Size=6
+link-rel\nested                Depth=2  Size=0
+link-rel\readme.txt            Depth=2  Size=6
+link-twin\nested               Depth=2  Size=0
+```
+
+（`link-twin` 与 `link-in` 指向同一个 `docs`；`link-rel` 的磁盘目标是相对串 `docs`；
+`link-out` 指向扫描根之外。三者都进入了、都产生了子项，且 `Errors` 中没有 `cycle`。）
+
+### 4.4 `-MaxDepth` 各值（实测，同一棵树）
+
+| 参数 | Stats | Errors |
 | --- | --- | --- |
-| `RelativePath` | string | 相对扫描根的路径，分隔符为 `\`；根自身不产生记录 |
-| `Kind` | string | `Directory` / `File` / `ReparsePoint` 三选一 |
-| `ReparseKind` | string 或 `null` | 仅当 `Kind` 为 `ReparsePoint` 时非空：`SymbolicLink` / `Junction` / `MountPoint` / `Unknown` |
-| `Target` | string 或 `null` | 仅 reparse 条目：磁盘上**原样**记录的目标串（可能是相对路径）；其余为 `null` |
-| `ResolvedTarget` | string 或 `null` | 仅 reparse 条目：按 §5.3 解析出的绝对路径；无法解析为 `null`；其余为 `null` |
-| `InScope` | bool | 仅 reparse 条目有意义：`ResolvedTarget` 是否落在扫描根之内；其余恒为 `false` |
-| `Depth` | int | 扫描根的**直接子项为 1**，逐层 +1 |
-| `Size` | int64 | 文件为字节长度；目录与 reparse 条目为 0 |
+| `-MaxDepth 0` | `{"Directories":0,"Files":0,"ReparsePoints":0,"Skipped":0,"Errors":1}` | `[{"RelativePath":".","Code":"too_deep","Message":"Depth limit of 0 reached; not enumerating."}]` |
+| `-MaxDepth -1` | **与 `-MaxDepth 0` 逐字节相同** | 同上 |
+| `-MaxDepth 1` | `{"Directories":4,"Files":6,"ReparsePoints":8,"Skipped":8,"Errors":4}` | 4 条 |
 
-判断条目是否为 reparse 点，只能依据文件属性中的 `FILE_ATTRIBUTE_REPARSE_POINT`。
-**硬链接不是 reparse 点**：它没有该属性，必须按普通 `File` 登记（即使其链接类型显示为
-`HardLink`）。
+### 4.5 深度层次（实测）
 
-### 3.2 Error
+```
+scanroot\beta\zeta.txt        Depth=2
+scanroot\data\sample.bin      Depth=2
+scanroot\docs\nested\deep.txt Depth=3
+scanroot\link-in              Depth=1
+```
 
-| 字段 | 类型 | 含义 |
+## 5. 路径语义样例
+
+### 5.1 `Get-WReparseCanonicalPath`（实测）
+
+| 输入 | 输出 |
+| --- | --- |
+| `C:\wreparse-fixture\outside` | `C:\wreparse-fixture\outside` |
+| `C:\wreparse-fixture\outside\` （带尾分隔符） | `C:\wreparse-fixture\outside` |
+| `C:\wreparse-fixture\outside\PLAIN.TXT`（磁盘上是 `outside`，内层原样） | `C:\wreparse-fixture\outside\PLAIN.TXT` |
+
+### 5.2 `Test-WReparseWithinRoot`（实测，`-Root = C:\wreparse-fixture\scanroot`）
+
+| `-Path` | 结果 |
+| --- | --- |
+| `C:\wreparse-fixture\scanroot\docs` | `True` |
+| `C:\wreparse-fixture\scanroot` | `True` |
+| `C:\wreparse-fixture\scanroot-extra` | **`False`** |
+
+### 5.3 `Resolve-WReparseLinkTarget`（实测）
+
+| `LinkFullPath` | `RawTarget` | 结果 |
 | --- | --- | --- |
-| `RelativePath` | string | 出错位置；扫描根自身出错时为 `.` |
-| `Code` | string | 见 §7 |
-| `Message` | string | 人类可读说明，不参与判定 |
+| `C:\...\scanroot\link-rel` | `docs` | `C:\wreparse-fixture\scanroot\docs` |
 
-### 3.3 Stats
+> 该样例的进程当前工作目录是题包目录，与结果无关；结果只与链接自身所在目录有关。
 
-| 字段 | 含义 |
-| --- | --- |
-| `Directories` | `Kind` 为 `Directory` 的记录数 |
-| `Files` | `Kind` 为 `File` 的记录数 |
-| `ReparsePoints` | `Kind` 为 `ReparsePoint` 的记录数 |
-| `Skipped` | 因未跟随而**没有进入**的 reparse 点数量 |
-| `Errors` | `Errors` 数组长度 |
+## 6. 排序与确定性样例
 
-三个类别计数互斥且必须与实际记录一致；`Directories + Files + ReparsePoints` 等于记录总数。
+### 6.1 `Records` 的实测次序（同一棵树，未给 `-Follow`）
 
-## 4. 遍历语义
+```
+beta
+beta.txt
+beta\zeta.txt
+data
+data\sample.bin
+docs
+docs\nested
+docs\nested\deep.txt
+```
 
-1. **默认不跟随**：未给 `-Follow` 时，遇到 reparse 点只登记该条目本身，**绝不进入**其目标，
-   并把 `Skipped` 加一。
-2. **跟随模式**（`-Follow`）：对每个 reparse 点，先按 §5.3 解析目标：
-   - 目标无法解析，或解析结果在磁盘上不存在 → 记 `broken_target`，不进入；
-   - 目标解析结果已出现在**当前分支的祖先链**上 → 记 `cycle`，不进入；
-   - 目标存在且不构成循环，且是目录 → 进入，其下条目仍以**链接路径**为前缀命名
-     （例如 `link-in\readme.txt`），而不是以真实目标路径命名；
-   - 目标是文件 → 只登记链接条目，不产生子项。
-3. **深度**：`Depth` 从 1 起算（见 §3.1）。某目录的 `Depth` 已达到 `-MaxDepth` 时，
-   不再枚举其子项，并为该目录记一条 `too_deep`。`-MaxDepth` 小于 0 时按 0 处理。
-4. **失败隔离**：单个目录枚举失败不得中断整次扫描，其余分支必须照常产出记录。
-5. 扫描根本身不产生 `Record`。
+含非 ASCII 名字的条目实测次序（与上文同类样本一起排序时）：
 
-## 5. 路径语义
+```
+Z.txt          Depth=1  Size=8
+Ä.txt          Depth=1  Size=8
+ö.txt          Depth=1  Size=8
+```
 
-### 5.1 规范化
+> `assets` 中记录了这组名字在 `en-US` / `de-DE` / `ja-JP` 三种区域设置下的
+> `Sort-Object` 实测差异，以及序数（ordinal）次序的实测结果——**两者必须一致**，
+> 请自行比对后归纳实现。
 
-`Get-WReparseCanonicalPath` 必须：展开为绝对路径、折叠 `.` 与 `..`、去掉末尾分隔符；
-但**卷根**（`C:\`）与 **UNC 共享根**（`\\server\share`）保留其形态。大小写原样保留。
+### 6.2 重复调用（实测）
 
-### 5.2 边界判定
+同树同参数连续两次 `Get-WReparseReport` + `ConvertTo-WReparseJson`，
+两次输出**逐字节相同**（实测比较结果 `True`）。报告中不得出现时间戳、
+进程号、随机值或机器相关字段。
 
-`Test-WReparseWithinRoot` 必须按**目录边界**判断，而不是字符串前缀：
+## 7. 错误码（码名固定，触发时机见样例）
 
-- `C:\root` 与 `C:\root2` 是**两个不同的目录**，后者不在前者之内；
-- 比较使用**序数、忽略大小写**（Windows 路径语义）；
-- 路径等于根时视为在内。
+只允许以下七个码：
 
-### 5.3 链接目标解析
+```
+not_found / access_denied / cycle / broken_target / structure / too_deep / invalid_argument
+```
 
-`Resolve-WReparseLinkTarget`：
+实测样例：
 
-- 目标为**绝对路径** → 直接规范化；
-- 目标为**相对路径** → 相对**链接自身所在目录**解析。**不得**相对进程当前工作目录，
-  也**不得**相对扫描根解析；
-- 目标为空或无法规范化 → 返回 `$null`。
+```json
+{"RelativePath": ".", "Code": "not_found",  "Message": "Scan root does not exist: C:\\...\\does-not-exist"}
+{"RelativePath": ".", "Code": "structure",  "Message": "Scan root is not a directory: C:\\...\\outside\\secret.txt"}
+{"RelativePath": ".", "Code": "too_deep",   "Message": "Depth limit of 0 reached; not enumerating."}
+{"RelativePath": "link-dangling", "Code": "broken_target", "Message": "The reparse target does not exist."}
+{"RelativePath": "link-loop",     "Code": "cycle", "Message": "The reparse target is an ancestor already visited on this branch."}
+```
 
-## 6. 排序与确定性
-
-1. `Records` 必须按 `RelativePath` 排序，主键为**序数、忽略大小写**；主键相同时以
-   **序数、区分大小写**决胜，保证结果稳定。
-2. **不得**使用受宿主区域设置（culture）影响的默认排序。
-3. `Errors` 亦须稳定排序（先按 `RelativePath`，再按 `Code`），比较规则同上。
-4. 同一棵树、同一参数连续两次调用，`ConvertTo-WReparseJson` 的输出必须**逐字节相同**。
-   报告不得包含时间戳、进程号、随机值或机器相关字段。
-
-## 7. 错误码
-
-| Code | 触发条件 |
-| --- | --- |
-| `not_found` | 扫描根不存在（`RelativePath` 为 `.`） |
-| `access_denied` | 枚举某目录失败 |
-| `cycle` | `-Follow` 下目标构成祖先环 |
-| `broken_target` | `-Follow` 下目标无法解析或不存在 |
-| `structure` | 扫描根存在但不是目录 |
-| `too_deep` | 某目录已达 `-MaxDepth`，未枚举其子项 |
-| `invalid_argument` | 扫描根字符串无法规范化 |
-
-未给 `-Follow` 时，不得产生 `cycle` 与 `broken_target`。
+未给 `-Follow` 时，实测的 `Errors` 为空（即使树里有环与悬空目标）。
 
 ## 8. 序列化
 
-`ConvertTo-WReparseJson` 使用 `ConvertTo-Json`，`-Depth` 至少 12；`null` 字段必须序列化为
-JSON `null`，空数组序列化为 `[]`。键顺序与 §3 一致。
-
-## 10. provider 细节与实测事实
-
-本文件规定**语义**：字段含义、遍历规则、路径判定、错误码与序列化要求。
-
-它**不**规定 provider 层返回值的真实形状——那是宿主实现决定的，并且会随
-Windows 版本与访问方式变化。真机实测的权威事实记录在
-`assets/observed-provider-facts.json`，包括：
-
-- 重解析点与硬链接在文件属性上的区别；
-- provider 给出的 `LinkType` 取值集合；
-- `.Target` 的实际类型与相对/绝对形态；
-- PowerShell 转发单元素数组时的类型行为；
-- 枚举顺序与契约排序规则的关系。
-
-**当本文件的文字与 `assets/observed-provider-facts.json` 的实测事实在实现细节上
-冲突时，以实测事实为准。** 语义层面的规则仍以本文件为准。
+`ConvertTo-WReparseJson` 的输出形如 §3.6 与 §5 的样例：键顺序与 §3.1 一致，
+`null` 字段为 JSON `null`、空数组为 `[]`，`-Depth` 足够容纳最深层级（实测最深 3 层，
+但 `-Follow` 下的嵌套更浅；取值须保证任意 `-MaxDepth` 下不被截断）。
 
 ## 9. 非目标
 
 - 不修改、不删除、不创建任何被扫描的条目（只读）。
 - 不跨越卷去解析挂载点内容（未给 `-Follow` 时一律不进入）。
-- 不追求读取 reparse 点的原始字节（`FSCTL_GET_REPARSE_POINT`）；契约只要求登记
+- 不追求读取 reparse 点的原始字节（`FSCTL_GET_REPARSE_POINT`）；本契约只要求登记
   目标路径与分类。
 - 不承诺在非 Windows 平台上的行为。
+
+## 10. provider 细节与实测事实
+
+本文件的样例**只覆盖一个夹具树**；provider 层返回值的真实形状会随 Windows 版本与
+访问方式变化。真机实测的权威事实记录在 `assets/observed-provider-facts.json`，包括：
+
+- 重解析点与硬链接在文件属性上的区别；
+- provider 给出的 `LinkType` 取值集合；
+- `.Target` 的实际类型与相对/绝对形态；
+- PowerShell 转发单元素数组时的类型行为；
+- 枚举顺序、三种区域设置下的 `Sort-Object` 差异与序数次序的实测结果。
+
+**当本文件的文字与 `assets/observed-provider-facts.json` 的实测事实在实现细节上
+冲突时，以实测事实为准。** 语义层面以本文件为准。

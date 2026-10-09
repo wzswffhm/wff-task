@@ -1,5 +1,51 @@
 # CHANGELOG —— harbor-windows 题包目录
 
+## [wreparse-217 再次加深：1.2.0 → 1.3.0（D1–D6 激进档）] - 2026-10-09
+
+### 变更原因
+
+1.2.0 按 215 的 L4 设计加深后，四模型 8 场验证**全部满分**（Qwen 3×36/36、Opus 3×36/36、
+Kimi 1×36/36、GLM 1×36/36），`run_model_validation.py --score-only` 判定 **False**
+（`各模型最终积分相同且不全为 0（Opus 3 vs Qwen 3）`）→ 区分度失败。
+根因是加深**只增加了"要检查什么"，没有改变"答案可从文档直接抄出"**这一本质。
+
+### 变更内容（D1–D6）
+
+1. **D1 契约黑盒化**：`docs/REPARSE-CONTRACT.md` 删除 §2/§3/§4/§5/§6/§7 的规则文本，
+   改为 **15+ 个实测样例**（8 条 reparse Record 对照、空树完整 JSON、`-MaxDepth` 0/-1/1 三组、
+   `-Follow` 的 stats 与 errors、`link-in\readme.txt` 前缀、canonical/within_root 对照、
+   `Z/Ä/ö` 实测次序、7 个错误码的实测 Message），并明示"唯一允许照抄的只有 API 签名表"。
+2. **D1 题面**：`instruction.md` 的「必须满足的行为」12 条规则复述与「用户可见验收」17 条
+   答案式断言全部去答案，改为"只给要覆盖的情形、不给期望值"；新增**验收 18 可复现自证脚本**。
+3. **D2 矛盾源**：新增 `docs/REPARSE-CONTRACT.draft.md`（含 9 处与正式契约/实测相反的陷阱，
+   如"报告含 GeneratedAt 时间戳"、"`-Follow` 默认开启"、"`LinkType` 非空即重解析点"、
+   "直接用 `Sort-Object`"）；`assets/observed-provider-facts.json` 6 → **16 条纯观测**
+   （三种文化下的 `Sort-Object` 实测、reparse tag、相对目标解析探测、depth/maxdepth 探测等），
+   只给数据不给结论。
+4. **D4 夹具**：`tests/prepare.ps1` 新增 8 层深链（`level1..level8` + 两个文件）。
+5. **D3 判据**：`tests/run_tests.ps1` +24 条检查 → **60 条**；
+   `required_testcases.json` 36 → **60**（45 F2P / 15 P2P）；
+   `rubric.json` 9 项权重保持合计 1.0、60/60 全覆盖，`task_version` → 1.3.0。
+6. **D5 冒烟测试**：`tests/test_wreparse_basic.ps1` 不再检查 `Records/Errors/Stats` 字段名
+   与 JSON 结构，通过它完全无法推断报告形态。
+7. **版本与元数据**：`task.toml` / `source.json` / `tests/run_tests.ps1` → **1.3.0**；
+   `difficulty` 保持 **L4**、step 上限保持 **40**（与其它题包口径一致）。
+
+### 复验证据
+
+- **本机控制组 3+3**（`_qc_runs/controls_217_v130.json`）：
+  Oracle 3 次全部 `VALID` / `formal_score=1` / **60 of 60**；
+  NOP 3 次全部 `VALID` / `formal_score=0` / 22 of 60（15 个 P2P 全过 + 7 个 F2P 过）。
+- `task_hash` 由 `tree_hash()` 重算（排除 `jobs/` 与 `platform_import.json`）。
+- 已砍掉三条不可行判据：`access_denied`（判分进程为管理员会绕过 ACL）、UNC（容器
+  bind filter 语义不同）、同名不同大小写决胜（NTFS 不允许同名文件）。
+
+### 待办
+
+- 三模型区分度必须重跑；若仍全满分，需进一步加深（候选方向：删除契约文档、只留 assets）。
+- 甲方 QC 动态门禁需 Windows 容器，待环境恢复后重跑。
+
+
 ## [wreparse-217 难度加深 L3 → L4] - 2026-10-09
 
 ### 变更原因

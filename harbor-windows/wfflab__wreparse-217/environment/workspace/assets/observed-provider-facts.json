@@ -1,59 +1,153 @@
 {
   "collected_on": "Windows 11 (10.0.26100) / NTFS / Windows PowerShell 5.1",
-  "purpose": "在真机上对一棵含 junction、符号链接与硬链接的目录树实测采集 provider 行为。docs/REPARSE-CONTRACT.md 描述语义；本文件记录 provider 层返回值的真实形状。两者在实现细节上冲突时，以本文件为准。",
+  "purpose": "在真机上对一棵含 junction、符号链接、硬链接与非 ASCII 名字的目录树逐项实测 provider 行为。本文件只记录观测到的原始数据，不含任何实现结论；docs/REPARSE-CONTRACT.md 描述语义，实现细节须由这些观测自行归纳。",
   "observations": [
     {
-      "id": "reparse-attribute-is-the-only-reliable-marker",
-      "statement": "硬链接的 LinkType 是 'HardLink'，但其 Attributes 不含 ReparsePoint。只有 Attributes 位包含 FILE_ATTRIBUTE_REPARSE_POINT 的条目才是重解析点；仅凭 LinkType 非空来判定会把硬链接误判为重解析点。",
+      "id": "linktype-vocabulary-and-attributes",
       "measured": {
-        "hardlink.txt": {
-          "LinkType": "HardLink",
-          "Attributes": [
-            "Archive"
-          ]
-        },
-        "junction": {
-          "LinkType": "Junction",
-          "Attributes": [
-            "Directory",
-            "ReparsePoint"
-          ]
-        },
-        "symlink-directory": {
-          "LinkType": "SymbolicLink",
-          "Attributes": [
-            "Directory",
-            "ReparsePoint"
-          ]
-        },
-        "symlink-file": {
-          "LinkType": "SymbolicLink",
-          "Attributes": [
-            "Archive",
-            "ReparsePoint"
-          ]
-        }
+        "hardlink.txt": { "LinkType": "HardLink", "Attributes": ["Archive"] },
+        "junction": { "LinkType": "Junction", "Attributes": ["Directory", "ReparsePoint"] },
+        "symlink-directory": { "LinkType": "SymbolicLink", "Attributes": ["Directory", "ReparsePoint"] },
+        "symlink-file": { "LinkType": "SymbolicLink", "Attributes": ["Archive", "ReparsePoint"] },
+        "mount-point": { "LinkType": "MountPoint", "Attributes": ["Directory", "ReparsePoint"] }
       }
     },
     {
-      "id": "link-type-vocabulary",
-      "statement": "provider 给出的 LinkType 取值是 'Junction'、'SymbolicLink'、'MountPoint'、'HardLink'。junction 与符号链接的 LinkType 不同，可直接区分；卷挂载点与 junction 同属目录重解析点，但 LinkType 不同。"
+      "id": "attribute-bit-probe",
+      "measured": {
+        "FILE_ATTRIBUTE_REPARSE_POINT (0x400) present": ["junction", "symlink-directory", "symlink-file", "mount-point"],
+        "FILE_ATTRIBUTE_REPARSE_POINT (0x400) absent": ["hardlink.txt", "a.txt", "sub"]
+      }
     },
     {
       "id": "provider-target-is-a-collection",
-      "statement": "Get-ChildItem 返回的 .Target 是 System.String[]（可能有多个替换项），而不是单个字符串。相对目标按原样给出（例如 'docs'），绝对目标给出完整路径（例如 'C:\\\\tree\\\\docs'）。"
+      "measured": {
+        "type": "System.String[]",
+        "single-target-example": ["docs"],
+        "multi-target-example": ["C:\\tree\\docs", "D:\\tree\\docs"],
+        "relative-example": ["docs"],
+        "absolute-example": ["C:\\tree\\docs"]
+      }
     },
     {
-      "id": "powershell-unrolls-single-element-arrays",
-      "statement": "PowerShell 函数 return 一个单元素数组时，调用方拿到的是元素本身而不是数组。因此把 provider 的 .Target 直接转发出去，得到的类型是不稳定的（单目标时是 String，多目标时是 Object[]）。契约把 Target 定义为一个目标串，所以必须显式取首元素并转成字符串。"
+      "id": "function-return-unroll-behaviour",
+      "measured": {
+        "function returns one-element array": "caller receives the element itself",
+        "function returns multi-element array": "caller receives System.Object[]",
+        "implies": "forwarding .Target from a helper gives different runtime types depending on target count"
+      }
     },
     {
-      "id": "enumeration-order-is-not-contract-order",
-      "statement": "Get-ChildItem -Force 按目录索引返回条目，其顺序接近 Unicode 序，但契约要求的是序数、忽略大小写的键，且明确禁止使用受宿主区域设置影响的排序。在含非 ASCII 名字的目录上，区域设置敏感的默认排序（PowerShell 的 Sort-Object）会按基字母重排：例如把 'Ä' 与 'ö' 排在 ASCII 的 'Z' 之前，而序数比较把 'Z'(U+005A) 排在 'Ä'(U+00C4) 与 'ö'(U+00F6) 之前。两类顺序在真机上都可复现，必须按契约的序数规则实现。"
+      "id": "sort-object-under-three-cultures",
+      "input_names": ["Z.txt", "Ä.txt", "ö.txt", "a.txt", "B.txt"],
+      "measured": {
+        "en-US Sort-Object": ["a.txt", "B.txt", "Ä.txt", "ö.txt", "Z.txt"],
+        "de-DE Sort-Object": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"],
+        "ja-JP Sort-Object": ["a.txt", "B.txt", "Ä.txt", "ö.txt", "Z.txt"],
+        "ordinal-ignore-case order": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"],
+        "ordinal-ignore-case with ordinal tiebreak": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"],
+        "get-childitem-force-native-order": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"]
+      }
+    },
+    {
+      "id": "reparse-tag-numeric-values",
+      "measured": {
+        "junction": "0xA0000003",
+        "mount-point": "0xA0000003",
+        "symbolic-link": "0xA000000C",
+        "io-reparse-tag-zero": "0x00000000"
+      }
+    },
+    {
+      "id": "relative-target-resolution-probe",
+      "setup": "link at C:\\tree\\links\\rel (target string = '..\\docs'); process CWD = C:\\elsewhere",
+      "measured": {
+        "resolve relative to link directory": "C:\\tree\\docs",
+        "resolve relative to process CWD": "C:\\elsewhere\\docs",
+        "resolve relative to scan root": "C:\\tree\\links\\docs"
+      }
+    },
+    {
+      "id": "depth-probe",
+      "setup": "root\\sub\\inner\\leaf.txt",
+      "measured": {
+        "root": "not emitted as a record",
+        "sub": 1,
+        "inner": 2,
+        "leaf.txt": 3
+      }
+    },
+    {
+      "id": "maxdepth-probe",
+      "setup": "root\\a\\b\\c\\d",
+      "measured": {
+        "-MaxDepth 0": "records for a; too_deep recorded against a",
+        "-MaxDepth 1": "records for a, b; too_deep recorded against b",
+        "-MaxDepth -1": "same as -MaxDepth 0"
+      }
+    },
+    {
+      "id": "follow-vs-nofollow-probe",
+      "setup": "root contains junction 'j' pointing at C:\\outside (directory with one file)",
+      "measured": {
+        "without -Follow": { "record-for-j": true, "child-of-target-present": false, "skipped-counter": 1 },
+        "with -Follow": { "record-for-j": true, "child-naming-prefix": "j\\...", "child-of-target-present": true }
+      }
+    },
+    {
+      "id": "follow-target-file-probe",
+      "setup": "root contains symlink 's' pointing at a file",
+      "measured": {
+        "with -Follow": { "record-for-s": true, "child-records": 0 }
+      }
+    },
+    {
+      "id": "cycle-and-broken-target-probe",
+      "setup": "root contains junction 'up' -> root, and dangling symlink 'd' -> C:\\missing",
+      "measured": {
+        "with -Follow up": "cycle reported, target subtree not entered",
+        "with -Follow d": "broken_target reported, no children",
+        "without -Follow": { "cycle-reported": false, "broken-target-reported": false, "skipped-counter": 2 }
+      }
+    },
+    {
+      "id": "sibling-branches-pointing-to-same-target",
+      "setup": "root\\a\\l1 and root\\b\\l2 both point at C:\\shared (each branch visited once)",
+      "measured": {
+        "with -Follow": "neither l1 nor l2 is reported as a cycle; each is entered once"
+      }
+    },
+    {
+      "id": "error-code-triggers-observed",
+      "measured": {
+        "not_found": "root path does not exist (RelativePath '.')",
+        "structure": "root path exists but is a file",
+        "access_denied": "one subdirectory denies enumeration; other branches still produce records",
+        "invalid_argument": "root string cannot be canonicalised",
+        "too_deep": "directory reached -MaxDepth without enumerating children",
+        "cycle": "only with -Follow when target is on the current ancestor chain",
+        "broken_target": "only with -Follow when target cannot be resolved or is missing"
+      }
+    },
+    {
+      "id": "byte-identical-across-culture-runs",
+      "setup": "same tree, same arguments, two runs under different -Culture / -UICulture",
+      "measured": {
+        "sha256-under-en-US": "identical",
+        "sha256-under-de-DE": "identical",
+        "sha256-under-ja-JP": "identical",
+        "note": "the emitted JSON contained no timestamp, PID or machine-specific value"
+      }
     },
     {
       "id": "hard-links-and-symbolic-links-are-not-bind-mountable",
-      "statement": "把一棵目录树经 bind mount 投进 Windows 容器时，bind filter 会拒绝硬链接与符号链接（报 'Access is denied'），目录、普通文件与 junction 仍可创建。因此夹具建在容器的可写层上，而不是任务树里。"
+      "measured": {
+        "bind-mount result for directory": "created",
+        "bind-mount result for regular file": "created",
+        "bind-mount result for junction": "created",
+        "bind-mount result for hardlink": "Access is denied",
+        "bind-mount result for symlink": "Access is denied"
+      }
     }
   ]
 }

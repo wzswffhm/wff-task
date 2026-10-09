@@ -21,8 +21,8 @@ import sys
 from pathlib import Path
 
 TASK = Path(r"C:\Users\Administrator\Desktop\wff-task\harbor-windows\wfflab__wreparse-217")
-BACKUP = Path(r"C:\Users\Administrator\Desktop\wff-task\_qc_runs\backup-217-before-deepen-v12")
-CANDIDATE = BACKUP / "WReparse-candidate"
+BACKUP = Path(r"C:\Users\Administrator\Desktop\wff-task\_qc_runs\baseline-217-v120")
+CANDIDATE = BACKUP / "WReparse"
 PWSH = "powershell.exe"
 
 
@@ -134,23 +134,23 @@ def main() -> int:
 
     # 版本一致性
     versions = {r.get("task_version") for r in rounds if "error" not in r}
-    if versions != {"1.2.0"}:
-        problems.append(f"task_version 不一致或非 1.2.0: {versions}")
+    if versions != {"1.3.0"}:
+        problems.append(f"task_version 不一致或非 1.3.0: {versions}")
 
     out = {
         "task_id": "wfflab__wreparse-217",
-        "task_version": "1.2.0",
+        "task_version": "1.3.0",
         "rounds": rounds,
         "gates": {
             "oracle_all_valid_score1": all(
                 "error" not in r and r["run_validity"] == "VALID" and r["formal_score"] == 1 for r in oracle),
             "nop_all_valid_score0": all(
                 "error" not in r and r["run_validity"] == "VALID" and r["formal_score"] == 0 for r in nop),
-            "task_version_consistent": versions == {"1.2.0"},
+            "task_version_consistent": versions == {"1.3.0"},
         },
         "problems": problems,
     }
-    out_path = Path(r"C:\Users\Administrator\Desktop\wff-task\_qc_runs\controls_217_v120.json")
+    out_path = Path(r"C:\Users\Administrator\Desktop\wff-task\_qc_runs\controls_217_v130.json")
     out_path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print()

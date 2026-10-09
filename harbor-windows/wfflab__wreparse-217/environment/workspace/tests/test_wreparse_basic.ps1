@@ -1,9 +1,8 @@
 # WReparse - visible smoke test
 #
-# Covers one thing only: the report this module produces can be read back by the
-# module itself. It does NOT check any clause of the behaviour contract, and
-# passing it does NOT mean the implementation matches docs/REPARSE-CONTRACT.md.
-# The grader runs a separate contract-conformance suite.
+# 覆盖面刻意收窄到「能不能跑起来」：模块能导入、能产出报告对象、报告能序列化。
+# 它不检查 docs/REPARSE-CONTRACT.md 的任何条款，也**刻意不检查报告的字段结构**、
+# 排序或语义 —— 过了它不代表实现正确。判官会另跑完整的契约一致性套件。
 #
 # Exit codes: 0 pass; 1 fail.
 
@@ -28,46 +27,45 @@ Import-Module $modulePath -Force
 
 $failed = 0
 
-# 1) the module imports and can report its schema version
+# 1) the module imports and returns some schema version (value is not asserted)
 try {
     $version = Get-WReparseSchemaVersion
     if ([string]::IsNullOrWhiteSpace([string]$version)) { throw 'schema version is empty' }
-    Write-Host "[PASS] module imports; SchemaVersion = $version"
+    Write-Host '[PASS] module imports and returns a schema version'
 }
 catch {
     Write-Host "[FAIL] import or Get-WReparseSchemaVersion failed: $($_.Exception.Message)"
     $failed++
 }
 
-# 2) scanning a scratch directory yields a report carrying Records / Errors / Stats
+# 2) a scan produces a report object -- field names are deliberately NOT checked,
+#    so passing this says nothing about the report shape.
 $probe = Join-Path $env:TEMP ('wreparse-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path (Join-Path $probe 'sub') -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $probe 'a.txt') -Value 'a' -NoNewline -Encoding ASCII
 $report = $null
 try {
     $report = Get-WReparseReport -Root $probe
-    foreach ($field in @('Records', 'Errors', 'Stats')) {
-        if ($null -eq $report.PSObject.Properties[$field]) { throw "report is missing $field" }
-    }
-    Write-Host '[PASS] report carries Records / Errors / Stats'
+    if ($null -eq $report) { throw 'report is null' }
+    Write-Host '[PASS] Get-WReparseReport returns a report object'
 }
 catch {
     Write-Host "[FAIL] Get-WReparseReport failed: $($_.Exception.Message)"
     $failed++
 }
 
-# 3) the report serialises to JSON
+# 3) the report serialises to a non-empty string (structure is not asserted)
 try {
     $json = ConvertTo-WReparseJson -Report $report
     if ([string]::IsNullOrWhiteSpace([string]$json)) { throw 'serialised report is empty' }
-    Write-Host '[PASS] report serialises to JSON'
+    Write-Host '[PASS] report serialises to a non-empty string'
 }
 catch {
     Write-Host "[FAIL] ConvertTo-WReparseJson failed: $($_.Exception.Message)"
     $failed++
 }
 
-# 4) the path helper is callable
+# 4) the path helper is callable (return value is not asserted)
 try {
     $canonical = Get-WReparseCanonicalPath -Path $probe
     if ([string]::IsNullOrWhiteSpace([string]$canonical)) { throw 'canonical path is empty' }

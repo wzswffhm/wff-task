@@ -413,7 +413,7 @@ Add-WReparseCheck 'empty-tree-serialises-empty-arrays' {
     return $true
 }
 
-# ---- deepening round 1.2.0: contract clauses previously not covered ---------
+# ---- deepening round 1.3.0: contract clauses previously not covered ---------
 # Each check restates a rule the behaviour contract already makes authoritative;
 # no new requirement is introduced.
 
@@ -499,13 +499,228 @@ Add-WReparseCheck 'inscope-is-false-for-non-reparse-entries' {
     return $true
 }
 
+
+# ---- deepened contract checks (24, added by v1.3.0) --------------------------------------------------------------
+Add-WReparseCheck 'culture-en-us-ordinal-order' {
+    $prevT = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+        $r = Get-WReparseReport -Root $scanRoot
+        $p = @($r.Records | ForEach-Object { [string]$_.RelativePath })
+        $z = [Array]::IndexOf($p, "$([char]0x5A).txt"); $a = [Array]::IndexOf($p, "$([char]0xC4).txt"); $o = [Array]::IndexOf($p, "$([char]0xF6).txt")
+        if ($z -lt 0 -or $a -lt 0 -or $o -lt 0) { return 'Z/umlaut records missing' }
+        if (-not ($z -lt $a -and $z -lt $o)) { return "en-US: ordinal order violated (Z=$z A=$a o=$o)" }
+        return $true
+    } finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $prevT }
+}
+
+Add-WReparseCheck 'culture-de-de-ordinal-order' {
+    $prevT = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('de-DE')
+        $r = Get-WReparseReport -Root $scanRoot
+        $p = @($r.Records | ForEach-Object { [string]$_.RelativePath })
+        $z = [Array]::IndexOf($p, "$([char]0x5A).txt"); $a = [Array]::IndexOf($p, "$([char]0xC4).txt"); $o = [Array]::IndexOf($p, "$([char]0xF6).txt")
+        if ($z -lt 0 -or $a -lt 0 -or $o -lt 0) { return 'Z/umlaut records missing' }
+        if (-not ($z -lt $a -and $z -lt $o)) { return "de-DE: ordinal order violated (Z=$z A=$a o=$o)" }
+        return $true
+    } finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $prevT }
+}
+
+Add-WReparseCheck 'culture-ja-jp-ordinal-order' {
+    $prevT = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('ja-JP')
+        $r = Get-WReparseReport -Root $scanRoot
+        $p = @($r.Records | ForEach-Object { [string]$_.RelativePath })
+        $z = [Array]::IndexOf($p, "$([char]0x5A).txt"); $a = [Array]::IndexOf($p, "$([char]0xC4).txt"); $o = [Array]::IndexOf($p, "$([char]0xF6).txt")
+        if ($z -lt 0 -or $a -lt 0 -or $o -lt 0) { return 'Z/umlaut records missing' }
+        if (-not ($z -lt $a -and $z -lt $o)) { return "ja-JP: ordinal order violated (Z=$z A=$a o=$o)" }
+        return $true
+    } finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $prevT }
+}
+
+Add-WReparseCheck 'deep-tree-emits-all-levels' {
+    $cursor = $scanRoot
+    for ($i = 1; $i -le 8; $i++) {
+        $cursor = Join-Path $cursor ('level' + $i)
+        $rec = Get-WReparseTestRecord -Report $never -RelativePath ($cursor.Substring($scanRoot.Length + 1))
+        if ($null -eq $rec) { return "level$i is missing from the default scan" }
+        if ([int]$rec.Depth -ne $i) { return "level$i Depth=$($rec.Depth), expected $i" }
+        if ($rec.Kind -ne 'Directory') { return "level$i Kind=$($rec.Kind), expected Directory" }
+    }
+    $tip = Get-WReparseTestRecord -Report $never -RelativePath 'level1\level2\level3\level4\level5\level6\level7\level8\deepest.txt'
+    if ($null -eq $tip) { return 'deepest.txt missing' }
+    if ([int]$tip.Depth -ne 9) { return "deepest.txt Depth=$($tip.Depth), expected 9" }
+    return $true
+}
+
+Add-WReparseCheck 'maxdepth-1-count-is-exact' {
+    $direct = @(Get-ChildItem -LiteralPath $scanRoot -Force -ErrorAction SilentlyContinue)
+    $r1 = Get-WReparseReport -Root $scanRoot -MaxDepth 1
+    $expected = $direct.Count
+    $actual = @($r1.Records).Count
+    if ($actual -ne $expected) { return "MaxDepth 1 emitted $actual records, fixture has $expected direct children" }
+    return $true
+}
+
+Add-WReparseCheck 'default-maxdepth-covers-deep-tree' {
+    if ([int]$never.Stats.Directories -lt 9) { return "default scan found only $($never.Stats.Directories) directories; the 8-level chain was truncated" }
+    $tip = Get-WReparseTestRecord -Report $never -RelativePath 'level1\level2\level3\level4\level5\level6\level7\level8\deepest.txt'
+    if ($null -eq $tip) { return 'deepest.txt not emitted under the default -MaxDepth' }
+    return $true
+}
+
+Add-WReparseCheck 'stats-sum-equals-record-count' {
+    $sum = [int]$never.Stats.Directories + [int]$never.Stats.Files + [int]$never.Stats.ReparsePoints
+    if ($sum -ne @($never.Records).Count) { return "Stats sum $sum != record count $(@($never.Records).Count)" }
+    return $true
+}
+
+Add-WReparseCheck 'stats-match-kind-counts' {
+    $d = @($never.Records | Where-Object { $_.Kind -eq 'Directory' }).Count
+    $f = @($never.Records | Where-Object { $_.Kind -eq 'File' }).Count
+    $r = @($never.Records | Where-Object { $_.Kind -eq 'ReparsePoint' }).Count
+    if ([int]$never.Stats.Directories -ne $d) { return "Stats.Directories=$($never.Stats.Directories) but Kind=Directory count=$d" }
+    if ([int]$never.Stats.Files -ne $f) { return "Stats.Files=$($never.Stats.Files) but Kind=File count=$f" }
+    if ([int]$never.Stats.ReparsePoints -ne $r) { return "Stats.ReparsePoints=$($never.Stats.ReparsePoints) but Kind=ReparsePoint count=$r" }
+    return $true
+}
+
+Add-WReparseCheck 'skipped-equals-unfollowed-reparse-count' {
+    $rp = @($never.Records | Where-Object { $_.Kind -eq 'ReparsePoint' }).Count
+    if ([int]$never.Stats.Skipped -ne $rp) { return "Skipped=$($never.Stats.Skipped) but only $rp reparse records exist" }
+    if ([int]$follow.Stats.Skipped -ne 0) { return "with -Follow Skipped=$($follow.Stats.Skipped), expected 0" }
+    return $true
+}
+
+Add-WReparseCheck 'canonical-folds-dot-dot' {
+    $in = Join-Path (Join-Path $scanRoot 'docs') '..\data'
+    $expect = Join-Path $scanRoot 'data'
+    $actual = [string](Get-WReparseCanonicalPath -Path $in)
+    if ($actual -cne $expect) { return "Get-WReparseCanonicalPath('$in')='$actual', expected '$expect'" }
+    return $true
+}
+
+Add-WReparseCheck 'within-root-rejects-prefix-sibling' {
+    $sibling = Join-Path (Split-Path -Parent $scanRoot) 'scanroot-extra'
+    if (-not (Test-Path -LiteralPath $sibling)) { return "fixture sibling $sibling missing" }
+    if (Test-WReparseWithinRoot -Path $sibling -Root $scanRoot) { return "$sibling reported inside $scanRoot; they only share a name prefix" }
+    if (-not (Test-WReparseWithinRoot -Path (Join-Path $scanRoot 'docs') -Root $scanRoot)) { return 'real child reported outside the root' }
+    return $true
+}
+
+Add-WReparseCheck 'resolve-absolute-target-normalised' {
+    $expected = Join-Path $scanRoot 'docs'
+    $abs = [string](Resolve-WReparseLinkTarget -LinkFullPath (Join-Path $scanRoot 'link-in') -RawTarget $expected)
+    if ($abs -cne $expected) { return "absolute target resolved to '$abs', expected '$expected'" }
+    $nullOut = Resolve-WReparseLinkTarget -LinkFullPath (Join-Path $scanRoot 'link-rel') -RawTarget ''
+    if ($null -ne $nullOut) { return "empty RawTarget returned '$nullOut', expected `$null" }
+    return $true
+}
+
+Add-WReparseCheck 'report-root-is-canonical' {
+    $expected = [string](Get-WReparseCanonicalPath -Path $scanRoot)
+    if ([string]$never.Root -cne $expected) { return "Root='$($never.Root)', canonical is '$expected'" }
+    if ([string]$never.Root -ne [string]$follow.Root) { return 'Root differs between default and -Follow scans' }
+    return $true
+}
+
+Add-WReparseCheck 'follow-prefix-uses-link-name' {
+    $child = Get-WReparseTestRecord -Report $follow -RelativePath 'link-in\readme.txt'
+    if ($null -eq $child) { return 'link-in\readme.txt missing under -Follow' }
+    if ([string]$child.Kind -ne 'File') { return "link-in\readme.txt Kind=$($child.Kind)" }
+    if ([int]$child.Depth -ne 2) { return "link-in\readme.txt Depth=$($child.Depth), expected 2" }
+    return $true
+}
+
+Add-WReparseCheck 'follow-never-emits-target-real-name' {
+    foreach ($p in @('outside\secret.txt')) {
+        $rec = Get-WReparseTestRecord -Report $follow -RelativePath $p
+        if ($null -ne $rec) { return "$p was emitted under -Follow; entries reached through a link must keep the link path prefix" }
+    }
+    return $true
+}
+
+Add-WReparseCheck 'follow-file-link-has-no-children' {
+    $linkRec = Get-WReparseTestRecord -Report $follow -RelativePath 'link-file'
+    if ($null -eq $linkRec) { return 'link-file record missing under -Follow' }
+    $kids = @($follow.Records | Where-Object { $_.RelativePath -like 'link-file\*' })
+    if ($kids.Count -ne 0) { return "link-file has $($kids.Count) child records; its target is a file" }
+    return $true
+}
+
+Add-WReparseCheck 'follow-enters-twin-without-cycle' {
+    $twin = Get-WReparseTestRecord -Report $follow -RelativePath 'link-twin'
+    if ($null -eq $twin) { return 'link-twin missing under -Follow' }
+    $kids = @($follow.Records | Where-Object { $_.RelativePath -like 'link-twin\*' })
+    if ($kids.Count -eq 0) { return 'link-twin was not entered; two siblings pointing at the same target is not a cycle' }
+    $cyc = @($follow.Errors | Where-Object { [string]$_.Code -eq 'cycle' })
+    foreach ($c in $cyc) { if ([string]$c.RelativePath -eq 'link-twin') { return 'link-twin was reported as a cycle' } }
+    return $true
+}
+
+Add-WReparseCheck 'follow-vs-default-record-relation' {
+    $nDef = @($never.Records).Count
+    $nFol = @($follow.Records).Count
+    if ($nFol -le $nDef) { return "default scan has $nDef records, -Follow has $nFol; entering links must add records" }
+    return $true
+}
+
+Add-WReparseCheck 'report-json-has-no-volatile-field' {
+    $json = [string](ConvertTo-WReparseJson -Report $never)
+    if ([string]::IsNullOrWhiteSpace($json)) { return 'serialised report is empty' }
+    foreach ($bad in @('GeneratedAt', 'Timestamp', 'timestamp', 'ProcessId', 'PID', 'Random', 'Guid', 'guid')) {
+        if ($json.Contains($bad)) { return "serialised report contains volatile field marker '$bad'" }
+    }
+    return $true
+}
+
+Add-WReparseCheck 'errors-serialise-as-empty-array' {
+    if (@($never.Errors).Count -ne 0) { return "default scan produced $(@($never.Errors).Count) errors on a healthy fixture" }
+    $json = [string](ConvertTo-WReparseJson -Report $never)
+    if ($json -notmatch '"Errors"\s*:\s*\[\s*\]') { return 'Errors did not serialise as an empty array' }
+    return $true
+}
+
+Add-WReparseCheck 'schema-version-is-constant' {
+    if ([string](Get-WReparseSchemaVersion) -ne [string]$never.SchemaVersion) { return "Get-WReparseSchemaVersion differs from report SchemaVersion" }
+    if ([string]$never.SchemaVersion -ne 'wreparse/1.0') { return "SchemaVersion='$($never.SchemaVersion)'" }
+    return $true
+}
+
+Add-WReparseCheck 'record-fields-match-contract-exactly' {
+    $want = @('RelativePath','Kind','ReparseKind','Target','ResolvedTarget','InScope','Depth','Size')
+    foreach ($rec in @($never.Records | Select-Object -First 12)) {
+        $got = @($rec.PSObject.Properties.Name)
+        if (($got -join ',') -ne ($want -join ',')) { return "record '$($rec.RelativePath)' fields are [$($got -join ',')]" }
+    }
+    return $true
+}
+
+Add-WReparseCheck 'size-zero-for-non-file-records' {
+    foreach ($rec in @($never.Records | Where-Object { $_.Kind -ne 'File' })) {
+        if ([int64]$rec.Size -ne 0) { return "'$($rec.RelativePath)' Kind=$($rec.Kind) Size=$($rec.Size), expected 0" }
+    }
+    return $true
+}
+
+Add-WReparseCheck 'non-reparse-null-fields-stay-null' {
+    foreach ($rec in @($never.Records | Where-Object { $_.Kind -ne 'ReparsePoint' })) {
+        if ($null -ne $rec.ReparseKind) { return "'$($rec.RelativePath)' ReparseKind=$($rec.ReparseKind), expected null" }
+        if ($null -ne $rec.Target) { return "'$($rec.RelativePath)' Target=$($rec.Target), expected null" }
+        if ($null -ne $rec.ResolvedTarget) { return "'$($rec.RelativePath)' ResolvedTarget=$($rec.ResolvedTarget), expected null" }
+    }
+    return $true
+}
+
 # ---- persist ---------------------------------------------------------------
 $checksDirectory = Split-Path -Parent $ChecksPath
 if (-not (Test-Path -LiteralPath $checksDirectory)) { New-Item -ItemType Directory -Path $checksDirectory -Force | Out-Null }
 
 $payload = [pscustomobject][ordered]@{
     task_id      = 'wfflab__wreparse-217'
-    task_version = '1.2.0'
+    task_version = '1.3.0'
     scan_root    = $scanRoot
     checks       = @($results.ToArray())
 }
