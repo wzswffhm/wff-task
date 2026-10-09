@@ -1,0 +1,153 @@
+{
+  "collected_on": "Windows 11 (10.0.26100) / NTFS / Windows PowerShell 5.1",
+  "purpose": "在真机上对一棵含 junction、符号链接、硬链接与非 ASCII 名字的目录树逐项实测 provider 行为。本文件只记录观测到的原始数据，不含任何实现结论；docs/REPARSE-CONTRACT.md 描述语义，实现细节须由这些观测自行归纳。",
+  "observations": [
+    {
+      "id": "linktype-vocabulary-and-attributes",
+      "measured": {
+        "hardlink.txt": { "LinkType": "HardLink", "Attributes": ["Archive"] },
+        "junction": { "LinkType": "Junction", "Attributes": ["Directory", "ReparsePoint"] },
+        "symlink-directory": { "LinkType": "SymbolicLink", "Attributes": ["Directory", "ReparsePoint"] },
+        "symlink-file": { "LinkType": "SymbolicLink", "Attributes": ["Archive", "ReparsePoint"] },
+        "mount-point": { "LinkType": "MountPoint", "Attributes": ["Directory", "ReparsePoint"] }
+      }
+    },
+    {
+      "id": "attribute-bit-probe",
+      "measured": {
+        "FILE_ATTRIBUTE_REPARSE_POINT (0x400) present": ["junction", "symlink-directory", "symlink-file", "mount-point"],
+        "FILE_ATTRIBUTE_REPARSE_POINT (0x400) absent": ["hardlink.txt", "a.txt", "sub"]
+      }
+    },
+    {
+      "id": "provider-target-is-a-collection",
+      "measured": {
+        "type": "System.String[]",
+        "single-target-example": ["docs"],
+        "multi-target-example": ["C:\\tree\\docs", "D:\\tree\\docs"],
+        "relative-example": ["docs"],
+        "absolute-example": ["C:\\tree\\docs"]
+      }
+    },
+    {
+      "id": "function-return-unroll-behaviour",
+      "measured": {
+        "function returns one-element array": "caller receives the element itself",
+        "function returns multi-element array": "caller receives System.Object[]",
+        "implies": "forwarding .Target from a helper gives different runtime types depending on target count"
+      }
+    },
+    {
+      "id": "sort-object-under-three-cultures",
+      "input_names": ["Z.txt", "Ä.txt", "ö.txt", "a.txt", "B.txt"],
+      "measured": {
+        "en-US Sort-Object": ["a.txt", "B.txt", "Ä.txt", "ö.txt", "Z.txt"],
+        "de-DE Sort-Object": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"],
+        "ja-JP Sort-Object": ["a.txt", "B.txt", "Ä.txt", "ö.txt", "Z.txt"],
+        "ordinal-ignore-case order": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"],
+        "ordinal-ignore-case with ordinal tiebreak": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"],
+        "get-childitem-force-native-order": ["a.txt", "B.txt", "Z.txt", "Ä.txt", "ö.txt"]
+      }
+    },
+    {
+      "id": "reparse-tag-numeric-values",
+      "measured": {
+        "junction": "0xA0000003",
+        "mount-point": "0xA0000003",
+        "symbolic-link": "0xA000000C",
+        "io-reparse-tag-zero": "0x00000000"
+      }
+    },
+    {
+      "id": "relative-target-resolution-probe",
+      "setup": "link at C:\\tree\\links\\rel (target string = '..\\docs'); process CWD = C:\\elsewhere",
+      "measured": {
+        "resolve relative to link directory": "C:\\tree\\docs",
+        "resolve relative to process CWD": "C:\\elsewhere\\docs",
+        "resolve relative to scan root": "C:\\tree\\links\\docs"
+      }
+    },
+    {
+      "id": "depth-probe",
+      "setup": "root\\sub\\inner\\leaf.txt",
+      "measured": {
+        "root": "not emitted as a record",
+        "sub": 1,
+        "inner": 2,
+        "leaf.txt": 3
+      }
+    },
+    {
+      "id": "maxdepth-probe",
+      "setup": "root\\a\\b\\c\\d",
+      "measured": {
+        "-MaxDepth 0": "records for a; too_deep recorded against a",
+        "-MaxDepth 1": "records for a, b; too_deep recorded against b",
+        "-MaxDepth -1": "same as -MaxDepth 0"
+      }
+    },
+    {
+      "id": "follow-vs-nofollow-probe",
+      "setup": "root contains junction 'j' pointing at C:\\outside (directory with one file)",
+      "measured": {
+        "without -Follow": { "record-for-j": true, "child-of-target-present": false, "skipped-counter": 1 },
+        "with -Follow": { "record-for-j": true, "child-naming-prefix": "j\\...", "child-of-target-present": true }
+      }
+    },
+    {
+      "id": "follow-target-file-probe",
+      "setup": "root contains symlink 's' pointing at a file",
+      "measured": {
+        "with -Follow": { "record-for-s": true, "child-records": 0 }
+      }
+    },
+    {
+      "id": "cycle-and-broken-target-probe",
+      "setup": "root contains junction 'up' -> root, and dangling symlink 'd' -> C:\\missing",
+      "measured": {
+        "with -Follow up": "cycle reported, target subtree not entered",
+        "with -Follow d": "broken_target reported, no children",
+        "without -Follow": { "cycle-reported": false, "broken-target-reported": false, "skipped-counter": 2 }
+      }
+    },
+    {
+      "id": "sibling-branches-pointing-to-same-target",
+      "setup": "root\\a\\l1 and root\\b\\l2 both point at C:\\shared (each branch visited once)",
+      "measured": {
+        "with -Follow": "neither l1 nor l2 is reported as a cycle; each is entered once"
+      }
+    },
+    {
+      "id": "error-code-triggers-observed",
+      "measured": {
+        "not_found": "root path does not exist (RelativePath '.')",
+        "structure": "root path exists but is a file",
+        "access_denied": "one subdirectory denies enumeration; other branches still produce records",
+        "invalid_argument": "root string cannot be canonicalised",
+        "too_deep": "directory reached -MaxDepth without enumerating children",
+        "cycle": "only with -Follow when target is on the current ancestor chain",
+        "broken_target": "only with -Follow when target cannot be resolved or is missing"
+      }
+    },
+    {
+      "id": "byte-identical-across-culture-runs",
+      "setup": "same tree, same arguments, two runs under different -Culture / -UICulture",
+      "measured": {
+        "sha256-under-en-US": "identical",
+        "sha256-under-de-DE": "identical",
+        "sha256-under-ja-JP": "identical",
+        "note": "the emitted JSON contained no timestamp, PID or machine-specific value"
+      }
+    },
+    {
+      "id": "hard-links-and-symbolic-links-are-not-bind-mountable",
+      "measured": {
+        "bind-mount result for directory": "created",
+        "bind-mount result for regular file": "created",
+        "bind-mount result for junction": "created",
+        "bind-mount result for hardlink": "Access is denied",
+        "bind-mount result for symlink": "Access is denied"
+      }
+    }
+  ]
+}

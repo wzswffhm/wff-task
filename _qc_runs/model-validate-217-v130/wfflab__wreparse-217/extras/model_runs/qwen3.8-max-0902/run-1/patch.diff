@@ -1,0 +1,2643 @@
+diff --git a/WReparse/Audit.ps1 b/WReparse/Audit.ps1
+index f4ba512..0a91d56 100644
+--- a/WReparse/Audit.ps1
++++ b/WReparse/Audit.ps1
+@@ -1,84 +1,98 @@
+-# WReparse - report assembly
+-# Deterministic ordering, statistics and serialisation.
+-# Part of the WReparse reference implementation.
+-
+-# Stable merge sort so the report never depends on the enumerator order or on
+-# the host culture. Sort-Object is deliberately not used: its default string
+-# comparison is culture-aware and would order non-ASCII names differently on
+-# different hosts.
+-function Sort-WReparseStable {
+-    [CmdletBinding()]
+-    param(
+-        [AllowEmptyCollection()][object[]]$Items,
+-        [Parameter(Mandatory = $true)][scriptblock]$KeySelector
+-    )
+-    $array = @($Items)
+-    if ($array.Count -le 1) { return @($array) }
+-    $middle = [int]($array.Count / 2)
+-    $left = @(Sort-WReparseStable -Items @($array[0..($middle - 1)]) -KeySelector $KeySelector)
+-    $right = @(Sort-WReparseStable -Items @($array[$middle..($array.Count - 1)]) -KeySelector $KeySelector)
+-    $merged = New-Object System.Collections.ArrayList
+-    $i = 0
+-    $j = 0
+-    while ($i -lt $left.Count -and $j -lt $right.Count) {
+-        $leftKey = [string](& $KeySelector $left[$i])
+-        $rightKey = [string](& $KeySelector $right[$j])
+-        if ((Compare-WReparsePath -Left $leftKey -Right $rightKey) -le 0) {
+-            [void]$merged.Add($left[$i]); $i++
+-        }
+-        else {
+-            [void]$merged.Add($right[$j]); $j++
+-        }
+-    }
+-    while ($i -lt $left.Count) { [void]$merged.Add($left[$i]); $i++ }
+-    while ($j -lt $right.Count) { [void]$merged.Add($right[$j]); $j++ }
+-    return @($merged.ToArray())
+-}
+-
+-function Get-WReparseStats {
+-    [CmdletBinding()]
+-    param(
+-        [AllowEmptyCollection()][object[]]$Records,
+-        [int]$Skipped = 0,
+-        [int]$ErrorCount = 0
+-    )
+-    $directories = 0
+-    $files = 0
+-    $reparse = 0
+-    foreach ($record in @($Records)) {
+-        if ($record.Kind -eq 'File') {
+-            $files++
+-        }
+-        else {
+-            $directories++
+-            if ($record.Kind -eq 'ReparsePoint') { $reparse++ }
+-        }
+-    }
+-    return New-WReparseStats -Directories $directories -Files $files -ReparsePoints $reparse `
+-        -Skipped $Skipped -Errors $ErrorCount
+-}
+-
+-function Get-WReparseReport {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$Root,
+-        [int]$MaxDepth = 32,
+-        [switch]$Follow
+-    )
+-    $followMode = if ($Follow) { 'Always' } else { 'Never' }
+-    $walk = Invoke-WReparseWalk -Root $Root -FollowMode $followMode -MaxDepth $MaxDepth
+-    $records = @($walk.Records | Sort-Object -Property RelativePath)
+-    $errors = @($walk.Errors | Sort-Object -Property Code)
+-    $stats = Get-WReparseStats -Records $records -Skipped $walk.Skipped -ErrorCount $errors.Count
+-    $canonicalRoot = $null
+-    try { $canonicalRoot = Get-WReparseCanonicalPath $Root } catch { $canonicalRoot = $Root }
+-    return New-WReparseReport -Root $canonicalRoot -Records $records -Errors $errors -Stats $stats
+-}
+-
+-function ConvertTo-WReparseJson {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)]$Report
+-    )
+-    return ($Report | ConvertTo-Json -Depth 12)
+-}
++# WReparse - report assembly
++# Deterministic ordering, statistics and serialisation.
++# Part of the WReparse implementation. See docs/REPARSE-CONTRACT.md
++#
++# Ordering must not depend on the host culture: Sort-Object is deliberately NOT
++# used, because its default string comparison is culture-aware and would order
++# non-ASCII names differently on en-US, de-DE and ja-JP hosts. Records are
++# ordered by RelativePath with the ordinal-ignore-case comparer and an ordinal
++# tie-break, which is the order the observed provider facts require and which is
++# identical on every host.
++
++$script:WReparseJsonDepth = 16
++
++# OrderBy is a documented stable sort, so applying the lower priority key first
++# and the higher priority key afterwards yields exactly
++# "ordinal-ignore-case, then ordinal" without needing a custom comparer type.
++function Get-WReparseSortedRecords {
++    [CmdletBinding()]
++    param([AllowEmptyCollection()][AllowNull()][object[]]$Items)
++    $array = @($Items)
++    if ($array.Count -eq 0) { return [object[]]@() }
++    $keyPath = [Func[object, string]] { param($item) [string]$item.RelativePath }
++    $byOrdinal = [System.Linq.Enumerable]::OrderBy([object[]]$array, $keyPath, [System.StringComparer]::Ordinal)
++    $byPath = [System.Linq.Enumerable]::OrderBy($byOrdinal, $keyPath, [System.StringComparer]::OrdinalIgnoreCase)
++    return [object[]][System.Linq.Enumerable]::ToArray($byPath)
++}
++
++# Errors are ordered by RelativePath (same comparer as the records), then by Code
++# and Message, so that two runs over the same tree always emit them in the same
++# order even when several errors share one path.
++function Get-WReparseSortedErrors {
++    [CmdletBinding()]
++    param([AllowEmptyCollection()][AllowNull()][object[]]$Items)
++    $array = @($Items)
++    if ($array.Count -eq 0) { return [object[]]@() }
++    $keyMessage = [Func[object, string]] { param($item) [string]$item.Message }
++    $keyCode = [Func[object, string]] { param($item) [string]$item.Code }
++    $keyPath = [Func[object, string]] { param($item) [string]$item.RelativePath }
++    $byMessage = [System.Linq.Enumerable]::OrderBy([object[]]$array, $keyMessage, [System.StringComparer]::Ordinal)
++    $byCode = [System.Linq.Enumerable]::OrderBy($byMessage, $keyCode, [System.StringComparer]::Ordinal)
++    $byOrdinal = [System.Linq.Enumerable]::OrderBy($byCode, $keyPath, [System.StringComparer]::Ordinal)
++    $byPath = [System.Linq.Enumerable]::OrderBy($byOrdinal, $keyPath, [System.StringComparer]::OrdinalIgnoreCase)
++    return [object[]][System.Linq.Enumerable]::ToArray($byPath)
++}
++
++function Get-WReparseStats {
++    [CmdletBinding()]
++    param(
++        [AllowEmptyCollection()][AllowNull()][object[]]$Records,
++        [int]$Skipped = 0,
++        [int]$ErrorCount = 0
++    )
++    $directories = 0
++    $files = 0
++    $reparse = 0
++    foreach ($record in @($Records)) {
++        if ($null -eq $record) { continue }
++        switch ([string]$record.Kind) {
++            'File' { $files++ }
++            'Directory' { $directories++ }
++            'ReparsePoint' { $reparse++ }
++        }
++    }
++    return New-WReparseStats -Directories $directories -Files $files -ReparsePoints $reparse `
++        -Skipped $Skipped -Errors $ErrorCount
++}
++
++function Get-WReparseReport {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Root,
++        [int]$MaxDepth = 32,
++        [switch]$Follow
++    )
++
++    $walk = Invoke-WReparseWalk -Root $Root -Follow ([bool]$Follow) -MaxDepth $MaxDepth
++    $records = @(Get-WReparseSortedRecords -Items ([object[]]$walk.Records))
++    $errors = @(Get-WReparseSortedErrors -Items ([object[]]$walk.Errors))
++    $stats = Get-WReparseStats -Records $records -Skipped ([int]$walk.Skipped) -ErrorCount $errors.Count
++
++    return New-WReparseReport -Root ([string]$walk.Root) -Records ([object[]]$records) `
++        -Errors ([object[]]$errors) -Stats $stats
++}
++
++function ConvertTo-WReparseJson {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)]$Report
++    )
++    $json = ConvertTo-Json -InputObject $Report -Depth $script:WReparseJsonDepth
++    $json = [string]$json
++    # Windows PowerShell renders an empty collection across several lines; the
++    # contract wants the compact '[]' form. A JSON string value can never
++    # contain a raw newline (it is escaped), so this only ever rewrites the
++    # structural whitespace of an empty array.
++    $json = [System.Text.RegularExpressions.Regex]::Replace($json, '\[\s*\n\s*\]', '[ ]')
++    return $json
++}
+diff --git a/WReparse/Model.ps1 b/WReparse/Model.ps1
+index 2c856e1..59e2d5c 100644
+--- a/WReparse/Model.ps1
++++ b/WReparse/Model.ps1
+@@ -1,116 +1,135 @@
+-# WReparse - data model
+-# Shared vocabulary: error codes, enumerations, and factory helpers.
+-# Part of the WReparse implementation. See the contract under docs/
+-
+-Set-StrictMode -Version Latest
+-
+-# Error codes are part of the public contract. Order is stable and is not
+-# sorted at serialisation time; callers match on the literal string.
+-$script:WReparseErrorCode = @(
+-    'not_found'
+-    'access_denied'
+-    'cycle'
+-    'broken_target'
+-    'structure'
+-    'too_deep'
+-    'invalid_argument'
+-)
+-
+-$script:WReparseSchemaVersion = ('wreparse' + '/1.0')
+-
+-# Entry kinds. A hard link is a FILE, not a reparse point: the two NTFS
+-# directory entries share one data stream and neither entry carries a
+-# reparse attribute. Only entries whose file attributes contain
+-# FILE_ATTRIBUTE_REPARSE_POINT are reported with Kind = 'ReparsePoint'.
+-$script:WReparseKindDirectory = 'Directory'
+-$script:WReparseKindFile = 'File'
+-$script:WReparseKindReparse = 'ReparsePoint'
+-
+-function Get-WReparseErrorCode {
+-    [CmdletBinding()]
+-    param()
+-    return $script:WReparseErrorCode
+-}
+-
+-function Get-WReparseSchemaVersion {
+-    [CmdletBinding()]
+-    param()
+-    return $script:WReparseSchemaVersion
+-}
+-
+-function New-WReparseError {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$RelativePath,
+-        [Parameter(Mandatory = $true)][string]$Code,
+-        [Parameter(Mandatory = $true)][string]$Message
+-    )
+-    if ($script:WReparseErrorCode -notcontains $Code) {
+-        throw "Unknown WReparse error code: $Code"
+-    }
+-    return [pscustomobject][ordered]@{
+-        RelativePath = $RelativePath
+-        Code         = $Code
+-        Message      = $Message
+-    }
+-}
+-
+-function New-WReparseRecord {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$RelativePath,
+-        [Parameter(Mandatory = $true)][string]$Kind,
+-        $ReparseKind = $null,
+-        $Target = $null,
+-        $ResolvedTarget = $null,
+-        [bool]$InScope = $false,
+-        [int]$Depth = 0,
+-        [long]$Size = 0
+-    )
+-    return [pscustomobject][ordered]@{
+-        RelativePath   = $RelativePath
+-        Kind           = $Kind
+-        ReparseKind    = $ReparseKind
+-        Target         = $Target
+-        ResolvedTarget = $ResolvedTarget
+-        InScope        = $InScope
+-        Depth          = $Depth
+-        Size           = $Size
+-    }
+-}
+-
+-function New-WReparseStats {
+-    [CmdletBinding()]
+-    param(
+-        [int]$Directories = 0,
+-        [int]$Files = 0,
+-        [int]$ReparsePoints = 0,
+-        [int]$Skipped = 0,
+-        [int]$Errors = 0
+-    )
+-    return [pscustomobject][ordered]@{
+-        Directories   = $Directories
+-        Files         = $Files
+-        ReparsePoints = $ReparsePoints
+-        Skipped       = $Skipped
+-        Errors        = $Errors
+-    }
+-}
+-
+-function New-WReparseReport {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$Root,
+-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Records,
+-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Errors,
+-        [Parameter(Mandatory = $true)][object]$Stats
+-    )
+-    return [pscustomobject][ordered]@{
+-        SchemaVersion = $script:WReparseSchemaVersion
+-        GeneratedAt   = (Get-Date).ToString('o')
+-        Root          = $Root
+-        Records       = @($Records)
+-        Errors        = @($Errors)
+-        Stats         = $Stats
+-    }
+-}
++# WReparse - data model
++# Shared vocabulary: error codes, enumerations, and factory helpers.
++# Part of the WReparse implementation. See docs/REPARSE-CONTRACT.md
++#
++# The report data model is fixed by the contract (section 3):
++#   SchemaVersion / Root / Records / Errors / Stats
++# No generation timestamp, no process id, no machine specific value may appear
++# anywhere in the report: two runs over the same tree with the same arguments
++# have to serialise byte-for-byte identically.
++
++Set-StrictMode -Version Latest
++
++# Error codes are part of the public contract. The set is closed: exactly these
++# seven codes may ever show up in Errors[].Code.
++$script:WReparseErrorCode = @(
++    'not_found'
++    'access_denied'
++    'cycle'
++    'broken_target'
++    'structure'
++    'too_deep'
++    'invalid_argument'
++)
++
++$script:WReparseSchemaVersion = 'wreparse/1.0'
++
++# Entry kinds. A hard link is a FILE, not a reparse point: the two NTFS
++# directory entries share one data stream and neither entry carries the
++# FILE_ATTRIBUTE_REPARSE_POINT (0x400) bit. Only entries whose file attributes
++# contain that bit are reported with Kind = 'ReparsePoint'.
++$script:WReparseKindDirectory = 'Directory'
++$script:WReparseKindFile = 'File'
++$script:WReparseKindReparse = 'ReparsePoint'
++
++# A [string] parameter declaration would coerce $null into '', and the contract
++# wants a real JSON null for the optional record fields. Values are therefore
++# normalised through this helper instead of being typed as [string].
++function Get-WReparseNullableString {
++    [CmdletBinding()]
++    param([AllowNull()]$Value)
++    if ($null -eq $Value) { return $null }
++    $text = [string]$Value
++    if ($text.Length -eq 0) { return $null }
++    return $text
++}
++
++function Get-WReparseErrorCode {
++    [CmdletBinding()]
++    param()
++    return $script:WReparseErrorCode
++}
++
++function Get-WReparseSchemaVersion {
++    [CmdletBinding()]
++    param()
++    return $script:WReparseSchemaVersion
++}
++
++function New-WReparseError {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativePath,
++        [Parameter(Mandatory = $true)][string]$Code,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message
++    )
++    if ($script:WReparseErrorCode -notcontains $Code) {
++        throw "Unknown WReparse error code: $Code"
++    }
++    return [pscustomobject][ordered]@{
++        RelativePath = $RelativePath
++        Code         = $Code
++        Message      = $Message
++    }
++}
++
++function New-WReparseRecord {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativePath,
++        [Parameter(Mandatory = $true)][string]$Kind,
++        [AllowNull()]$ReparseKind = $null,
++        [AllowNull()]$Target = $null,
++        [AllowNull()]$ResolvedTarget = $null,
++        [bool]$InScope = $false,
++        [int]$Depth = 0,
++        [long]$Size = 0
++    )
++    return [pscustomobject][ordered]@{
++        RelativePath   = $RelativePath
++        Kind           = $Kind
++        ReparseKind    = (Get-WReparseNullableString -Value $ReparseKind)
++        Target         = (Get-WReparseNullableString -Value $Target)
++        ResolvedTarget = (Get-WReparseNullableString -Value $ResolvedTarget)
++        InScope        = [bool]$InScope
++        Depth          = [int]$Depth
++        Size           = [long]$Size
++    }
++}
++
++function New-WReparseStats {
++    [CmdletBinding()]
++    param(
++        [int]$Directories = 0,
++        [int]$Files = 0,
++        [int]$ReparsePoints = 0,
++        [int]$Skipped = 0,
++        [int]$Errors = 0
++    )
++    return [pscustomobject][ordered]@{
++        Directories   = $Directories
++        Files         = $Files
++        ReparsePoints = $ReparsePoints
++        Skipped       = $Skipped
++        Errors        = $Errors
++    }
++}
++
++function New-WReparseReport {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Root,
++        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][object[]]$Records,
++        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][object[]]$Errors,
++        [Parameter(Mandatory = $true)][object]$Stats
++    )
++    # Field order is contractual (section 3.1) and there is no GeneratedAt:
++    # a timestamp would break byte-for-byte reproducibility.
++    return [pscustomobject][ordered]@{
++        SchemaVersion = $script:WReparseSchemaVersion
++        Root          = $Root
++        Records       = [object[]]@($Records)
++        Errors        = [object[]]@($Errors)
++        Stats         = $Stats
++    }
++}
+diff --git a/WReparse/PathSemantics.ps1 b/WReparse/PathSemantics.ps1
+index babc53d..710f5ab 100644
+--- a/WReparse/PathSemantics.ps1
++++ b/WReparse/PathSemantics.ps1
+@@ -1,93 +1,181 @@
+-# WReparse - path semantics
+-# Canonicalisation, directory-boundary containment, and link-target resolution.
+-# Part of the WReparse implementation. See the contract under docs/
+-
+-# Canonical form used for every comparison and for the report:
+-#   * full (rooted) path with '.' and '..' collapsed
+-#   * no trailing directory separator, except for a volume root ('C:\')
+-#     or a UNC share root
+-#   * original casing preserved
+-function Get-WReparseCanonicalPath {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$Path
+-    )
+-    $full = [System.IO.Path]::GetFullPath($Path)
+-    $trimmed = $full.TrimEnd([char]'\', [char]'/')
+-    return $trimmed.ToLowerInvariant()
+-}
+-
+-# Directory-boundary aware containment. 'C:\root2' is NOT inside 'C:\root'
+-# even though 'C:\root2'.StartsWith('C:\root') is true. Windows path
+-# comparison is case-insensitive, so the ordinal-ignore-case comparer is used.
+-function Test-WReparseWithinRoot {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$Path,
+-        [Parameter(Mandatory = $true)][string]$Root
+-    )
+-    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) {
+-        return $false
+-    }
+-    $p = Get-WReparseCanonicalPath $Path
+-    $r = Get-WReparseCanonicalPath $Root
+-    return $p.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)
+-}
+-
+-# Relative path of a scanned entry with respect to the scan root, using the
+-# Windows separator. The root itself yields '.'.
+-function Get-WReparseRelativePath {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$FullPath,
+-        [Parameter(Mandatory = $true)][string]$Root
+-    )
+-    $p = Get-WReparseCanonicalPath $FullPath
+-    $r = Get-WReparseCanonicalPath $Root
+-    if ([System.StringComparer]::OrdinalIgnoreCase.Equals($p, $r)) { return '.' }
+-    $prefix = $r
+-    if (-not $prefix.EndsWith('\')) { $prefix = $prefix + '\' }
+-    if ($p.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+-        return $p.Substring($prefix.Length)
+-    }
+-    return $p
+-}
+-
+-# The reparse target stored on disk may be relative. A relative target is
+-# resolved against the directory that CONTAINS the link, never against the
+-# process working directory and never against the scan root.
+-function Resolve-WReparseLinkTarget {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$LinkFullPath,
+-        [AllowNull()][string]$RawTarget
+-    )
+-    if ([string]::IsNullOrWhiteSpace($RawTarget)) { return $null }
+-    $candidate = $null
+-    if ([System.IO.Path]::IsPathRooted($RawTarget)) {
+-        $candidate = $RawTarget
+-    }
+-    else {
+-        $candidate = [System.IO.Path]::GetFullPath($RawTarget)
+-    }
+-    try {
+-        return Get-WReparseCanonicalPath $candidate
+-    }
+-    catch {
+-        return $null
+-    }
+-}
+-
+-# Stable ordering key: ordinal, case-insensitive first, with a case-sensitive
+-# tie-break so that two entries whose names differ only by case keep a
+-# deterministic position.
+-function Compare-WReparsePath {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$Left,
+-        [Parameter(Mandatory = $true)][string]$Right
+-    )
+-    $primary = [System.StringComparer]::OrdinalIgnoreCase.Compare($Left, $Right)
+-    if ($primary -ne 0) { return $primary }
+-    return [System.StringComparer]::Ordinal.Compare($Left, $Right)
+-}
++# WReparse - path semantics
++# Canonicalisation, directory-boundary containment, and link-target resolution.
++# Part of the WReparse implementation. See docs/REPARSE-CONTRACT.md
++#
++# Canonical form used for every comparison and for the report:
++#   * full (rooted) path with '.' and '..' collapsed
++#   * separators normalised to '\'
++#   * no trailing directory separator, except for a volume root ('C:\')
++#   * the caller's casing is preserved verbatim - canonicalisation is a lexical
++#     operation, so it never lower-cases a path and never asks the file system
++#     for the 'real' spelling of a name.
++
++# Current file-system location, used only to expand a relative argument. It is
++# never used to resolve a relative *link target*: those are resolved against the
++# directory that contains the link.
++function Get-WReparseCurrentLocation {
++    [CmdletBinding()]
++    param()
++    try {
++        $location = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation
++        if ($null -ne $location) {
++            $providerPath = $location.ProviderPath
++            if (-not [string]::IsNullOrEmpty($providerPath)) { return [string]$providerPath }
++        }
++    }
++    catch { }
++    try {
++        $pwdPath = $PWD.ProviderPath
++        if (-not [string]::IsNullOrEmpty($pwdPath)) { return [string]$pwdPath }
++    }
++    catch { }
++    return [string][System.Environment]::CurrentDirectory
++}
++
++# Lexical canonicalisation. Returns $null when the string cannot be turned into a
++# rooted path at all (empty, whitespace only, illegal characters, malformed UNC,
++# ...). Callers decide how to report that; the scan reports 'invalid_argument'.
++function Get-WReparseCanonicalPathOrNull {
++    [CmdletBinding()]
++    param([AllowNull()][AllowEmptyString()][string]$Path)
++
++    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
++    $candidate = [string]$Path
++
++    # '\\?\' and '\??\' are NT namespace transport forms of the very same path.
++    if ($candidate.Length -ge 4) {
++        $head = $candidate.Substring(0, 4)
++        if ($head -eq '\\?\' -or $head -eq '\??\') {
++            $candidate = $candidate.Substring(4)
++            if ($candidate.StartsWith('UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
++                $candidate = '\' + $candidate.Substring(4)
++            }
++        }
++    }
++
++    $isRooted = $false
++    try { $isRooted = [System.IO.Path]::IsPathRooted($candidate) }
++    catch { return $null }
++
++    if (-not $isRooted) {
++        $base = Get-WReparseCurrentLocation
++        if (-not [string]::IsNullOrEmpty($base)) {
++            try { $candidate = [System.IO.Path]::Combine($base, $candidate) }
++            catch { return $null }
++        }
++    }
++
++    $full = $null
++    try { $full = [System.IO.Path]::GetFullPath($candidate) }
++    catch { return $null }
++    if ([string]::IsNullOrWhiteSpace($full)) { return $null }
++
++    $full = $full.Replace([char]'/', [char]'\')
++
++    # Strip trailing separators, but never mangle a volume root ('C:\').
++    $isVolumeRoot = ($full.Length -eq 3) -and ($full[1] -eq [char]':') -and ($full[2] -eq [char]'\')
++    if ((-not $isVolumeRoot) -and ($full.Length -gt 1)) {
++        $full = $full.TrimEnd([char]'\')
++    }
++    if ([string]::IsNullOrEmpty($full)) { return $null }
++    return $full
++}
++
++function Get-WReparseCanonicalPath {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path
++    )
++    $canonical = Get-WReparseCanonicalPathOrNull -Path $Path
++    if ($null -eq $canonical) {
++        throw (New-Object System.ArgumentException("Path cannot be canonicalised: '$Path'", 'Path'))
++    }
++    return $canonical
++}
++
++# Directory-boundary aware containment. 'C:\root2' is NOT inside 'C:\root' even
++# though 'C:\root2'.StartsWith('C:\root') is true, so the prefix has to be
++# terminated by a separator. Windows path comparison is case-insensitive; the
++# ordinal-ignore-case comparer is used so the answer never depends on the host
++# culture (a culture-aware compare would order non-ASCII names differently).
++function Test-WReparseWithinRoot {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Root
++    )
++    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) {
++        return $false
++    }
++    $child = Get-WReparseCanonicalPathOrNull -Path $Path
++    $parent = Get-WReparseCanonicalPathOrNull -Path $Root
++    if ($null -eq $child -or $null -eq $parent) { return $false }
++    if ([string]::Equals($child, $parent, [System.StringComparison]::OrdinalIgnoreCase)) {
++        return $true
++    }
++    $prefix = $parent
++    if (-not $prefix.EndsWith([string][char]'\', [System.StringComparison]::Ordinal)) {
++        $prefix = $prefix + '\'
++    }
++    return [bool]$child.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
++}
++
++# The reparse target stored on disk may be relative. A relative target is
++# resolved against the directory that CONTAINS the link - never against the
++# process working directory and never against the scan root. The result is
++# purely lexical: a dangling link still resolves to the path it points at.
++function Resolve-WReparseLinkTarget {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$LinkFullPath,
++        [AllowNull()][AllowEmptyString()][string]$RawTarget
++    )
++    if ([string]::IsNullOrWhiteSpace($RawTarget)) { return $null }
++    $raw = ([string]$RawTarget).Trim()
++    if ($raw.Length -eq 0) { return $null }
++
++    # Volume GUID paths ('\\?\Volume{...}\') keep their namespace form.
++    if ($raw.StartsWith('\??\Volume{', [System.StringComparison]::OrdinalIgnoreCase) -or
++        $raw.StartsWith('\\?\Volume{', [System.StringComparison]::OrdinalIgnoreCase)) {
++        return [string]('\\?\' + $raw.Substring(4).TrimEnd([char]'\'))
++    }
++
++    $candidate = $raw
++    $isRooted = $false
++    try { $isRooted = [System.IO.Path]::IsPathRooted($candidate) }
++    catch { return $null }
++
++    if (-not $isRooted) {
++        $linkDirectory = $null
++        if (-not [string]::IsNullOrWhiteSpace($LinkFullPath)) {
++            $canonicalLink = Get-WReparseCanonicalPathOrNull -Path $LinkFullPath
++            if ($null -ne $canonicalLink) {
++                try { $linkDirectory = [System.IO.Path]::GetDirectoryName($canonicalLink) }
++                catch { $linkDirectory = $null }
++            }
++        }
++        if ([string]::IsNullOrEmpty($linkDirectory)) { $linkDirectory = Get-WReparseCurrentLocation }
++        try { $candidate = [System.IO.Path]::Combine($linkDirectory, $raw) }
++        catch { return $null }
++    }
++
++    return Get-WReparseCanonicalPathOrNull -Path $candidate
++}
++
++# Stable ordering key: ordinal, case-insensitive first, with a case-sensitive
++# tie-break so that two entries whose names differ only by case keep a
++# deterministic position. This is the order the observed provider facts require
++# and it is identical under en-US, de-DE and ja-JP because no culture-aware
++# collation is involved at all.
++function Compare-WReparsePath {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Left,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Right
++    )
++    $leftValue = [string]$Left
++    $rightValue = [string]$Right
++    $primary = [System.StringComparer]::OrdinalIgnoreCase.Compare($leftValue, $rightValue)
++    if ($primary -ne 0) { return $primary }
++    return [System.StringComparer]::Ordinal.Compare($leftValue, $rightValue)
++}
+diff --git a/WReparse/WReparse.psd1 b/WReparse/WReparse.psd1
+index 1303467..d2fe6b6 100644
+--- a/WReparse/WReparse.psd1
++++ b/WReparse/WReparse.psd1
+@@ -1,19 +1,26 @@
+-@{
+-    RootModule        = 'WReparse.psm1'
+-    ModuleVersion     = '1.0.0'
+-    GUID              = 'b6a1f0d2-3c47-4f8e-9a51-0d7c2e5b8143'
+-    Author            = 'vendor'
+-    CompanyName       = 'vendor'
+-    Description       = 'Safe reparse-point traversal and deterministic audit reporting for Windows directory trees.'
+-    PowerShellVersion = '5.1'
+-    FunctionsToExport = '*'
+-    CmdletsToExport   = @()
+-    VariablesToExport = @()
+-    AliasesToExport   = @()
+-    PrivateData       = @{
+-        PSData = @{
+-            Tags       = @('windows', 'ntfs', 'reparse', 'powershell')
+-            ProjectUri = ''
+-        }
+-    }
+-}
++@{
++    RootModule        = 'WReparse.psm1'
++    ModuleVersion     = '1.0.0'
++    GUID              = 'b6a1f0d2-3c47-4f8e-9a51-0d7c2e5b8143'
++    Author            = 'vendor'
++    CompanyName       = 'vendor'
++    Description       = 'Safe reparse-point traversal and deterministic audit reporting for Windows directory trees.'
++    PowerShellVersion = '5.1'
++    FunctionsToExport = @(
++        'Get-WReparseReport'
++        'ConvertTo-WReparseJson'
++        'Get-WReparseSchemaVersion'
++        'Test-WReparseWithinRoot'
++        'Get-WReparseCanonicalPath'
++        'Resolve-WReparseLinkTarget'
++    )
++    CmdletsToExport   = @()
++    VariablesToExport = @()
++    AliasesToExport   = @()
++    PrivateData       = @{
++        PSData = @{
++            Tags       = @('windows', 'ntfs', 'reparse', 'powershell')
++            ProjectUri = ''
++        }
++    }
++}
+diff --git a/WReparse/WReparse.psm1 b/WReparse/WReparse.psm1
+index 29511d1..bae4c32 100644
+--- a/WReparse/WReparse.psm1
++++ b/WReparse/WReparse.psm1
+@@ -1,12 +1,23 @@
+-# WReparse - root module
+-# Root module. Loads the implementation files and publishes the public surface
+-# described in the contract under docs/
+-
+-$moduleRoot = $PSScriptRoot
+-
+-. (Join-Path $moduleRoot ('Model' + '.ps1'))
+-. (Join-Path $moduleRoot ('PathSemantics' + '.ps1'))
+-. (Join-Path $moduleRoot ('Walker' + '.ps1'))
+-. (Join-Path $moduleRoot ('Audit' + '.ps1'))
+-
+-Export-ModuleMember -Function *
++# WReparse - root module
++# Loads the implementation files and publishes exactly the public surface
++# described in docs/REPARSE-CONTRACT.md section 2. Everything else defined by the
++# implementation stays module-private: importing WReparse must make exactly six
++# functions visible.
++
++$moduleRoot = $PSScriptRoot
++
++. (Join-Path $moduleRoot ('Model' + '.ps1'))
++. (Join-Path $moduleRoot ('PathSemantics' + '.ps1'))
++. (Join-Path $moduleRoot ('Walker' + '.ps1'))
++. (Join-Path $moduleRoot ('Audit' + '.ps1'))
++
++$script:WReparsePublicFunctions = @(
++    'Get-WReparseReport'
++    'ConvertTo-WReparseJson'
++    'Get-WReparseSchemaVersion'
++    'Test-WReparseWithinRoot'
++    'Get-WReparseCanonicalPath'
++    'Resolve-WReparseLinkTarget'
++)
++
++Export-ModuleMember -Function $script:WReparsePublicFunctions
+diff --git a/WReparse/Walker.ps1 b/WReparse/Walker.ps1
+index 79e6514..fdefe94 100644
+--- a/WReparse/Walker.ps1
++++ b/WReparse/Walker.ps1
+@@ -1,200 +1,348 @@
+-# WReparse - directory walker
+-# Safe directory enumeration: reparse classification, containment, cycle and
+-# depth control. Part of the WReparse reference implementation.
+-
+-function Get-WReparseMemberValue {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)]$InputObject,
+-        [Parameter(Mandatory = $true)][string]$Name
+-    )
+-    if ($null -eq $InputObject) { return $null }
+-    $property = $InputObject.PSObject.Properties[$Name]
+-    if ($null -eq $property) { return $null }
+-    return $property.Value
+-}
+-
+-# Maps the provider link type to the contract vocabulary. Only entries whose
+-# file attributes carry FILE_ATTRIBUTE_REPARSE_POINT reach this function, so a
+-# hard link (which has a link type but no reparse attribute) is never mapped.
+-function Get-WReparseKindFromLinkType {
+-    [CmdletBinding()]
+-    param([AllowNull()][string]$LinkType)
+-    switch ($LinkType) {
+-        'SymbolicLink' { return 'SymbolicLink' }
+-        'Junction' { return 'SymbolicLink' }
+-        'MountPoint' { return 'MountPoint' }
+-        default { return 'Unknown' }
+-    }
+-}
+-
+-function Test-WReparseIsReparsePoint {
+-    [CmdletBinding()]
+-    param([Parameter(Mandatory = $true)]$Item)
+-    $linkType = Get-WReparseMemberValue -InputObject $Item -Name 'LinkType'
+-    return -not [string]::IsNullOrWhiteSpace([string]$linkType)
+-}
+-
+-function Add-WReparseError {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][hashtable]$State,
+-        [Parameter(Mandatory = $true)][string]$RelativePath,
+-        [Parameter(Mandatory = $true)][string]$Code,
+-        [Parameter(Mandatory = $true)][string]$Message
+-    )
+-    [void]$State.Errors.Add((New-WReparseError -RelativePath $RelativePath -Code $Code -Message $Message))
+-}
+-
+-function Invoke-WReparseDirectoryWalk {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$RealDirectory,
+-        [Parameter(Mandatory = $true)][string]$VirtualDirectory,
+-        [Parameter(Mandatory = $true)][int]$Depth,
+-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Ancestry,
+-        [Parameter(Mandatory = $true)][hashtable]$State
+-    )
+-    if ($Depth -ge $State.MaxDepth) {
+-        $relative = Get-WReparseRelativePath -FullPath $VirtualDirectory -Root $State.Root
+-        Add-WReparseError -State $State -RelativePath $relative -Code 'too_deep' `
+-            -Message "Depth limit of $($State.MaxDepth) reached; not enumerating."
+-        return
+-    }
+-
+-    $children = @()
+-    try {
+-        $children = @(Get-ChildItem -LiteralPath $RealDirectory -Force -ErrorAction Stop)
+-    }
+-    catch [System.UnauthorizedAccessException] {
+-        $relative = Get-WReparseRelativePath -FullPath $VirtualDirectory -Root $State.Root
+-        Add-WReparseError -State $State -RelativePath $relative -Code 'access_denied' `
+-            -Message 'Access denied while enumerating the directory.'
+-        return
+-    }
+-    catch {
+-        $relative = Get-WReparseRelativePath -FullPath $VirtualDirectory -Root $State.Root
+-        Add-WReparseError -State $State -RelativePath $relative -Code 'access_denied' `
+-            -Message $_.Exception.Message
+-        return
+-    }
+-
+-    foreach ($child in $children) {
+-        $childDepth = $Depth + 1
+-        $realChild = Get-WReparseMemberValue -InputObject $child -Name 'FullName'
+-        $virtualChild = Join-Path $VirtualDirectory (Split-Path -Leaf $realChild)
+-        $relative = Get-WReparseRelativePath -FullPath $virtualChild -Root $State.Root
+-
+-        if (Test-WReparseIsReparsePoint -Item $child) {
+-            $linkType = [string](Get-WReparseMemberValue -InputObject $child -Name 'LinkType')
+-            $rawTargetValue = Get-WReparseMemberValue -InputObject $child -Name 'Target'
+-            # The provider exposes Target as a string[] (a reparse point may
+-            # carry several substitutions); the contract keeps the first one.
+-            if ($null -eq $rawTargetValue) {
+-                $rawTarget = $null
+-            }
+-            elseif ($rawTargetValue -is [string]) {
+-                $rawTarget = $rawTargetValue
+-            }
+-            else {
+-                $rawTarget = [string](@($rawTargetValue) | Select-Object -First 1)
+-            }
+-            $resolved = Resolve-WReparseLinkTarget -LinkFullPath $realChild -RawTarget $rawTarget
+-            $inScope = $false
+-            if ($null -ne $resolved) {
+-                $inScope = Test-WReparseWithinRoot -Path $resolved -Root $State.Root
+-            }
+-            [void]$State.Records.Add((New-WReparseRecord -RelativePath $relative -Kind 'ReparsePoint' `
+-                -ReparseKind (Get-WReparseKindFromLinkType -LinkType $linkType) `
+-                -Target $rawTarget -ResolvedTarget $resolved -InScope $inScope `
+-                -Depth $Depth -Size 0))
+-
+-            if ($null -eq $resolved) {
+-                Add-WReparseError -State $State -RelativePath $relative -Code 'broken_target' `
+-                    -Message 'The reparse target could not be resolved.'
+-                if (-not $State.Follow) { $State.Skipped++ }
+-                continue
+-            }
+-            if (-not (Test-Path -LiteralPath $resolved)) {
+-                Add-WReparseError -State $State -RelativePath $relative -Code 'broken_target' `
+-                    -Message 'The reparse target does not exist.'
+-                if (-not $State.Follow) { $State.Skipped++ }
+-                continue
+-            }
+-            if (-not $State.Follow) {
+-                $State.Skipped++
+-                continue
+-            }
+-            if ($Ancestry -contains $resolved) {
+-                Add-WReparseError -State $State -RelativePath $relative -Code 'cycle' `
+-                    -Message 'The reparse target is an ancestor already visited on this branch.'
+-                continue
+-            }
+-            if (Test-Path -LiteralPath $resolved -PathType Container) {
+-                Invoke-WReparseDirectoryWalk -RealDirectory $resolved -VirtualDirectory $resolved `
+-                    -Depth $childDepth -Ancestry ($Ancestry + $resolved) -State $State
+-            }
+-            continue
+-        }
+-
+-        $isContainer = [bool](Get-WReparseMemberValue -InputObject $child -Name 'PSIsContainer')
+-        $size = 0
+-        if (-not $isContainer) {
+-            $length = Get-WReparseMemberValue -InputObject $child -Name 'Length'
+-            if ($null -ne $length) { $size = [long]$length }
+-        }
+-        $kind = if ($isContainer) { 'Directory' } else { 'File' }
+-        [void]$State.Records.Add((New-WReparseRecord -RelativePath $relative -Kind $kind `
+-            -InScope (Test-WReparseWithinRoot -Path $realChild -Root $State.Root) -Depth $Depth -Size $size))
+-
+-        if ($isContainer) {
+-            $realChildCanonical = Get-WReparseCanonicalPath $realChild
+-            Invoke-WReparseDirectoryWalk -RealDirectory $realChildCanonical -VirtualDirectory $virtualChild `
+-                -Depth $childDepth -Ancestry ($Ancestry + $realChildCanonical) -State $State
+-        }
+-    }
+-}
+-
+-function Invoke-WReparseWalk {
+-    [CmdletBinding()]
+-    param(
+-        [Parameter(Mandatory = $true)][string]$Root,
+-        [ValidateSet('Never', 'Always')][string]$FollowMode = 'Never',
+-        [int]$MaxDepth = 32
+-    )
+-    $state = @{
+-        Records  = New-Object System.Collections.ArrayList
+-        Errors   = New-Object System.Collections.ArrayList
+-        Skipped  = 0
+-        Root     = $null
+-        Follow   = $true
+-        MaxDepth = $MaxDepth
+-    }
+-
+-    $canonicalRoot = $null
+-    try { $canonicalRoot = Get-WReparseCanonicalPath $Root }
+-    catch {
+-        return [pscustomobject]@{ Records = @(); Errors = @(); Skipped = 0 }
+-    }
+-
+-    if (-not (Test-Path -LiteralPath $canonicalRoot)) {
+-        Add-WReparseError -State $state -RelativePath '.' -Code 'not_found' `
+-            -Message "Scan root does not exist: $canonicalRoot"
+-        return [pscustomobject]@{ Records = @(); Errors = $state.Errors.ToArray(); Skipped = 0 }
+-    }
+-    if (-not (Test-Path -LiteralPath $canonicalRoot -PathType Container)) {
+-        Add-WReparseError -State $state -RelativePath '.' -Code 'structure' `
+-            -Message "Scan root is not a directory: $canonicalRoot"
+-        return [pscustomobject]@{ Records = @(); Errors = $state.Errors.ToArray(); Skipped = 0 }
+-    }
+-
+-    $state.Root = $canonicalRoot
+-    Invoke-WReparseDirectoryWalk -RealDirectory $canonicalRoot -VirtualDirectory $canonicalRoot `
+-        -Depth 0 -Ancestry @($canonicalRoot) -State $state
+-
+-    return [pscustomobject]@{
+-        Records = $state.Records.ToArray()
+-        Errors  = $state.Errors.ToArray()
+-        Skipped = $state.Skipped
+-    }
+-}
++# WReparse - directory walker
++# Safe directory enumeration: reparse classification, containment, cycle and
++# depth control. Part of the WReparse implementation.
++# See docs/REPARSE-CONTRACT.md and ../assets/observed-provider-facts.json
++#
++# Ground rules that the walk has to honour:
++#   * the scan root itself is never emitted as a record; its children are at
++#     depth 1, and depth grows by one per level;
++#   * a directory whose own depth already reached -MaxDepth is NOT enumerated;
++#     a single 'too_deep' error is recorded against it. -MaxDepth below zero is
++#     clamped to 0, which makes '-MaxDepth -1' byte-identical to '-MaxDepth 0';
++#   * without -Follow no reparse point is ever entered (each one is counted in
++#     Stats.Skipped) and no cycle/broken_target probing happens at all;
++#   * with -Follow a reparse point is entered under the NAME OF THE LINK, not
++#     under the real target path; only a target that is an ancestor of the
++#     current branch is a cycle - two sibling links pointing at the same
++#     directory are not;
++#   * entries are classified by the FILE_ATTRIBUTE_REPARSE_POINT bit, never by
++#     the provider's LinkType: a hard link has a LinkType but no reparse bit and
++#     is therefore an ordinary file.
++
++# FILE_ATTRIBUTE_REPARSE_POINT
++$script:WReparseAttributeReparsePoint = 0x400
++
++function Get-WReparseMemberValue {
++    [CmdletBinding()]
++    param(
++        [AllowNull()]$InputObject,
++        [Parameter(Mandatory = $true)][string]$Name
++    )
++    if ($null -eq $InputObject) { return $null }
++    $psObject = $InputObject.PSObject
++    if ($null -eq $psObject) { return $null }
++    $property = $psObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    try { return $property.Value }
++    catch { return $null }
++}
++
++# The provider reports LinkType for hard links too ('HardLink'), but hard links
++# are not reparse points, so this mapping is only ever reached for entries that
++# do carry the reparse attribute. Junction and SymbolicLink stay distinct.
++function Get-WReparseKindFromLinkType {
++    [CmdletBinding()]
++    param([AllowNull()][string]$LinkType)
++    switch ([string]$LinkType) {
++        'SymbolicLink' { return 'SymbolicLink' }
++        'Junction' { return 'Junction' }
++        'MountPoint' { return 'MountPoint' }
++        'HardLink' { return 'HardLink' }
++        '' { return 'Unknown' }
++        default { return [string]$LinkType }
++    }
++}
++
++function Test-WReparseIsReparsePoint {
++    [CmdletBinding()]
++    param([AllowNull()]$Item)
++    $attributes = Get-WReparseMemberValue -InputObject $Item -Name 'Attributes'
++    if ($null -eq $attributes) { return $false }
++    return (([int]$attributes -band $script:WReparseAttributeReparsePoint) -ne 0)
++}
++
++function Test-WReparseIsContainer {
++    [CmdletBinding()]
++    param([AllowNull()]$Item)
++    $isContainer = Get-WReparseMemberValue -InputObject $Item -Name 'PSIsContainer'
++    if ($null -eq $isContainer) { return $false }
++    return [bool]$isContainer
++}
++
++# The provider hands out .Target as a collection (System.String[] for links, a
++# List[string] for hard links) and PowerShell unrolls a single-element array when
++# it is returned from a helper, so the runtime type of a forwarded .Target would
++# depend on the number of targets. The report always stores a string: one target
++# is stored verbatim, several targets are joined with ';'.
++function Get-WReparseRawTargetString {
++    [CmdletBinding()]
++    param([AllowNull()]$Target)
++    if ($null -eq $Target) { return $null }
++    if ($Target -is [string]) {
++        $single = [string]$Target
++        if ($single.Length -eq 0) { return $null }
++        return $single
++    }
++    $elements = @($Target)
++    if ($elements.Count -eq 0) { return $null }
++    $parts = New-Object System.Collections.ArrayList
++    foreach ($element in $elements) {
++        if ($null -ne $element) {
++            $text = [string]$element
++            if ($text.Length -gt 0) { [void]$parts.Add($text) }
++        }
++    }
++    if ($parts.Count -eq 0) { return $null }
++    return [string]::Join(';', [string[]]$parts.ToArray())
++}
++
++function Test-WReparseIsAncestor {
++    [CmdletBinding()]
++    param(
++        [AllowNull()][string[]]$Ancestry,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path
++    )
++    if ($null -eq $Ancestry) { return $false }
++    foreach ($ancestor in $Ancestry) {
++        if ($null -eq $ancestor) { continue }
++        if ([string]::Equals([string]$ancestor, $Path, [System.StringComparison]::OrdinalIgnoreCase)) {
++            return $true
++        }
++    }
++    return $false
++}
++
++function Add-WReparseError {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][hashtable]$State,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativePath,
++        [Parameter(Mandatory = $true)][string]$Code,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message
++    )
++    [void]$State.Errors.Add((New-WReparseError -RelativePath $RelativePath -Code $Code -Message $Message))
++}
++
++# '.' is the contractual relative path of the scan root itself.
++function Get-WReparseDisplayRelativePath {
++    [CmdletBinding()]
++    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$RelativePath)
++    if ([string]::IsNullOrEmpty($RelativePath)) { return '.' }
++    return $RelativePath
++}
++
++function Invoke-WReparseDirectoryWalk {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][string]$RealDirectory,
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$VirtualRelative,
++        [Parameter(Mandatory = $true)][int]$Depth,
++        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Ancestry,
++        [Parameter(Mandatory = $true)][hashtable]$State
++    )
++
++    if ($Depth -ge $State.MaxDepth) {
++        Add-WReparseError -State $State `
++            -RelativePath (Get-WReparseDisplayRelativePath -RelativePath $VirtualRelative) `
++            -Code 'too_deep' `
++            -Message "Depth limit of $($State.MaxDepth) reached; not enumerating."
++        return
++    }
++
++    $children = @()
++    try {
++        $children = @(Get-ChildItem -LiteralPath $RealDirectory -Force -ErrorAction Stop)
++    }
++    catch {
++        Add-WReparseError -State $State `
++            -RelativePath (Get-WReparseDisplayRelativePath -RelativePath $VirtualRelative) `
++            -Code 'access_denied' `
++            -Message ('Directory could not be enumerated: ' + [string]$_.Exception.Message)
++        return
++    }
++
++    foreach ($child in $children) {
++        if ($null -eq $child) { continue }
++
++        $name = [string](Get-WReparseMemberValue -InputObject $child -Name 'Name')
++        $childFull = [string](Get-WReparseMemberValue -InputObject $child -Name 'FullName')
++        if ([string]::IsNullOrEmpty($name)) {
++            if ([string]::IsNullOrEmpty($childFull)) { continue }
++            $name = [string]$childFull
++        }
++        $childDepth = $Depth + 1
++        if ([string]::IsNullOrEmpty($VirtualRelative)) {
++            $childRelative = $name
++        }
++        else {
++            $childRelative = $VirtualRelative + '\' + $name
++        }
++
++        if (Test-WReparseIsReparsePoint -Item $child) {
++            $linkType = [string](Get-WReparseMemberValue -InputObject $child -Name 'LinkType')
++            $rawTarget = Get-WReparseRawTargetString -Target (Get-WReparseMemberValue -InputObject $child -Name 'Target')
++            $resolved = Resolve-WReparseLinkTarget -LinkFullPath $childFull -RawTarget $rawTarget
++
++            $inScope = $false
++            if ($null -ne $resolved) {
++                $inScope = Test-WReparseWithinRoot -Path $resolved -Root $State.Root
++            }
++
++            [void]$State.Records.Add((New-WReparseRecord `
++                -RelativePath $childRelative `
++                -Kind $script:WReparseKindReparse `
++                -ReparseKind (Get-WReparseKindFromLinkType -LinkType $linkType) `
++                -Target $rawTarget `
++                -ResolvedTarget $resolved `
++                -InScope $inScope `
++                -Depth $childDepth `
++                -Size 0))
++
++            if (-not $State.Follow) {
++                # Registered but never entered; no probing of the target either,
++                # so a dangling or looping target produces no error at all.
++                $State.Skipped = [int]$State.Skipped + 1
++                continue
++            }
++
++            if ($null -eq $resolved) {
++                Add-WReparseError -State $State -RelativePath $childRelative -Code 'broken_target' `
++                    -Message 'The reparse target could not be resolved.'
++                continue
++            }
++
++            $exists = $false
++            $isContainer = $false
++            try {
++                $exists = [bool](Test-Path -LiteralPath $resolved)
++                if ($exists) { $isContainer = [bool](Test-Path -LiteralPath $resolved -PathType Container) }
++            }
++            catch {
++                $exists = $false
++                $isContainer = $false
++            }
++
++            if (-not $exists) {
++                Add-WReparseError -State $State -RelativePath $childRelative -Code 'broken_target' `
++                    -Message 'The reparse target does not exist.'
++                continue
++            }
++            if (-not $isContainer) {
++                # A link onto a file is registered, but it has no children.
++                continue
++            }
++
++            $targetCanonical = Get-WReparseCanonicalPathOrNull -Path $resolved
++            if ($null -eq $targetCanonical) { $targetCanonical = $resolved }
++
++            if (Test-WReparseIsAncestor -Ancestry $Ancestry -Path $targetCanonical) {
++                Add-WReparseError -State $State -RelativePath $childRelative -Code 'cycle' `
++                    -Message 'The reparse target is an ancestor already visited on this branch.'
++                continue
++            }
++
++            # Entered under the link's own relative path, so every descendant is
++            # named after the link and not after the real target.
++            Invoke-WReparseDirectoryWalk -RealDirectory $targetCanonical -VirtualRelative $childRelative `
++                -Depth $childDepth -Ancestry (@($Ancestry) + $targetCanonical) -State $State
++            continue
++        }
++
++        $isContainer = Test-WReparseIsContainer -Item $child
++        $size = [long]0
++        if (-not $isContainer) {
++            $length = Get-WReparseMemberValue -InputObject $child -Name 'Length'
++            if ($null -ne $length) {
++                try { $size = [long]$length } catch { $size = [long]0 }
++            }
++        }
++
++        $kind = if ($isContainer) { $script:WReparseKindDirectory } else { $script:WReparseKindFile }
++
++        # InScope only means something for a reparse point (it says whether the
++        # resolved target stays inside the scan root). Plain files and
++        # directories are where they are, so they are always false.
++        [void]$State.Records.Add((New-WReparseRecord `
++            -RelativePath $childRelative `
++            -Kind $kind `
++            -ReparseKind $null `
++            -Target $null `
++            -ResolvedTarget $null `
++            -InScope $false `
++            -Depth $childDepth `
++            -Size $size))
++
++        if ($isContainer) {
++            $childCanonical = Get-WReparseCanonicalPathOrNull -Path $childFull
++            if ($null -eq $childCanonical) { $childCanonical = $childFull }
++            Invoke-WReparseDirectoryWalk -RealDirectory $childCanonical -VirtualRelative $childRelative `
++                -Depth $childDepth -Ancestry (@($Ancestry) + $childCanonical) -State $State
++        }
++    }
++}
++
++function Invoke-WReparseWalk {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Root,
++        [bool]$Follow = $false,
++        [int]$MaxDepth = 32
++    )
++
++    # '-MaxDepth -1' has to behave exactly like '-MaxDepth 0'.
++    $effectiveMaxDepth = $MaxDepth
++    if ($effectiveMaxDepth -lt 0) { $effectiveMaxDepth = 0 }
++
++    $state = @{
++        Records  = (New-Object System.Collections.ArrayList)
++        Errors   = (New-Object System.Collections.ArrayList)
++        Skipped  = 0
++        Root     = [string]$Root
++        Follow   = [bool]$Follow
++        MaxDepth = [int]$effectiveMaxDepth
++    }
++
++    $canonicalRoot = Get-WReparseCanonicalPathOrNull -Path $Root
++    if ($null -eq $canonicalRoot) {
++        Add-WReparseError -State $state -RelativePath '.' -Code 'invalid_argument' `
++            -Message "Scan root cannot be canonicalised: $Root"
++        return [pscustomobject]@{
++            Root    = [string]$Root
++            Records = [object[]]@()
++            Errors  = [object[]]$state.Errors.ToArray()
++            Skipped = 0
++        }
++    }
++    $state.Root = $canonicalRoot
++
++    if (-not (Test-Path -LiteralPath $canonicalRoot)) {
++        Add-WReparseError -State $state -RelativePath '.' -Code 'not_found' `
++            -Message "Scan root does not exist: $canonicalRoot"
++        return [pscustomobject]@{
++            Root    = $canonicalRoot
++            Records = [object[]]@()
++            Errors  = [object[]]$state.Errors.ToArray()
++            Skipped = 0
++        }
++    }
++    if (-not (Test-Path -LiteralPath $canonicalRoot -PathType Container)) {
++        Add-WReparseError -State $state -RelativePath '.' -Code 'structure' `
++            -Message "Scan root is not a directory: $canonicalRoot"
++        return [pscustomobject]@{
++            Root    = $canonicalRoot
++            Records = [object[]]@()
++            Errors  = [object[]]$state.Errors.ToArray()
++            Skipped = 0
++        }
++    }
++
++    Invoke-WReparseDirectoryWalk -RealDirectory $canonicalRoot -VirtualRelative '' `
++        -Depth 0 -Ancestry @($canonicalRoot) -State $state
++
++    return [pscustomobject]@{
++        Root    = $canonicalRoot
++        Records = [object[]]$state.Records.ToArray()
++        Errors  = [object[]]$state.Errors.ToArray()
++        Skipped = [int]$state.Skipped
++    }
++}
+diff --git a/selftest.ps1 b/selftest.ps1
+new file mode 100644
+index 0000000..9bdaaab
+--- /dev/null
++++ b/selftest.ps1
+@@ -0,0 +1,1272 @@
++<#
++.SYNOPSIS
++    Candidate-side self verification for the WReparse module.
++
++.DESCRIPTION
++    Builds an NTFS fixture (junction, relative/absolute symbolic links, hard link,
++    non-ASCII names, access-denied sub directory, ancestor loop, dangling target,
++    sibling links that share one target, link onto a file, empty directory, subtree
++    deeper than the default depth limit, plus a replica of the tree used by the
++    published contract samples) and asserts every behaviour of the acceptance list
++    against the module's public API.
++
++    The script is read-only with respect to the repository, does not touch the
++    network, needs no external module and needs no administrator rights. Symbolic
++    link creation is attempted; when the privilege is missing the affected checks
++    are reported as [SKIP] instead of [FAIL].
++
++    Usage:
++        powershell -NoProfile -ExecutionPolicy Bypass -File environment\workspace\selftest.ps1
++
++    Exit code: 0 when every executed check passed, 1 otherwise.
++#>
++
++[CmdletBinding()]
++param(
++    [string]$WorkRoot = '',
++    [string]$ModuleManifest = ''
++)
++
++$ErrorActionPreference = 'Stop'
++
++$script:PassCount = 0
++$script:FailCount = 0
++$script:SkipCount = 0
++
++# ---------------------------------------------------------------------------
++# assertion helpers
++# ---------------------------------------------------------------------------
++function Format-Value {
++    param($Value)
++    if ($null -eq $Value) { return '$null' }
++    if (($Value -is [System.Collections.IEnumerable]) -and ($Value -isnot [string])) {
++        return ('[' + ((@($Value) | ForEach-Object { Format-Value $_ }) -join ', ') + ']')
++    }
++    return [string]$Value
++}
++
++function Write-CheckResult {
++    param([string]$Status, [string]$Title, [string]$Detail)
++    if ([string]::IsNullOrEmpty($Detail)) { Write-Host ("[{0}] {1}" -f $Status, $Title) }
++    else { Write-Host ("[{0}] {1} -- {2}" -f $Status, $Title, $Detail) }
++}
++
++function Invoke-Check {
++    param(
++        [Parameter(Mandatory = $true)][string]$Title,
++        [Parameter(Mandatory = $true)][scriptblock]$Body
++    )
++    try {
++        & $Body
++        $script:PassCount++
++        Write-CheckResult 'PASS' $Title ''
++    }
++    catch {
++        $script:FailCount++
++        $detail = [string]$_.Exception.Message
++        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = [string]$_ }
++        $detail = ($detail -replace '\s+', ' ').Trim()
++        if ($detail.Length -gt 260) { $detail = $detail.Substring(0, 260) + '...' }
++        Write-CheckResult 'FAIL' $Title $detail
++    }
++}
++
++function Invoke-Skip {
++    param([string]$Title, [string]$Reason)
++    $script:SkipCount++
++    Write-CheckResult 'SKIP' $Title $Reason
++}
++
++function Invoke-SymLinkCheck {
++    param(
++        [Parameter(Mandatory = $true)][string]$Title,
++        [Parameter(Mandatory = $true)][scriptblock]$Body
++    )
++    if ($script:HaveSymLinks) { Invoke-Check -Title $Title -Body $Body }
++    else { Invoke-Skip -Title $Title -Reason 'symbolic link creation is not permitted for this user' }
++}
++
++function Assert-True {
++    param([bool]$Condition, [string]$Message)
++    if (-not $Condition) { throw $Message }
++}
++
++function Assert-Equal {
++    param($Expected, $Actual, [string]$What)
++    $expectedText = Format-Value $Expected
++    $actualText = Format-Value $Actual
++    if (-not [string]::Equals($expectedText, $actualText, [System.StringComparison]::Ordinal)) {
++        throw ("{0}: expected <{1}> but got <{2}>" -f $What, $expectedText, $actualText)
++    }
++}
++
++function Assert-Throws {
++    param([scriptblock]$Body, [string]$What)
++    $threw = $false
++    try { & $Body | Out-Null } catch { $threw = $true }
++    Assert-True $threw ("{0} should have thrown" -f $What)
++}
++
++function Get-OrdinalSorted {
++    param([string[]]$Items)
++    $copy = [string[]]@($Items)
++    if ($copy.Count -gt 1) { [System.Array]::Sort($copy, [System.StringComparer]::OrdinalIgnoreCase) }
++    return $copy
++}
++
++# ---------------------------------------------------------------------------
++# fixture helpers
++# ---------------------------------------------------------------------------
++function New-Directory {
++    param([Parameter(Mandatory = $true)][string]$Path)
++    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
++}
++
++function New-TextFile {
++    param(
++        [Parameter(Mandatory = $true)][string]$Path,
++        [string]$Content = ''
++    )
++    $parent = Split-Path -Parent $Path
++    if (-not [string]::IsNullOrEmpty($parent)) { New-Directory $parent }
++    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
++}
++
++function New-Junction {
++    param(
++        [Parameter(Mandatory = $true)][string]$Path,
++        [Parameter(Mandatory = $true)][string]$Target
++    )
++    $output = & cmd.exe /c "mklink /J `"$Path`" `"$Target`"" 2>&1
++    if ($LASTEXITCODE -ne 0) { throw ('mklink /J failed: ' + (($output | ForEach-Object { [string]$_ }) -join ' ')) }
++}
++
++$script:SymLinkAvailable = $null
++$script:HaveSymLinks = $false
++
++function New-SymLink {
++    param(
++        [Parameter(Mandatory = $true)][string]$Path,
++        [Parameter(Mandatory = $true)][string]$Target,
++        [switch]$Directory
++    )
++    $flag = ''
++    if ($Directory) { $flag = '/D ' }
++    $output = & cmd.exe /c "mklink $flag`"$Path`" `"$Target`"" 2>&1
++    if ($LASTEXITCODE -ne 0) {
++        $text = (($output | ForEach-Object { [string]$_ }) -join ' ')
++        if ($text -match 'privilege') { $script:SymLinkAvailable = $false }
++        throw ('mklink failed: ' + $text)
++    }
++    if ($null -eq $script:SymLinkAvailable) { $script:SymLinkAvailable = $true }
++}
++
++function New-HardLink {
++    param(
++        [Parameter(Mandatory = $true)][string]$Path,
++        [Parameter(Mandatory = $true)][string]$Target
++    )
++    New-Item -ItemType HardLink -Path $Path -Target $Target -ErrorAction Stop | Out-Null
++}
++
++function Test-ReparsePoint {
++    param([Parameter(Mandatory = $true)]$Item)
++    $property = $Item.PSObject.Properties['Attributes']
++    if ($null -eq $property -or $null -eq $property.Value) { return $false }
++    return (([int]$property.Value -band 0x400) -ne 0)
++}
++
++function Get-Record {
++    param($Report, [string]$RelativePath)
++    foreach ($record in @($Report.Records)) {
++        if ($null -eq $record) { continue }
++        if ([string]::Equals([string]$record.RelativePath, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase)) { return $record }
++    }
++    return $null
++}
++
++function Get-ErrorEntry {
++    param($Report, [string]$RelativePath, [string]$Code)
++    foreach ($entry in @($Report.Errors)) {
++        if ($null -eq $entry) { continue }
++        if ([string]::Equals([string]$entry.RelativePath, $RelativePath, [System.StringComparison]::OrdinalIgnoreCase) -and
++            [string]::Equals([string]$entry.Code, $Code, [System.StringComparison]::Ordinal)) { return $entry }
++    }
++    return $null
++}
++
++function Get-ChildRecordsUnder {
++    param($Report, [string]$Prefix)
++    $found = New-Object System.Collections.ArrayList
++    $needle = $Prefix + '\'
++    foreach ($record in @($Report.Records)) {
++        if ($null -eq $record) { continue }
++        if (([string]$record.RelativePath).StartsWith($needle, [System.StringComparison]::OrdinalIgnoreCase)) { [void]$found.Add($record) }
++    }
++    return @($found.ToArray())
++}
++
++function Get-DeepRelativePath {
++    param([int]$Levels)
++    $parts = New-Object System.Collections.ArrayList
++    for ($i = 1; $i -le $Levels; $i++) { [void]$parts.Add(('d{0:d2}' -f $i)) }
++    return [string]::Join('\', [string[]]$parts.ToArray())
++}
++
++# Walks the fixture without ever entering a reparse point, so a loop junction
++# cannot send the snapshot walker around forever.
++function Get-FixtureSnapshot {
++    param([Parameter(Mandatory = $true)][string]$Root)
++    $lines = New-Object System.Collections.ArrayList
++    $stack = New-Object System.Collections.Stack
++    $stack.Push($Root)
++    while ($stack.Count -gt 0) {
++        $current = [string]$stack.Pop()
++        $children = @()
++        try { $children = @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop) } catch { $children = @() }
++        foreach ($child in $children) {
++            if ($null -eq $child) { continue }
++            $size = [long]-1
++            $lengthProperty = $child.PSObject.Properties['Length']
++            if (($null -ne $lengthProperty) -and ($null -ne $lengthProperty.Value)) { $size = [long]$lengthProperty.Value }
++            [void]$lines.Add(('{0}|{1}|{2}|{3}' -f [string]$child.FullName, [int]$child.Attributes, $size, $child.LastWriteTimeUtc.Ticks))
++            if ($child.PSIsContainer -and -not (Test-ReparsePoint -Item $child)) { $stack.Push([string]$child.FullName) }
++        }
++    }
++    return [string[]](Get-OrdinalSorted -Items ([string[]]@($lines.ToArray())))
++}
++
++function Remove-ReparsePoints {
++    param([Parameter(Mandatory = $true)][string]$Root)
++    if (-not (Test-Path -LiteralPath $Root)) { return }
++    $stack = New-Object System.Collections.Stack
++    $stack.Push($Root)
++    $links = New-Object System.Collections.ArrayList
++    while ($stack.Count -gt 0) {
++        $current = [string]$stack.Pop()
++        $children = @()
++        try { $children = @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop) } catch { $children = @() }
++        foreach ($child in $children) {
++            if ($null -eq $child) { continue }
++            if (Test-ReparsePoint -Item $child) { [void]$links.Add([string]$child.FullName); continue }
++            if ($child.PSIsContainer) { $stack.Push([string]$child.FullName) }
++        }
++    }
++    foreach ($link in @($links.ToArray())) {
++        $item = $null
++        try { $item = Get-Item -LiteralPath $link -Force -ErrorAction Stop } catch { $item = $null }
++        if (($null -ne $item) -and $item.PSIsContainer) { & cmd.exe /c "rmdir `"$link`"" 2>&1 | Out-Null }
++        else { & cmd.exe /c "del /f /q `"$link`"" 2>&1 | Out-Null }
++    }
++}
++
++# ---------------------------------------------------------------------------
++# locate module and work directory
++# ---------------------------------------------------------------------------
++$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
++if ([string]::IsNullOrWhiteSpace($ModuleManifest)) {
++    $ModuleManifest = Join-Path (Join-Path $scriptRoot 'WReparse') 'WReparse.psd1'
++}
++if (-not (Test-Path -LiteralPath $ModuleManifest)) {
++    Write-Host "[FAIL] module manifest not found at $ModuleManifest"
++    exit 1
++}
++
++$script:OwnWorkRoot = $false
++if ([string]::IsNullOrWhiteSpace($WorkRoot)) {
++    $WorkRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('wreparse-selftest-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
++    $script:OwnWorkRoot = $true
++}
++
++Import-Module $ModuleManifest -Force -ErrorAction Stop
++
++# Work with the canonical (8.3-expanded) form of the fixture root so that every
++# comparison below uses the same spelling the module reports.
++$WorkRoot = Get-WReparseCanonicalPath -Path $WorkRoot
++
++Write-Host ('selftest: module  = ' + $ModuleManifest)
++Write-Host ('selftest: fixture = ' + $WorkRoot)
++Write-Host ('selftest: host    = Windows PowerShell ' + $PSVersionTable.PSVersion.ToString() + ', culture ' + (Get-Culture).Name)
++Write-Host ''
++
++$exitCode = 1
++$fixtureBuilt = $false
++$denied = Join-Path (Join-Path $WorkRoot 'scanroot') 'denied'
++$denyApplied = $false
++$icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
++
++try {
++    # -----------------------------------------------------------------------
++    # build the fixture
++    # -----------------------------------------------------------------------
++    if (Test-Path -LiteralPath $WorkRoot) {
++        if ((Test-Path -LiteralPath $icacls) -and (Test-Path -LiteralPath $denied)) {
++            & $icacls $denied /remove:d "$($env:USERDOMAIN)\$($env:USERNAME)" /c 2>&1 | Out-Null
++            & $icacls $denied /reset /t /c 2>&1 | Out-Null
++        }
++        Remove-ReparsePoints -Root $WorkRoot
++        Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
++    }
++
++    $fx = $WorkRoot
++    $scanroot = Join-Path $fx 'scanroot'
++    $outside = Join-Path $fx 'outside'
++    $extra = Join-Path $fx 'scanroot-extra'
++    $emptyTree = Join-Path $fx 'empty-dir'
++    $deepTree = Join-Path $fx 'deep-tree'
++    $contract = Join-Path $fx 'contract'
++    $contractExtra = Join-Path $fx 'contract-extra'
++
++    foreach ($directory in @($scanroot, $outside, $extra, $emptyTree, $deepTree, $contract, $contractExtra)) {
++        New-Directory $directory
++    }
++
++    $nameAE = [string][char]0x00C4 + '.txt'
++    $nameOE = [string][char]0x00F6 + '.txt'
++
++    # -- main tree ----------------------------------------------------------
++    New-TextFile (Join-Path $scanroot 'plain.txt') 'abcd'
++    New-TextFile (Join-Path $scanroot 'beta.txt') 'abcd'
++    New-TextFile (Join-Path $scanroot 'Z.txt') 'xxxxxxxx'
++    New-TextFile (Join-Path $scanroot $nameAE) 'xxxxxxxx'
++    New-TextFile (Join-Path $scanroot $nameOE) 'xxxxxxxx'
++    New-TextFile (Join-Path $scanroot 'a.txt') 'xxxxxxxx'
++    New-TextFile (Join-Path $scanroot 'B.txt') 'xxxxxxxx'
++    New-TextFile (Join-Path $scanroot 'beta\zeta.txt') 'abcd'
++    New-TextFile (Join-Path $scanroot 'data\sample.bin') 'abcd'
++    New-TextFile (Join-Path $scanroot 'docs\readme.txt') 'readme'
++    New-TextFile (Join-Path $scanroot 'docs\nested\deep.txt') 'abcd'
++    New-Directory (Join-Path $scanroot 'empty')
++    New-TextFile (Join-Path $scanroot 'denied\inside.txt') 'nope'
++    New-TextFile (Join-Path $outside 'secret.txt') 'secret'
++    New-TextFile (Join-Path $extra 'other.txt') 'other'
++
++    New-HardLink -Path (Join-Path $scanroot 'hardlink.txt') -Target (Join-Path $scanroot 'plain.txt')
++
++    New-Junction -Path (Join-Path $scanroot 'link-in') -Target (Join-Path $scanroot 'docs')
++    New-Junction -Path (Join-Path $scanroot 'link-twin') -Target (Join-Path $scanroot 'docs')
++    New-Junction -Path (Join-Path $scanroot 'link-loop') -Target $scanroot
++    New-Junction -Path (Join-Path $scanroot 'link-out') -Target $outside
++    New-Junction -Path (Join-Path $scanroot 'link-prefix') -Target $extra
++    New-Junction -Path (Join-Path $scanroot 'data\link-docs') -Target (Join-Path $scanroot 'docs')
++
++    $symlinkError = $null
++    try {
++        New-SymLink -Path (Join-Path $scanroot 'link-rel') -Target 'docs' -Directory
++        New-SymLink -Path (Join-Path $scanroot 'link-file') -Target 'plain.txt'
++        New-SymLink -Path (Join-Path $scanroot 'link-dangling') -Target 'missing-target' -Directory
++        New-SymLink -Path (Join-Path $scanroot 'beta\link-up') -Target '..' -Directory
++    }
++    catch { $symlinkError = $_ }
++    $script:HaveSymLinks = [bool]($null -eq $symlinkError)
++    if (-not $script:HaveSymLinks) {
++        Write-Host ('selftest: symbolic links unavailable (' + ([string]$symlinkError.Exception.Message) + '); symlink checks are skipped')
++    }
++
++    # -- replica of the tree used by the published contract samples ----------
++    New-TextFile (Join-Path $contract 'beta.txt') 'abcd'
++    New-TextFile (Join-Path $contract 'plain.txt') 'abcd'
++    New-TextFile (Join-Path $contract 'Z.txt') 'xxxxxxxx'
++    New-TextFile (Join-Path $contract $nameAE) 'xxxxxxxx'
++    New-TextFile (Join-Path $contract $nameOE) 'xxxxxxxx'
++    New-TextFile (Join-Path $contract 'beta\zeta.txt') 'abcd'
++    New-TextFile (Join-Path $contract 'data\sample.bin') 'abcd'
++    New-TextFile (Join-Path $contract 'docs\readme.txt') 'readme'
++    New-TextFile (Join-Path $contract 'docs\nested\deep.txt') 'abcd'
++    New-Directory (Join-Path $contract 'empty')
++    New-TextFile (Join-Path $contractExtra 'other.txt') 'other'
++    New-HardLink -Path (Join-Path $contract 'hardlink.txt') -Target (Join-Path $contract 'plain.txt')
++    New-Junction -Path (Join-Path $contract 'link-in') -Target (Join-Path $contract 'docs')
++    New-Junction -Path (Join-Path $contract 'link-twin') -Target (Join-Path $contract 'docs')
++    New-Junction -Path (Join-Path $contract 'link-loop') -Target $contract
++    New-Junction -Path (Join-Path $contract 'link-out') -Target $outside
++    New-Junction -Path (Join-Path $contract 'link-prefix') -Target $contractExtra
++    if ($script:HaveSymLinks) {
++        New-SymLink -Path (Join-Path $contract 'link-rel') -Target 'docs' -Directory
++        New-SymLink -Path (Join-Path $contract 'link-file') -Target 'plain.txt'
++        New-SymLink -Path (Join-Path $contract 'link-dangling') -Target 'missing-target' -Directory
++    }
++
++    # -- subtree deeper than the default -MaxDepth (32) ----------------------
++    $deepLeaf = $deepTree
++    for ($i = 1; $i -le 35; $i++) { $deepLeaf = Join-Path $deepLeaf ('d{0:d2}' -f $i) }
++    New-TextFile (Join-Path $deepLeaf 'bottom.txt') 'abcd'
++
++    # -- access denied sub directory ----------------------------------------
++    if (Test-Path -LiteralPath $icacls) {
++        $denyIdentity = "$($env:USERDOMAIN)\$($env:USERNAME)"
++        $denyOutput = & $icacls $denied /deny "${denyIdentity}:(OI)(CI)(RD)" 2>&1
++        if ($LASTEXITCODE -eq 0) { $denyApplied = $true }
++        else { Write-Host ('selftest: could not apply the deny ACE (' + (($denyOutput | ForEach-Object { [string]$_ }) -join ' ') + ')') }
++    }
++
++    $fixtureBuilt = $true
++
++    $reportPlain = Get-WReparseReport -Root $scanroot
++    $reportFollow = Get-WReparseReport -Root $scanroot -Follow
++
++    # -----------------------------------------------------------------------
++    # 01 every reparse point is registered, none is entered without -Follow
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '01a every reparse point is registered and counted as skipped (no -Follow)' -Body {
++        $expected = @('link-in', 'link-twin', 'link-loop', 'link-out', 'link-prefix', 'data\link-docs')
++        if ($script:HaveSymLinks) { $expected += @('link-rel', 'link-file', 'link-dangling', 'beta\link-up') }
++        foreach ($name in $expected) {
++            $record = Get-Record $reportPlain $name
++            Assert-True ($null -ne $record) ("missing record for reparse point '{0}'" -f $name)
++            Assert-Equal 'ReparsePoint' $record.Kind ("Kind of '{0}'" -f $name)
++            Assert-Equal 0 $record.Size ("Size of '{0}'" -f $name)
++        }
++        Assert-Equal $expected.Count $reportPlain.Stats.ReparsePoints 'Stats.ReparsePoints'
++        Assert-Equal $expected.Count $reportPlain.Stats.Skipped 'Stats.Skipped'
++        Assert-Equal $scanroot $reportPlain.Root 'Report.Root is the canonical scan root'
++    }
++
++    Invoke-Check -Title '01b no reparse point is entered without -Follow' -Body {
++        foreach ($name in @('link-in', 'link-twin', 'link-loop', 'link-out', 'link-prefix', 'data\link-docs', 'link-rel', 'link-file', 'beta\link-up')) {
++            Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportPlain -Prefix $name).Count ("records below '{0}'" -f $name)
++        }
++        Assert-True ($null -eq (Get-Record $reportPlain 'link-out\secret.txt')) 'link-out\secret.txt must not be recorded'
++        Assert-True ($null -eq (Get-Record $reportPlain 'link-prefix\other.txt')) 'link-prefix\other.txt must not be recorded'
++        Assert-True ($null -eq (Get-Record $reportPlain 'link-in\readme.txt')) 'link-in\readme.txt must not be recorded'
++        Assert-Equal 6 $reportPlain.Stats.Directories 'Stats.Directories'
++        Assert-Equal 12 $reportPlain.Stats.Files 'Stats.Files'
++    }
++
++    # -----------------------------------------------------------------------
++    # 02 InScope: prefix-similar sibling vs. target inside the scan root
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '02a InScope separates a prefix-similar sibling from an in-root target' -Body {
++        $in = Get-Record $reportPlain 'link-in'
++        $prefix = Get-Record $reportPlain 'link-prefix'
++        $out = Get-Record $reportPlain 'link-out'
++        Assert-Equal $true $in.InScope 'link-in.InScope'
++        Assert-Equal $false $prefix.InScope 'link-prefix.InScope (shares only the name prefix)'
++        Assert-Equal $false $out.InScope 'link-out.InScope'
++        Assert-Equal (Join-Path $scanroot 'docs') $in.ResolvedTarget 'link-in.ResolvedTarget'
++        Assert-Equal $extra $prefix.ResolvedTarget 'link-prefix.ResolvedTarget'
++        Assert-Equal $outside $out.ResolvedTarget 'link-out.ResolvedTarget'
++    }
++
++    Invoke-Check -Title '02b Test-WReparseWithinRoot honours the directory boundary' -Body {
++        Assert-Equal $true (Test-WReparseWithinRoot -Path (Join-Path $scanroot 'docs') -Root $scanroot) 'root\docs within root'
++        Assert-Equal $true (Test-WReparseWithinRoot -Path $scanroot -Root $scanroot) 'root within itself'
++        Assert-Equal $true (Test-WReparseWithinRoot -Path (Join-Path $scanroot 'docs\nested\deep.txt') -Root $scanroot) 'deep child within root'
++        Assert-Equal $false (Test-WReparseWithinRoot -Path $extra -Root $scanroot) 'scanroot-extra is NOT within scanroot'
++        Assert-Equal $false (Test-WReparseWithinRoot -Path $outside -Root $scanroot) 'outside is NOT within scanroot'
++        Assert-Equal $false (Test-WReparseWithinRoot -Path '' -Root $scanroot) 'empty path'
++        Assert-Equal $false (Test-WReparseWithinRoot -Path (Join-Path $scanroot 'docs') -Root '') 'empty root'
++        Assert-Equal $true (Test-WReparseWithinRoot -Path ($scanroot.ToUpperInvariant() + '\DOCS') -Root $scanroot) 'comparison is case-insensitive'
++        Assert-Equal $true (Test-WReparseWithinRoot -Path ((Join-Path $scanroot 'docs') + '\') -Root ($scanroot + '\')) 'trailing separators are tolerated'
++    }
++
++    # -----------------------------------------------------------------------
++    # 03 relative link resolution is independent of the process location
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '03a Resolve-WReparseLinkTarget resolves relative to the link directory' -Body {
++        $linkRel = Join-Path $scanroot 'link-rel'
++        $expectedDocs = Join-Path $scanroot 'docs'
++        $processCwd = [System.Environment]::CurrentDirectory
++        $savedLocation = $PWD
++        try {
++            foreach ($probe in @($env:SystemRoot, [System.IO.Path]::GetPathRoot($env:SystemRoot), $env:TEMP)) {
++                Push-Location -LiteralPath $probe
++                try {
++                    [System.Environment]::CurrentDirectory = $probe
++                    Assert-Equal $expectedDocs (Resolve-WReparseLinkTarget -LinkFullPath $linkRel -RawTarget 'docs') ('relative target from cwd ' + $probe)
++                    Assert-Equal $scanroot (Resolve-WReparseLinkTarget -LinkFullPath (Join-Path $scanroot 'beta\link-up') -RawTarget '..') 'beta\link-up ("..") resolves against the link directory'
++                    Assert-Equal $outside (Resolve-WReparseLinkTarget -LinkFullPath $linkRel -RawTarget $outside) 'absolute raw target'
++                    Assert-Equal $expectedDocs (Resolve-WReparseLinkTarget -LinkFullPath $linkRel -RawTarget '.\docs\.') 'dot segments in the raw target'
++                    Assert-Equal $scanroot (Resolve-WReparseLinkTarget -LinkFullPath $linkRel -RawTarget '..\scanroot') 'parent segment in the raw target'
++                    Assert-Equal $null (Resolve-WReparseLinkTarget -LinkFullPath $linkRel -RawTarget '') 'empty raw target'
++                    Assert-Equal $null (Resolve-WReparseLinkTarget -LinkFullPath $linkRel -RawTarget $null) 'null raw target'
++                }
++                finally { Pop-Location }
++            }
++        }
++        finally {
++            [System.Environment]::CurrentDirectory = $processCwd
++            Set-Location -LiteralPath $savedLocation
++        }
++    }
++
++    Invoke-SymLinkCheck -Title '03b the report of a relative link does not depend on the process location' -Body {
++        $processCwd = [System.Environment]::CurrentDirectory
++        $savedLocation = $PWD
++        $collected = New-Object System.Collections.ArrayList
++        try {
++            foreach ($probe in @($env:SystemRoot, $env:TEMP)) {
++                Push-Location -LiteralPath $probe
++                try {
++                    [System.Environment]::CurrentDirectory = $probe
++                    [void]$collected.Add((ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot)))
++                }
++                finally { Pop-Location }
++            }
++        }
++        finally {
++            [System.Environment]::CurrentDirectory = $processCwd
++            Set-Location -LiteralPath $savedLocation
++        }
++        Assert-True ([string]::Equals([string]$collected[0], [string]$collected[1], [System.StringComparison]::Ordinal)) 'JSON differs between working directories'
++        Assert-Equal (Join-Path $scanroot 'docs') ((Get-Record $reportPlain 'link-rel').ResolvedTarget) 'link-rel.ResolvedTarget'
++        Assert-Equal 'docs' ((Get-Record $reportPlain 'link-rel').Target) 'link-rel.Target keeps the raw relative string'
++    }
++
++    # -----------------------------------------------------------------------
++    # 04 repeated report + serialisation is byte identical
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '04a two consecutive runs serialise byte-identically' -Body {
++        $first = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot)
++        $second = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot)
++        Assert-True ([string]::Equals($first, $second, [System.StringComparison]::Ordinal)) 'no-follow JSON differs between runs'
++        $firstFollow = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot -Follow)
++        $secondFollow = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot -Follow)
++        Assert-True ([string]::Equals($firstFollow, $secondFollow, [System.StringComparison]::Ordinal)) '-Follow JSON differs between runs'
++        $deepFirst = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $deepTree)
++        $deepSecond = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $deepTree)
++        Assert-True ([string]::Equals($deepFirst, $deepSecond, [System.StringComparison]::Ordinal)) 'deep tree JSON differs between runs'
++        foreach ($text in @($first, $firstFollow)) {
++            Assert-True ($text -notmatch 'GeneratedAt') 'no timestamp field'
++            Assert-True ($text -notmatch ([regex]::Escape([string]$PID))) 'no process id'
++            Assert-True ($text -notmatch '\d{4}-\d{2}-\d{2}T') 'no ISO-8601 timestamp value'
++        }
++    }
++
++    # -----------------------------------------------------------------------
++    # 05 classification: hard link vs junction vs symbolic link
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '05a hard link, junction and symbolic link are classified distinctly' -Body {
++        $hard = Get-Record $reportPlain 'hardlink.txt'
++        Assert-True ($null -ne $hard) 'hardlink.txt is missing'
++        Assert-Equal 'File' $hard.Kind 'hard link Kind'
++        Assert-Equal '$null' (Format-Value $hard.ReparseKind) 'hard link ReparseKind'
++        Assert-Equal '$null' (Format-Value $hard.Target) 'hard link Target'
++        Assert-Equal '$null' (Format-Value $hard.ResolvedTarget) 'hard link ResolvedTarget'
++        Assert-Equal $false $hard.InScope 'hard link InScope'
++        Assert-Equal 4 $hard.Size 'hard link Size'
++        Assert-Equal 1 $hard.Depth 'hard link Depth'
++
++        $junction = Get-Record $reportPlain 'link-in'
++        Assert-Equal 'Junction' $junction.ReparseKind 'junction ReparseKind'
++        Assert-Equal 'ReparsePoint' $junction.Kind 'junction Kind'
++
++        if ($script:HaveSymLinks) {
++            $symLink = Get-Record $reportPlain 'link-rel'
++            Assert-Equal 'SymbolicLink' $symLink.ReparseKind 'symbolic link ReparseKind'
++            Assert-True (-not [string]::Equals([string]$junction.ReparseKind, [string]$symLink.ReparseKind, [System.StringComparison]::Ordinal)) 'junction and symbolic link must be distinguishable'
++            $fileLink = Get-Record $reportPlain 'link-file'
++            Assert-Equal 'SymbolicLink' $fileLink.ReparseKind 'file symbolic link ReparseKind'
++            Assert-Equal 'ReparsePoint' $fileLink.Kind 'file symbolic link Kind'
++        }
++
++        $kinds = @{}
++        foreach ($record in @($reportPlain.Records)) {
++            Assert-True (@('File', 'Directory', 'ReparsePoint') -contains [string]$record.Kind) ('unexpected Kind ' + $record.Kind)
++            if ([string]$record.Kind -eq 'ReparsePoint') {
++                Assert-True (-not [string]::IsNullOrEmpty([string]$record.ReparseKind)) ('ReparseKind of ' + $record.RelativePath)
++                $kinds[[string]$record.ReparseKind] = $true
++            }
++            else {
++                Assert-Equal '$null' (Format-Value $record.ReparseKind) ('ReparseKind of plain entry ' + $record.RelativePath)
++            }
++        }
++        Assert-True $kinds.ContainsKey('Junction') 'Junction present in the fixture'
++    }
++
++    # -----------------------------------------------------------------------
++    # 06 three distinct root errors
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '06a missing root, file root and uncanonicalisable root report three distinct codes' -Body {
++        $missing = Get-WReparseReport -Root (Join-Path $fx 'does-not-exist')
++        Assert-Equal 1 @($missing.Errors).Count 'missing root error count'
++        Assert-Equal 'not_found' @($missing.Errors)[0].Code 'missing root code'
++        Assert-Equal '.' @($missing.Errors)[0].RelativePath 'missing root RelativePath'
++        Assert-Equal 0 @($missing.Records).Count 'missing root records'
++        Assert-Equal (Join-Path $fx 'does-not-exist') $missing.Root 'missing root Root'
++
++        $asFile = Get-WReparseReport -Root (Join-Path $outside 'secret.txt')
++        Assert-Equal 1 @($asFile.Errors).Count 'file root error count'
++        Assert-Equal 'structure' @($asFile.Errors)[0].Code 'file root code'
++        Assert-Equal '.' @($asFile.Errors)[0].RelativePath 'file root RelativePath'
++        Assert-Equal 0 @($asFile.Records).Count 'file root records'
++        Assert-Equal (Join-Path $outside 'secret.txt') $asFile.Root 'file root Root'
++
++        $bad = Get-WReparseReport -Root 'C:\this|is<not>a*path'
++        Assert-Equal 1 @($bad.Errors).Count 'bad root error count'
++        Assert-Equal 'invalid_argument' @($bad.Errors)[0].Code 'bad root code'
++        Assert-Equal '.' @($bad.Errors)[0].RelativePath 'bad root RelativePath'
++        Assert-Equal 0 @($bad.Records).Count 'bad root records'
++
++        $blank = Get-WReparseReport -Root '   '
++        Assert-Equal 'invalid_argument' @($blank.Errors)[0].Code 'whitespace root code'
++        $emptyRoot = Get-WReparseReport -Root ''
++        Assert-Equal 'invalid_argument' @($emptyRoot.Errors)[0].Code 'empty root code'
++
++        $codes = @([string]@($missing.Errors)[0].Code, [string]@($asFile.Errors)[0].Code, [string]@($bad.Errors)[0].Code)
++        Assert-Equal 3 @($codes | Select-Object -Unique).Count 'the three codes must be distinct'
++        Assert-Equal 'wreparse/1.0' $missing.SchemaVersion 'a report is returned even for a bad root'
++        Assert-Equal 0 $missing.Stats.ReparsePoints 'stats stay zero for a bad root'
++    }
++
++    # -----------------------------------------------------------------------
++    # 07 -MaxDepth semantics
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '07a -MaxDepth -1 and -MaxDepth 0 are byte identical' -Body {
++        $zero = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot -MaxDepth 0)
++        $minus = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot -MaxDepth -1)
++        Assert-True ([string]::Equals($zero, $minus, [System.StringComparison]::Ordinal)) 'JSON of -MaxDepth -1 differs from -MaxDepth 0'
++        $report = Get-WReparseReport -Root $scanroot -MaxDepth 0
++        Assert-Equal 0 @($report.Records).Count 'records at -MaxDepth 0'
++        Assert-Equal 1 @($report.Errors).Count 'errors at -MaxDepth 0'
++        Assert-Equal 'too_deep' @($report.Errors)[0].Code 'code at -MaxDepth 0'
++        Assert-Equal '.' @($report.Errors)[0].RelativePath 'RelativePath at -MaxDepth 0'
++        Assert-Equal 'Depth limit of 0 reached; not enumerating.' @($report.Errors)[0].Message 'message at -MaxDepth 0'
++        Assert-Equal 0 $report.Stats.Directories 'Directories at -MaxDepth 0'
++        Assert-Equal 0 $report.Stats.Files 'Files at -MaxDepth 0'
++        Assert-Equal 0 $report.Stats.ReparsePoints 'ReparsePoints at -MaxDepth 0'
++        Assert-Equal 0 $report.Stats.Skipped 'Skipped at -MaxDepth 0'
++        Assert-Equal 1 $report.Stats.Errors 'Errors at -MaxDepth 0'
++        $minusReport = Get-WReparseReport -Root $scanroot -MaxDepth -1
++        Assert-Equal 'Depth limit of 0 reached; not enumerating.' @($minusReport.Errors)[0].Message '-MaxDepth -1 names the clamped limit'
++    }
++
++    Invoke-Check -Title '07b a subtree deeper than -MaxDepth is cut off with too_deep' -Body {
++        $report = Get-WReparseReport -Root $deepTree
++        $deepest = 0
++        foreach ($record in @($report.Records)) { if ([int]$record.Depth -gt $deepest) { $deepest = [int]$record.Depth } }
++        Assert-Equal 32 $deepest 'deepest recorded Depth with the default -MaxDepth'
++        Assert-Equal 32 @($report.Records).Count 'records of the deep chain'
++        $atLimit = Get-DeepRelativePath -Levels 32
++        $beyondLimit = Get-DeepRelativePath -Levels 33
++        Assert-True ($null -ne (Get-Record $report $atLimit)) 'the depth-32 directory must be recorded'
++        Assert-True ($null -eq (Get-Record $report $beyondLimit)) 'the depth-33 directory must not be recorded'
++        Assert-True ($null -eq (Get-Record $report (Get-DeepRelativePath -Levels 35))) 'bottom of the chain must not be recorded'
++        Assert-True ($null -eq (Get-Record $report ((Get-DeepRelativePath -Levels 35) + '\bottom.txt'))) 'bottom.txt must not be recorded'
++        Assert-True ($null -ne (Get-ErrorEntry $report $atLimit 'too_deep')) 'too_deep against the depth-32 directory'
++        Assert-Equal 1 @($report.Errors).Count 'exactly one too_deep error'
++        Assert-Equal 32 $report.Stats.Directories 'Directories of the deep chain'
++
++        $shallow = Get-WReparseReport -Root $deepTree -MaxDepth 2
++        $shallowDeepest = 0
++        foreach ($record in @($shallow.Records)) { if ([int]$record.Depth -gt $shallowDeepest) { $shallowDeepest = [int]$record.Depth } }
++        Assert-Equal 2 $shallowDeepest 'deepest recorded Depth with -MaxDepth 2'
++        Assert-Equal 2 @($shallow.Records).Count 'records with -MaxDepth 2'
++        Assert-Equal 2 $shallow.Stats.Directories 'Directories with -MaxDepth 2'
++        Assert-True ($null -ne (Get-ErrorEntry $shallow (Get-DeepRelativePath -Levels 2) 'too_deep')) 'too_deep against the depth-2 directory'
++
++        $deepFollow = Get-WReparseReport -Root $deepTree -Follow
++        Assert-Equal 32 $deepFollow.Stats.Directories '-Follow does not change the default limit'
++        Assert-True ((ConvertTo-WReparseJson -Report $deepFollow) -match [regex]::Escape('"d32"')) 'serialisation is not truncated at the deepest level'
++    }
++
++    # -----------------------------------------------------------------------
++    # 08 followed entries are named after the link path
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '08a followed children are named after the link, not after the real target' -Body {
++        $nested = Get-Record $reportFollow 'link-in\nested'
++        Assert-True ($null -ne $nested) 'link-in\nested must exist'
++        Assert-Equal 'Directory' $nested.Kind 'link-in\nested Kind'
++        Assert-Equal 2 $nested.Depth 'link-in\nested Depth'
++        Assert-Equal 0 $nested.Size 'link-in\nested Size'
++        $readme = Get-Record $reportFollow 'link-in\readme.txt'
++        Assert-True ($null -ne $readme) 'link-in\readme.txt must exist'
++        Assert-Equal 'File' $readme.Kind 'link-in\readme.txt Kind'
++        Assert-Equal 2 $readme.Depth 'link-in\readme.txt Depth'
++        Assert-Equal 6 $readme.Size 'link-in\readme.txt Size'
++        $deep = Get-Record $reportFollow 'link-in\nested\deep.txt'
++        Assert-True ($null -ne $deep) 'link-in\nested\deep.txt must exist'
++        Assert-Equal 3 $deep.Depth 'link-in\nested\deep.txt Depth'
++        Assert-Equal 4 $deep.Size 'link-in\nested\deep.txt Size'
++        Assert-True ($null -ne (Get-Record $reportFollow 'link-out\secret.txt')) 'out-of-scope link is entered under -Follow'
++        Assert-True ($null -ne (Get-Record $reportFollow 'link-prefix\other.txt')) 'prefix-sibling link is entered under -Follow'
++        Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'docs\link-in').Count 'no naming through the real target path'
++        Assert-Equal 0 $reportFollow.Stats.Skipped 'Skipped is 0 under -Follow'
++        Assert-Equal 'ReparsePoint' (Get-Record $reportFollow 'link-in').Kind 'the link itself stays a ReparsePoint under -Follow'
++        Assert-Equal 1 (Get-Record $reportFollow 'link-in').Depth 'the link itself stays at Depth 1'
++        $nestedLinkChild = Get-Record $reportFollow 'data\link-docs\readme.txt'
++        Assert-True ($null -ne $nestedLinkChild) 'a link below a sub directory is named after its own path'
++        Assert-Equal 3 $nestedLinkChild.Depth 'data\link-docs\readme.txt Depth'
++    }
++
++    # -----------------------------------------------------------------------
++    # 09 a link onto a file yields no children
++    # -----------------------------------------------------------------------
++    Invoke-SymLinkCheck -Title '09a a link whose target is a file produces no children' -Body {
++        $record = Get-Record $reportFollow 'link-file'
++        Assert-True ($null -ne $record) 'link-file must be recorded under -Follow'
++        Assert-Equal 'ReparsePoint' $record.Kind 'link-file Kind'
++        Assert-Equal (Join-Path $scanroot 'plain.txt') $record.ResolvedTarget 'link-file ResolvedTarget'
++        Assert-Equal $true $record.InScope 'link-file InScope'
++        Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'link-file').Count 'link-file must not have children'
++        Assert-True ($null -eq (Get-ErrorEntry $reportFollow 'link-file' 'broken_target')) 'link-file must not be reported as broken'
++        Assert-True ($null -eq (Get-ErrorEntry $reportFollow 'link-file' 'cycle')) 'link-file must not be reported as a cycle'
++        Assert-True ($null -ne (Get-Record $reportFollow 'plain.txt')) 'the real file is still recorded once'
++    }
++
++    # -----------------------------------------------------------------------
++    # 10 sibling branches sharing one target are not a cycle
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '10a sibling links onto the same target are all entered, no cycle' -Body {
++        $in = @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'link-in')
++        $twin = @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'link-twin')
++        $branch = @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'data\link-docs')
++        Assert-Equal 3 $in.Count 'link-in children'
++        Assert-Equal $in.Count $twin.Count 'link-twin has the same children as link-in'
++        Assert-Equal $in.Count $branch.Count 'data\link-docs has the same children'
++        foreach ($name in @('link-in', 'link-twin', 'data\link-docs', 'link-rel')) {
++            Assert-True ($null -eq (Get-ErrorEntry $reportFollow $name 'cycle')) ("'{0}' must not be reported as a cycle" -f $name)
++        }
++        Assert-Equal $in.Count (@(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'link-rel')).Count 'link-rel children'
++    }
++
++    Invoke-Check -Title '10b ancestor loops are reported as cycle and not entered' -Body {
++        $loop = Get-Record $reportFollow 'link-loop'
++        Assert-True ($null -ne $loop) 'link-loop must be recorded'
++        Assert-Equal $scanroot $loop.ResolvedTarget 'link-loop ResolvedTarget'
++        $cycleError = Get-ErrorEntry $reportFollow 'link-loop' 'cycle'
++        Assert-True ($null -ne $cycleError) 'link-loop must be reported as a cycle'
++        Assert-Equal 'The reparse target is an ancestor already visited on this branch.' $cycleError.Message 'cycle message'
++        Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'link-loop').Count 'a cycle must not be entered'
++        if ($script:HaveSymLinks) {
++            Assert-True ($null -ne (Get-ErrorEntry $reportFollow 'beta\link-up' 'cycle')) 'beta\link-up ("..") must be reported as a cycle'
++            Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'beta\link-up').Count 'a nested cycle must not be entered'
++        }
++    }
++
++    Invoke-SymLinkCheck -Title '10c a dangling target is reported as broken_target under -Follow only' -Body {
++        $entry = Get-ErrorEntry $reportFollow 'link-dangling' 'broken_target'
++        Assert-True ($null -ne $entry) 'link-dangling must be reported as broken_target under -Follow'
++        Assert-Equal 'The reparse target does not exist.' $entry.Message 'broken_target message'
++        $record = Get-Record $reportFollow 'link-dangling'
++        Assert-Equal (Join-Path $scanroot 'missing-target') $record.ResolvedTarget 'dangling target is resolved lexically'
++        Assert-Equal 'missing-target' $record.Target 'dangling raw target'
++        Assert-Equal $true $record.InScope 'a dangling target inside the root is in scope'
++        Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportFollow -Prefix 'link-dangling').Count 'a dangling target has no children'
++        Assert-True ($null -eq (Get-ErrorEntry $reportPlain 'link-dangling' 'broken_target')) 'no broken_target without -Follow'
++    }
++
++    # -----------------------------------------------------------------------
++    # 11 empty tree
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '11a an empty directory serialises with Records and Errors as []' -Body {
++        $report = Get-WReparseReport -Root $emptyTree
++        $json = ConvertTo-WReparseJson -Report $report
++        Assert-Equal 0 @($report.Records).Count 'Records of an empty tree'
++        Assert-Equal 0 @($report.Errors).Count 'Errors of an empty tree'
++        Assert-Equal $emptyTree $report.Root 'Root of an empty tree'
++        Assert-Equal 0 $report.Stats.Directories 'Stats.Directories'
++        Assert-Equal 0 $report.Stats.Files 'Stats.Files'
++        Assert-Equal 0 $report.Stats.ReparsePoints 'Stats.ReparsePoints'
++        Assert-Equal 0 $report.Stats.Skipped 'Stats.Skipped'
++        Assert-Equal 0 $report.Stats.Errors 'Stats.Errors'
++        Assert-True ($json -match '"Records":\s*\[\s*\]') 'Records serialise as an empty JSON array'
++        Assert-True ($json -match '"Errors":\s*\[\s*\]') 'Errors serialise as an empty JSON array'
++        Assert-True ($json -notmatch '\[\s*\n') 'no multi-line empty array'
++
++        $emptySub = Get-Record $reportPlain 'empty'
++        Assert-True ($null -ne $emptySub) 'the empty sub directory must be recorded'
++        Assert-Equal 'Directory' $emptySub.Kind 'empty sub directory Kind'
++        Assert-Equal 0 $emptySub.Size 'empty sub directory Size'
++        Assert-Equal 0 @(Get-ChildRecordsUnder -Report $reportPlain -Prefix 'empty').Count 'empty sub directory has no children'
++        Assert-True ($null -eq (Get-ErrorEntry $reportPlain 'empty' 'too_deep')) 'an empty directory is not too_deep'
++    }
++
++    # -----------------------------------------------------------------------
++    # 12 exported surface
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '12a the module exports exactly the six contractual functions' -Body {
++        $expected = Get-OrdinalSorted -Items @(
++            'ConvertTo-WReparseJson', 'Get-WReparseCanonicalPath', 'Get-WReparseReport',
++            'Get-WReparseSchemaVersion', 'Resolve-WReparseLinkTarget', 'Test-WReparseWithinRoot'
++        )
++        $module = Get-Module 'WReparse'
++        Assert-True ($null -ne $module) 'module WReparse is not loaded'
++        Assert-Equal $expected (Get-OrdinalSorted -Items ([string[]]@($module.ExportedFunctions.Keys))) 'ExportedFunctions'
++        Assert-Equal 6 $module.ExportedFunctions.Count 'ExportedFunctions count'
++        Assert-Equal 0 $module.ExportedCmdlets.Count 'ExportedCmdlets count'
++        Assert-Equal 0 $module.ExportedAliases.Count 'ExportedAliases count'
++        Assert-Equal 0 $module.ExportedVariables.Count 'ExportedVariables count'
++        Assert-Equal $expected (Get-OrdinalSorted -Items ([string[]]@(Get-Command -Module 'WReparse' | ForEach-Object { $_.Name }))) 'Get-Command -Module'
++        foreach ($internal in @('Invoke-WReparseWalk', 'Invoke-WReparseDirectoryWalk', 'New-WReparseRecord', 'New-WReparseReport',
++                'New-WReparseError', 'New-WReparseStats', 'Get-WReparseStats', 'Sort-WReparseStable', 'Compare-WReparsePath',
++                'Get-WReparseMemberValue', 'Get-WReparseCanonicalPathOrNull', 'Get-WReparseErrorCode', 'Get-WReparseRawTargetString',
++                'Get-WReparseSortedRecords', 'Get-WReparseSortedErrors', 'Add-WReparseError', 'Get-WReparseCurrentLocation')) {
++            Assert-True ($null -eq (Get-Command -Name $internal -ErrorAction SilentlyContinue)) ("internal helper '{0}' must not be visible" -f $internal)
++        }
++        Assert-Equal 'wreparse/1.0' (Get-WReparseSchemaVersion) 'Get-WReparseSchemaVersion'
++        Assert-Equal 'wreparse/1.0' (ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $emptyTree) | ConvertFrom-Json).SchemaVersion 'serialised SchemaVersion'
++    }
++
++    Invoke-Check -Title '12b the public parameter names and defaults match the contract verbatim' -Body {
++        $expected = @{
++            'Get-WReparseReport'         = @('Follow', 'MaxDepth', 'Root')
++            'ConvertTo-WReparseJson'     = @('Report')
++            'Get-WReparseSchemaVersion'  = @()
++            'Test-WReparseWithinRoot'    = @('Path', 'Root')
++            'Get-WReparseCanonicalPath'  = @('Path')
++            'Resolve-WReparseLinkTarget' = @('LinkFullPath', 'RawTarget')
++        }
++        $common = @('Verbose', 'Debug', 'ErrorAction', 'WarningAction', 'InformationAction', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'OutVariable', 'OutBuffer', 'PipelineVariable')
++        foreach ($name in $expected.Keys) {
++            $command = Get-Command -Name $name -ErrorAction Stop
++            Assert-Equal 'Function' ([string]$command.CommandType) ("{0} must be a function" -f $name)
++            $actual = Get-OrdinalSorted -Items ([string[]]@($command.Parameters.Keys | Where-Object { $common -notcontains $_ }))
++            Assert-Equal (Get-OrdinalSorted -Items ([string[]]@($expected[$name]))) $actual ("parameters of {0}" -f $name)
++        }
++        $reportCommand = Get-Command -Name 'Get-WReparseReport'
++        $rootAttributes = @($reportCommand.Parameters['Root'].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] })
++        Assert-Equal 1 $rootAttributes.Count '-Root has one Parameter attribute'
++        Assert-Equal $true $rootAttributes[0].Mandatory '-Root is mandatory'
++        Assert-Equal $true ([int].Equals($reportCommand.Parameters['MaxDepth'].ParameterType)) '-MaxDepth is an int'
++        Assert-Equal $true ([switch].Equals($reportCommand.Parameters['Follow'].ParameterType)) '-Follow is a switch'
++        Assert-Equal $true $reportCommand.Parameters['Follow'].SwitchParameter '-Follow is declared as a switch parameter'
++        $parameterAsts = $reportCommand.ScriptBlock.Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ParameterAst] }, $true)
++        $maxDepthAst = @($parameterAsts | Where-Object { $_.Name.VariablePath.UserPath -eq 'MaxDepth' })
++        Assert-Equal 1 $maxDepthAst.Count '-MaxDepth parameter found once'
++        Assert-Equal '32' $maxDepthAst[0].DefaultValue.Extent.Text '-MaxDepth default value'
++        $reportWithoutDepth = Get-WReparseReport -Root $deepTree
++        Assert-Equal 32 $reportWithoutDepth.Stats.Directories '-MaxDepth really defaults to 32'
++    }
++
++    # -----------------------------------------------------------------------
++    # 13 report shape
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '13a report, record, error and stats field sets match the contract exactly' -Body {
++        Assert-Equal @('SchemaVersion', 'Root', 'Records', 'Errors', 'Stats') (@($reportPlain.PSObject.Properties | ForEach-Object { $_.Name })) 'top level fields and their order'
++        Assert-Equal 'wreparse/1.0' $reportPlain.SchemaVersion 'SchemaVersion'
++        Assert-Equal @('RelativePath', 'Kind', 'ReparseKind', 'Target', 'ResolvedTarget', 'InScope', 'Depth', 'Size') (@((Get-Record $reportPlain 'link-in').PSObject.Properties | ForEach-Object { $_.Name })) 'reparse record fields and their order'
++        Assert-Equal @('RelativePath', 'Kind', 'ReparseKind', 'Target', 'ResolvedTarget', 'InScope', 'Depth', 'Size') (@((Get-Record $reportPlain 'docs').PSObject.Properties | ForEach-Object { $_.Name })) 'directory record fields and their order'
++        Assert-Equal @('Directories', 'Files', 'ReparsePoints', 'Skipped', 'Errors') (@($reportPlain.Stats.PSObject.Properties | ForEach-Object { $_.Name })) 'stats fields and their order'
++
++        $json = ConvertTo-WReparseJson -Report $reportPlain
++        Assert-True ($json -notmatch '"GeneratedAt"') 'no GeneratedAt field'
++        Assert-True ($json -notmatch '"Timestamp"') 'no Timestamp field'
++        Assert-True ($json -match '"ReparseKind":\s*null') 'ReparseKind of a plain entry is JSON null'
++        Assert-True ($json -match '"Target":\s*null') 'Target of a plain entry is JSON null'
++        Assert-True ($json -match '"ResolvedTarget":\s*null') 'ResolvedTarget of a plain entry is JSON null'
++        Assert-True ($json -notmatch '"Target":\s*\[') 'Target is never a JSON array'
++        Assert-True ($json -match '"InScope":\s*(true|false)') 'InScope is a JSON boolean'
++        Assert-True ($json -match '"Depth":\s*\d+') 'Depth is a JSON number'
++        Assert-True ($json -match '"Size":\s*\d+') 'Size is a JSON number'
++
++        $parsed = $json | ConvertFrom-Json
++        Assert-Equal @($reportPlain.Records).Count @($parsed.Records).Count 'record count survives the round trip'
++        Assert-Equal @($reportPlain.Errors).Count @($parsed.Errors).Count 'error count survives the round trip'
++        Assert-Equal @('SchemaVersion', 'Root', 'Records', 'Errors', 'Stats') (@($parsed.PSObject.Properties | ForEach-Object { $_.Name })) 'parsed field order'
++    }
++
++    Invoke-Check -Title '13b error entries carry RelativePath, Code and Message only' -Body {
++        $report = Get-WReparseReport -Root $deepTree
++        Assert-True (@($report.Errors).Count -ge 1) 'the deep tree produces at least one error'
++        foreach ($entry in @($report.Errors)) {
++            Assert-Equal @('RelativePath', 'Code', 'Message') (@($entry.PSObject.Properties | ForEach-Object { $_.Name })) 'error fields and their order'
++        }
++    }
++
++    # -----------------------------------------------------------------------
++    # 14 ordering of non-ASCII names is culture independent
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '14a records are ordered ordinal-ignore-case, not by the host culture' -Body {
++        $names = @('Z.txt', $nameAE, $nameOE, 'a.txt', 'B.txt')
++        $expected = @('a.txt', 'B.txt', 'Z.txt', $nameAE, $nameOE)
++        $actual = New-Object System.Collections.ArrayList
++        foreach ($record in @($reportPlain.Records)) {
++            if (([int]$record.Depth -eq 1) -and ([string]$record.Kind -eq 'File') -and ($names -contains [string]$record.RelativePath)) {
++                [void]$actual.Add([string]$record.RelativePath)
++            }
++        }
++        Assert-Equal $expected @($actual.ToArray()) 'ordering of Z.txt / AE.txt / oe.txt / a.txt / B.txt'
++
++        $paths = [string[]]@($reportPlain.Records | ForEach-Object { [string]$_.RelativePath })
++        $sorted = [string[]][System.Linq.Enumerable]::ToArray([System.Linq.Enumerable]::OrderBy([object[]]$paths, [Func[object, string]] { param($item) [string]$item }, [System.StringComparer]::OrdinalIgnoreCase))
++        Assert-Equal $sorted $paths 'Records are sorted with the ordinal-ignore-case comparer'
++
++        $cultureSorted = [string[]]@($names | Sort-Object -Culture 'en-US')
++        $differs = $false
++        for ($i = 0; $i -lt $expected.Count; $i++) {
++            if (-not [string]::Equals($cultureSorted[$i], $expected[$i], [System.StringComparison]::Ordinal)) { $differs = $true }
++        }
++        Assert-True $differs 'a culture-aware Sort-Object would order these names differently, so the check above is meaningful'
++
++        $headPaths = [string[]]@($reportPlain.Records | Select-Object -First 8 | ForEach-Object { [string]$_.RelativePath })
++        Assert-Equal $headPaths (Get-OrdinalSorted -Items $headPaths) 'the first records are in ascending ordinal order'
++    }
++
++    Invoke-Check -Title '14b the serialisation is identical under en-US, de-DE and ja-JP' -Body {
++        $baseline = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot)
++        $hashes = @{}
++        foreach ($cultureName in @('en-US', 'de-DE', 'ja-JP')) {
++            $culture = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
++            $previousDefault = [System.Globalization.CultureInfo]::DefaultThreadCurrentCulture
++            $previousDefaultUi = [System.Globalization.CultureInfo]::DefaultThreadCurrentUICulture
++            $previousThread = [System.Threading.Thread]::CurrentThread.CurrentCulture
++            $previousThreadUi = [System.Threading.Thread]::CurrentThread.CurrentUICulture
++            try {
++                [System.Globalization.CultureInfo]::DefaultThreadCurrentCulture = $culture
++                [System.Globalization.CultureInfo]::DefaultThreadCurrentUICulture = $culture
++                [System.Threading.Thread]::CurrentThread.CurrentCulture = $culture
++                [System.Threading.Thread]::CurrentThread.CurrentUICulture = $culture
++                $text = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot)
++            }
++            finally {
++                [System.Globalization.CultureInfo]::DefaultThreadCurrentCulture = $previousDefault
++                [System.Globalization.CultureInfo]::DefaultThreadCurrentUICulture = $previousDefaultUi
++                [System.Threading.Thread]::CurrentThread.CurrentCulture = $previousThread
++                [System.Threading.Thread]::CurrentThread.CurrentUICulture = $previousThreadUi
++            }
++            Assert-Equal $baseline $text ('serialisation under ' + $cultureName)
++            $sha = [System.Security.Cryptography.SHA256]::Create()
++            try { $hashes[$cultureName] = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text))) }
++            finally { $sha.Dispose() }
++        }
++        Assert-Equal $hashes['en-US'] $hashes['de-DE'] 'sha256 en-US vs de-DE'
++        Assert-Equal $hashes['en-US'] $hashes['ja-JP'] 'sha256 en-US vs ja-JP'
++    }
++
++    # -----------------------------------------------------------------------
++    # 15 no cycle / broken_target without -Follow
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '15a without -Follow there is neither cycle nor broken_target' -Body {
++        $codes = [string[]]@($reportPlain.Errors | ForEach-Object { [string]$_.Code })
++        Assert-True ($codes -notcontains 'cycle') 'cycle must not appear without -Follow'
++        Assert-True ($codes -notcontains 'broken_target') 'broken_target must not appear without -Follow'
++        $allowed = @('not_found', 'access_denied', 'cycle', 'broken_target', 'structure', 'too_deep', 'invalid_argument')
++        foreach ($code in $codes) { Assert-True ($allowed -contains $code) ('unexpected error code ' + $code) }
++        foreach ($code in [string[]]@($reportFollow.Errors | ForEach-Object { [string]$_.Code })) {
++            Assert-True ($allowed -contains $code) ('unexpected error code under -Follow: ' + $code)
++        }
++        foreach ($code in [string[]]@((Get-WReparseReport -Root $deepTree).Errors | ForEach-Object { [string]$_.Code })) {
++            Assert-True ($allowed -contains $code) ('unexpected error code in the deep tree: ' + $code)
++        }
++        foreach ($code in [string[]]@((Get-WReparseReport -Root $contract).Errors | ForEach-Object { [string]$_.Code })) {
++            Assert-True ($allowed -contains $code) ('unexpected error code in the contract replica: ' + $code)
++        }
++    }
++
++    # -----------------------------------------------------------------------
++    # 16 InScope is false for every non-reparse entry
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '16a InScope is false for plain files and directories' -Body {
++        $seen = 0
++        foreach ($record in @($reportPlain.Records)) {
++            if ([string]$record.Kind -ne 'ReparsePoint') {
++                $seen++
++                Assert-Equal $false $record.InScope ('InScope of ' + $record.RelativePath + ' (' + $record.Kind + ')')
++                Assert-Equal '$null' (Format-Value $record.ResolvedTarget) ('ResolvedTarget of ' + $record.RelativePath)
++            }
++        }
++        Assert-True ($seen -gt 5) 'the fixture must contain plain entries'
++        foreach ($record in @($reportFollow.Records)) {
++            if ([string]$record.Kind -ne 'ReparsePoint') {
++                Assert-Equal $false $record.InScope ('InScope of ' + $record.RelativePath + ' under -Follow')
++            }
++        }
++        foreach ($record in @((Get-WReparseReport -Root $contract).Records)) {
++            if ([string]$record.Kind -ne 'ReparsePoint') {
++                Assert-Equal $false $record.InScope ('InScope of ' + $record.RelativePath + ' in the contract replica')
++            }
++        }
++    }
++
++    # -----------------------------------------------------------------------
++    # 17 Target is always a string on reparse records
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '17a Target and ResolvedTarget are strings on every reparse record' -Body {
++        $seen = 0
++        foreach ($report in @($reportPlain, $reportFollow, (Get-WReparseReport -Root $contract -Follow))) {
++            foreach ($record in @($report.Records)) {
++                if ([string]$record.Kind -ne 'ReparsePoint') { continue }
++                $seen++
++                Assert-True ($record.Target -is [string]) ('Target of ' + $record.RelativePath + ' is ' + $(if ($null -eq $record.Target) { '$null' } else { $record.Target.GetType().FullName }))
++                Assert-True ($record.ResolvedTarget -is [string]) ('ResolvedTarget of ' + $record.RelativePath + ' is not a string')
++                Assert-True ($record.ReparseKind -is [string]) ('ReparseKind of ' + $record.RelativePath + ' is not a string')
++                Assert-True ($record.InScope -is [bool]) ('InScope of ' + $record.RelativePath + ' is not a bool')
++                Assert-True ($record.Depth -is [int]) ('Depth of ' + $record.RelativePath + ' is not an int')
++                Assert-True ($record.RelativePath -is [string]) ('RelativePath of ' + $record.RelativePath + ' is not a string')
++            }
++        }
++        Assert-True ($seen -ge 16) 'the fixture must contain reparse points in all three scans'
++    }
++
++    # -----------------------------------------------------------------------
++    # 18 published contract samples
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '18a contract 3.5: stats of the published fixture without -Follow' -Body {
++        $report = Get-WReparseReport -Root $contract
++        Assert-Equal 5 $report.Stats.Directories 'Directories'
++        Assert-Equal 10 $report.Stats.Files 'Files'
++        Assert-Equal 8 $report.Stats.ReparsePoints 'ReparsePoints'
++        Assert-Equal 8 $report.Stats.Skipped 'Skipped'
++        Assert-Equal 0 $report.Stats.Errors 'Errors'
++        Assert-Equal 0 @($report.Errors).Count 'Errors collection'
++        Assert-Equal 23 @($report.Records).Count 'total records'
++    }
++
++    Invoke-SymLinkCheck -Title '18b contract 4.2: stats and errors of the published fixture with -Follow' -Body {
++        $report = Get-WReparseReport -Root $contract -Follow
++        Assert-Equal 8 $report.Stats.Directories 'Directories'
++        Assert-Equal 18 $report.Stats.Files 'Files'
++        Assert-Equal 8 $report.Stats.ReparsePoints 'ReparsePoints'
++        Assert-Equal 0 $report.Stats.Skipped 'Skipped'
++        Assert-Equal 2 $report.Stats.Errors 'Errors'
++        Assert-Equal 2 @($report.Errors).Count 'Errors collection'
++        Assert-Equal 'link-dangling' @($report.Errors)[0].RelativePath 'first error path'
++        Assert-Equal 'broken_target' @($report.Errors)[0].Code 'first error code'
++        Assert-Equal 'The reparse target does not exist.' @($report.Errors)[0].Message 'first error message'
++        Assert-Equal 'link-loop' @($report.Errors)[1].RelativePath 'second error path'
++        Assert-Equal 'cycle' @($report.Errors)[1].Code 'second error code'
++        Assert-Equal 'The reparse target is an ancestor already visited on this branch.' @($report.Errors)[1].Message 'second error message'
++    }
++
++    Invoke-SymLinkCheck -Title '18c contract 3.2/3.3/3.4/4.5: record shapes and depths' -Body {
++        $report = Get-WReparseReport -Root $contract
++        $beta = Get-Record $report 'beta'
++        Assert-Equal 'Directory' $beta.Kind 'beta Kind'
++        Assert-Equal '$null' (Format-Value $beta.ReparseKind) 'beta ReparseKind'
++        Assert-Equal '$null' (Format-Value $beta.Target) 'beta Target'
++        Assert-Equal '$null' (Format-Value $beta.ResolvedTarget) 'beta ResolvedTarget'
++        Assert-Equal $false $beta.InScope 'beta InScope'
++        Assert-Equal 1 $beta.Depth 'beta Depth'
++        Assert-Equal 0 $beta.Size 'beta Size'
++
++        $betaText = Get-Record $report 'beta.txt'
++        Assert-Equal 'File' $betaText.Kind 'beta.txt Kind'
++        Assert-Equal 1 $betaText.Depth 'beta.txt Depth'
++        Assert-Equal 4 $betaText.Size 'beta.txt Size'
++        Assert-Equal $false $betaText.InScope 'beta.txt InScope'
++
++        Assert-Equal 2 (Get-Record $report 'beta\zeta.txt').Depth 'beta\zeta.txt Depth'
++        Assert-Equal 2 (Get-Record $report 'data\sample.bin').Depth 'data\sample.bin Depth'
++        Assert-Equal 3 (Get-Record $report 'docs\nested\deep.txt').Depth 'docs\nested\deep.txt Depth'
++        Assert-Equal 1 (Get-Record $report 'link-in').Depth 'link-in Depth'
++
++        $hard = Get-Record $report 'hardlink.txt'
++        Assert-Equal 'File' $hard.Kind 'hardlink.txt Kind'
++        Assert-Equal '$null' (Format-Value $hard.ReparseKind) 'hardlink.txt ReparseKind'
++        Assert-Equal 4 $hard.Size 'hardlink.txt Size'
++        Assert-Equal 1 $hard.Depth 'hardlink.txt Depth'
++
++        $dangling = Get-Record $report 'link-dangling'
++        Assert-Equal 'ReparsePoint' $dangling.Kind 'link-dangling Kind'
++        Assert-Equal 'SymbolicLink' $dangling.ReparseKind 'link-dangling ReparseKind'
++        Assert-Equal 'missing-target' $dangling.Target 'link-dangling Target'
++        Assert-Equal (Join-Path $contract 'missing-target') $dangling.ResolvedTarget 'link-dangling ResolvedTarget'
++        Assert-Equal $true $dangling.InScope 'link-dangling InScope'
++        Assert-Equal 1 $dangling.Depth 'link-dangling Depth'
++        Assert-Equal 0 $dangling.Size 'link-dangling Size'
++
++        $fileLink = Get-Record $report 'link-file'
++        Assert-Equal 'SymbolicLink' $fileLink.ReparseKind 'link-file ReparseKind'
++        Assert-Equal 'plain.txt' $fileLink.Target 'link-file Target'
++        Assert-Equal (Join-Path $contract 'plain.txt') $fileLink.ResolvedTarget 'link-file ResolvedTarget'
++        Assert-Equal $true $fileLink.InScope 'link-file InScope'
++
++        $rel = Get-Record $report 'link-rel'
++        Assert-Equal 'SymbolicLink' $rel.ReparseKind 'link-rel ReparseKind'
++        Assert-Equal 'docs' $rel.Target 'link-rel Target'
++        Assert-Equal (Join-Path $contract 'docs') $rel.ResolvedTarget 'link-rel ResolvedTarget'
++        Assert-Equal $true $rel.InScope 'link-rel InScope'
++
++        $loop = Get-Record $report 'link-loop'
++        Assert-Equal 'Junction' $loop.ReparseKind 'link-loop ReparseKind'
++        Assert-Equal $contract $loop.Target 'link-loop Target'
++        Assert-Equal $contract $loop.ResolvedTarget 'link-loop ResolvedTarget'
++        Assert-Equal $true $loop.InScope 'link-loop InScope'
++
++        $out = Get-Record $report 'link-out'
++        Assert-Equal 'Junction' $out.ReparseKind 'link-out ReparseKind'
++        Assert-Equal $outside $out.ResolvedTarget 'link-out ResolvedTarget'
++        Assert-Equal $false $out.InScope 'link-out InScope'
++
++        $prefix = Get-Record $report 'link-prefix'
++        Assert-Equal 'Junction' $prefix.ReparseKind 'link-prefix ReparseKind'
++        Assert-Equal $contractExtra $prefix.ResolvedTarget 'link-prefix ResolvedTarget'
++        Assert-Equal $false $prefix.InScope 'link-prefix InScope'
++
++        $twin = Get-Record $report 'link-twin'
++        Assert-Equal 'Junction' $twin.ReparseKind 'link-twin ReparseKind'
++        Assert-Equal (Join-Path $contract 'docs') $twin.ResolvedTarget 'link-twin ResolvedTarget'
++        Assert-Equal $true $twin.InScope 'link-twin InScope'
++
++        $in = Get-Record $report 'link-in'
++        Assert-Equal (Join-Path $contract 'docs') $in.Target 'link-in Target is the on-disk string'
++        Assert-Equal (Join-Path $contract 'docs') $in.ResolvedTarget 'link-in ResolvedTarget'
++    }
++
++    Invoke-Check -Title '18d contract 4.1/6.1: prefix sibling is not entered and the order matches' -Body {
++        $report = Get-WReparseReport -Root $contract
++        Assert-True ($null -eq (Get-Record $report 'link-prefix\other.txt')) 'the prefix-sibling content must not show up'
++        $paths = [string[]]@($report.Records | ForEach-Object { [string]$_.RelativePath })
++        $expectedOrder = @(
++            'beta', 'beta.txt', 'beta\zeta.txt',
++            'data', 'data\sample.bin',
++            'docs', 'docs\nested', 'docs\nested\deep.txt', 'docs\readme.txt',
++            'empty', 'hardlink.txt',
++            'link-dangling', 'link-file', 'link-in', 'link-loop', 'link-out', 'link-prefix', 'link-rel', 'link-twin',
++            'plain.txt', 'Z.txt', $nameAE, $nameOE
++        )
++        if ($script:HaveSymLinks) {
++            Assert-Equal $expectedOrder $paths 'complete record order'
++        }
++        else {
++            for ($i = 0; $i -lt 8; $i++) { Assert-Equal $expectedOrder[$i] $paths[$i] ('record order at index ' + $i) }
++        }
++    }
++
++    Invoke-SymLinkCheck -Title '18e contract 4.3: names and depths after following links' -Body {
++        $report = Get-WReparseReport -Root $contract -Follow
++        $expected = @(
++            @{ Path = 'link-in\nested'; Kind = 'Directory'; Depth = 2; Size = 0 }
++            @{ Path = 'link-in\readme.txt'; Kind = 'File'; Depth = 2; Size = 6 }
++            @{ Path = 'link-in\nested\deep.txt'; Kind = 'File'; Depth = 3; Size = 4 }
++            @{ Path = 'link-out\secret.txt'; Kind = 'File'; Depth = 2; Size = 6 }
++            @{ Path = 'link-rel\nested'; Kind = 'Directory'; Depth = 2; Size = 0 }
++            @{ Path = 'link-rel\readme.txt'; Kind = 'File'; Depth = 2; Size = 6 }
++            @{ Path = 'link-rel\nested\deep.txt'; Kind = 'File'; Depth = 3; Size = 4 }
++            @{ Path = 'link-twin\nested'; Kind = 'Directory'; Depth = 2; Size = 0 }
++            @{ Path = 'link-twin\readme.txt'; Kind = 'File'; Depth = 2; Size = 6 }
++            @{ Path = 'link-twin\nested\deep.txt'; Kind = 'File'; Depth = 3; Size = 4 }
++            @{ Path = 'link-prefix\other.txt'; Kind = 'File'; Depth = 2; Size = 5 }
++        )
++        foreach ($item in $expected) {
++            $record = Get-Record $report $item.Path
++            Assert-True ($null -ne $record) ('missing record ' + $item.Path)
++            Assert-Equal $item.Depth $record.Depth ('Depth of ' + $item.Path)
++            Assert-Equal $item.Size $record.Size ('Size of ' + $item.Path)
++            Assert-Equal $item.Kind $record.Kind ('Kind of ' + $item.Path)
++        }
++    }
++
++    Invoke-Check -Title '18f contract 4.4: -MaxDepth 1 over the published fixture' -Body {
++        $report = Get-WReparseReport -Root $contract -MaxDepth 1
++        Assert-Equal 4 $report.Stats.Directories 'Directories'
++        Assert-Equal 6 $report.Stats.Files 'Files'
++        Assert-Equal 8 $report.Stats.ReparsePoints 'ReparsePoints'
++        Assert-Equal 8 $report.Stats.Skipped 'Skipped'
++        Assert-Equal 4 $report.Stats.Errors 'Errors'
++        Assert-Equal 4 @($report.Errors).Count 'Errors collection'
++        foreach ($record in @($report.Records)) { Assert-Equal 1 $record.Depth ('Depth of ' + $record.RelativePath) }
++        foreach ($entry in @($report.Errors)) {
++            Assert-Equal 'too_deep' $entry.Code 'error code at -MaxDepth 1'
++            Assert-Equal 'Depth limit of 1 reached; not enumerating.' $entry.Message 'error message at -MaxDepth 1'
++        }
++    }
++
++    # -----------------------------------------------------------------------
++    # 19 path semantics samples (contract 5.1)
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '19a Get-WReparseCanonicalPath samples' -Body {
++        Assert-Equal $outside (Get-WReparseCanonicalPath -Path $outside) 'already canonical'
++        Assert-Equal $outside (Get-WReparseCanonicalPath -Path ($outside + '\')) 'trailing separator is stripped'
++        Assert-Equal $outside (Get-WReparseCanonicalPath -Path ($outside + '\.')) 'dot segment is collapsed'
++        Assert-Equal $outside (Get-WReparseCanonicalPath -Path ($outside + '\..\outside')) 'parent segment is collapsed'
++        Assert-Equal $outside (Get-WReparseCanonicalPath -Path ($outside.Replace('\', '/'))) 'forward slashes are normalised'
++        $mixed = Join-Path $outside 'PLAIN.TXT'
++        Assert-Equal $mixed (Get-WReparseCanonicalPath -Path $mixed) 'casing is preserved verbatim for a non-existent leaf'
++        Assert-Equal ($outside.ToUpperInvariant()) (Get-WReparseCanonicalPath -Path $outside.ToUpperInvariant()) 'casing of the input is kept'
++        Assert-True (-not [string]::Equals((Get-WReparseCanonicalPath -Path $outside), $outside.ToLowerInvariant(), [System.StringComparison]::Ordinal)) 'canonicalisation must not lower-case'
++        $volume = [System.IO.Path]::GetPathRoot($outside)
++        Assert-Equal $volume (Get-WReparseCanonicalPath -Path $volume) 'volume root keeps its trailing separator'
++        Assert-Equal $volume (Get-WReparseCanonicalPath -Path ($volume + '\')) 'volume root is stable'
++        Assert-Throws { Get-WReparseCanonicalPath -Path 'C:\bad<>|path' } 'Get-WReparseCanonicalPath on an illegal path'
++        Assert-Throws { Get-WReparseCanonicalPath -Path '' } 'Get-WReparseCanonicalPath on an empty path'
++    }
++
++    # -----------------------------------------------------------------------
++    # 20 access denied sub directory
++    # -----------------------------------------------------------------------
++    if ($denyApplied) {
++        Invoke-Check -Title '20a a denied sub directory reports access_denied, the rest still scans' -Body {
++            $report = Get-WReparseReport -Root $scanroot
++            Assert-True ($null -ne (Get-ErrorEntry $report 'denied' 'access_denied')) 'access_denied must be reported for the denied directory'
++            Assert-Equal 1 @($report.Errors).Count 'the denied directory is the only error'
++            Assert-Equal 1 $report.Stats.Errors 'Stats.Errors'
++            $deniedRecord = Get-Record $report 'denied'
++            Assert-True ($null -ne $deniedRecord) 'the denied directory itself is still recorded'
++            Assert-Equal 'Directory' $deniedRecord.Kind 'denied Kind'
++            Assert-Equal 1 $deniedRecord.Depth 'denied Depth'
++            Assert-True ($null -ne (Get-Record $report 'docs\readme.txt')) 'other branches still produce records'
++            Assert-True ($null -eq (Get-Record $report 'denied\inside.txt')) 'children of the denied directory are not recorded'
++            Assert-True ($null -ne (Get-ErrorEntry (Get-WReparseReport -Root $scanroot -Follow) 'denied' 'access_denied')) 'access_denied is reported under -Follow too'
++        }
++    }
++    else {
++        Invoke-Skip -Title '20a a denied sub directory reports access_denied, the rest still scans' -Reason 'the deny ACE could not be applied'
++    }
++
++    # -----------------------------------------------------------------------
++    # 21 the scan is read only
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '21a scanning does not modify the fixture' -Body {
++        $before = Get-FixtureSnapshot -Root $fx
++        Get-WReparseReport -Root $scanroot | Out-Null
++        Get-WReparseReport -Root $scanroot -Follow | Out-Null
++        Get-WReparseReport -Root $contract -Follow | Out-Null
++        Get-WReparseReport -Root $deepTree | Out-Null
++        Get-WReparseReport -Root $emptyTree | Out-Null
++        ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $scanroot) | Out-Null
++        Test-WReparseWithinRoot -Path $scanroot -Root $scanroot | Out-Null
++        Get-WReparseCanonicalPath -Path $scanroot | Out-Null
++        $after = Get-FixtureSnapshot -Root $fx
++        Assert-True ($before.Count -gt 50) 'the snapshot must not be empty'
++        $differences = @(Compare-Object -ReferenceObject $before -DifferenceObject $after)
++        if ($differences.Count -gt 0) {
++            $shown = @($differences | Select-Object -First 4 | ForEach-Object { [string]$_.SideIndicator + ' ' + [string]$_.InputObject })
++            throw ('the fixture changed during the scan: ' + ($shown -join ' | '))
++        }
++    }
++
++    # -----------------------------------------------------------------------
++    # 22 published empty-tree serialisation (contract 3.6)
++    # -----------------------------------------------------------------------
++    Invoke-Check -Title '22a serialisation of an empty tree matches contract 3.6 byte for byte' -Body {
++        $json = ConvertTo-WReparseJson -Report (Get-WReparseReport -Root $emptyTree)
++        $expectedLines = @(
++            '{'
++            '    "SchemaVersion":  "wreparse/1.0",'
++            ('    "Root":  "' + ($emptyTree.Replace('\', '\\')) + '",')
++            '    "Records":  [ ],'
++            '    "Errors":  [ ],'
++            '    "Stats":  {'
++            '                  "Directories":  0,'
++            '                  "Files":  0,'
++            '                  "ReparsePoints":  0,'
++            '                  "Skipped":  0,'
++            '                  "Errors":  0'
++            '              }'
++            '}'
++        )
++        Assert-Equal ([string]::Join("`r`n", [string[]]$expectedLines)) $json 'serialised empty tree'
++    }
++
++    $exitCode = 0
++}
++catch {
++    Write-Host ''
++    Write-Host ('[FAIL] fixture/setup: ' + $_.Exception.Message)
++    if ($_.ScriptStackTrace) { Write-Host ($_.ScriptStackTrace) }
++    $script:FailCount++
++    $exitCode = 1
++}
++finally {
++    if ($denyApplied -and (Test-Path -LiteralPath $icacls) -and (Test-Path -LiteralPath $denied)) {
++        $denyIdentity = "$($env:USERDOMAIN)\$($env:USERNAME)"
++        & $icacls $denied /remove:d $denyIdentity /c 2>&1 | Out-Null
++        & $icacls $denied /reset /t /c 2>&1 | Out-Null
++    }
++    if ($script:OwnWorkRoot -and (Test-Path -LiteralPath $WorkRoot)) {
++        Remove-ReparsePoints -Root $WorkRoot
++        Remove-Item -LiteralPath $WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
++        if (Test-Path -LiteralPath $WorkRoot) { & cmd.exe /c "rd /s /q `"$WorkRoot`"" 2>&1 | Out-Null }
++    }
++}
++
++Write-Host ''
++Write-Host ('selftest: {0} passed, {1} failed, {2} skipped' -f $script:PassCount, $script:FailCount, $script:SkipCount)
++if (($script:FailCount -gt 0) -or ($exitCode -ne 0)) {
++    Write-Host 'selftest: FAILED'
++    exit 1
++}
++Write-Host 'selftest: OK'
++exit 0
