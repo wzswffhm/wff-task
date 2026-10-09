@@ -413,13 +413,99 @@ Add-WReparseCheck 'empty-tree-serialises-empty-arrays' {
     return $true
 }
 
+# ---- deepening round 1.2.0: contract clauses previously not covered ---------
+# Each check restates a rule the behaviour contract already makes authoritative;
+# no new requirement is introduced.
+
+Add-WReparseCheck 'sorting-is-culture-independent' {
+    if ($reportError) { return $reportError }
+    $asciiZ = [string][char]0x005A + '.txt'
+    $umlautA = [string][char]0x00C4 + '.txt'
+    $umlautO = [string][char]0x00F6 + '.txt'
+    $paths = @($never.Records | ForEach-Object { [string]$_.RelativePath })
+    $indexOf = @{}
+    for ($i = 0; $i -lt $paths.Count; $i++) { if (-not $indexOf.ContainsKey($paths[$i])) { $indexOf[$paths[$i]] = $i } }
+    foreach ($name in @($asciiZ, $umlautA, $umlautO)) {
+        if (-not $indexOf.ContainsKey($name)) { return "record '$name' is missing from the report" }
+    }
+    if ($indexOf[$asciiZ] -ge $indexOf[$umlautA] -or $indexOf[$umlautA] -ge $indexOf[$umlautO]) {
+        return ("records are not in ordinal order around the non-ASCII names " +
+                "($asciiZ at $($indexOf[$asciiZ]), $umlautA at $($indexOf[$umlautA]), $umlautO at $($indexOf[$umlautO])); " +
+                "the contract requires an ordinal-ignore-case key, so a culture-aware sort is not acceptable")
+    }
+    return $true
+}
+
+Add-WReparseCheck 'module-exports-exactly-six-functions' {
+    $expected = @(
+        'Get-WReparseReport', 'ConvertTo-WReparseJson', 'Get-WReparseSchemaVersion',
+        'Test-WReparseWithinRoot', 'Get-WReparseCanonicalPath', 'Resolve-WReparseLinkTarget'
+    )
+    $actual = @(Get-Command -Module 'WReparse' -CommandType Function -ErrorAction SilentlyContinue |
+        ForEach-Object { [string]$_.Name })
+    if ($actual.Count -eq 0) { return 'the module surface could not be inspected (Get-Command -Module WReparse returned nothing)' }
+    $extra = @($actual | Where-Object { $expected -notcontains $_ })
+    if ($extra.Count -gt 0) {
+        return "the module exports functions outside the contract surface: $($extra -join ', ')"
+    }
+    $missing = @($expected | Where-Object { $actual -notcontains $_ })
+    if ($missing.Count -gt 0) { return "the module does not export: $($missing -join ', ')" }
+    return $true
+}
+
+Add-WReparseCheck 'target-is-serialised-as-string' {
+    if ($reportError) { return $reportError }
+    $link = Get-WReparseTestRecord -Report $never -RelativePath 'link-rel'
+    if ($null -eq $link) { return 'record link-rel is missing' }
+    if ($null -ne $link.Target -and $link.Target -isnot [string]) {
+        return "link-rel Target has type '$($link.Target.GetType().FullName)'; the contract defines Target as a single target string"
+    }
+    return $true
+}
+
+Add-WReparseCheck 'report-has-exactly-contract-fields' {
+    if ($reportError) { return $reportError }
+    $expected = @('SchemaVersion', 'Root', 'Records', 'Errors', 'Stats')
+    $actual = @($never.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    $extra = @($actual | Where-Object { $expected -notcontains $_ })
+    if ($extra.Count -gt 0) {
+        return "the report carries fields the contract does not define: $($extra -join ', ')"
+    }
+    $missing = @($expected | Where-Object { $actual -notcontains $_ })
+    if ($missing.Count -gt 0) { return "the report is missing contract fields: $($missing -join ', ')" }
+    return $true
+}
+
+Add-WReparseCheck 'no-follow-produces-no-cycle-or-broken-target' {
+    if ($reportError) { return $reportError }
+    foreach ($code in @('cycle', 'broken_target')) {
+        $hits = @($never.Errors | Where-Object { [string]$_.Code -eq $code })
+        if ($hits.Count -gt 0) {
+            return "a default (non-follow) scan produced '$code'; without -Follow the contract forbids cycle and broken_target"
+        }
+    }
+    return $true
+}
+
+Add-WReparseCheck 'inscope-is-false-for-non-reparse-entries' {
+    if ($reportError) { return $reportError }
+    foreach ($path in @('plain.txt', 'docs', 'hardlink.txt')) {
+        $record = Get-WReparseTestRecord -Report $never -RelativePath $path
+        if ($null -eq $record) { return "record $path is missing" }
+        if ($record.InScope -ne $false) {
+            return "$path has Kind '$($record.Kind)' but InScope=$($record.InScope); InScope is only meaningful for reparse entries and is false otherwise"
+        }
+    }
+    return $true
+}
+
 # ---- persist ---------------------------------------------------------------
 $checksDirectory = Split-Path -Parent $ChecksPath
 if (-not (Test-Path -LiteralPath $checksDirectory)) { New-Item -ItemType Directory -Path $checksDirectory -Force | Out-Null }
 
 $payload = [pscustomobject][ordered]@{
     task_id      = 'wfflab__wreparse-217'
-    task_version = '1.1.0'
+    task_version = '1.2.0'
     scan_root    = $scanRoot
     checks       = @($results.ToArray())
 }

@@ -1,5 +1,57 @@
 # CHANGELOG —— harbor-windows 题包目录
 
+## [wreparse-217 难度加深 L3 → L4] - 2026-10-09
+
+### 变更原因
+
+`wfflab__wreparse-217` 与 `wfflab__wfmt-215` 同为交付题包，但难度不对等：215 是 **L4**，
+217 只有 **L3**。根因在**行为依据的完备程度**——215 的 `docs/FORMAT.md` 是早期草稿、
+与真实布局脱节，`assets/` 下的样本才是唯一权威，模型必须逆向；而 217 的
+`docs/REPARSE-CONTRACT.md` 把规则逐条写全，模型照抄即可。
+
+甲方 QC 门禁两题都已通过（215：15 项；217：30 项），所以差距不在 QC 是否达标，
+而在难度等级本身。
+
+### 变更内容（215 → 217 的 L4 设计复刻）
+
+1. **权威依据分流**：新增 `environment/workspace/assets/observed-provider-facts.json`
+   （真机 Windows 11 + NTFS + Windows PowerShell 5.1 实测的 6 条 provider 事实）；
+   契约文档新增 §10，声明它只规定**语义**、不规定 provider 层返回值形状，
+   两者在实现细节上冲突时以实测事实为准。
+2. **自我一致性陷阱**：新增可见冒烟测试 `environment/workspace/tests/test_wreparse_basic.ps1`，
+   只验证「模块能导入、报告结构存在、能序列化」。**当前带 23 处契约偏差的实现同样全部通过**，
+   与 215「pack 能读回自己的输出、所以可见冒烟测试掩盖问题」同构。
+   `instruction.md` 明确声明通过它不代表符合契约。
+3. **新增 6 条契约一致性检查**（required 30 → **36**：23 F2P + 13 P2P）：
+   模块导出面恰好六个函数（§2）、报告字段集合恰为五项（§3）、排序与宿主 culture 无关
+   （§6.1/§6.2）、未给 `-Follow` 时不得报 `cycle`/`broken_target`（§7）、
+   普通条目 `InScope` 恒为 `false`（§3.1）、`Target` 类型稳定（§3.1）。
+   另把 `target-is-serialised-as-string` 登记为 P2P（合法解修复前后都必须通过）。
+4. **夹具增强**：`scanroot` 下新增 `Z.txt` / `Ä.txt` / `ö.txt`。三者的**序数顺序**与
+   **区域设置敏感顺序**相反（实测：`Sort-Object` 在 zh-CN 下给出 `Ä, ö, …, Z`，
+   序数规则要求 `Z, Ä, ö`），因此把排序委托给 `Sort-Object` 的实现必然失败。
+   文件名以字符码构造，避免脚本编码影响。
+5. **候选实现新增 5 处可观测偏差**并同步 Golden：导出面放宽为 `*`（psm1 + manifest 两处）、
+   用 `Sort-Object` 排序记录、错误列表只按 `Code` 排序、默认扫描也解析目标并报
+   `broken_target`、普通条目写入 `InScope`。
+6. **版本与元数据**：`task.toml` `difficulty` L3 → **L4**、`[task].version` → **1.2.0**；
+   `rubric.json` 新增 `public-surface` 项并把 9 项权重重新配平到合计 1.0；
+   `instruction.md` 增补第 9~12 条行为要求与第 12~17 条验收项。
+
+### 复验证据
+
+- **本机控制组**（`_qc_runs/controls_217_v120.json`）：
+  Oracle 3 次全部 `VALID` / `formal_score=1` / 36 of 36；
+  NOP 3 次全部 `VALID` / `formal_score=0` / 13 of 36（13 个 P2P 全过、23 个 F2P 全挂）。
+- **包哈希**：`task_hash = 90354fb76e46943681d514c8f3358a4439d00ec9c1dc8f21d50167bb379eecda`。
+
+### 待办
+
+- 三模型区分度（Qwen ×3 / Opus ×3 / GLM ≥1 / Kimi ≥1）必须重跑，原 `qualified: true`
+  （`task_versions: ["1.0.0"]`）不再适用。
+- 甲方 QC 工具的动态门禁需要 **Windows 容器**（本机 Docker 当前为 WSL2/Linux 引擎、
+  `Containers` 可选功能为 `Disabled`），待环境恢复后重跑。
+
 ## [范围对齐 + 标准 Harbor 兼容] - 2026-10-08
 
 ### 变更原因

@@ -1,4 +1,4 @@
-# monitor_and_deliver.ps1
+﻿# monitor_and_deliver.ps1
 #
 # 真·后台监控：轮询 runner 的 runs/ 直到 215 与 217 的 Opus 各满 3 轮（或超时），
 # 然后自动汇总 Qwen/Opus 的 score_sum、判定区分度（Opus 严格大于 Qwen），

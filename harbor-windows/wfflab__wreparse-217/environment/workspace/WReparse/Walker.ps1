@@ -109,18 +109,20 @@ function Invoke-WReparseDirectoryWalk {
                 -Target $rawTarget -ResolvedTarget $resolved -InScope $inScope `
                 -Depth $Depth -Size 0))
 
-            if (-not $State.Follow) {
-                $State.Skipped++
-                continue
-            }
             if ($null -eq $resolved) {
                 Add-WReparseError -State $State -RelativePath $relative -Code 'broken_target' `
                     -Message 'The reparse target could not be resolved.'
+                if (-not $State.Follow) { $State.Skipped++ }
                 continue
             }
             if (-not (Test-Path -LiteralPath $resolved)) {
                 Add-WReparseError -State $State -RelativePath $relative -Code 'broken_target' `
                     -Message 'The reparse target does not exist.'
+                if (-not $State.Follow) { $State.Skipped++ }
+                continue
+            }
+            if (-not $State.Follow) {
+                $State.Skipped++
                 continue
             }
             if ($Ancestry -contains $resolved) {
@@ -143,7 +145,7 @@ function Invoke-WReparseDirectoryWalk {
         }
         $kind = if ($isContainer) { 'Directory' } else { 'File' }
         [void]$State.Records.Add((New-WReparseRecord -RelativePath $relative -Kind $kind `
-            -Depth $Depth -Size $size))
+            -InScope (Test-WReparseWithinRoot -Path $realChild -Root $State.Root) -Depth $Depth -Size $size))
 
         if ($isContainer) {
             $realChildCanonical = Get-WReparseCanonicalPath $realChild

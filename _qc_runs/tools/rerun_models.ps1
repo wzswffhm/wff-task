@@ -1,4 +1,4 @@
-# rerun_models.ps1 —— 在整改后的题包上重跑指定模型的候选轮次
+﻿# rerun_models.ps1 —— 在整改后的题包上重跑指定模型的候选轮次
 #
 # 必须设置 DOCKER_CONTEXT=desktop-windows：runner 默认解析到
 # dockerDesktopLinuxEngine，而本机 Docker Desktop 处于 Windows 容器模式，

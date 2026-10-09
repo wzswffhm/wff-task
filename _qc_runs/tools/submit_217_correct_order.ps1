@@ -1,4 +1,4 @@
-# submit_217_correct_order.ps1
+﻿# submit_217_correct_order.ps1
 #
 # 为什么需要这个脚本：upload_feishu.ps1 的顺序是「先 record-upsert 写状态、后 upload-attachment」。
 # 但本表在状态被置为「待质检」的那一刻，标注员就失去该记录的写权限 —— 所以后面的附件上传

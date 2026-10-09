@@ -67,8 +67,8 @@ function Get-WReparseReport {
     )
     $followMode = if ($Follow) { 'Always' } else { 'Never' }
     $walk = Invoke-WReparseWalk -Root $Root -FollowMode $followMode -MaxDepth $MaxDepth
-    $records = @($walk.Records)
-    $errors = @($walk.Errors)
+    $records = @($walk.Records | Sort-Object -Property RelativePath)
+    $errors = @($walk.Errors | Sort-Object -Property Code)
     $stats = Get-WReparseStats -Records $records -Skipped $walk.Skipped -ErrorCount $errors.Count
     $canonicalRoot = $null
     try { $canonicalRoot = Get-WReparseCanonicalPath $Root } catch { $canonicalRoot = $Root }

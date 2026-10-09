@@ -9,11 +9,4 @@ $moduleRoot = $PSScriptRoot
 . (Join-Path $moduleRoot ('Walker' + '.ps1'))
 . (Join-Path $moduleRoot ('Audit' + '.ps1'))
 
-Export-ModuleMember -Function @(
-    'Get-WReparseReport'
-    'ConvertTo-WReparseJson'
-    'Get-WReparseSchemaVersion'
-    'Test-WReparseWithinRoot'
-    'Get-WReparseCanonicalPath'
-    'Resolve-WReparseLinkTarget'
-)
+Export-ModuleMember -Function *

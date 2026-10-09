@@ -48,10 +48,12 @@
 | K19 | 重要经验 | **已排除的三种「提分」假设（全部实测反效果或无效）**：① 加倍 agent 回合预算（`--agent-max-steps 80`）→ Opus 在 wfmt-215 由 12/15 降到 9/15，行为退化为命令空转（46–60 次 `run_command`、0–3 次 `write_file`）；② 在 system prompt 中显式鼓励并行工具调用 → 并行度确实从 1.2 升到 1.9 工具/回合，但 wsync-142 通过数由 19–22/24 腰斩到 9/24（改动已回滚）；③ 加大难度：Opus 失败比 Qwen 更早更猛，加大难度只会把「持平」变成「Qwen 胜」 | 避免后续重复试错 | 端点修复前不要再在出题侧找解 |
 | K20 | 提示 | `wfflab__wtask-216`（本次新建，Windows 计划任务调度语义引擎）结构完整、可复现：no-change ×3 = 0.0、Golden ×3 = 1.0（均 VALID）、Qwen/Opus/GLM/Kimi 全 1.0；`validate_package.py` PASS=393 / FAIL=1（缺 delivery-extras）。**8.2 判定为 FAIL（Opus 3.0 vs Qwen 3.0，同分且非 0）**，属难度不足（薄题），同样卡在 K18 | 该题不参与本轮交付，但可在端点修复后直接复用 | 若端点恢复且需要对上「非满分」的 Qwen，可优先复用 `wfmt-215`(Qwen 2.0) / `wproc-209` / `winstall-210` |
 
+| K21 | 重要变更 | **`wfflab__wreparse-217` 已按 215 的 L4 难度设计加深（1.1.0 → 1.2.0）**：原题的行为依据是一份把规则写全的契约文档，模型照抄即可，因此停在 L3。本轮补齐 L4 所需的「信息不完备 + 自我一致性陷阱」：① 新增真机实测的 provider 权威事实 `environment/workspace/assets/observed-provider-facts.json`，契约文档补 §10 声明它不覆盖 provider 层返回值形状，两者冲突时以实测事实为准（对应 215 的「`docs/FORMAT.md` 是草稿、`assets/` 样本才是唯一权威」）；② 新增可见冒烟测试 `environment/workspace/tests/test_wreparse_basic.ps1`，只验证「自己产出的报告自己能读懂」，**当前带偏差的实现同样全过**（对应 215 的「可见冒烟测试掩盖问题」）；③ 新增 6 条契约一致性检查（导出面恰好六个函数、报告字段集合恰为五项、排序与宿主 culture 无关、未跟随不得报 cycle/broken_target、普通条目 InScope 恒 false、Target 类型稳定），required 由 30 条增至 **36 条**；④ 夹具有意加入 `Z.txt` / `Ä.txt` / `ö.txt`，其序数顺序与区域设置敏感顺序相反，用 `Sort-Object` 修排序必然踩中。 | 该题的 `task_version` / `task_hash` / `image_ref` 再次改变，**1.0.0 时代的 `qualification_summary.json`（QWEN 2 / OPUS 3、`qualified: true`）不再适用** | 本机控制组已复验通过（Oracle 3×`VALID/1`、NOP 3×`VALID/0`，证据 `_qc_runs/controls_217_v120.json`）；**三模型区分度必须重跑后才能重新声明 qualified** |
+
 ## 题号对照（本目录 2 题）
 
 - `wfflab__wfmt-215` —— 编码与区域（二进制容器格式，近似映射）｜L4｜required **8 F2P + 7 P2P = 15**
-- `wfflab__wreparse-217` —— 文件系统与路径（NTFS 重解析点）｜L3｜required **13 F2P + 11 P2P = 24**
+- `wfflab__wreparse-217` —— 文件系统与路径（NTFS 重解析点）｜**L4**｜required **23 F2P + 13 P2P = 36**
 
 > 历史材料中出现的 `wsync-142`、`wreserved-201`、`wads-202`、`wacl-203`、`wpathext-204`、
 > `wreg-205`、`wencoding-206`、`wps-207`、`wrotate-208`、`wproc-209`、`winstall-210`、

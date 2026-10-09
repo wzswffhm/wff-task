@@ -6,14 +6,7 @@
     CompanyName       = 'vendor'
     Description       = 'Safe reparse-point traversal and deterministic audit reporting for Windows directory trees.'
     PowerShellVersion = '5.1'
-    FunctionsToExport = @(
-        'Get-WReparseReport'
-        'ConvertTo-WReparseJson'
-        'Get-WReparseSchemaVersion'
-        'Test-WReparseWithinRoot'
-        'Get-WReparseCanonicalPath'
-        'Resolve-WReparseLinkTarget'
-    )
+    FunctionsToExport = '*'
     CmdletsToExport   = @()
     VariablesToExport = @()
     AliasesToExport   = @()

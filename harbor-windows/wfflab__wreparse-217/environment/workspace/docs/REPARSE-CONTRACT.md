@@ -143,6 +143,23 @@ Stats         : object      # 见 3.3
 `ConvertTo-WReparseJson` 使用 `ConvertTo-Json`，`-Depth` 至少 12；`null` 字段必须序列化为
 JSON `null`，空数组序列化为 `[]`。键顺序与 §3 一致。
 
+## 10. provider 细节与实测事实
+
+本文件规定**语义**：字段含义、遍历规则、路径判定、错误码与序列化要求。
+
+它**不**规定 provider 层返回值的真实形状——那是宿主实现决定的，并且会随
+Windows 版本与访问方式变化。真机实测的权威事实记录在
+`assets/observed-provider-facts.json`，包括：
+
+- 重解析点与硬链接在文件属性上的区别；
+- provider 给出的 `LinkType` 取值集合；
+- `.Target` 的实际类型与相对/绝对形态；
+- PowerShell 转发单元素数组时的类型行为；
+- 枚举顺序与契约排序规则的关系。
+
+**当本文件的文字与 `assets/observed-provider-facts.json` 的实测事实在实现细节上
+冲突时，以实测事实为准。** 语义层面的规则仍以本文件为准。
+
 ## 9. 非目标
 
 - 不修改、不删除、不创建任何被扫描的条目（只读）。

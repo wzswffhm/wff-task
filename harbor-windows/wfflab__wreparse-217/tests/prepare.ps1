@@ -56,6 +56,15 @@ Set-Content -LiteralPath (Join-Path (Join-Path $scanRoot 'data') 'sample.bin') -
 Set-Content -LiteralPath (Join-Path (Join-Path $scanRoot 'beta') 'zeta.txt') -Value 'zeta' -NoNewline -Encoding ASCII
 Set-Content -LiteralPath (Join-Path $scanRoot 'beta.txt') -Value 'beta' -NoNewline -Encoding ASCII
 Set-Content -LiteralPath (Join-Path $scanRoot 'plain.txt') -Value 'plain' -NoNewline -Encoding ASCII
+
+# Names whose ordinal ordering differs from their culture-aware ordering.
+# The contract fixes the sort key to ordinal-ignore-case, so a host whose
+# culture collates by base letter would order these differently. The names
+# are built from code points so that the fixture never depends on the
+# encoding of this script.
+Set-Content -LiteralPath (Join-Path $scanRoot ([string][char]0x005A + '.txt')) -Value 'ascii-z' -NoNewline -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $scanRoot ([string][char]0x00C4 + '.txt')) -Value 'umlaut-a' -NoNewline -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $scanRoot ([string][char]0x00F6 + '.txt')) -Value 'umlaut-o' -NoNewline -Encoding ASCII
 Set-Content -LiteralPath (Join-Path $outsideRoot 'secret.txt') -Value 'secret' -NoNewline -Encoding ASCII
 Set-Content -LiteralPath (Join-Path $prefixSibling 'other.txt') -Value 'other' -NoNewline -Encoding ASCII
 

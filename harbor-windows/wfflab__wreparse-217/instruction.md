@@ -10,8 +10,16 @@
 1. 遍历器会悄悄跟随重解析点，越出扫描根目录读到无关数据；
 2. 同一棵树在不同机器上产出不同的报告，导致下游比对全部失效。
 
-`environment/workspace/WReparse` 是当前实现，`environment/workspace/docs/REPARSE-CONTRACT.md`
-是它的**唯一权威行为规格**。当前实现与契约之间存在多处偏差，需要全部修掉。
+`environment/workspace/WReparse` 是当前实现。行为依据有两个来源，分工明确：
+
+- `environment/workspace/docs/REPARSE-CONTRACT.md` 规定**语义**（字段含义、遍历规则、
+  路径判定、错误码、序列化要求），语义层面以它为准；
+- `environment/workspace/assets/observed-provider-facts.json` 是在真机
+  （Windows 11 + NTFS + Windows PowerShell 5.1）上实测采集的 **provider 层权威事实**
+  （属性与 `LinkType` 的真实取值、`.Target` 的实际类型、枚举顺序与排序规则的关系等）。
+  **两者在实现细节上冲突时，以实测事实为准。**
+
+当前实现与以上两个来源之间存在多处偏差，需要全部修掉。
 
 ## 目标
 
@@ -40,6 +48,16 @@
    的记录数，且总和等于记录总数；`Stats.Skipped` 等于因未跟随而没有进入的重解析点数量。
 8. **错误码**：只使用契约 §7 的七个码，触发条件与契约一致（含 `invalid_argument`）；
    未给 `-Follow` 时不得产生 `cycle` 与 `broken_target`。
+9. **导出面**：模块**只**导出契约 §2 的六个函数。内部辅助函数（遍历、排序、
+   记录构造等）不得出现在模块的可见命令面上。
+10. **报告字段集合**：报告对象的字段**恰好**是契约 §3 的 `SchemaVersion` / `Root` /
+    `Records` / `Errors` / `Stats` 五项，不得多出任何字段（包括生成时间戳之类的元数据）。
+11. **排序与宿主区域设置无关**：`Records` 与 `Errors` 的比较键必须是**序数**比较。
+    不得把排序委托给受宿主 culture 影响的默认排序——在含非 ASCII 名字的目录上，
+    这种排序会按基字母重排，使同一棵树在不同宿主机上产出不同报告。
+12. **记录字段的类型稳定**：`Target` 是一个目标串。provider 可能把目标返回成集合，
+    且 PowerShell 转发单元素数组时会退化成元素本身；实现必须显式把它规范成字符串，
+    不得让 `Target` 的类型随目标个数变化。
 
 ## 边界和约束
 
@@ -51,6 +69,9 @@
   `environment/workspace/docs/REPARSE-CONTRACT.md`。
 - 不引入外部依赖：保持纯 PowerShell + .NET BCL。
 - 模块必须在 Windows PowerShell 5.1 下可正常导入并运行（不得要求 PowerShell 7）。
+- `environment/workspace/assets/observed-provider-facts.json` 是只读的权威事实，
+  不得修改；`environment/workspace/tests/test_wreparse_basic.ps1` 是可见冒烟测试，
+  也不得修改。
 
 ## 运行入口
 
@@ -58,7 +79,11 @@
 junction、符号链接、硬链接，以及循环、悬空目标和名字前缀相似的兄弟目录等边界情形），
 再对模块公共 API 运行一组契约一致性检查，结果写入 `results/result.json`。
 
-所述夹具与检查脚本属于**评测资产，不提供给候选**。请严格按
+`environment/workspace/tests/test_wreparse_basic.ps1` 是**可见冒烟测试**：它只确认
+模块能导入、报告结构存在、能序列化。它**不**校验上面任何一条细则，
+通过它**不代表**实现了契约——当前这份有偏差的实现同样能通过它。
+
+所述评测夹具与检查脚本属于**评测资产，不提供给候选**。请严格按
 `docs/REPARSE-CONTRACT.md` 实现语义，并逐条核对这些边界情形：普通文件与目录、junction 与
 符号链接（两者 `ReparseKind` 必须不同）、硬链接（必须按普通文件登记）、相对目标链接、
 指向扫描根之外的链接、循环链接与悬空目标、仅前缀相同的兄弟目录、**目标为文件的链接**、
@@ -83,3 +108,14 @@ junction、符号链接、硬链接，以及循环、悬空目标和名字前缀
 10. 同一个目标被**兄弟分支**上的两个链接分别指向时**不构成环**：两个分支都应被正常进入，
     且 `Errors` 中不得出现针对它们的 `cycle`。
 11. 扫描一棵**空目录**树时，序列化结果中 `Records` 与 `Errors` 均为 `[]`。
+12. 导入模块后，可见函数恰好是 `Get-WReparseReport`、`ConvertTo-WReparseJson`、
+    `Get-WReparseSchemaVersion`、`Test-WReparseWithinRoot`、`Get-WReparseCanonicalPath`、
+    `Resolve-WReparseLinkTarget` 六个；内部辅助函数（如遍历与排序函数）不可见。
+13. 报告对象不含 `SchemaVersion` / `Root` / `Records` / `Errors` / `Stats` 之外的字段。
+14. 在名字含非 ASCII 字符（如 `Ä`、`ö`）的目录上，`Records` 仍严格按**序数**规则排序：
+    例如 ASCII 的 `Z` 必须排在 `Ä` 与 `ö` 之前——按基字母排序的实现会给出相反结果。
+15. 未给 `-Follow` 时，报告的 `Errors` 中不出现 `cycle` 与 `broken_target`，
+    即使扫描树里存在环和悬空目标。
+16. 普通文件与目录（如 `plain.txt`、`docs`、硬链接）的 `InScope` 恒为 `false`；
+    `InScope` 只对重解析点条目有意义。
+17. 任何重解析点条目的 `Target` 都是字符串类型，不因目标个数而变化。
