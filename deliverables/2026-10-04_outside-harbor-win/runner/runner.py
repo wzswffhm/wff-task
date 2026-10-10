@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -85,6 +86,11 @@ DEFAULT_PROFILE = {
 }
 
 TASK_PROFILE: dict = dict(DEFAULT_PROFILE)
+
+# Frozen once per invocation, then stamped into every run directory. The 118
+# rework rejection was raised because job records could not be tied back to the
+# task they were produced from, so each run now carries its own identity.
+TASK_IDENTITY: dict = {}
 
 # Binary fixtures are handed to the model as a hex dump. Cap the dump so one
 # large sample cannot swallow the whole context window.
@@ -141,8 +147,9 @@ def resolve_image_tag(task_dir: Path) -> str:
     text = (task_dir / "task.toml").read_text(encoding="utf-8-sig")
     match = re.search(r'(?m)^\s*task_id\s*=\s*"([^"]+)"', text)
     task_id = match.group(1) if match else task_dir.name
-    match = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', text)
-    version = match.group(1) if match else "1.0.0"
+    # [task].version, not the top-level platform schema version: the image tag has
+    # to track the deliverable version that task_version reports.
+    version = task_version_of(task_dir) or "1.0.0"
     return f"outside-harbor/{task_id}:{version}"
 
 
@@ -197,6 +204,81 @@ def ensure_image(task_dir: Path) -> str:
     if proc.returncode != 0:
         raise DockerError(f"image build failed: {(proc.stderr or proc.stdout)[-2000:]}")
     return tag
+
+
+# Run artefacts, not task content: they must never contribute to the task hash,
+# both because they change on every run and because a receiver recomputes the
+# hash from the delivered task tree alone.
+TASK_HASH_SKIP_DIRS = {"jobs", "runs", "work", "results", "__pycache__",
+                       ".pytest_cache", ".mypy_cache", ".git"}
+
+
+def compute_task_hash(task_dir: Path) -> str:
+    """sha256 over (relative path + sha256 of content) for every task file."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in task_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(task_dir)
+        if any(part in TASK_HASH_SKIP_DIRS for part in rel.parts):
+            continue
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            continue
+        digest.update(rel.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(payload).hexdigest().encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def task_version_of(task_dir: Path) -> str | None:
+    """The task's own version, not the platform schema version.
+
+    task.toml carries a top-level ``version = "1.0"`` (the Outside Harbor schema
+    version) *and* ``[task].version`` (the deliverable version the platform
+    tracks as task_version). Only the latter belongs in the identity record.
+    """
+    try:
+        data = _load_toml(task_dir / "task.toml")
+    except Exception:  # noqa: BLE001 - the manifest is advisory
+        return None
+    task = data.get("task") or {}
+    metadata = data.get("metadata") or {}
+    return task.get("version") or metadata.get("task_version") or data.get("version")
+
+
+def build_task_identity(task_dir: Path, image: str) -> dict:
+    proc = docker(["image", "inspect", image, "--format", "{{.Id}}"])
+    image_digest = proc.stdout.strip() if proc.returncode == 0 else ""
+    return {
+        "task_id": TASK_PROFILE.get("task_id") or task_dir.name,
+        "task_version": task_version_of(task_dir),
+        "task_hash": compute_task_hash(task_dir),
+        "task_hash_algorithm": (
+            "sha256 over (relative posix path + sha256(file content)) for every file in the "
+            "task tree, sorted by path; jobs/, runs/, work/, results/ and caches are excluded"),
+        "docker_image": image,
+        "docker_image_digest": image_digest,
+        "captured_at": now_iso(),
+    }
+
+
+def capture_run_identity(run_dir: Path) -> None:
+    """Write the task identity and the exact prompts fed to the model.
+
+    Evidence capture must never abort a run, so every write is guarded.
+    """
+    try:
+        (run_dir / "task_identity.json").write_text(
+            json.dumps(TASK_IDENTITY, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - orchestration layer
+        log(f"  !! task identity capture failed: {type(exc).__name__}: {exc}")
+    for name, builder in (("prompt.system.txt", build_system_prompt),
+                          ("prompt.task.txt", build_task_prompt)):
+        try:
+            (run_dir / name).write_text(builder(), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 - orchestration layer
+            log(f"  !! {name} capture failed: {type(exc).__name__}: {exc}")
 
 
 def wait_for_engine(max_wait: int = 900, poll: int = 10) -> bool:
@@ -946,6 +1028,7 @@ def run_once(task_dir: Path, image: str, mode: str, cfg: dict | None,
     # transcript and the stderr capture both stream into it while the run is
     # still in flight.
     run_dir.mkdir(parents=True, exist_ok=True)
+    capture_run_identity(run_dir)
     copy_tree(task_dir, case_dir)
 
     agent_info: dict = {}
@@ -998,6 +1081,8 @@ def run_once(task_dir: Path, image: str, mode: str, cfg: dict | None,
 
     result = collect_run_artifacts(case_dir, run_dir, log_text)
     result["mode"] = mode
+    if TASK_IDENTITY:
+        result["task_identity"] = dict(TASK_IDENTITY)
     if cfg:
         # `model_alias` must be the short qualification alias (QWEN/OPUS/GLM/KIMI):
         # summarize_model_runs.py matches it with str(...).upper() == model.
@@ -1088,6 +1173,12 @@ def main() -> int:
 
     image = ensure_image(task_dir)
     log(f"image ready: {image}")
+
+    global TASK_IDENTITY
+    TASK_IDENTITY = build_task_identity(task_dir, image)
+    log(f"task identity: {TASK_IDENTITY['task_id']}@{TASK_IDENTITY['task_version']} "
+        f"task_hash={TASK_IDENTITY['task_hash']} "
+        f"image_digest={TASK_IDENTITY['docker_image_digest'][:19]}")
 
     env = load_env_file(Path(args.env_file))
 

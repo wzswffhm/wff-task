@@ -45,6 +45,31 @@ def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+SKIP_DIRS_RUNNER = {"jobs", "runs", "work", "results", "__pycache__",
+                    ".pytest_cache", ".mypy_cache", ".git"}
+
+
+def runner_task_hash(task_dir: Path) -> str:
+    """与 runner.py / make_jobs_from_runs.py 完全一致的 task_hash 口径。
+
+    每个 job 的 jobs/<job_id>/binding.json 记录的就是这个值。118 号返修要求
+    job 能绑定「当前 Task」，因此两个口径都写进 platform_import.json：
+      - task_hash        : 平台口径 tree_hash（排除 jobs/ 与 platform_import.json）
+      - task_hash_runner : 跑分口径 runner_task_hash（排除 jobs/runs/work/results/缓存）
+    审计方可任选其一独立复算。
+    """
+    digest = hashlib.sha256()
+    for path in sorted(p for p in task_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(task_dir)
+        if any(part in SKIP_DIRS_RUNNER for part in rel.parts):
+            continue
+        digest.update(rel.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def collect_asset_files() -> list[tuple[Path, str]]:
     """题包本体（不含 jobs/）→ outside_harbor-assets/<task>/..."""
     items: list[tuple[Path, str]] = []
@@ -77,11 +102,17 @@ def main() -> int:
 
     task_version = cfg["task"]["version"]
     digest = tree_hash(SRC)
+    run_digest = runner_task_hash(SRC)
     import_json = {
         "instance_id": TASK,
         "task_version": task_version,
         "task_hash": digest,
-        "docker_image": f"outside-harbor/{TASK}:1.0",
+        "task_hash_runner": run_digest,
+        "task_hash_runner_algorithm": ("sha256 over (relative posix path + NUL + sha256(file content) + LF) "
+                                       "for every file in the task tree, sorted by path; jobs/, runs/, work/, "
+                                       "results/ and caches excluded. 与每个 job 的 "
+                                       "jobs/<job_id>/binding.json:task_hash 同口径。"),
+        "docker_image": f"outside-harbor/{TASK}:{task_version}",
         "image_digest": args.image_digest or "PENDING_BUILD",
         "instruction_file": f"{TASK}/instruction.md",
         "assets_path": TASK,
@@ -103,7 +134,8 @@ def main() -> int:
     # ---- 1) 平台布局 delivery.zip -------------------------------------
     delivery = out_dir / f"{TASK}-v{task_version}-delivery.zip"
     items = collect_asset_files()
-    golden = sorted((SRC / "jobs").glob("*-golden-oracle-01"))
+    golden = sorted(list((SRC / "jobs").glob("*-golden-oracle-01"))
+                    + list((SRC / "jobs").glob("*-golden-golden-01-*")))
     if golden:
         gdir = golden[0] / "verifier"
         for f in sorted(gdir.iterdir()) if gdir.is_dir() else []:

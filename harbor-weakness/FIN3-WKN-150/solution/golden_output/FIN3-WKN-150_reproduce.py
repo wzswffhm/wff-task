@@ -441,7 +441,7 @@ ax.annotate('★ 可比公司原始导出需清洗', xy=(4, 8), xytext=(6, 8.4),
 save(fig, 'FIN3-WKN-150_chart01_材料覆盖与数据缺口.png')
 
 # ==================== 复合图 2：收入结构与利润口径还原 ====================
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig, axes = plt.subplots(1, 2, figsize=(18, 6))
 
 # (a) 收入结构与毛利率
 prod = pd.read_csv(IN / '21_收入明细_分产品_2025.csv')
@@ -471,9 +471,10 @@ ax.legend(h1 + h2, l1 + l2, fontsize=9, loc='lower right')
 ax = axes[1]
 y25 = adj['2025']
 steps = [('净利润', y25['net'], BLUE), ('−非经常性损益', -y25['nonrec'], RED),
-         ('扣非归母净利润', y25['kf'], ORANGE), ('＋所得税', y25['tax'], GREY),
-         ('＋利息费用', y25['intexp'], GREY), ('＋折旧摊销', y25['da'], GREY),
-         ('＋股份支付', y25['sbp'], GREY), ('调整后EBITDA', y25['ebitda_adj'], GREEN)]
+         ('扣非归母净利润', y25['kf'], ORANGE), ('＋非经常性损益', y25['nonrec'], GREY),
+         ('＋所得税', y25['tax'], GREY), ('＋利息费用', y25['intexp'], GREY),
+         ('＋折旧摊销', y25['da'], GREY), ('＋股份支付', y25['sbp'], GREY),
+         ('调整后EBITDA', y25['ebitda_adj'], GREEN)]
 cum = y25['net']
 for i, (nm, v, c) in enumerate(steps):
     if nm in ('扣非归母净利润', '调整后EBITDA'):
@@ -487,7 +488,7 @@ for i, (nm, v, c) in enumerate(steps):
         cum += v
 ax.set_ylim(0, max(y25['net'], y25['ebitda_adj']) * 1.22)
 ax.set_xticks(range(len(steps)))
-ax.set_xticklabels([s[0] for s in steps], rotation=20, fontsize=9)
+ax.set_xticklabels([s[0] for s in steps], rotation=35, fontsize=7.5)
 ax.set_ylabel('万元')
 ax.set_title('(b) 2025 年利润口径还原（净利润 → 扣非归母 → 调整后 EBITDA）')
 
@@ -735,6 +736,7 @@ A('|---|---|---|')
 A(f'| 净利润 | {fm(adj["2025"]["net"])} | 审计报告 |')
 A(f'| 减：非经常性损益（税后） | {fm(adj["2025"]["nonrec"])} | 《11_非经常性损益明细.csv》 |')
 A(f'| **扣非归母净利润** | **{fm(adj["2025"]["kf"])}** | 计算值 |')
+A(f'| 加：非经常性损益（税后） | {fm(adj["2025"]["nonrec"])} | 《11_非经常性损益明细.csv》 |')
 A(f'| 加：所得税费用 | {fm(adj["2025"]["tax"])} | 审计报告 |')
 A(f'| 加：利息费用 | {fm(adj["2025"]["intexp"])} | 附注 |')
 A(f'| 加：折旧与摊销 | {fm(adj["2025"]["da"])} | 附注 |')

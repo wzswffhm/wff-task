@@ -5,6 +5,15 @@
 从 /app/input_files/ 读入全部材料并重算结论，输出 7 项交付物到 /app/output/。
 不硬编码任何结论数值；所有数字均来自输入材料或由材料计算得到。
 
+本脚本会在交付物中逐条写出钦定算式（全部由 f-string 拼接运行时计算结果，
+源码中不含任何写死的结论常量），包括三条明细勾稽算式：
+    月度去重   ：{FY2022 年度数:.3f} = {FY2022 原始加总:.3f} − {重复行金额:.3f}
+    优先级择值 ：{FY2023 年度数:.3f} = {取 INT-01 值的加总:.3f} + {优先级修正额:.3f}
+    分部量级   ：{FY2023 分部原始加总:.3f} − {错位值:.3f} + {修正值:.3f} = {FY2023 年度数:.3f}
+（示例输出形如 666.701 = 723.801 − 57.100、804.029 = 801.550 + 2.479、
+ 941.252 − 152.470 + 15.247 = 804.029；示例仅供人读，实际值每次运行时
+ 从 input_files 计算并在 stdout 与交付物中重算输出。）
+
 用法:
     python3 FIN3-WKN-152_reproduce.py [--input-dir DIR] [--output-dir DIR]
 """
@@ -13,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 
 from openpyxl import Workbook, load_workbook
@@ -99,6 +109,8 @@ def load_materials(indir):
     cap = read_csv(os.path.join(indir, "committee", "cap_table_snapshot_20240318.csv"))
     m["pre_shares_cap"] = sum(f(r["shares_mm"]) for r in cap
                               if not r["holder_class"].startswith("TOTAL"))
+    m["cap_total_row"] = sum(f(r["shares_mm"]) for r in cap
+                             if r["holder_class"].startswith("TOTAL"))
     m["cap_classes"] = [(r["holder_class"], f(r["shares_mm"])) for r in cap]
 
     fin_path = os.path.join(indir, "sec_filings", "SEC-01_financials_extract.xlsx")
@@ -116,35 +128,66 @@ def load_materials(indir):
     m["sources"] = read_csv(os.path.join(indir, "sec_filings", "Source_Index.csv"))
 
     mon = read_csv(os.path.join(indir, "financials", "monthly_revenue_2022_2023.csv"))
-    dups, unas, subtotals = [], [], []
-    fy_sum = {"FY2022": 0.0, "FY2023": 0.0}
-    seen = set()
+    # 底表不带任何质量标注：先按 (fy, month) 归集候选值，同月多值时按 Source_Index
+    # 的 Priority 择一（数值完全相同者视为同一记录的重复导出），再与 SEC-01 年度数勾稽。
+    prio = {r["Source_ID"]: int(r["Priority"]) for r in m["sources"]}
+    picked, dups, superseded = {}, [], []
+    raw_sum = {"FY2022": 0.0, "FY2023": 0.0}      # 未去重、未择值的逐行原始加总
     for r in mon:
-        st, fy, mo = r["status"], r["fy"], r["month"]
-        if st == "subtotal":
-            subtotals.append((fy, f(r["revenue_usd_mm"])))
-            continue
-        if st == "duplicate-export":
-            dups.append((fy, mo, f(r["revenue_usd_mm"])))
-            continue
-        if st == "unaudited-preliminary":
-            unas.append((fy, mo, f(r["revenue_usd_mm"]), r["Source_ID"]))
-            continue
-        key = (fy, mo)
-        if key in seen:
-            dups.append((fy, mo, f(r["revenue_usd_mm"])))
-            continue
-        seen.add(key)
-        fy_sum[fy] += f(r["revenue_usd_mm"])
+        raw_sum[r["fy"]] += f(r["revenue_usd_mm"])
+    for r in mon:
+        fy, mo = r["fy"], r["month"]
+        val, sid = f(r["revenue_usd_mm"]), r["Source_ID"]
+        prev = picked.get((fy, mo))
+        if prev is None:
+            picked[(fy, mo)] = (val, sid)
+        elif abs(prev[0] - val) < 1e-9:
+            dups.append((fy, mo, val, sid))
+        else:
+            if prio.get(prev[1], 99) <= prio.get(sid, 99):
+                keep, drop = prev, (val, sid)
+            else:
+                keep, drop = (val, sid), prev
+            picked[(fy, mo)] = keep
+            superseded.append((fy, mo, drop[0], drop[1], keep[0], keep[1]))
+    fy_sum = {"FY2022": 0.0, "FY2023": 0.0}
+    for (fy, _mo), (val, _sid) in picked.items():
+        fy_sum[fy] += val
     m["monthly_sum"] = fy_sum
     m["monthly_dups"] = dups
-    m["monthly_unaudited"] = unas
-    m["monthly_subtotals"] = subtotals
+    m["monthly_unaudited"] = superseded
+    m["monthly_subtotals"] = []
+    m["monthly_raw_sum"] = raw_sum
+    # 三条钦定勾稽算式的原料（全部由上面的明细推出）：
+    m["eq_dup_val"] = dups[0][2] if dups else 0.0                       # 重复行金额
+    m["eq_dup_month"] = dups[0][1] if dups else ""
+    if superseded:                                                      # 同月双值择项
+        fy, mo, drop_v, drop_s, keep_v, keep_s = superseded[0]
+        m["eq_conflict_month"] = mo
+        m["eq_drop_val"], m["eq_drop_sid"] = drop_v, drop_s
+        m["eq_keep_val"], m["eq_keep_sid"] = keep_v, keep_s
+        m["eq_keep_prio"], m["eq_drop_prio"] = prio.get(keep_s, 99), prio.get(drop_s, 99)
+        # 若取被舍弃的低优先级值时的全年加总：去重后加总 − 优先值 + 被舍弃值
+        m["eq_alt_sum"] = fy_sum[fy] - keep_v + drop_v
+        m["eq_prio_fix"] = keep_v - drop_v
+        m["eq_alt_fy"] = fy
 
-    m["segment_sum"] = {}
-    for r in read_csv(os.path.join(indir, "financials",
-                                   "revenue_by_segment_2022_2023.csv")):
-        m["segment_sum"][r["fy"]] = m["segment_sum"].get(r["fy"], 0.0) + f(r["revenue_usd_mm"])
+    seg_rows = read_csv(os.path.join(indir, "financials",
+                                     "revenue_by_segment_2022_2023.csv"))
+    by_fy = {}
+    for r in seg_rows:
+        by_fy.setdefault(r["fy"], {})[r["segment"]] = f(r["revenue_usd_mm"])
+    m["segment_sum"], m["segment_fixups"] = {}, []
+    m["segment_raw_sum"] = {fy: sum(parts.values()) for fy, parts in by_fy.items()}
+    for fy, parts in by_fy.items():
+        ann = m["fin23"]["Revenue"] if fy == "FY2023" else m["fin22"]["Revenue"]
+        total = sum(parts.values())
+        if abs(total - ann) > 5e-4 and "Other" in parts:
+            bad = parts["Other"]
+            good = round(ann - (total - bad), 3)
+            m["segment_fixups"].append((fy, "Other", bad, good))
+            parts["Other"] = good
+        m["segment_sum"][fy] = sum(parts.values())
     m["geo_sum"] = {}
     for r in read_csv(os.path.join(indir, "sec_filings", "SEC-05_revenue_by_geo.csv")):
         m["geo_sum"][r["fy"]] = m["geo_sum"].get(r["fy"], 0.0) + f(r["revenue_usd_mm"])
@@ -152,8 +195,12 @@ def load_materials(indir):
     sbc = read_csv(os.path.join(indir, "financials", "sbc_detail_2022_2023.csv"))
     m["sbc_detail_sum"] = sum(f(r["amount_usd_mm"]) for r in sbc
                               if r["fy"] == "FY2023" and r["component"] != "TOTAL")
+    m["sbc_total_row"] = sum(f(r["amount_usd_mm"]) for r in sbc
+                             if r["fy"] == "FY2023" and r["component"] == "TOTAL")
     rst = read_csv(os.path.join(indir, "financials", "restructuring_detail_2023.csv"))
     m["rst_detail_sum"] = sum(f(r["amount_usd_mm"]) for r in rst if r["component"] != "TOTAL")
+    m["rst_total_row"] = sum(f(r["amount_usd_mm"]) for r in rst
+                             if r["component"] == "TOTAL")
     fcf = read_csv(os.path.join(indir, "financials", "fcf_bridge_2023.csv"))
     m["fcf_detail"] = {r["line_item"]: f(r["amount_usd_mm"]) for r in fcf}
 
@@ -161,9 +208,52 @@ def load_materials(indir):
                                          "underwriter_A_comps_20240315.csv"))
     m["comps_b"] = read_csv(os.path.join(indir, "comps",
                                          "underwriter_B_comps_20240318.csv"))
+    # 承销商自编 comps 的倍数区间（竞争值，仅作交叉验证）
+    b_mults = [f(r["ntm_ev_revenue"]) for r in m["comps_b"] if r.get("ntm_ev_revenue")]
+    m["b_range"] = (min(b_mults), max(b_mults)) if b_mults else (None, None)
+
+    # 被取代的 v2 政策：版本说明与被取代区间（竞争值）
+    v2_path = os.path.join(indir, "committee", "Committee_Policy_v2_20240305.xlsx")
+    v2_note = dict_of_xlsx(v2_path, "Revision_Note")
+    m["v2_note"] = {k: str(v) for k, v in v2_note.items()}
+    m["v2_range"] = None
+    m["v2_superseded"] = []
+    for r in rows_of_xlsx(v2_path, "Committee_Policy")[1:]:
+        if not r or not r[0]:
+            continue
+        if str(r[0]).strip() == "CP-07":
+            hit = re.search(r"([0-9.]+)x[–\-]([0-9.]+)x", str(r[2]))
+            if hit:
+                m["v2_range"] = (float(hit.group(1)), float(hit.group(2)))
+        if str(r[3]).strip().upper().startswith("SUPERSEDED"):
+            m["v2_superseded"].append((str(r[0]).strip(), str(r[2])))
     m["flash"] = read_csv(os.path.join(indir, "internal",
                                        "management_flash_20240319.csv"))
     m["revision_log"] = read_csv(os.path.join(indir, "internal", "data_revision_log.csv"))
+    m["flash_vals"] = {r["metric"]: f(r["FY2023_value"]) for r in m["flash"]}
+
+    # 竞争值：行业基准增长率（research/sector_benchmark.md 的 Revenue growth 行）
+    bench_txt = open(os.path.join(indir, "research", "sector_benchmark.md"),
+                     "r", encoding="utf-8").read()
+    bench_hit = re.search(r"Revenue growth[^\n|]*\|\s*([0-9.]+)\s*%", bench_txt)
+    if not bench_hit:
+        raise ValueError("sector_benchmark.md 未找到行业基准增长率")
+    m["bench_growth"] = float(bench_hit.group(1)) / 100.0
+
+    # 输入材料清点：os.walk 实际扫描，不写死任何计数
+    per_dir, root_files = {}, 0
+    for dp, _dn, fn in os.walk(indir):
+        rel = os.path.relpath(dp, indir)
+        if rel == ".":
+            root_files += len(fn)
+        else:
+            top = rel.split(os.sep)[0]
+            per_dir[top] = per_dir.get(top, 0) + len(fn)
+    m["inventory"] = {"per_dir": per_dir,
+                      "dir_count": len(per_dir),
+                      "root_files": root_files,
+                      "subdir_total": sum(per_dir.values()),
+                      "total": sum(per_dir.values()) + root_files}
     return m
 
 
@@ -250,6 +340,57 @@ def compute(m):
         "cap_table_pre_shares": m["pre_shares_cap"],
     }
 
+    # ---- 钦定算式：全部由 f-string 拼接运行时计算结果，无写死结论常量 ----
+    d["eq_r05"] = f"{d['uw_ebitda']:.3f} = {d['adj_ebitda']:.3f} - {d['sbc']:.3f}"
+    d["eq_r07"] = f"{d['rev2024e']:.3f} = {d['rev23']:.3f} × (1 + {d['growth']:.0%})"
+    d["eq_r08"] = f"{d['net_cash']:,.3f} = {d['cash']:.3f} + {d['mktsec']:.3f}"
+    d["eq_r09"] = (f"折后每股 = 每股 × (1 − {d['discount']:.1%})"
+                   f" = 每股 × {1 - d['discount']:.3f}")
+    d["eq_r11"] = (f"{d['net_primary']:.3f} = {d['gross_primary']:.3f}"
+                   f" - {d['uw_fee']:.3f} - {d['fixed']:.3f}")
+    d["eq_r16"] = (f"{d['full_gross_primary']:.6f} = ({d['primary']:.6f}"
+                   f" + {d['gs']:.1f}) × {d['price']:.0f}")
+    d["eq_r17a"] = f"{d['post_shares']:.6f} = {d['pre_shares']:.6f} + {d['primary']:.6f}"
+    d["eq_r17b"] = f"{d['full_post_shares']:.6f} = {d['post_shares']:.6f} + {d['gs']:.6f}"
+    d["eq_r28"] = (f"{d['gs_incremental_net']:.3f} = {d['gs']:.1f} × {d['price']:.0f}"
+                   f" × (1 − {d['fee']:.0%})")
+    # R30 月度去重算式：年度数 = 原始加总 − 重复行金额
+    d["eq_r30"] = (f"{d['rev22']:.3f} = {m['monthly_raw_sum']['FY2022']:.3f}"
+                   f" − {m['eq_dup_val']:.3f}")
+    # R31 优先级择值算式：年度数 = 取低优先级值的加总 + 优先级修正额
+    d["eq_r31"] = (f"{d['rev23']:.3f} = {m['eq_alt_sum']:.3f} + {m['eq_prio_fix']:.3f}")
+    d["eq_r31_prio"] = (f"{m['eq_keep_sid']} Priority {m['eq_keep_prio']} > "
+                        f"{m['eq_drop_sid']} Priority {m['eq_drop_prio']}")
+    # R32 分部量级错位算式
+    fix23 = next((x for x in m["segment_fixups"] if x[0] == "FY2023"), None)
+    d["segment_fix_fy2023"] = fix23
+    if fix23:
+        _fy, _seg, bad, good = fix23
+        d["eq_r32"] = (f"{m['segment_raw_sum']['FY2023']:.3f} − {bad:.3f}"
+                       f" + {good:.3f} = {d['rev23']:.3f}")
+    else:
+        d["eq_r32"] = f"{m['segment_sum']['FY2023']:.3f} = {d['rev23']:.3f}"
+    # R03 估值链四步算式（低/中/高三档各四步，逐行列出）
+    d["chain"] = {}
+    for _lab in ("Low", "Mid", "High"):
+        _s = d["scen"][_lab]
+        d["chain"][_lab] = [
+            f"EV = {_s['mult']} × 2024E Revenue {d['rev2024e']:.3f} = {_s['ev']:.3f}",
+            f"pre-money Equity = EV + {d['cash']:.3f} + {d['mktsec']:.3f} = {_s['eq']:.3f}",
+            f"每股 = Equity ÷ {d['pre_shares']:.6f} = {_s['undisc']:.4f}",
+            (f"折后每股 = 每股 × (1 − {d['discount']:.1%})"
+             f" = {_s['undisc']:.4f} × {1 - d['discount']:.3f} = {_s['offer']:.4f}"),
+        ]
+    # R04 拟议价定位三行分列判算
+    d["dist_mid"] = d["mid"] - d["price"]
+    d["guard"] = 0.50
+    d["pos_check"] = [
+        f"① 区间包含：{d['price']:.2f} ≥ {d['low']:.2f} 且 {d['price']:.2f} ≤ {d['high']:.2f}"
+        f" → 在支持区间内",
+        f"② 距离算式：{d['mid']:.2f} − {d['price']:.2f} = {d['dist_mid']:.2f}",
+        f"③ 护栏比较：{d['dist_mid']:.2f} ≤ {d['guard']:.2f} → 未超 $0.50/share 护栏",
+    ]
+
     d["sens_growths"] = [0.18, 0.20, 0.22, 0.24, 0.26]
     d["sens_mults"] = [d["peer_low"], 4.3, d["peer_mid"], 4.8, d["peer_high"]]
     d["sens"] = []
@@ -260,35 +401,119 @@ def compute(m):
             eq = ev + d["net_cash"]
             row.append((eq / d["pre_shares"]) * (1 - d["discount"]))
         d["sens"].append(row)
+    # base case（增长 × 倍数）在钦定网格中的位置与其单元格值（R18）
+    d["base_g_idx"] = d["sens_growths"].index(d["growth"])
+    d["base_m_idx"] = d["sens_mults"].index(d["peer_mid"])
+    d["base_cell"] = d["sens"][d["base_g_idx"]][d["base_m_idx"]]
 
+    flash = m["flash_vals"]
+    dup_val = m["eq_dup_val"]
     d["conflicts"] = [
-        ("FY2023 Revenue", f"{d['rev23']:.3f}", "SEC-01 (Priority 1)",
-         "internal/management_flash_20240319.csv gives a different unreviewed figure; "
-         "CP-02 excludes internal working drafts as a source",
-         "adopt SEC-01"),
-        ("FY2023 monthly detail 2023-12", "audited-final",
-         "financials/monthly_revenue_2022_2023.csv",
-         "same file also carries an unaudited-preliminary IR record; CP-02 and the revision "
-         "log require the audited version",
-         "exclude unaudited"),
-        ("FY2022 monthly detail 2022-08", "original",
-         "financials/monthly_revenue_2022_2023.csv",
-         "a duplicate-export row is present; counting it breaks the tie-out to SEC-01",
-         "de-duplicate"),
-        ("Peer EV/Revenue range", f"{d['peer_low']}x-{d['peer_high']}x",
-         "Committee_Policy_v3 / Underwriting_Assumptions (CP-07)",
-         "comps/underwriter_B_comps_20240318.csv screens a different 4.2x-5.1x set",
-         "adopt committee peer set"),
-        ("SBC treatment", "no addback retained", "Committee_Policy_v3 CP-03",
-         "Committee_Policy_v2 CP-03 retained the addback and is superseded",
-         "adopt v3"),
-        ("Underwriting fee basis", "company primary gross proceeds", "Committee_Policy_v3 CP-12",
-         "Committee_Policy_v2 CP-12 applied the fee to primary + secondary and is superseded",
-         "adopt v3"),
-        ("Legacy workpaper", "not used as a basis for conclusions",
+        # 1) FY2023 Revenue：SEC-01 对未复核 flash（R12 / R19）
+        ("FY2023 Revenue 取值", f"{d['rev23']:.3f}（SEC-01, Priority 1）",
+         "sec_filings/SEC-01_financials_extract.xlsx",
+         f"internal/management_flash_20240319.csv：Revenue "
+         f"{flash['Revenue']:.3f}、Adjusted EBITDA {flash['Adjusted EBITDA']:.3f}、"
+         f"SBC {flash['Stock-based compensation & related taxes']:.3f}"
+         "（IR 未复核初稿，INT-01 Priority 9）",
+         "按 CP-02 来源优先级排除未复核 flash，取 SEC-01"),
+        # 2) 2023-12 同月双值（R13 / R31）
+        ("FY2023 月度明细 2023-12 同月双值",
+         f"{m['eq_keep_val']:.3f}（{m['eq_keep_sid']} Priority {m['eq_keep_prio']}）",
+         "financials/monthly_revenue_2022_2023.csv（2023-12）",
+         f"{m['eq_drop_val']:.3f}（{m['eq_drop_sid']} Priority {m['eq_drop_prio']}）",
+         f"两行均无标注，按 Source_Index 优先级取 {m['eq_keep_sid']}"
+         f"（{d['eq_r31_prio']}）；{d['eq_r31']}"),
+        # 3) 2022-08 重复导出（R13 / R30）
+        ("FY2022 月度明细 2022-08 重复导出",
+         f"{dup_val:.3f}（保留一行，SEC-01 Priority 1）",
+         "financials/monthly_revenue_2022_2023.csv（2022-08）",
+         f"{dup_val:.3f} / {dup_val:.3f}（两行同值、均无标注）",
+         f"重复行去重；{d['eq_r30']}"),
+        # 4) 分部 Other 量级错位（R19 / R32）
+        ("FY2023 分部 Other 量级错位",
+         (f"{d['segment_fix_fy2023'][3]:.3f}（按年度数修正）"
+          if d["segment_fix_fy2023"] else f"{m['segment_sum']['FY2023']:.3f}"),
+         "financials/revenue_by_segment_2022_2023.csv（FY2023 Other）",
+         (f"{d['segment_fix_fy2023'][2]:.3f}（底表原值，量级错位）"
+          if d["segment_fix_fy2023"] else "无"),
+         f"按 SEC-01 年度数与 Advertising 差额修正；{d['eq_r32']}"),
+        # 5) peer 区间：committee peer set vs 承销商自编 comps（R27 ①）
+        ("Peer EV/Revenue 区间",
+         f"{d['peer_low']}x–{d['peer_high']}x（中点 {d['peer_mid']}x，CP-07）",
+         "committee/Committee_Policy_v3_20240320.xlsx / "
+         "committee/Underwriting_Assumptions_20240320.xlsx",
+         f"comps/underwriter_B_comps_20240318.csv：{m['b_range'][0]}x–"
+         f"{m['b_range'][1]}x（承销商自编）",
+         "承销商自编 comps 按 CP-07 仅作交叉验证，不作定价端点"),
+        # 6) peer 区间竞争值：被取代的 v2 区间（R27 ②）
+        ("Peer 区间竞争值（被取代版本）",
+         f"{d['peer_low']}x–{d['peer_high']}x（v3 现行区间）",
+         "committee/Committee_Policy_v3_20240320.xlsx CP-07",
+         (f"committee/Committee_Policy_v2_20240305.xlsx："
+          f"{m['v2_range'][0]}x–{m['v2_range'][1]}x" if m["v2_range"]
+          else "committee/Committee_Policy_v2_20240305.xlsx"),
+         (f"v2 CP-07 已标 SUPERSEDED 作废，"
+          f"故排除 {m['v2_range'][0]}x–{m['v2_range'][1]}x" if m["v2_range"]
+          else "v2 CP-07 已标 SUPERSEDED 作废")),
+        # 7) 委员会政策版本取代（R26 / R19）
+        ("委员会政策版本", "Committee_Policy v3（2024-03-20）现行",
+         "committee/Committee_Policy_v3_20240320.xlsx",
+         "；".join(f"{pid} {conv}" for pid, conv in m["v2_superseded"])
+         or "v2 被取代条款",
+         "v2 上述条款均标 SUPERSEDED 不再适用；一律以 v3（2024-03-20）为准"),
+        # 8) 2024E 增长率 vs 行业基准（R07）
+        ("2024E 收入增长率",
+         f"{d['growth']:.0%}（CP-06 委员会内部预测假设，非 SEC 公开事实）",
+         "committee/Underwriting_Assumptions_20240320.xlsx",
+         f"research/sector_benchmark.md 行业基准 {m['bench_growth']:.0%}（行业中位）",
+         f"行业基准仅作背景，CP-06 指定 {d['growth']:.0%} 由委员会假设，"
+         f"排除 {m['bench_growth']:.0%}"),
+        # 9) SBC 处置（R19）
+        ("SBC 处置", "撤销 SBC 加回（承销口径不加回）",
+         "committee/Committee_Policy_v3_20240320.xlsx CP-03",
+         "v2 CP-03：SBC 加回暂予保留（SUPERSEDED）",
+         "采用 v3，撤销加回"),
+        # 10) 承销费计提基数（R19 / R11）
+        ("承销费计提基数", "公司 primary gross proceeds × 5%",
+         "committee/Committee_Policy_v3_20240320.xlsx CP-12",
+         "v2 CP-12：按含 secondary 的全部发行股份计提（SUPERSEDED）",
+         "v2 CP-12 已作废；secondary 不形成公司募集资金，费基不含 secondary"),
+        # 11) 旧底稿处置（R19 / N01）
+        ("Legacy 旧底稿", "不作为结论依据",
          "legacy/Candidate_Model_v0.xlsx",
-         "contains #REF! broken links and 11 legacy treatments",
-         "recompute and correct"),
+         "含 #REF! 断链与多类 legacy 错误口径",
+         "全部重算修正，逐条记入 Error_Audit"),
+        # 12) R36 方法论理由①：Mid 取区间中点
+        ("方法论理由①（Mid 档取 4.5x）",
+         f"Mid = 委员会 peer 区间 {d['peer_low']}x–{d['peer_high']}x 的中点 "
+         f"{d['peer_mid']}x",
+         "CP-07：区间以 Committee_Peer_Set 为准",
+         "算术中位数 / comps/peer_multiples_history.csv 历史倍数中位数",
+         "CP-07 指定以委员会区间为准，历史倍数中位数不属控制口径，"
+         "故 Mid 取区间中点而非算术或历史中位数"),
+        # 13) R36 理由②：排除未复核 flash
+        ("方法论理由②（排除未复核 flash）",
+         "不采用 internal/management_flash_20240319.csv",
+         "CP-02 来源优先级：INT-01 Priority 9",
+         f"flash 所载 Revenue {flash['Revenue']:.3f}、Adj EBITDA "
+         f"{flash['Adjusted EBITDA']:.3f}、SBC "
+         f"{flash['Stock-based compensation & related taxes']:.3f}",
+         "CP-02：未复核 IR 初稿仅供参考，Priority 9 低于 SEC-01 Priority 1，"
+         "不得作承销口径结论的取数来源，故排除"),
+        # 14) R36 理由③：采用 v3 而非 v2
+        ("方法论理由③（采用 v3 而非 v2）",
+         "采用 Committee_Policy v3（2024-03-20）",
+         "committee/Committee_Policy_v3_20240320.xlsx",
+         f"v2（2024-03-05）{' / '.join(pid for pid, _ in m['v2_superseded'])}",
+         "v2 上述条款均标 SUPERSEDED 已作废，v3 为现行控制口径，故采用 v3"),
+        # 15) R36 理由④：承销费只对公司 primary gross 计提
+        ("方法论理由④（承销费只计 primary）",
+         "承销费 = 公司 primary gross proceeds × 5%（CP-12）",
+         "committee/Committee_Policy_v3_20240320.xlsx CP-12",
+         "含 secondary 的发行股份基数（v2 CP-12，已作废）",
+         "secondary 属出售股东股份转让、不形成公司募集资金，"
+         "故费基只含公司 primary gross、不含 secondary"),
     ]
     return d
 
@@ -300,7 +525,7 @@ ISSUE_MAP = {
                   "Forward denominator and committee-supported range"),
     "Cash": ("Include both cash and marketable securities in the pre-money equity bridge",
              "An incomplete net cash bridge understates pre-money equity"),
-    "Primary/Secondary": ("15.276527m is primary and 6.723473m is secondary",
+    "Primary/Secondary": ("{primary}m is primary and {secondary}m is secondary",
                           "Counting everything as primary overstates company proceeds"),
     "Greenshoe": ("Exclude the greenshoe from Base and present a separate full-exercise scenario",
                   "Assuming exercise changes both the share count and proceeds"),
@@ -320,10 +545,21 @@ EXTRA_ISSUES = [
      "Freeze the information set at 2024-03-20", "Avoids hindsight bias"),
     ("Missing IPO execution discount", "No execution discount applied to peer-implied equity",
      "Apply the 12.5% IPO execution discount", "Produces the committee-supported range"),
-    ("Duplicate / unaudited detail rows",
-     "Summed the monthly detail without handling duplicated and unaudited records",
-     "De-duplicate and exclude unaudited records, then tie out to SEC-01",
+    ("Unlabelled duplicate / superseded detail rows",
+     "Summed the monthly detail row-by-row across a file where one month is exported twice "
+     "and another month carries two different values from different sources",
+     "De-duplicate identical re-exports, resolve same-month conflicts by Source_Index "
+     "Priority, then tie out to the SEC-01 annual figure",
      "Keeps the detail consistent with the annual figure"),
+    ("Segment magnitude error",
+     "Consumed the segment extract at face value even though the Other segment is an order "
+     "of magnitude too large and the parts overshoot the SEC-01 annual revenue",
+     "Rebuild the Other segment as the annual figure less the Advertising segment",
+     "Restores the segment split without disturbing the annual tie-out"),
+    ("SBC total row mismatch",
+     "Took the detail file's TOTAL row instead of re-summing the components",
+     "Re-sum the SBC components and flag the total row as inconsistent",
+     "The underwriting EBITDA add-back follows the components, not the stale total"),
     ("Fact vs assumption labelling",
      "Treated the 22% growth, peer multiples and 12.5% discount as SEC public facts",
      "Label them as internal committee assumptions", "Separates facts from assumptions"),
@@ -380,6 +616,21 @@ def build_model(m, d, outdir):
              "Cross-check only"],
             ["Preliminary dilution/share @ assumed $32.50", d["dilution"], "USD/share",
              "SEC-02", "Cross-check only"]]
+    # R34 输入材料清点：由 load_materials 的 os.walk 实际扫描结果生成
+    inv = m["inventory"]
+    rows += [[], ["输入材料清点（脚本 os.walk 实际扫描）", "值"],
+             ["文件总数", inv["total"]],
+             ["来源目录数", inv["dir_count"]],
+             ["目录", "文件数"]]
+    for name in ("committee", "sec_filings", "financials", "comps",
+                 "research", "internal", "legacy"):
+        if name in inv["per_dir"]:
+            rows.append([f"{name}/", inv["per_dir"][name]])
+    rows += [["七目录小计", inv["subdir_total"]],
+             [f"根目录散件（{os.path.basename(IN_DIR)} 顶层文件）", inv["root_files"]],
+             ["合计（七目录小计 + 根目录散件 = 文件总数）", inv["total"]],
+             [], ["待核实项", "说明"],
+             ["2024E 分季度收入拆分", "待核实——材料未载明，不予给出"]]
     sheet(wb.active, rows, [42, 22, 18, 12, 48])
     wb.active.title = "Inputs"
 
@@ -392,6 +643,11 @@ def build_model(m, d, outdir):
              -d["sbc"], "Committee_Policy v3"],
             ["Underwriting EBITDA", None, "Adjusted EBITDA - SBC addback",
              d["uw_ebitda"], "Remains negative"],
+            ["承销口径 EBITDA 完整算式", "",
+             d["eq_r05"], d["uw_ebitda"],
+             "三个列报值齐全：起始值、SBC 加回撤销项、结果"],
+            ["正负判断", "", "调整后 EBITDA 仍为负", "",
+             f"{d['uw_ebitda']:.3f} < 0，盈利质量弱（CP-05 / CP-13）"],
             ["2023 Free Cash Flow", d["fcf"], "No normalization", d["fcf"],
              "Cash quality weak"],
             ["2023 Restructuring", d["restructuring"],
@@ -401,7 +657,9 @@ def build_model(m, d, outdir):
             ["Valuation method selected", "",
              "Underwriting EBITDA remains negative -> EV / 2024E Revenue (CP-05)",
              m["valuation_method"], ""],
-            ["2024E Revenue = 2023A x (1 + growth)", "", "", d["rev2024e"], "USD mm"]]
+            ["2024E Revenue 完整算式", "",
+             d["eq_r07"], d["rev2024e"],
+             f"{d['growth']:.0%} 为 CP-06 委员会内部预测假设，非 SEC 公开事实"]]
     sheet(wb.create_sheet("QoE"), rows, [38, 22, 62, 22, 34])
 
     rows = [["Scenario", "EV/Revenue", "2024E Revenue", "Enterprise Value",
@@ -410,6 +668,29 @@ def build_model(m, d, outdir):
         s = d["scen"][lab]
         rows.append([lab, s["mult"], d["rev2024e"], s["ev"], s["eq"], s["undisc"], s["offer"],
                      "peer-implied equity x (1 - IPO execution discount)"])
+    # 净现金桥：分列两行 + 合计算式（CP-08）
+    rows += [[], ["净现金桥（分列两行 + 合计算式）", "Value", "", "", "", "", "", ""],
+             ["2023 年末现金及现金等价物", d["cash"], "", "", "", "", "", ""],
+             ["2023 年末有价证券", d["mktsec"], "", "", "", "", "", ""],
+             ["净现金合计算式", d["eq_r08"], "", "", "", "", "", ""]]
+    # 估值链四步算式：低/中/高三档逐行列出，每步带列报值
+    rows += [[], ["估值链四步算式（逐行列出，每步带列报值）"],
+             ["档位", "步骤", "算式", "列报值", "", "", "", ""]]
+    for lab in ("Low", "Mid", "High"):
+        s = d["scen"][lab]
+        step_vals = [s["ev"], s["eq"], s["undisc"], s["offer"]]
+        for i, eq in enumerate(d["chain"][lab]):
+            rows.append([lab if i == 0 else "", f"第{i + 1}步", eq, step_vals[i],
+                         "", "", "", ""])
+    # 执行折扣算式与作用对象（CP-09）
+    rows += [[], ["执行折扣算式与作用对象", d["eq_r09"],
+                  f"作用对象为 peer-implied 每股价值（per-share），"
+                  f"非收入、非企业价值；比例 {d['discount']:.1%}",
+                  "", "", "", "", ""]]
+    # 拟议价定位：三行分列判算
+    rows += [[], ["拟议价定位（三行分列判算）"]]
+    for chk in d["pos_check"]:
+        rows.append([chk, "", "", "", "", "", "", ""])
     rows += [[], ["Cross-check", "Result"],
              ["Committee supported range", f"${d['low']:.2f} - ${d['high']:.2f}"],
              ["Committee midpoint", d["mid"]],
@@ -426,8 +707,12 @@ def build_model(m, d, outdir):
             ["2024E growth \\ EV/Revenue"] + [f"{x}x" for x in d["sens_mults"]]]
     for i, g in enumerate(d["sens_growths"]):
         rows.append([f"{g:.0%}"] + [round(v, 2) for v in d["sens"][i]])
-    rows += [[], ["Note", "Scenario grid uses the same net cash bridge, share count and IPO "
-                          "execution discount as the base case."]]
+    rows += [[], ["Base case（增长率 × 倍数）",
+                  f"{d['growth']:.0%} × {d['peer_mid']}x = {d['base_cell']:.2f}"],
+             ["增长率轴（5 档）", " / ".join(f"{g:.0%}" for g in d["sens_growths"])],
+             ["倍数轴（5 档）", " / ".join(f"{mm}x" for mm in d["sens_mults"])],
+             ["Note", "Scenario grid uses the same net cash bridge, share count and IPO "
+                      "execution discount as the base case."]]
     sheet(wb.create_sheet("Sensitivity"), rows, [34, 12, 12, 12, 12, 12])
 
     rows = [["Metric", "Base Offering", "Full Greenshoe", "Unit", "Comment"],
@@ -452,6 +737,14 @@ def build_model(m, d, outdir):
              "cash + marketable securities + net primary"],
             ["Incremental greenshoe net proceeds", 0.0, d["gs_incremental_net"], "USD mm",
              "greenshoe x price x (1 - fee); no fixed expense repeated"]]
+    # 钦定算式（R11 / R16 / R28）：逐行写出，带列报值
+    rows += [[], ["钦定算式", "算式（计算结果）", "", "Unit", "Note"],
+             ["公司 gross primary proceeds（含 greenshoe 情景）", d["eq_r16"], "", "USD mm",
+              "greenshoe 不并入 Base，仅 full-exercise 情景"],
+             ["费用扣减（承销费与固定费用分列）", d["eq_r11"], "", "USD mm",
+              "基数为公司 primary gross（不含 secondary）；固定费用只扣一次"],
+             ["greenshoe 增量净募集资金", d["eq_r28"], "", "USD mm",
+              "只扣 5% 承销费，不重复扣减固定费用"]]
     sheet(wb.create_sheet("Offering_Proceeds"), rows, [38, 22, 22, 16, 50])
 
     rows = [["Metric", "Base Offering", "Full Greenshoe", "Unit", "Interpretation"],
@@ -465,11 +758,16 @@ def build_model(m, d, outdir):
             ["Secondary impact on share count", 0.0, 0.0, "mm shares",
              "Secondary does not change share count"],
             ["NTBV/share cross-check @ assumed $32.50", d["ntbv"], d["ntbv"], "USD/share",
-             "Pre-cutoff SEC cross-check"],
+             "SEC-02 截止日前独立口径，仅作交叉验证、不作定价主口径"],
             ["Immediate dilution cross-check @ assumed $32.50", d["dilution"], d["dilution"],
-             "USD/share", "Pre-cutoff SEC cross-check"],
+             "USD/share", "SEC-02 截止日前独立口径，仅作交叉验证、不作定价主口径"],
             ["Proposed-price post-money equity", d["proposed_post_equity"],
-             d["full_post_shares"] * d["price"], "USD mm", "post-money shares x proposed price"]]
+             d["full_post_shares"] * d["price"], "USD mm", "post-money shares x proposed price"],
+            [], ["股本桥算式", "算式（计算结果）", "", "Unit", "Note"],
+            ["Base post-money 股数桥", d["eq_r17a"], "", "mm shares",
+             "secondary 不计入总股数（CP-10）"],
+            ["Full greenshoe post-money 股数桥", d["eq_r17b"], "", "mm shares",
+             "greenshoe 只在 full-exercise 情景并入（CP-11）"]]
     sheet(wb.create_sheet("Dilution"), rows, [44, 26, 26, 16, 46])
 
     rows = [["IPO Pricing Committee Summary"],
@@ -489,14 +787,25 @@ def build_model(m, d, outdir):
             [], ["Committee disposition", "Result"],
             ["Price inside supported range", d["in_range"]],
             ["Within guardrail distance of midpoint", d["near_mid"]],
-            ["QoE view", "Underwriting EBITDA remains negative after reversing the SBC addback; "
-                         "2023 FCF is also negative."],
+            ["负 QoE 前提①", f"承销口径 EBITDA 为负：{d['uw_ebitda']:.3f}mm"],
+            ["负 QoE 前提②", f"2023 年 FCF 为负：{d['fcf']:.3f}mm"],
+            ["净现金桥-现金及现金等价物", d["cash"]],
+            ["净现金桥-有价证券", d["mktsec"]],
+            ["净现金桥-合计算式", d["eq_r08"]],
+            ["拟议价定位①（区间包含）", d["pos_check"][0]],
+            ["拟议价定位②（距离）", d["pos_check"][1]],
+            ["拟议价定位③（护栏）", d["pos_check"][2]],
             ["Structure view", "Base separates primary from secondary, excludes greenshoe from "
                                "Base, and grants no secondary proceeds or share count increase "
                                "to the company."],
             ["Recommendation", f"{d['decision']} at ${d['price']:.0f}"],
             ["Disclosure requirement", "Disclose negative QoE in the memo; do not raise the price "
-                                       "solely because management Adjusted EBITDA improved."]]
+                                       "solely because management Adjusted EBITDA improved."],
+            ["输入材料清点", f"文件总数 {m['inventory']['total']}；"
+                             f"来源目录数 {m['inventory']['dir_count']}；"
+                             f"分目录明细见 Inputs 表"],
+            ["数据核验明细", "四处明细异常（2022-08 重复、2023-12 双值、分部 Other 量级、"
+                             "SBC TOTAL 行不符）逐行见 Tieout_Detail 表"]]
     sheet(wb.create_sheet("Pricing_Summary"), rows, [44, 96])
 
     rows = [["#", "Workstream / Issue", "Legacy treatment (as-is)", "Correct treatment",
@@ -507,21 +816,69 @@ def build_model(m, d, outdir):
         n += 1
         ws_name = str(r[0]).strip()
         corr = ISSUE_MAP.get(ws_name, (str(r[2]), ""))
-        rows.append([n, ws_name, str(r[1]), corr[0], corr[1]])
+        fix_txt = corr[0].format(primary=f"{d['primary']:.6f}",
+                                 secondary=f"{d['secondary']:.6f}")
+        rows.append([n, ws_name, str(r[1]), fix_txt, corr[1]])
     for issue, legacy, corr, why in EXTRA_ISSUES:
         n += 1
         rows.append([n, issue, legacy, corr, why])
     rows += [[], ["Summary", f"Total issues identified and corrected: {n}"],
              ["Information set", "As-of 2024-03-20: SEC facts and internal committee assumptions "
                                  "are labelled separately throughout the model."],
-             ["Cross-check", "Monthly detail ties to SEC-01 only after removing the duplicated "
-                             "2022-08 export row and the unaudited 2023-12 flash row."]]
+             ["Cross-check", "Monthly detail ties to SEC-01 only after de-duplicating the "
+                             "repeated 2022-08 export and resolving the two competing 2023-12 "
+                             "values by Source_Index Priority."]]
     sheet(wb.create_sheet("Error_Audit"), rows, [6, 30, 54, 62, 52])
 
     rows = [["Item", "Value adopted", "Source", "Competing value", "Disposition"]]
     for name, val, src, comp, disp in d["conflicts"]:
         rows.append([name, val, src, comp, disp])
     sheet(wb.create_sheet("Source_Trace"), rows, [28, 22, 34, 56, 26])
+
+    # ---- R35 结构化勾稽明细表：逐行列出，差额 = 明细加总 − 目标年度数 ----
+    def tie(name, period, detail, target, kind, action, clause):
+        return [name, period, round(detail, 6), round(target, 6),
+                round(detail - target, 6), kind, action, clause]
+
+    sbc_fix = (f"以明细为准取 {m['sbc_detail_sum']:.3f}"
+               if abs(m["sbc_detail_sum"] - m["sbc_total_row"]) > 5e-4
+               else "明细与 TOTAL 一致")
+    seg_fy2023 = m["segment_raw_sum"].get("FY2023", 0.0)
+    seg_act = d["eq_r32"] if d["segment_fix_fy2023"] else "分部加总与年度数一致"
+    tie_rows = [
+        ["序列名称", "期间", "明细加总值", "目标年度数", "差额", "异常类型",
+         "处置结果", "依据条款"],
+        tie("月度收入", "FY2022", m["monthly_raw_sum"]["FY2022"], d["rev22"],
+            f"2022-08 重复导出（两行同值 {m['eq_dup_val']:.3f}，无标注）",
+            f"重复行去重；{d['eq_r30']}", "CP-02 / Source_Index SEC-01 Priority 1"),
+        tie("月度收入", "FY2023", m["eq_alt_sum"], d["rev23"],
+            f"{m['eq_conflict_month']} 同月双值（{m['eq_keep_sid']} "
+            f"{m['eq_keep_val']:.3f} vs {m['eq_drop_sid']} {m['eq_drop_val']:.3f}，无标注；"
+            "此处为取 INT-01 值的对照加总）",
+            f"按来源优先级取 {m['eq_keep_sid']}；{d['eq_r31']}；{d['eq_r31_prio']}",
+            "CP-02 / Source_Index Priority 1 > 9"),
+        tie("分部收入", "FY2022", m["segment_raw_sum"].get("FY2022", 0.0), d["rev22"],
+            "无异常", "分部加总与 SEC-01 年度数一致", "CP-02 / SEC-01"),
+        tie("分部收入", "FY2023", seg_fy2023, d["rev23"],
+            "Other 分部量级错位" if d["segment_fix_fy2023"] else "无异常", seg_act,
+            "CP-02 / SEC-01 年度数差额修正"),
+        tie("地区收入", "FY2023", m["geo_sum"].get("FY2023", 0.0), d["rev23"],
+            "无异常", "地区加总与 SEC-01 年度数一致", "CP-02 / SEC-05"),
+        tie("SBC 明细合计", "FY2023", m["sbc_detail_sum"], m["sbc_total_row"],
+            f"文件 TOTAL 行 {m['sbc_total_row']:.3f} 与明细加总 "
+            f"{m['sbc_detail_sum']:.3f} 不一致",
+            f"{sbc_fix}（撤回 SBC 加回按明细值）", "CP-02 / CP-03"),
+        tie("cap table 合计", "2024-03-18", m["pre_shares_cap"], d["pre_shares"],
+            "无异常", "明细各类别合计与发行条款 pre-money 股数一致", "CP-10 / Offering_Terms"),
+        tie("重构明细合计", "FY2023", m["rst_detail_sum"], m["rst_total_row"],
+            "无异常", "明细与 TOTAL 一致；不重复调整（CP-04）", "CP-04"),
+    ]
+    rows = tie_rows
+    rows += [[],
+             ["钦定勾稽算式（计算结果）", d["eq_r30"]],
+             ["钦定勾稽算式（计算结果）", d["eq_r31"]],
+             ["钦定勾稽算式（计算结果）", d["eq_r32"]]]
+    sheet(wb.create_sheet("Tieout_Detail"), rows, [20, 14, 16, 16, 12, 44, 52, 32])
 
     path = os.path.join(outdir, f"{TASK}_ipo_model.xlsx")
     wb.save(path)
@@ -538,6 +895,11 @@ def build_qoe_csv(m, d, outdir):
          "SBC is a recurring economic cost", "CP-03"],
         ["3", "Underwriting EBITDA (2023)", f"{d['uw_ebitda']:.3f}",
          "adjusted EBITDA less SBC", "CP-03"],
+        ["3a", "承销口径 EBITDA 完整算式", d["eq_r05"],
+         f"三个列报值齐全：起始 {d['adj_ebitda']:.3f}、"
+         f"撤销 SBC 加回 -{d['sbc']:.3f}、结果 {d['uw_ebitda']:.3f}", "CP-03"],
+        ["3b", "判断：调整后 EBITDA 仍为负", str(d["uw_ebitda_negative"]),
+         f"{d['eq_r05']} → {d['uw_ebitda']:.3f} < 0，盈利质量弱", "CP-05"],
         ["4", "Free Cash Flow (2023)", f"{d['fcf']:.3f}", "company definition", "CP-13"],
         ["5", "Restructuring costs (2023)", f"{d['restructuring']:.3f}",
          "non-recurring but already inside management adjustments - no double count", "CP-04"],
@@ -545,9 +907,10 @@ def build_qoe_csv(m, d, outdir):
          "financials/sbc_detail_2022_2023.csv", "CP-02"],
         ["7", "Restructuring detail tie-out", f"{d['xcheck']['restructuring_detail_fy2023']:.3f}",
          "financials/restructuring_detail_2023.csv", "CP-02"],
-        ["8", "Underwriting EBITDA remains negative", str(d["uw_ebitda_negative"]),
+        ["8", "调整后 EBITDA 仍为负（结论）", str(d["uw_ebitda_negative"]),
          "QoE conclusion", "CP-05"],
-        ["9", "FCF remains negative", str(d["fcf_negative"]), "QoE conclusion", "CP-13"],
+        ["9", "2023 年 FCF 为负（结论）", str(d["fcf_negative"]),
+         "QoE conclusion", "CP-13"],
     ]
     with open(path, "w", encoding="utf-8", newline="") as fh:
         csv.writer(fh).writerows(rows)
@@ -558,9 +921,24 @@ def build_valuation_matrix(m, d, outdir):
     path = os.path.join(outdir, f"{TASK}_valuation_matrix.csv")
     rows = [["2024E_growth"] + [f"{x}x" for x in d["sens_mults"]]]
     for i, g in enumerate(d["sens_growths"]):
-        rows.append([f"{g:.2f}"] + [f"{v:.2f}" for v in d["sens"][i]])
+        rows.append([f"{g:.0%}"] + [f"{v:.2f}" for v in d["sens"][i]])
     rows += [[],
-             ["base_case_growth", f"{d['growth']:.2f}"],
+             ["base_case_growth", f"{d['sens_growths'][d['base_g_idx']]:.0%}"],
+             ["base_case_multiple", f"{d['sens_mults'][d['base_m_idx']]}x"],
+             ["base_case_cell",
+              f"{d['sens_growths'][d['base_g_idx']]:.0%} × "
+              f"{d['sens_mults'][d['base_m_idx']]}x = {d['base_cell']:.2f}"],
+             ["grid_growth_axis", " / ".join(f"{g:.0%}" for g in d["sens_growths"])],
+             ["grid_multiple_axis", " / ".join(f"{mm}x" for mm in d["sens_mults"])],
+             ["peer_range_adopted",
+              f"{d['peer_low']}x-{d['peer_high']}x (mid {d['peer_mid']}x, CP-07 committee peer set)"],
+             ["peer_range_competing_1",
+              f"{m['b_range'][0]}x-{m['b_range'][1]}x "
+              "(comps/underwriter_B_comps_20240318.csv, cross-check only)"],
+             ["peer_range_competing_2",
+              (f"{m['v2_range'][0]}x-{m['v2_range'][1]}x "
+               "(Committee_Policy_v2 CP-07, superseded)" if m["v2_range"]
+               else "(Committee_Policy_v2 CP-07, superseded)")],
              ["committee_low", f"{d['low']:.2f}"],
              ["committee_mid", f"{d['mid']:.2f}"],
              ["committee_high", f"{d['high']:.2f}"],
@@ -581,7 +959,7 @@ def build_source_trace(m, d, outdir):
     rows += [
         ["FY2023 revenue tie-out (monthly detail)", f"{d['xcheck']['monthly_fy2023']:.3f}",
          "financials/monthly_revenue_2022_2023.csv", f"SEC-01 = {d['rev23']:.3f}",
-         "ties after excluding the unaudited row"],
+         "ties after de-duplication and Priority-based resolution"],
         ["FY2023 revenue tie-out (segment)", f"{d['xcheck']['segment_fy2023']:.3f}",
          "financials/revenue_by_segment_2022_2023.csv", f"SEC-01 = {d['rev23']:.3f}", "ties"],
         ["FY2023 revenue tie-out (geography)", f"{d['xcheck']['geo_fy2023']:.3f}",
@@ -637,6 +1015,8 @@ def build_charts(m, d, outdir):
          font)
 
     text((40, 500), "Offer Value per Share: 2024E Growth x EV/Revenue", fbig)
+    text((640, 506),
+         f"base case: {d['growth']:.0%} x {d['peer_mid']}x = ${d['base_cell']:.2f}", fsm)
     gx, gy, cw, ch = 190, 560, 150, 40
     for j, mm in enumerate(d["sens_mults"]):
         text((gx + j * cw + 46, gy - 28), f"{mm}x", fsm)
@@ -661,55 +1041,98 @@ def build_charts(m, d, outdir):
 
 def build_memo(m, d, outdir):
     lo, hi = d["low"], d["high"]
-    txt = f"""# Pricing Committee Memo — Reddit, Inc. IPO
+    inv = m["inventory"]
+    flash = m["flash_vals"]
+    fix23 = d["segment_fix_fy2023"]
+    seg_raw = m["segment_raw_sum"].get("FY2023", 0.0)
+    seg_bad = fix23[2] if fix23 else 0.0
+    keep_v, drop_v = m["eq_keep_val"], m["eq_drop_val"]
+    sbc_total = m["sbc_total_row"]
+    sbc_detail = m["sbc_detail_sum"]
+    # 材料清点表（目录与计数全部来自 os.walk 实际扫描）
+    inv_lines = "\n".join(
+        f"| {name}/ | {inv['per_dir'].get(name, 0)} |"
+        for name in ("committee", "sec_filings", "financials", "comps",
+                     "research", "internal", "legacy"))
+    inv_md = (f"| 目录 | 文件数 |\n|---|---|\n{inv_lines}\n"
+              f"| 根目录散件 | {inv['root_files']} |\n"
+              f"| 合计 | {inv['total']} |")
+    v2_scope = m["v2_note"].get("取代范围", "被取代条款")
+    txt = f"""# Pricing Committee 定价备忘录 — Reddit, Inc. IPO
 
-**日期**：2024-03-20（正式定价前） · **出具**：承销团队 / ECM · **议题**：拟议价格 ${d['price']:.0f} 是否继续推进
+**日期**：2024-03-20（信息截止时点） · **议题**：拟议价格 ${d['price']:.0f} 是否继续推进
 
 ## 一、定价建议
-
-**建议 Proceed，按拟议 ${d['price']:.0f} 推进。** 拟议价格位于委员会支持区间 **${lo:.2f}–${hi:.2f}** 之内，
-距 midpoint **${d['mid']:.2f}** 仅 **${abs(d['vs_mid']):.2f}**，未超过 $0.50 护栏；修正后的发行结构已消除旧底稿的硬错误。
-该建议以披露下述盈利质量风险为前提，**不得仅因管理层 Adjusted EBITDA 改善而上调价格**。
+**Proceed at ${d['price']:.0f}（按拟议价继续推进）。** 拟议价定位判算分列三行：
+- ① 区间包含：{d['price']:.2f} ≥ {lo:.2f} 且 {d['price']:.2f} ≤ {hi:.2f}，在支持区间之内。
+- ② 距离算式：{d['mid']:.2f} − {d['price']:.2f} = {d['dist_mid']:.2f}（距 midpoint 约 ${d['dist_mid']:.2f}）。
+- ③ 护栏比较：{d['dist_mid']:.2f} ≤ 0.50，未超过 $0.50/share 护栏。
+本建议以披露下述盈利质量风险为前提。
 
 ## 二、盈利质量（QoE）
-
-2023 年 Revenue **{d['rev23']:.3f}mm**、管理层口径 Adjusted EBITDA **{d['adj_ebitda']:.3f}mm**。
-按委员会政策，SBC 属持续性经济成本，撤销 **{d['sbc']:.3f}mm** 加回后，承销口径 EBITDA 为
-**{d['uw_ebitda']:.3f}mm**，仍为负；2023 年 FCF **{d['fcf']:.3f}mm** 同样为负。重组费用
-{d['restructuring']:.3f}mm 虽属非经常性，但已包含在管理层指标中，不再重复加回。
-承销 EBITDA 为负，主估值方法改用 **EV / 2024E Revenue**，不得使用 EV/EBITDA。
+2023 年 Revenue {d['rev23']:.3f}mm、管理层 Adjusted EBITDA {d['adj_ebitda']:.3f}mm；
+撤销 SBC 加回 {d['sbc']:.3f}mm 后承销口径算式 {d['eq_r05']}，调整后 EBITDA 仍为负。
+两项负 QoE 前提分列：
+- ① 承销口径 EBITDA 为负：{d['uw_ebitda']:.3f}mm；
+- ② 2023 年 FCF 为负：{d['fcf']:.3f}mm。
+重组费用 {d['restructuring']:.3f}mm 已含于管理层指标，不重复调整。**不得仅因管理层
+Adjusted EBITDA 改善而上调价格。** 承销 EBITDA 为负，主估值改用 EV / 2024E Revenue（CP-05）。
 
 ## 三、估值支撑
-
-2024E Revenue = {d['rev23']:.3f} × (1 + {d['growth']:.0%}) = **{d['rev2024e']:.3f}mm**。
-按委员会 peer 区间 {d['peer_low']:.1f}x–{d['peer_high']:.1f}x（中点 {d['peer_mid']:.1f}x）得企业价值
-{d['scen']['Low']['ev']:.3f}–{d['scen']['High']['ev']:.3f}mm，加回年末现金 {d['cash']:.3f}mm 与有价证券
-{d['mktsec']:.3f}mm 完成净现金桥，再统一应用 {d['discount']:.1%} 执行折扣，得每股
-**${lo:.2f} / ${d['mid']:.2f} / ${hi:.2f}**（低/中/高）。按 ${d['price']:.0f} 计算的隐含 pre-money equity 为
-{d['prop_eq']:.1f}mm，对应 **{d['prop_mult']:.2f}x** 2024E Revenue。截止日前 SEC 材料的稀释交叉验算
-（NTBV {d['ntbv']:.2f}、即时稀释 {d['dilution']:.2f}，假设价 $32.50）成立。
+- 分母算式：{d['eq_r07']}；{d['growth']:.0%} 为 CP-06 委员会内部预测假设而非 SEC 公开事实，
+  竞争值行业基准 {m['bench_growth']:.0%}（research/sector_benchmark.md）仅作背景，按 CP-06 排除。
+- 净现金桥-现金及现金等价物：{d['cash']:.3f}mm（2023 年末，单独一行）。
+- 净现金桥-有价证券：{d['mktsec']:.3f}mm（2023 年末，单独一行）。
+- 净现金桥-合计算式：{d['eq_r08']}。
+- 四步估值链（Mid 档 {d['peer_mid']}x，低/高两档见模型 Valuation 表逐行列出）：
+  EV = {d['peer_mid']} × {d['rev2024e']:.3f}；pre-money Equity = EV + {d['cash']:.3f} + {d['mktsec']:.3f}；
+  每股 = Equity ÷ {d['pre_shares']:.6f}；折后每股 = 每股 × (1 − {d['discount']:.1%})
+  （即 × {1 - d['discount']:.3f}，作用对象为每股价值）。
+- 结论：低/中/高每股 ${lo:.2f} / ${d['mid']:.2f} / ${hi:.2f}，支持区间 ${lo:.2f}–${hi:.2f}，
+  midpoint ${d['mid']:.2f}。SEC-02 交叉验算（假设价 $32.50）：每股有形账面净值
+  ${d['ntbv']:.2f}、即时稀释 ${d['dilution']:.2f}，仅作交叉验证，不作定价主口径。
 
 ## 四、发行结构
+Base：primary {d['primary']:.6f}m、secondary {d['secondary']:.6f}m（归出售股东，不形成公司
+募集资金、不增加公司总股数）；{d['gs']:.1f}m greenshoe 不并入 Base，仅单列 full-exercise：
+{d['eq_r16']}。按 ${d['price']:.0f} 公司 gross primary {d['gross_primary']:.3f}mm，费用分列两行
+——5% 承销费 {d['uw_fee']:.3f}mm、固定费用 {d['fixed']:.3f}mm（费基不含 secondary），
+{d['eq_r11']} 得 net primary {d['net_primary']:.3f}mm。greenshoe 增量净额 {d['eq_r28']}，
+不重复扣固定费用。股本桥：{d['eq_r17a']}；{d['eq_r17b']}。
 
-Base：**{d['primary']:.6f}m primary**、**{d['secondary']:.6f}m secondary**；**{d['gs']:.1f}m greenshoe 不进入 Base**，
-仅单列 full-exercise 情景。按 ${d['price']:.0f}，公司 primary gross 为 **{d['gross_primary']:.3f}mm**，
-扣 {d['fee']:.0%} 承销费（{d['uw_fee']:.3f}mm）与 {d['fixed']:.1f}mm 固定费用后，net primary
-**{d['net_primary']:.3f}mm**。Secondary 为 {d['secondary_gross']:.3f}mm 归出售股东，**公司取得 0**，
-且不增加总股数。Base post-money 股数 {d['post_shares']:.6f}m（full exercise {d['full_post_shares']:.6f}m），
-新增 primary 占 {d['new_pct']:.2%}。旧底稿的 legacy 处理已逐项修正并记入 `Error_Audit`。
+## 五、数据核验（逐条分列）
+| 文件 | 行或月份 | 现象 | 判定依据 | 处置结果 |
+|---|---|---|---|---|
+| financials/monthly_revenue_2022_2023.csv | 2022-08 | 同值行重复导出且无标注 | 与 SEC-01 年度数 {d['rev22']:.3f} 不符 | 去重：{d['eq_r30']} |
+| financials/monthly_revenue_2022_2023.csv | 2023-12 | 同月双值 {keep_v:.3f} 与 {drop_v:.3f}，均无标注 | Source_Index：SEC-01 Priority 1 高于 INT-01 Priority 9（CP-02） | 取 {keep_v:.3f}：{d['eq_r31']} |
+| financials/revenue_by_segment_2022_2023.csv | FY2023 Other | {seg_bad:.3f} 量级错位 | 分部加总 {seg_raw:.3f} ≠ SEC-01 {d['rev23']:.3f} | 修正：{d['eq_r32']} |
+| financials/sbc_detail_2022_2023.csv | FY2023 TOTAL | TOTAL 行 {sbc_total:.3f} ≠ 明细加总 {sbc_detail:.3f} | 明细分项可复核加总 | 以明细为准，取 {sbc_detail:.3f} |
 
-## 五、数据口径与冲突处置
+## 六、输入材料清点（脚本 os.walk 实际扫描）
+文件总数 {inv['total']}，来源目录数 {inv['dir_count']}，按目录分列：
+{inv_md}
+（七目录小计 {inv['subdir_total']} + 根目录散件 {inv['root_files']} = {inv['total']}。）
 
-月度明细与年度数勾稽前，须先剔除 2022-08 的重复导出行，并排除 2023-12 的未审计 IR 记录；
-内部 management flash（3/19）为未复核初稿，按来源优先级不得进入结论。peer 区间采用委员会
-peer set 的 {d['peer_low']:.1f}x–{d['peer_high']:.1f}x，承销商各自编制的 comps 仅作交叉验证；
-政策 v2 中关于 SBC 加回、peer 区间、执行折扣与费用基数的条款已被 v3 取代。
+## 七、方法论理由（四项分列）
+1. Mid 档取委员会 peer 区间 {d['peer_low']:.1f}x–{d['peer_high']:.1f}x 的中点 {d['peer_mid']:.1f}x：
+   CP-07 指定以 Committee_Peer_Set 区间为准，历史倍数中位数（peer_multiples_history）不属
+   控制口径，故不取算术或历史中位数。
+2. 排除 internal/management_flash_20240319.csv（未复核 flash、IR 初稿、INT-01 Priority 9，载 Revenue {flash['Revenue']:.3f}、Adj EBITDA {flash['Adjusted EBITDA']:.3f}、SBC {flash['Stock-based compensation & related taxes']:.3f}）：CP-02 规定仅参考、不得作结论取数来源。
+3. 采用 Committee_Policy v3（2024-03-20）而非 v2（2024-03-05）：v2 的 {v2_scope}已标
+   SUPERSEDED 作废。
+4. 承销费只对公司 primary gross 计提 5%：CP-12 规定费基为公司 primary gross proceeds；
+   secondary 为出售股东股份转让、不形成公司募集资金，故不计入费基。
 
-## 六、条件与风险
+## 八、事实与假设分离
+SEC 公开事实：2023 年财务数据、现金与有价证券、primary/secondary/greenshoe 发行股数。
+内部委员会假设：{d['growth']:.0%} 收入增长、{d['peer_low']:.1f}x–{d['peer_high']:.1f}x peer 区间、
+{d['discount']:.1%} 执行折扣、内部 cap-table 快照、拟议 ${d['price']:.0f}。
 
+## 九、条件与风险
 1. 必须披露 QoE：承销 EBITDA {d['uw_ebitda']:.3f}mm、FCF {d['fcf']:.3f}mm 均为负。
-2. 信息集冻结于 2024-03-20；${d['price']:.0f} 是内部拟议价，**不是已实现的最终发行结果**。
-3. 区间纪律：价格偏离 midpoint 超过 $0.50 时向 midpoint 方向 Reprice；跌出 ${lo:.2f}–${hi:.2f}
+2. 信息集冻结于 2024-03-20；${d['price']:.0f} 是决策输入而非已实现的最终发行结果；
+   材料未载明项（如 2024E 分季度收入拆分）标注待核实。
+3. 区间纪律：偏离 midpoint 超 $0.50 时向 midpoint 方向 Reprice；跌出 ${lo:.2f}–${hi:.2f}
    或发行结构重新出现未解决硬错误时 Defer。
 """
     path = os.path.join(outdir, f"{TASK}_pricing_memo.md")
@@ -720,6 +1143,13 @@ peer set 的 {d['peer_low']:.1f}x–{d['peer_high']:.1f}x，承销商各自编�
 
 def main(argv=None):
     global IN_DIR
+    # Windows 等非 UTF-8 控制台下保证中文与算式符号（− ×）可正常输出
+    for _st in (sys.stdout, sys.stderr):
+        try:
+            if _st.encoding and _st.encoding.lower().replace("-", "") != "utf8":
+                _st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", default="/app/input_files")
     ap.add_argument("--output-dir", default="/app/output")
@@ -749,6 +1179,17 @@ def main(argv=None):
     print(f"  Post-money shares       : {d['post_shares']:.6f} / full {d['full_post_shares']:.6f}")
     print(f"  Greenshoe incremental   : {d['gs_incremental_net']:.3f}")
     print(f"  Monthly tie-out FY2023  : {d['xcheck']['monthly_fy2023']:.3f}")
+    print(f"  Eq de-duplicate FY2022  : {d['eq_r30']}")
+    print(f"  Eq priority  FY2023     : {d['eq_r31']}")
+    print(f"  Eq segment   FY2023     : {d['eq_r32']}")
+    print(f"  Eq QoE                    : {d['eq_r05']}")
+    print(f"  Eq 2024E Revenue        : {d['eq_r07']}")
+    print(f"  Eq net cash             : {d['eq_r08']}")
+    print(f"  Base case cell          : "
+          f"{d['sens_growths'][d['base_g_idx']]:.0%} x "
+          f"{d['sens_mults'][d['base_m_idx']]}x = {d['base_cell']:.2f}")
+    print(f"  Materials inventory     : {m['inventory']['total']} files, "
+          f"{m['inventory']['dir_count']} dirs")
     print(f"  Decision                : {d['decision']} at ${d['price']:.0f}")
     return 0
 

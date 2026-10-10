@@ -32,7 +32,7 @@ G1–G6（**归纳编号**）：结构齐全｜六处文件名逐字节一致+ta
 |---|---|---|---|
 | FIN3-WKN-149 | 金融/宏观压力测试 | `work_fin-b01_20261005_fix6-149` | G4 0.991422/36；G5 均分 0.595588；飞书 `rec28himvkSA77` rev223；zip 336624/1011976/8549036 |
 | FIN3-WKN-148 | 公司法 | — | **作废**（他人已用） |
-| FIN3-WKN-150 | 金融/Pre-IPO 尽调 | `work_fin-b01_20261006_fix2-150` | G4 g4v6 `Sek4FmX` **1.0**/36/err=0；G5 均分 0.621970；飞书行 `reczz28Jf9pZeD1T`；zip 14057147/68644/927362 |
+| FIN3-WKN-150 | 金融/Pre-IPO 尽调 | `work_fin-b01_20261006_fix6-150` | G4 **1.0**/36/err=0（**36 条全满分**）；G5 均分 **0.664773**（A1）；飞书行 `reczz28Jf9pZeD1T`；zip 14068377/68668/928842；task_version=1.0.6；**复检 239 三项全闭环**（金标利润桥补「加：非经常性损益 2,550」→ 24,740 闭合、包内 `.sh` 0755、新增 §9.1 判据变更史） |
 | FIN3-WKN-151 | 金融/银行授信 | `work_fin-b01_20261006-151` | G4 0.967914/32/err=0；G5 均分 0.659091；飞书行 `reczz28JsandcwbA`；zip 10235591/56919/587232；task_version=1.0.1 + run_task_version=1.0.0 |
 
 **★ 归档在批次级**：`跑分产物与轨迹/` 与任务目录、交付文档平级。zip 根=批次目录；zipfile 显式写 external_attr（*.sh→0755）。`check_package.py`：#9/#14 对"跑分产物与轨迹"豁免（**#8 真实密钥不豁免** → 轨迹 claude 日志须脱敏 sk-*/ark-*/Bearer/x-api-key）。
@@ -40,7 +40,7 @@ G1–G6（**归纳编号**）：结构齐全｜六处文件名逐字节一致+ta
 **★ 端点截断假分**：末轮 message 无 stop_reason + result 却是 tool_use + output_tokens≈1 + 交付物缺失。
 **★ summary 版本对账**：未重跑的修复批次写 `task_version=交付版本`+`run_task_version=实际运行版本`+`version_note`。
 **★ record-get 解析坑**：返回 `data.field_id_list`/`field_type_list`/`fields`(字段名列表)/`data`(行值列表)，按 zip(ids,names,types,row) 对齐，不是 fields dict。
-**★ 飞书（weakness 表）**：`+record-upload-attachment --file` 有路径白名单 → 先 cp 到 temp 再传；同名先删旧再传新。字段 `fld2LBu2Ns`=参考答案、`fld2TmGhqt`=标准答案附件。建行 `+record-upsert`；**探测可写性禁用「新建」试探**。序号↔金融Sheet(N-126)；base `QpzNb4fXSamfX6sLloBcPfHNnug`/table `tblPNrBtjFfwOowN`。
+**★ 飞书（weakness 表）**：`+record-upload-attachment --file` **只接受「相对当前工作目录」的路径**（绝对路径报 `unsafe file path: --file must be a relative path within the current directory`）→ 传 `subprocess.run(..., cwd=<zip所在目录>)` + 只给文件名；**先删旧再传新时必须先验证上传可用**，否则删除成功后上传失败会留下空字段。同名先删旧再传新。字段 `fld2LBu2Ns`=参考答案、`fld2TmGhqt`=标准答案附件。建行 `+record-upsert`；**探测可写性禁用「新建」试探**。序号↔金融Sheet(N-126)；base `QpzNb4fXSamfX6sLloBcPfHNnug`/table `tblPNrBtjFfwOowN`。
 
 ## 6 harbor-windows（Windows Coding Bench）
 三底线：① 反事实判定；② 二值判分（F2P+P2P 全过=1，异常=INVALID 不得伪装 0 分）；③ task_hash = `sha256("task_id="+id+"\n"+"task_version="+v+"\n"+"instruction_md_sha256="+h+"\n"+"test_patch_sha256="+h+"\n"+"oracle_patch_sha256="+h+"\n"+"dockerfile_sha256="+h")`，末行不带换行。
