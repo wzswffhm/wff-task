@@ -1,0 +1,510 @@
+diff --git a/check_crc.py b/check_crc.py
+new file mode 100644
+index 0000000..bfef93d
+--- /dev/null
++++ b/check_crc.py
+@@ -0,0 +1,73 @@
++import struct, zlib
++
++data = open('assets/sample.wlsg', 'rb').read()
++
++# Header: bytes 0..15
++header = data[:16]
++
++# Segments area: bytes 16..343
++seg_area = data[16:344]
++
++# Index region: bytes 344..383 (40 bytes = 5 entries * 8 bytes)
++index_region = data[344:384]
++
++# Trailer: bytes 384..391
++trailer = data[384:392]
++t1 = struct.unpack_from('<I', trailer, 0)[0]
++t2 = struct.unpack_from('<I', trailer, 4)[0]
++print(f"Stored trailer values: ({hex(t1)}, {hex(t2)})")
++
++# Standard CRC-32
++def std_crc(d):
++    return zlib.crc32(d) & 0xFFFFFFFF
++
++# Try various CRC coverage options
++print("\n--- Trying different CRC coverages ---")
++
++# Option 1: t1 = CRC(index), t2 = CRC(header + seg_area)
++c1 = std_crc(index_region)
++c2 = std_crc(header + seg_area)
++print(f"CRC(index)={hex(c1)}, CRC(header+seg_area)={hex(c2)}")
++print(f"  Match t1? {c1==t1}, Match t2? {c2==t2}")
++
++# Option 2: t1 = CRC(header + seg_area), t2 = CRC(index)
++print(f"  Swap: Match t1? {c2==t1}, Match t2? {c1==t2}")
++
++# Option 3: t1 = CRC(index), t2 = CRC(header only)
++c3 = std_crc(header)
++print(f"CRC(index)={hex(c1)}, CRC(header)={hex(c3)}")
++print(f"  Match t1? {c1==t1}, Match t2? {c3==t2}")
++
++# Option 4: CRC of entire file except trailer
++c4 = std_crc(data[:-8])
++print(f"CRC(all_except_trailer)={hex(c4)}")
++print(f"  Match t1? {c4==t1}, Match t2? {c4==t2}")
++
++# Option 5: t1 = CRC(seg_area only), t2 = CRC(header + index)
++c5 = std_crc(seg_area)
++c6 = std_crc(header + index_region)
++print(f"CRC(seg_area)={hex(c5)}, CRC(header+index)={hex(c6)}")
++print(f"  Match t1? {c5==t1}, Match t2? {c6==t2}")
++
++# Option 6: Maybe segment data without padding?
++# Build segment data without padding
++entries = [(16,16),(32,8),(40,24),(64,264),(328,16)]
++seg_no_pad = bytearray()
++for off, tlen in entries:
++    body_len = struct.unpack_from('<I', data, off+4)[0]
++    seg_no_pad += data[off:off+8+body_len]
++c7 = std_crc(header + bytes(seg_no_pad))
++print(f"CRC(header+seg_no_pad)={hex(c7)}")
++print(f"  Match t1? {c7==t1}, Match t2? {c7==t2}")
++
++# Also check empty sample
++print("\n=== Empty sample ===")
++edata = open('assets/sample_empty.wlsg', 'rb').read()
++etrailer = edata[16:24]
++et1 = struct.unpack_from('<I', etrailer, 0)[0]
++et2 = struct.unpack_from('<I', etrailer, 4)[0]
++print(f"Stored: ({hex(et1)}, {hex(et2)})")
++eheader = edata[:16]
++print(f"CRC(empty_header)={hex(std_crc(eheader))}")
++print(f"CRC(empty_bytes)={hex(std_crc(b''))}")
++print(f"Match et1? empty_crc={std_crc(b'')==et1}, header_crc={std_crc(eheader)==et2}")
+diff --git a/parse_sample.py b/parse_sample.py
+new file mode 100644
+index 0000000..e68cb86
+--- /dev/null
++++ b/parse_sample.py
+@@ -0,0 +1,68 @@
++import struct
++
++data = open('assets/sample.wlsg', 'rb').read()
++print(f"Total length: {len(data)}")
++
++# Header
++magic = data[0:4]
++version = data[4]
++flags = data[5]
++seg_count = struct.unpack_from('<H', data, 6)[0]
++index_offset = struct.unpack_from('<I', data, 8)[0]
++reserved = struct.unpack_from('<I', data, 12)[0]
++print(f"Header: magic={magic}, ver={version}, flags={flags}, seg_count={seg_count}, index_offset={index_offset}, reserved={reserved}")
++
++# Parse segments sequentially
++pos = 16
++print("\nSegments (sequential parse):")
++for i in range(seg_count):
++    seg_id = struct.unpack_from('<H', data, pos)[0]
++    sflags = data[pos+2]
++    sresv = data[pos+3]
++    body_len = struct.unpack_from('<I', data, pos+4)[0]
++    payload = data[pos+8:pos+8+body_len]
++    pad = (-(8 + body_len)) % 4
++    total = 8 + body_len + pad
++    print(f"  Seg {i}: pos={pos}, seg_id={seg_id}, flags={sflags}, resv={sresv}, body_len={body_len}, pad={pad}, total={total}")
++    print(f"    payload preview: {payload[:30]}")
++    pos += total
++
++print(f"\nAfter segments: pos={pos}, index_offset={index_offset}")
++
++# Index region
++idx_end = len(data) - 8  # assuming 8-byte trailer
++idx_region = data[index_offset:idx_end]
++print(f"\nIndex region ({index_offset} to {idx_end}):")
++print(f"  Index region size: {len(idx_region)} bytes")
++entry_size = len(idx_region) // seg_count if seg_count > 0 else 0
++print(f"  Entry size: {entry_size} bytes")
++
++# Try different entry sizes
++for esz in [4, 8, 12, 16]:
++    if len(idx_region) % esz == 0 and len(idx_region) // esz == seg_count:
++        print(f"\n  Trying entry_size={esz}:")
++        for j in range(seg_count):
++            entry = idx_region[j*esz:(j+1)*esz]
++            print(f"    [{j}] = {entry.hex()}")
++
++# Trailer
++trailer = data[-8:]
++print(f"\nTrailer (last 8 bytes): {trailer.hex()}")
++t1 = struct.unpack_from('<I', trailer, 0)[0]
++t2 = struct.unpack_from('<I', trailer, 4)[0]
++print(f"  As two LE uint32: ({hex(t1)}, {hex(t2)})")
++
++# Also check empty sample
++print("\n\n=== Empty sample ===")
++edata = open('assets/sample_empty.wlsg', 'rb').read()
++print(f"Length: {len(edata)}")
++print(f"Hex: {edata.hex()}")
++emagic = edata[0:4]
++ever = edata[4]
++efl = edata[5]
++esc = struct.unpack_from('<H', edata, 6)[0]
++eio = struct.unpack_from('<I', edata, 8)[0]
++eresv = struct.unpack_from('<I', edata, 12)[0]
++print(f"Header: magic={emagic}, ver={ever}, flags={efl}, seg_count={esc}, index_offset={eio}, reserved={eresv}")
++etrailer = edata[16:]
++print(f"After header: {etrailer.hex()} ({len(etrailer)} bytes)")
+diff --git a/parse_sample2.py b/parse_sample2.py
+new file mode 100644
+index 0000000..cc6df0d
+--- /dev/null
++++ b/parse_sample2.py
+@@ -0,0 +1,42 @@
++import struct
++
++data = open('assets/sample.wlsg', 'rb').read()
++
++# Index entries as (offset, total_length)
++entries = [
++    (16, 16),
++    (32, 8),
++    (40, 24),
++    (64, 264),
++    (328, 16),
++]
++
++for i, (off, tlen) in enumerate(entries):
++    seg_data = data[off:off+tlen]
++    print(f"\nSeg {i}: offset={off}, total_len={tlen}")
++    print(f"  Raw header (8 bytes): {seg_data[:8].hex()}")
++    
++    # Try current format: <HBBI (seg_id:H, flags:B, resv:B, body_len:I)
++    seg_id = struct.unpack_from('<H', seg_data, 0)[0]
++    flags = seg_data[2]
++    resv = seg_data[3]
++    body_len = struct.unpack_from('<I', seg_data, 4)[0]
++    print(f"  <HBBI: seg_id={seg_id}, flags={flags}, resv={resv}, body_len={body_len}")
++    if body_len <= tlen - 8:
++        payload = seg_data[8:8+body_len]
++        pad = tlen - 8 - body_len
++        print(f"    payload ({body_len} bytes): {payload[:40]}")
++        print(f"    padding: {pad} bytes")
++    else:
++        print(f"    ERROR: body_len > available space")
++    
++    # Try alternative format: <HHI (seg_id:H, flags:H, body_len:I)
++    seg_id2 = struct.unpack_from('<H', seg_data, 0)[0]
++    flags2 = struct.unpack_from('<H', seg_data, 2)[0]
++    body_len2 = struct.unpack_from('<I', seg_data, 4)[0]
++    print(f"  <HHI: seg_id={seg_id2}, flags={flags2}, body_len={body_len2}")
++    
++    # Try: <II (seg_id:I, body_len:I) 
++    seg_id3 = struct.unpack_from('<I', seg_data, 0)[0]
++    body_len3 = struct.unpack_from('<I', seg_data, 4)[0]
++    print(f"  <II: seg_id={seg_id3}, body_len={body_len3}")
+diff --git a/tmp/parse_sample.py b/tmp/parse_sample.py
+new file mode 100644
+index 0000000..e0e5614
+--- /dev/null
++++ b/tmp/parse_sample.py
+@@ -0,0 +1,68 @@
++import struct
++
++data = open('assets/sample.wlsg', 'rb').read()
++print(f"Total length: {len(data)}")
++
++# Header
++magic = data[0:4]
++version = data[4]
++flags = data[5]
++seg_count = struct.unpack_from('<H', data, 6)[0]
++index_offset = struct.unpack_from('<I', data, 8)[0]
++reserved = struct.unpack_from('<I', data, 12)[0]
++print(f"Header: magic={magic}, ver={version}, flags={flags}, seg_count={seg_count}, index_offset={index_offset}, reserved={reserved}")
++
++# Parse segments sequentially
++pos = 16
++print("\nSegments (sequential parse):")
++for i in range(seg_count):
++    seg_id = struct.unpack_from('<H', data, pos)[0]
++    sflags = data[pos+2]
++    sresv = data[pos+3]
++    body_len = struct.unpack_from('<I', data, pos+4)[0]
++    payload = data[pos+8:pos+8+body_len]
++    pad = (-(8 + body_len)) % 4
++    total = 8 + body_len + pad
++    print(f"  Seg {i}: pos={pos}, seg_id={seg_id}, flags={sflags}, resv={sresv}, body_len={body_len}, pad={pad}, total={total}")
++    print(f"    payload preview: {payload[:30]}")
++    pos += total
++
++print(f"\nAfter segments: pos={pos}, index_offset={index_offset}")
++
++# Index region
++print(f"\nIndex region ({index_offset} to {len(data)-8}):")
++idx_end = len(data) - 8  # assuming 8-byte trailer
++idx_region = data[index_offset:idx_end]
++print(f"  Index region size: {len(idx_region)} bytes")
++entry_size = len(idx_region) // seg_count if seg_count > 0 else 0
++print(f"  Entry size: {entry_size} bytes")
++
++# Try different entry sizes
++for esz in [4, 8, 12, 16]:
++    if len(idx_region) % esz == 0 and len(idx_region) // esz == seg_count:
++        print(f"\n  Trying entry_size={esz}:")
++        for j in range(seg_count):
++            entry = idx_region[j*esz:(j+1)*esz]
++            print(f"    [{j}] = {entry.hex()}")
++
++# Trailer
++trailer = data[-8:]
++print(f"\nTrailer (last 8 bytes): {trailer.hex()}")
++t1 = struct.unpack_from('<I', trailer, 0)[0]
++t2 = struct.unpack_from('<I', trailer, 4)[0]
++print(f"  As two LE uint32: ({hex(t1)}, {hex(t2)})")
++
++# Also check empty sample
++print("\n\n=== Empty sample ===")
++edata = open('assets/sample_empty.wlsg', 'rb').read()
++print(f"Length: {len(edata)}")
++print(f"Hex: {edata.hex()}")
++emagic = edata[0:4]
++ever = edata[4]
++efl = edata[5]
++esc = struct.unpack_from('<H', edata, 6)[0]
++eio = struct.unpack_from('<I', edata, 8)[0]
++eresv = struct.unpack_from('<I', edata, 12)[0]
++print(f"Header: magic={emagic}, ver={ever}, flags={efl}, seg_count={esc}, index_offset={eio}, reserved={eresv}")
++etrailer = edata[16:]
++print(f"After header: {etrailer.hex()} ({len(etrailer)} bytes)")
+diff --git a/wlogseg/codec.py b/wlogseg/codec.py
+index 9197691..e136033 100644
+--- a/wlogseg/codec.py
++++ b/wlogseg/codec.py
+@@ -7,7 +7,7 @@ import struct
+ from .crc import compute_crc
+ from .errors import WSegError
+ from .header import HEADER_SIZE, build_header, parse_header
+-from .index import INDEX_ENTRY_SIZE, build_index
++from .index import INDEX_ENTRY_SIZE, build_index, parse_index
+ from .segment import (
+     MAX_BODY,
+     MAX_SEG_ID,
+@@ -35,23 +35,25 @@ def pack(segments) -> bytes:
+             raise WSegError("structure", "payload is too large")
+         items.append((seg_id, body))
+ 
+-    offsets = []
+-    body = bytearray()
+-    checksummed = bytearray()
++    index_entries = []
++    seg_area = bytearray()
+     cursor = HEADER_SIZE
+     for seg_id, payload in items:
+         encoded = encode_segment(seg_id, payload)
+-        offsets.append(cursor)
+-        body += encoded
+-        checksummed += encoded[:SEGMENT_HEADER_SIZE + len(payload)]
+-        cursor += segment_length(len(payload))
++        index_entries.append((cursor, len(encoded)))
++        seg_area += encoded
++        cursor += len(encoded)
+ 
+     index_offset = cursor
+     header = build_header(len(items), index_offset)
+-    index_region = build_index(offsets)
+-    trailer = _TRAILER.pack(compute_crc(index_region),
+-                            compute_crc(bytes(header) + bytes(checksummed)))
+-    return bytes(header) + bytes(body) + index_region + trailer
++    index_region = build_index(index_entries)
++
++    # t1 = CRC of index region; t2 = CRC of header + segment area (with padding)
++    trailer = _TRAILER.pack(
++        compute_crc(index_region),
++        compute_crc(bytes(header) + bytes(seg_area)),
++    )
++    return bytes(header) + bytes(seg_area) + index_region + trailer
+ 
+ 
+ def unpack(data) -> list:
+@@ -61,35 +63,76 @@ def unpack(data) -> list:
+     data = bytes(data)
+ 
+     if len(data) < HEADER_SIZE + TRAILER_SIZE:
+-        raise WSegError("structure", f"container is only {len(data)} bytes")
++        raise WSegError("truncated", f"container is only {len(data)} bytes")
+ 
+-    _version, _flags, seg_count, index_offset = parse_header(data)
++    try:
++        _version, _flags, seg_count, index_offset = parse_header(data)
++    except WSegError:
++        raise
+ 
+     if index_offset > len(data):
+         raise WSegError("structure", f"index offset {index_offset} is beyond the container")
++
++    # Validate that there's room for index + trailer after index_offset
+     index_end = index_offset + INDEX_ENTRY_SIZE * seg_count
+     if index_end + TRAILER_SIZE > len(data):
+-        raise WSegError("structure", "the index and the trailer do not fit")
++        raise WSegError("truncated", "the index and the trailer do not fit")
++
++    # Also verify that index_offset == HEADER_SIZE + sum of segment lengths
++    # by parsing the index and checking consistency
++    try:
++        idx_entries = parse_index(data, index_offset, seg_count)
++    except WSegError:
++        raise
+ 
++    # Read segments using index entries
+     records = []
+-    checksummed = bytearray(data[:HEADER_SIZE])
+-    cursor = HEADER_SIZE
+-    for index in range(seg_count):
+-        if cursor + SEGMENT_HEADER_SIZE > len(data):
+-            raise WSegError("structure", f"segment {index} header is incomplete")
+-        seg_id, _seg_flags, body_len = parse_segment_header(data, cursor, len(data))
+-        start = cursor + SEGMENT_HEADER_SIZE
+-        if start + body_len > len(data):
+-            raise WSegError("structure", f"segment {index} payload is incomplete")
++    for i, (seg_off, seg_len) in enumerate(idx_entries):
++        if seg_off < HEADER_SIZE:
++            raise WSegError("structure", f"segment {i} offset {seg_off} is inside the header")
++        if seg_off + seg_len > index_offset:
++            raise WSegError("structure", f"segment {i} extends beyond the segment area")
++        if seg_len < SEGMENT_HEADER_SIZE:
++            raise WSegError("structure", f"segment {i} length {seg_len} is too small for header")
++
++        seg_id, _seg_flags, body_len = parse_segment_header(data, seg_off, len(data))
++
++        # Verify body_len is consistent with seg_len
++        expected_body_max = seg_len - SEGMENT_HEADER_SIZE
++        if body_len > expected_body_max:
++            raise WSegError("structure", f"segment {i} body_len {body_len} exceeds available space")
++
++        # Verify padding is correct
++        expected_total = segment_length(body_len)
++        if expected_total != seg_len:
++            raise WSegError("structure", f"segment {i} declared length {seg_len} != computed {expected_total}")
++
++        start = seg_off + SEGMENT_HEADER_SIZE
+         records.append((seg_id, data[start:start + body_len]))
+-        checksummed += data[cursor:start + body_len]
+-        cursor += segment_length(body_len)
+ 
+-    index_crc, data_crc = _TRAILER.unpack_from(data, len(data) - TRAILER_SIZE)
+-    if compute_crc(data[index_offset:index_end]) != index_crc:
++    # Verify sequential consistency: segments should be contiguous from HEADER_SIZE to index_offset
++    if seg_count > 0:
++        expected_pos = HEADER_SIZE
++        for i, (seg_off, seg_len) in enumerate(idx_entries):
++            if seg_off != expected_pos:
++                raise WSegError("structure", f"segment {i} offset {seg_off} != expected {expected_pos}")
++            expected_pos += seg_len
++        if expected_pos != index_offset:
++            raise WSegError("structure", f"segments end at {expected_pos} but index_offset is {index_offset}")
++
++    # Verify checksums
++    stored_index_crc, stored_data_crc = _TRAILER.unpack_from(data, len(data) - TRAILER_SIZE)
++
++    computed_index_crc = compute_crc(data[index_offset:index_end])
++    if computed_index_crc != stored_index_crc:
+         raise WSegError("checksum", "the index region does not match its checksum")
+-    if compute_crc(bytes(checksummed)) != data_crc:
++
++    # data_crc covers header + segment area (with padding)
++    seg_area = data[HEADER_SIZE:index_offset]
++    computed_data_crc = compute_crc(data[:HEADER_SIZE] + seg_area)
++    if computed_data_crc != stored_data_crc:
+         raise WSegError("checksum", "the segment region does not match its checksum")
++
+     return records
+ 
+ 
+@@ -98,7 +141,5 @@ def verify(data) -> bool:
+     try:
+         unpack(data)
+         return True
+-    except WSegError:
+-        return False
+     except Exception:  # noqa: BLE001
+         return False
+diff --git a/wlogseg/crc.py b/wlogseg/crc.py
+index 6656acb..253cd95 100644
+--- a/wlogseg/crc.py
++++ b/wlogseg/crc.py
+@@ -7,11 +7,11 @@ import zlib
+ 
+ def crc32_update(data, value: int = 0) -> int:
+     """在 ``value`` 的基础上继续累积校验和。"""
+-    return (zlib.crc32(bytes(data), value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++    return zlib.crc32(bytes(data), value) & 0xFFFFFFFF
+ 
+ 
+ def compute_crc(data) -> int:
+-    """返回容器使用的 32 位校验和。"""
++    """返回容器使用的 32 位校验和（标准 CRC-32）。"""
+     if isinstance(data, str):
+         raise TypeError("compute_crc expects a bytes-like object")
+-    return crc32_update(data, 0)
++    return zlib.crc32(bytes(data)) & 0xFFFFFFFF
+diff --git a/wlogseg/index.py b/wlogseg/index.py
+index 6db48e1..7ec5055 100644
+--- a/wlogseg/index.py
++++ b/wlogseg/index.py
+@@ -6,25 +6,26 @@ import struct
+ 
+ from .errors import WSegError
+ 
+-INDEX_ENTRY_SIZE = 4
++INDEX_ENTRY_SIZE = 8
+ 
+-_ENTRY = struct.Struct("<I")
++_ENTRY = struct.Struct("<II")
+ 
+ 
+-def build_index(offsets) -> bytes:
++def build_index(entries) -> bytes:
++    """构建索引区。``entries`` 为 (offset, total_segment_length) 对的序列。"""
+     out = bytearray()
+-    for offset in offsets:
+-        out += _ENTRY.pack(offset & 0xFFFFFFFF)
++    for offset, length in entries:
++        out += _ENTRY.pack(offset & 0xFFFFFFFF, length & 0xFFFFFFFF)
+     return bytes(out)
+ 
+ 
+ def parse_index(data: bytes, pos: int, count: int):
+-    """读取 ``count`` 个索引条目，返回各段偏移。"""
++    """读取 ``count`` 个索引条目，返回各段 (offset, length) 对列表。"""
+     needed = pos + INDEX_ENTRY_SIZE * count
+     if needed > len(data):
+-        raise WSegError("structure", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
+-    offsets = []
+-    for index in range(count):
+-        (offset,) = _ENTRY.unpack_from(data, pos + index * INDEX_ENTRY_SIZE)
+-        offsets.append(offset)
+-    return offsets
++        raise WSegError("truncated", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
++    entries = []
++    for i in range(count):
++        offset, length = _ENTRY.unpack_from(data, pos + i * INDEX_ENTRY_SIZE)
++        entries.append((offset, length))
++    return entries
+diff --git a/wlogseg/segment.py b/wlogseg/segment.py
+index cc8c196..c581b26 100644
+--- a/wlogseg/segment.py
++++ b/wlogseg/segment.py
+@@ -7,7 +7,7 @@ import struct
+ from .errors import WSegError
+ 
+ SEGMENT_HEADER_SIZE = 8
+-ALIGNMENT = 4
++ALIGNMENT = 8
+ MAX_SEG_ID = 0xFFFF
+ MAX_BODY = 0xFFFFFFFF
+ 
+@@ -32,6 +32,6 @@ def encode_segment(seg_id: int, payload: bytes, flags: int = 0) -> bytes:
+ def parse_segment_header(data: bytes, pos: int, limit: int):
+     """从 ``pos`` 读段头；``limit`` 是已经确认可读的字节上界。"""
+     if pos + SEGMENT_HEADER_SIZE > limit:
+-        raise WSegError("structure", f"segment header at {pos} is incomplete")
++        raise WSegError("truncated", f"segment header at {pos} is incomplete")
+     seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
+     return seg_id, flags, body_len

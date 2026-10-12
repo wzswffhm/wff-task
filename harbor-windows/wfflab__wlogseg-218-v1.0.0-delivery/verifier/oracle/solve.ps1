@@ -36,11 +36,26 @@ if ([string]::IsNullOrWhiteSpace($TaskRoot)) {
 }
 $TaskRoot = (Resolve-Path -LiteralPath $TaskRoot).Path
 
-if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
-    $WorkspaceRoot = Join-Path $TaskRoot 'environment\workspace'
-} else {
+# Workspace resolution: under Harbor the candidate workspace is the image
+# workdir (C:\testbed) and there is no C:\environment; local runs keep the
+# in-tree environment/workspace. First existing candidate wins.
+if (-not [string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
     $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
+} else {
+    $wsCandidates = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace($env:WLOGSEG_WORKSPACE_ROOT)) { [void]$wsCandidates.Add($env:WLOGSEG_WORKSPACE_ROOT) }
+    [void]$wsCandidates.Add((Join-Path $TaskRoot 'environment\workspace'))
+    [void]$wsCandidates.Add('C:\testbed')
+    [void]$wsCandidates.Add((Get-Location).Path)
+    $resolved = ''
+    foreach ($candidate in $wsCandidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if (Test-Path -LiteralPath (Join-Path $candidate 'wlogseg\__init__.py')) { $resolved = $candidate; break }
+    }
+    if ([string]::IsNullOrWhiteSpace($resolved)) { $resolved = Join-Path $TaskRoot 'environment\workspace' }
+    $WorkspaceRoot = $resolved
 }
+Write-Host "solve: workspace resolved to $WorkspaceRoot"
 
 function Test-Payload([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }

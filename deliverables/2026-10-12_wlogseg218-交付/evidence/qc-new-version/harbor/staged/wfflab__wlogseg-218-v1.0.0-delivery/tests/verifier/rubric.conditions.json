@@ -1,0 +1,141 @@
+{
+  "schema_version": "rubric-conditions-v2",
+  "task_id": "wfflab__wlogseg-218",
+  "task_version": "1.0.0",
+  "scope": "verifier-side only; never injected into the agent environment",
+  "programmatic_weight": 0.5,
+  "llm_judge_weight": 0.5,
+  "programmatic": [
+    {
+      "rubric_id": "sample-compatibility",
+      "weight": 0.12,
+      "test_ids": [
+        "f2p-sample-verifies",
+        "f2p-sample-roundtrip-byte-identical",
+        "f2p-sample-records-match-expected",
+        "f2p-empty-sample-roundtrip"
+      ],
+      "description": "The authoritative samples verify, round-trip byte for byte, and expose the documented segment sequence.",
+      "pass_condition": "verify() accepts both assets/sample.wlsg and assets/sample_empty.wlsg; pack(unpack(sample)) reproduces the sample byte for byte; unpack(sample) yields exactly the (seg_id, payload) sequence the samples encode, in file order; the zero-segment sample round-trips too.",
+      "failure_reason": "The implementation rejects or misreads the authoritative samples, or re-packing a parsed sample produces different bytes (which breaks downstream byte-hash incremental sync)."
+    },
+    {
+      "rubric_id": "layout-and-alignment",
+      "weight": 0.08,
+      "test_ids": [
+        "f2p-segment-alignment-is-eight-bytes",
+        "f2p-index-layout-matches-sample"
+      ],
+      "description": "Segments follow the on-disk layout of the real samples: fixed-width little-endian fields, every segment padded to an 8-byte boundary, and an 8-byte (offset, length) entry per segment in the tail index.",
+      "pass_condition": "Every segment starts on an 8-byte boundary and the declared entry length covers the stored padding, so byte offsets match the authoritative samples exactly; the tail index carries both the offset and the length of each segment and is laid out exactly as the sample is.",
+      "failure_reason": "Segment encoding or padding does not match the byte layout of the authoritative samples, or the index entries omit a field so offsets drift even though self-generated containers still round-trip."
+    },
+    {
+      "rubric_id": "checksum-semantics",
+      "weight": 0.1,
+      "test_ids": [
+        "f2p-crc-matches-standard-check-value",
+        "f2p-tampered-payload-is-rejected"
+      ],
+      "description": "The trailer is a general CRC-32/ISO-HDLC over the header plus the whole segment region and over the index region: it matches the standard check vectors and catches tampering anywhere in either covered region.",
+      "pass_condition": "compute_crc() matches a published standard check value for a known test vector; verify() returns False once segment content, segment padding or index bytes are altered; the segment-region digest covers the header, every segment header, every payload and the alignment padding.",
+      "failure_reason": "The checksum is a private or truncated fold that agrees with the sample only by accident, is computed over a subset of the container (for example skipping the header or the padding), or silently accepts tampered content."
+    },
+    {
+      "rubric_id": "error-classification",
+      "weight": 0.12,
+      "test_ids": [
+        "f2p-truncated-header-reports-truncated",
+        "f2p-missing-index-reports-truncated",
+        "f2p-truncated-segment-body-reports-truncated",
+        "f2p-truncated-stream-reports-truncated",
+        "f2p-index-offset-inside-header-reports-structure",
+        "f2p-segment-past-index-reports-structure",
+        "f2p-index-entry-mismatch-reports-structure",
+        "f2p-trailing-bytes-reports-structure",
+        "p2p-bad-magic-reports-magic",
+        "p2p-bad-version-reports-version",
+        "p2p-verify-never-raises"
+      ],
+      "description": "Structural and integrity problems raise WSegError with the documented kind, insufficient data is always classified as truncated before any contradiction is considered, and verify() never raises.",
+      "pass_condition": "A container that ends before the structure it declares can be read raises kind 'truncated' on the batch and the streaming path alike, including a wholly missing index region, a partly missing index, a missing trailer and a segment header that declares more payload than the file holds; a container whose bytes are all present but contradict each other raises kind 'structure', including an index offset that points inside the header, a segment that runs past the index region, index entries that disagree with the derived segment layout, a segment count that disagrees with the index region size, and bytes trailing the trailer; a wrong magic raises kind 'magic'; an unsupported version raises kind 'version'; verify() returns False for every malformed input instead of propagating ValueError, struct.error or IndexError.",
+      "failure_reason": "Malformed input leaks a built-in exception, the error kind does not distinguish the documented categories, insufficient data is reported as 'structure' (or accepted as valid), a structural contradiction is reported as 'checksum', or verify() raises instead of returning False."
+    },
+    {
+      "rubric_id": "streaming",
+      "weight": 0.04,
+      "test_ids": [
+        "f2p-iter-segments-is-streaming"
+      ],
+      "description": "iter_segments() is lazy: it only issues fixed-size read(n) calls and yields the first segment after reading a small prefix of the container.",
+      "pass_condition": "iter_segments() never issues an unbounded read (no read(), read(-1) or readlines()); the first segment is yielded after consuming only a bounded prefix of the stream, and the trailer is still verified after the last segment.",
+      "failure_reason": "The iterator buffers the whole container before yielding, so a few-hundred-MB container is still pulled into memory as one object."
+    },
+    {
+      "rubric_id": "api-and-regression",
+      "weight": 0.04,
+      "test_ids": [
+        "p2p-self-roundtrip-small-segments",
+        "p2p-empty-payload-roundtrip",
+        "p2p-generated-data-roundtrip-verified",
+        "p2p-read-all-matches-unpack",
+        "p2p-pack-rejects-out-of-range-segment-id"
+      ],
+      "description": "The public surface stays intact and self-consistent: small / empty-payload / generated containers round-trip, pack() rejects invalid input, and read_all() matches unpack().",
+      "pass_condition": "pack/unpack round-trips for small segments, empty payloads and freshly generated containers; pack() output is accepted by both verify() and iter_segments(); read_all() returns the same segments as unpack(); pack() raises WSegError for an out-of-range segment id and for a non-bytes payload.",
+      "failure_reason": "Regression in the public API or in self-produced containers: round-trip only works for the sample shape, read_all() disagrees with unpack(), or invalid input is silently accepted."
+    }
+  ],
+  "llm_judge": [
+    {
+      "rubric_id": "contract-preservation",
+      "weight": 0.15,
+      "description": "The delivered fix keeps the public surface the task contract names, including the documented exception taxonomy.",
+      "pass_condition": "pack / unpack / verify / iter_segments / read_all / compute_crc / WSegError keep their names, arity and observable semantics, and WSegError.kind still distinguishes the documented categories; the visible smoke test still passes unmodified.",
+      "failure_reason": "The fix renames or removes a public entry point, changes an argument contract, or makes the visible smoke test fail.",
+      "criteria": [
+        "Every public name listed by the task contract still exists and is importable.",
+        "No argument was renamed, reordered or given a new required default.",
+        "WSegError still carries the documented kind values and the original exception type.",
+        "The visible smoke test passes without being edited."
+      ]
+    },
+    {
+      "rubric_id": "implementation-quality",
+      "weight": 0.15,
+      "description": "The fix is a coherent implementation rather than a patch bolted onto the sample path.",
+      "pass_condition": "Header, segment, index and trailer handling share one consistent format model; the batch and the streaming path agree on every well-formed container and on the error taxonomy; no dead or duplicated code path is left behind.",
+      "failure_reason": "The batch path and the streaming path disagree about the format or about the error kinds, the trailer check exists only in one of them, or the fix is duplicated code kept separate on purpose.",
+      "criteria": [
+        "A single format model drives header, segment, index and trailer handling.",
+        "Streaming and batch readers agree on every well-formed container and on every malformed one the suite constructs.",
+        "No leftover scaffolding, commented-out experiment or debug print.",
+        "Errors are raised where the structure is violated, not swallowed and re-derived later."
+      ]
+    },
+    {
+      "rubric_id": "anti-shortcut-discipline",
+      "weight": 0.1,
+      "description": "The fix generalises beyond the two shipped samples instead of special-casing them.",
+      "pass_condition": "No branch keys off the sample bytes, the sample length, the segment count, or a literal expected digest; every behaviour the contract states holds for freshly generated containers, and the error classification is decided from the bytes at hand rather than from a hard-coded expectation.",
+      "failure_reason": "The implementation detects the sample (by hash, size or segment count) and returns a canned result, weakens a check so malformed input passes, hard-codes the kind of an error for a specific test input, or disables the trailer verification to make the sample verify.",
+      "criteria": [
+        "No literal comparison against the sample bytes or a hard-coded checksum of them.",
+        "Malformed inputs are still rejected after the fix, and freshly generated containers are classified by the same rules as the samples.",
+        "verify() returns False rather than raising for every malformed input the suite constructs."
+      ]
+    },
+    {
+      "rubric_id": "verification-report",
+      "weight": 0.1,
+      "description": "The delivery states how the fix was verified and the statement is reproducible.",
+      "pass_condition": "A short report names the commands the author ran, what they observed before and after the fix, and how a reviewer can repeat it in the same image; claims match the shipped artefacts.",
+      "failure_reason": "No verification statement is shipped, or the statement claims results the artefacts cannot reproduce.",
+      "criteria": [
+        "The report names concrete commands, not intentions.",
+        "Before/after observations are stated for the sample round-trip and for the truncation / structure classification.",
+        "The stated commands only use what the image ships."
+      ]
+    }
+  ]
+}

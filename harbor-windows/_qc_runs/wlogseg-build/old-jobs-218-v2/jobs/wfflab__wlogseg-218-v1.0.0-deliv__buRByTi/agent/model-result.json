@@ -1,0 +1,20 @@
+{
+  "alias": "opus",
+  "model": "claude-opus-5",
+  "label": "opus",
+  "protocol": "anthropic",
+  "base_url": "https://4router.net",
+  "auth": "x-api-key",
+  "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wlogseg-build\\harbor_agent\\wlogseg_model_agent.py",
+  "runner_sha256": "eb1f5d41e50f7c9763414746b0bfb9f85e9ae425edf9bd574898aba53f8000b2",
+  "steps": 30,
+  "submitted": true,
+  "submit_summary": "## 根因\n\n`docs/FORMAT.md`（草稿）描述的布局和真实样本不符，实现照草稿写，于是自产自销能跑通、真实样本读不了。从 `assets/sample.wlsg` 的字节反推出真实布局，与草稿有三处分歧：\n\n- 段对齐是 **8** 字节，不是 4；\n- 索引条目是 **8** 字节 `(起始偏移, 含填充的段总长)`，不是 4 字节只存偏移；\n- 尾部 CRC 覆盖**文件头 + 整个段区（含填充）**，`compute_crc` 多做了一次 `^ 0xFFFFFFFF`，所以不是任何标准 CRC。\n\n## 改动\n\n- `crc.py`：去掉多余取反，改为标准 CRC-32/ISO-HDLC（`b\"123456789\"` → `0xCBF43926`，空输入 → 0）。`crc32_update` 可累积，满足 `crc32_update(b, crc32_update(a)) == compute_crc(a+b)`，流式读取靠它增量算校验和。\n- `segment.py`：`ALIGNMENT` 4 → 8。\n- `index.py`：`INDEX_ENTRY_SIZE` 4 → 8，条目改为 `(offset, total_length)`。\n- `codec.py`：按真实布局 pack/unpack；CRC 覆盖范围改为头 + 完整段区；按声明长度顺序推进段，收尾要求落点正好等于 `index_offset`，并把索引条目与实走结果逐项比对，消除索引定位与顺序推进的错位；`pack` 完整校验入参（含非 pair、非 bytes payload、越界 seg_id、`bool`、段数超 65535）。\n- `header.py`：先验魔数再验长度，数据不足抛 `truncated` 而不是 `structure`。\n- `stream.py`：不再 `read()` 整体吞入，改为只用固定大小的正整数 `read(n)`（单次上限 64 KiB），逐段惰性 yield，边读边累积 CRC；取完最后一段后仍校验尾部索引与两个 CRC。短读（每次只给 1 字节）也能正确工作。\n- `docs/FORMAT.md`：按样本实际字节校正，避免下一个人再被草稿误导。\n\n错误分类现在是：魔数 → `magic`，版本 → `version`，字节不够读完声明结构 → `truncated`，声明自相矛盾（段数/段区长度/索引偏移不符、尾随多余字节）→ `structure`，CRC 不符 → `checksum`。`verify()` 全程不抛异常。\n\n## 验证\n\n- `tests/test_wlogseg_basic.py` 6 项全过。\n- 两个样本 `verify` 为 `True` 且 `pack(unpack(sample)) == sample` 逐字节一致；用解出的段集合重新 `pack` 也还原出与样本完全相同的 392 字节。\n- 覆盖了 20+ 种损坏/篡改输入的 kind 分类、payload 任意位翻转（含填充区与索引区）、流式短读、2 MB 容器与 500 KB 单段（流式单次读取始终 ≤ 64 KiB）、65535 段上限。\n\n临时验证脚本已删除；被 git 跟踪的 `__pycache__` 已还原，未留下多余文件。",
+  "input_tokens": 13789,
+  "output_tokens": 15811,
+  "elapsed_sec": 599.52,
+  "last_stop_reason": "tool_use",
+  "workspace": "C:\\testbed",
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wlogseg-build\\model-rounds\\jobs\\model-opus-3\\wfflab__wlogseg-218-v1.0.0-deliv__buRByTi\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-12T12:04:06.404458+00:00"
+}

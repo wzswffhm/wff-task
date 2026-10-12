@@ -51,24 +51,48 @@ def sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "-"
 
 
+ALIAS_FULL = {"qwen": "qwen3.8-max-0902", "opus": "opus-5",
+              "glm": "glm-5.3", "kimi": "kimi-k3"}
+
+
 def load_trials():
     out = []
     for d in sorted(p for p in JOBS.iterdir() if p.is_dir()):
+        if not (d / "result.json").is_file():
+            continue                      # 跳过 _index 之类非 trial 目录
         res = read_json(d / "result.json", {}) or {}
-        checks = read_json(d / "verifier" / "checks.json", {}) or {}
-        ch = checks.get("checks") or []
+        # 逐项结果：优先 verifier/result.json（本仓库补的），回退 checks.json
+        vres = read_json(d / "verifier" / "result.json", {}) or {}
+        cases = vres.get("testcases") or []
+        if cases:
+            total = len(cases)
+            passed = sum(1 for c in cases
+                         if str(c.get("outcome") or "").upper() == "PASS")
+            checks_sha = sha256_file(d / "verifier" / "result.json")[:18] + "..."
+        else:
+            checks = read_json(d / "verifier" / "checks.json", {}) or {}
+            ch = checks.get("checks") or []
+            total = len(ch)
+            passed = sum(1 for c in ch if c.get("status") == "PASS")
+            checks_sha = sha256_file(d / "verifier" / "checks.json")[:18] + "..."
         cfg = read_json(d / "config.json", {}) or {}
-        kwargs = ((cfg.get("agent") or {}).get("kwargs") or {})
-        label = kwargs.get("label") or "unknown"
-        kind = "control" if d.name.startswith("task0__") else "model"
+        # 与自检 job_identity 同口径：优先 result.json 里的 config.agent
+        agent = ((res.get("config") or {}).get("agent") or cfg.get("agent") or {})
+        kwargs = agent.get("kwargs") or {}
+        aname = str(agent.get("name") or "").casefold()
+        alias = (kwargs.get("alias")
+                 or ((res.get("agent_result") or {}).get("metadata") or {}).get("alias"))
+        kind = "control" if aname in ("oracle", "nop") else "model"
+        label = aname if kind == "control" else ALIAS_FULL.get(str(alias).casefold(),
+                                                               str(alias or "unknown"))
         out.append({
             "dir": d.name,
             "kind": kind,
             "label": label,
             "score": (res.get("verifier_result") or {}).get("rewards", {}).get("reward"),
-            "checks_total": len(ch),
-            "checks_passed": sum(1 for c in ch if c.get("status") == "PASS"),
-            "checks_sha": sha256_file(d / "verifier" / "checks.json")[:18] + "...",
+            "checks_total": total,
+            "checks_passed": passed,
+            "checks_sha": checks_sha,
             "validity": (res.get("judge") or {}).get("run_validity") or "VALID",
             "elapsed": (res.get("judge") or {}).get("elapsed_sec"),
         })
@@ -89,7 +113,7 @@ def badge(draw, text, right, top, ok=True):
 
 def header(draw, title, badge_text, ok=True):
     draw.text((60, 40), title, font=font(42, bold=True), fill=INK)
-    draw.text((60, 100), "Task: %s   Version: %s   Engine: host Windows runtime (no container)"
+    draw.text((60, 100), "Task: %s   Version: %s   Engine: Harbor + Windows containers"
               % (TASK_ID, VERSION), font=font(22), fill=MUTED)
     draw.text((60, 130), "Generated: %s" % datetime.now().astimezone().isoformat(),
               font=font(20), fill=MUTED)
@@ -152,8 +176,8 @@ def make_score_summary(trials) -> Path:
               "Invalid runs: 0" % ("OK" if g_ok else "FAIL", "OK" if n_ok else "FAIL"),
               font=font(22), fill=MUTED)
     draw.text((100, 808),
-              "Grading: task tests/test.ps1 on host Windows runtime; per-run patches from "
-              "agent runs (36/28/38 steps)", font=font(22), fill=MUTED)
+              "Grading: task tests/test.ps1 inside Harbor Windows containers; 8 model "
+              "runs + 3 oracle + 3 no-change", font=font(22), fill=MUTED)
 
     OUT.mkdir(parents=True, exist_ok=True)
     p = OUT / "score_summary.png"

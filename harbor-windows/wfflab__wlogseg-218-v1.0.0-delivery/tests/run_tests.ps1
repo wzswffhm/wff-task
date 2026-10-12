@@ -42,6 +42,10 @@ function Resolve-HiddenSuite([string]$Root) {
 $verifierCandidates = New-Object System.Collections.ArrayList
 if (-not [string]::IsNullOrWhiteSpace($VerifierRoot)) { [void]$verifierCandidates.Add($VerifierRoot) }
 if (-not [string]::IsNullOrWhiteSpace($env:WLOGSEG_VERIFIER_ROOT)) { [void]$verifierCandidates.Add($env:WLOGSEG_VERIFIER_ROOT) }
+# In-package fallbacks: the delivered task tree itself carries the suite at
+# tests/test_wlogseg_semantics.py, so a container run needs no side injection.
+[void]$verifierCandidates.Add((Join-Path $TaskRoot 'tests'))
+[void]$verifierCandidates.Add((Join-Path $TaskRoot 'tests\verifier'))
 [void]$verifierCandidates.Add('C:\verifier\wfflab__wlogseg-218')
 [void]$verifierCandidates.Add('C:\verifier')
 $packageRoot = Split-Path -Parent $TaskRoot

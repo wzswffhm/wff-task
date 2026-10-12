@@ -80,8 +80,7 @@ def find_existing(zip_name: str):
     return None
 
 
-def att_str(cells, name):
-    v = cells.get(name)
+def att_str(cells, name):    v = cells.get(name)
     if not isinstance(v, list):
         return ""
     return ", ".join("%s(%s)" % (x.get("name"), x.get("size")) for x in v)
@@ -141,6 +140,16 @@ def main() -> int:
     status_before = ",".join(map(str, before.get("状态") or [])) or "(empty)"
     print("status before : %s   (脚本不会修改它)" % status_before)
 
+    # 先删旧、再传新：附件字段保持恰好 1 个文件（与 215/216 的替换口径一致）
+    try:
+        run_cli(["base", "+record-upsert", "--as", "user", "--base-token", BASE,
+                 "--table-id", TABLE, "--record-id", record_id, "--format", "json",
+                 "--json", json.dumps({name: [] for _, name, _ in UPLOADS},
+                                      ensure_ascii=False)])
+        print("cleared    : " + " / ".join(name for _, name, _ in UPLOADS))
+    except Exception as e:  # noqa: BLE001
+        print("clear 警告（将直接追加）：%s" % e)
+
     for fid, fname, path in UPLOADS:
         run_cli(["base", "+record-upload-attachment", "--as", "user", "--base-token", BASE,
                  "--table-id", TABLE, "--record-id", record_id,
@@ -179,9 +188,7 @@ def main() -> int:
             for fid, fname, path in UPLOADS},
         "readback": {"text_ok": text_ok, "assignee_ok": assignee_ok,
                      "status_untouched": status_untouched},
-        "rounds": {"golden": [1, 1, 1], "nop": [0, 0, 0],
-                   "QWEN": [0, 0, 0], "OPUS": [0, 0, 0], "GLM": [0], "KIMI": [1],
-                   "differentiation": "both score_sum 0 -> Opus testcase_pass_sum 70 > Qwen 33 (condition 2)"},
+        "rounds": rounds_from_jobs(),
         "executed_by": "_qc_runs/wlogseg-build/submit_218.py --confirm-write",
     }
     RECEIPT.parent.mkdir(parents=True, exist_ok=True)

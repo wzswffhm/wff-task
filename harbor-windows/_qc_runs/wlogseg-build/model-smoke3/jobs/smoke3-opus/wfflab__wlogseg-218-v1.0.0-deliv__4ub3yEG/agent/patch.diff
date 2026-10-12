@@ -1,0 +1,136 @@
+diff --git a/wlogseg/crc.py b/wlogseg/crc.py
+index 6656acb..2beed73 100644
+--- a/wlogseg/crc.py
++++ b/wlogseg/crc.py
+@@ -1,4 +1,8 @@
+-"""容器尾部校验和使用的 32 位校验和。"""
++"""容器尾部校验和使用的 32 位校验和。
++
++容器使用的是标准的 CRC-32（CRC-32/ISO-HDLC，即 zlib / PNG / gzip 所用的那个
++变体：多项式 0xEDB88320 反射、初值 0xFFFFFFFF、结果再异或 0xFFFFFFFF）。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,12 +10,18 @@ import zlib
+ 
+ 
+ def crc32_update(data, value: int = 0) -> int:
+-    """在 ``value`` 的基础上继续累积校验和。"""
+-    return (zlib.crc32(bytes(data), value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++    """在 ``value`` 的基础上继续累积校验和。
++
++    满足 ``crc32_update(b, crc32_update(a)) == compute_crc(a + b)``，
++    因此可以用于流式分块计算。
++    """
++    if isinstance(data, str):
++        raise TypeError("crc32_update expects a bytes-like object")
++    return zlib.crc32(data, value & 0xFFFFFFFF) & 0xFFFFFFFF
+ 
+ 
+ def compute_crc(data) -> int:
+-    """返回容器使用的 32 位校验和。"""
++    """返回容器使用的 32 位校验和（标准 CRC-32）。"""
+     if isinstance(data, str):
+         raise TypeError("compute_crc expects a bytes-like object")
+     return crc32_update(data, 0)
+diff --git a/wlogseg/index.py b/wlogseg/index.py
+index 6db48e1..9e89c41 100644
+--- a/wlogseg/index.py
++++ b/wlogseg/index.py
+@@ -1,4 +1,8 @@
+-"""尾部段索引。"""
++"""尾部段索引。
++
++真实样本里每个索引条目是 8 字节：段在文件中的起始偏移 + 该段的整体长度
++（段头 + 数据 + 填充），都是小端 32 位无符号整数。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,25 +10,28 @@ import struct
+ 
+ from .errors import WSegError
+ 
+-INDEX_ENTRY_SIZE = 4
++INDEX_ENTRY_SIZE = 8
+ 
+-_ENTRY = struct.Struct("<I")
++_ENTRY = struct.Struct("<II")
+ 
+ 
+-def build_index(offsets) -> bytes:
++def build_index(entries) -> bytes:
++    """``entries`` 为 [(offset, total_length), ...]。"""
+     out = bytearray()
+-    for offset in offsets:
+-        out += _ENTRY.pack(offset & 0xFFFFFFFF)
++    for offset, total_length in entries:
++        out += _ENTRY.pack(offset & 0xFFFFFFFF, total_length & 0xFFFFFFFF)
+     return bytes(out)
+ 
+ 
+-def parse_index(data: bytes, pos: int, count: int):
+-    """读取 ``count`` 个索引条目，返回各段偏移。"""
++def parse_index(data, pos: int, count: int):
++    """读取 ``count`` 个索引条目，返回 [(offset, total_length), ...]。"""
++    if pos < 0 or count < 0:
++        raise WSegError("structure", f"bad index location {pos}/{count}")
+     needed = pos + INDEX_ENTRY_SIZE * count
+     if needed > len(data):
+-        raise WSegError("structure", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
+-    offsets = []
++        raise WSegError("truncated", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
++    entries = []
+     for index in range(count):
+-        (offset,) = _ENTRY.unpack_from(data, pos + index * INDEX_ENTRY_SIZE)
+-        offsets.append(offset)
+-    return offsets
++        offset, total_length = _ENTRY.unpack_from(data, pos + index * INDEX_ENTRY_SIZE)
++        entries.append((offset, total_length))
++    return entries
+diff --git a/wlogseg/segment.py b/wlogseg/segment.py
+index cc8c196..7340d37 100644
+--- a/wlogseg/segment.py
++++ b/wlogseg/segment.py
+@@ -1,4 +1,8 @@
+-"""段的头布局与编码。"""
++"""段的头布局与编码。
++
++真实样本里每个段整体（段头 + 数据 + 填充）对齐到 8 字节，而不是早期草稿里
++写的 4 字节。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,7 +11,7 @@ import struct
+ from .errors import WSegError
+ 
+ SEGMENT_HEADER_SIZE = 8
+-ALIGNMENT = 4
++ALIGNMENT = 8
+ MAX_SEG_ID = 0xFFFF
+ MAX_BODY = 0xFFFFFFFF
+ 
+@@ -25,13 +29,16 @@ def segment_length(body_len: int) -> int:
+ 
+ def encode_segment(seg_id: int, payload: bytes, flags: int = 0) -> bytes:
+     body = bytes(payload)
+-    head = _SEGMENT.pack(seg_id, flags & 0xFF, 0, len(body))
++    head = _SEGMENT.pack(seg_id & 0xFFFF, flags & 0xFF, 0, len(body))
+     return head + body + b"\x00" * padding_for(len(body))
+ 
+ 
+-def parse_segment_header(data: bytes, pos: int, limit: int):
++def parse_segment_header(data, pos: int, limit: int):
+     """从 ``pos`` 读段头；``limit`` 是已经确认可读的字节上界。"""
+-    if pos + SEGMENT_HEADER_SIZE > limit:
+-        raise WSegError("structure", f"segment header at {pos} is incomplete")
+-    seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
++    if pos < 0 or pos + SEGMENT_HEADER_SIZE > limit:
++        raise WSegError("truncated", f"segment header at {pos} is incomplete")
++    try:
++        seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
++    except struct.error as exc:  # 数据短于声明的上界
++        raise WSegError("truncated", f"segment header at {pos} is incomplete: {exc}") from None
+     return seg_id, flags, body_len

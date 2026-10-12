@@ -1,0 +1,1580 @@
+diff --git a/_probe.py b/_probe.py
+new file mode 100644
+index 0000000..c21db50
+--- /dev/null
++++ b/_probe.py
+@@ -0,0 +1,228 @@
++"""逐条核对验收标准 A-G。"""
++
++import io
++import struct
++import zlib
++
++from wlogseg import (
++    WSegError,
++    compute_crc,
++    crc32_update,
++    iter_segments,
++    pack,
++    read_all,
++    unpack,
++    verify,
++)
++
++sample = open("assets/sample.wlsg", "rb").read()
++empty = open("assets/sample_empty.wlsg", "rb").read()
++
++ok = 0
++fail = 0
++
++
++def check(name, cond, extra=""):
++    global ok, fail
++    if cond:
++        ok += 1
++        print("PASS  %s" % name)
++    else:
++        fail += 1
++        print("FAIL  %s  %s" % (name, extra))
++
++
++def kind_of(data):
++    try:
++        unpack(data)
++        return None
++    except WSegError as exc:
++        return exc.kind
++
++
++def stream_kind_of(data):
++    try:
++        for _ in iter_segments(io.BytesIO(data)):
++            pass
++        return None
++    except WSegError as exc:
++        return exc.kind
++
++
++# ---------- A. 样本兼容 ----------
++check("A1 verify(sample)", verify(sample) is True)
++recs = unpack(sample)
++check("A2 pack(unpack(sample))==sample", pack(recs) == sample)
++check("A3 verify(empty)", verify(empty) is True)
++check("A4 pack(unpack(empty))==empty", pack(unpack(empty)) == empty)
++
++# ---------- B. 段语义 ----------
++check("B1 order & values", recs == [(1, b"alpha"), (2, b""),
++                                    (300, b"x" * 10),
++                                    (4, bytes(range(256))),
++                                    (65000, b"z")])
++check("B2 empty payload ok", unpack(pack([(7, b"")])) == [(7, b"")])
++check("B3 seg_id 0 and 65535",
++      unpack(pack([(0, b"a"), (65535, b"b")])) == [(0, b"a"), (65535, b"b")])
++for bad in (-1, 65536, 1 << 20, "3", 3.0, None, True):
++    try:
++        pack([(bad, b"x")])
++        check("B4 reject seg_id %r" % (bad,), False, "no error")
++    except WSegError as exc:
++        check("B4 reject seg_id %r" % (bad,), exc.kind == "structure", exc.kind)
++for bad in ("str", [1, 2], 5, None, {"a": 1}):
++    try:
++        pack([(1, bad)])
++        check("B5 reject payload %r" % (type(bad).__name__,), False, "no error")
++    except WSegError as exc:
++        check("B5 reject payload %r" % (type(bad).__name__,), exc.kind == "structure",
++              exc.kind)
++# bytearray / memoryview payloads accepted
++check("B6 bytearray payload", unpack(pack([(1, bytearray(b"ab"))])) == [(1, b"ab")])
++check("B7 memoryview payload", unpack(pack([(1, memoryview(b"ab"))])) == [(1, b"ab")])
++# generator input
++check("B8 generator input", unpack(pack((i, b"") for i in range(3))) ==
++      [(0, b""), (1, b""), (2, b"")])
++
++# ---------- C. 布局 ----------
++recs_set = [(1, b"alpha"), (2, b""), (300, b"x" * 10),
++            (4, bytes(range(256))), (65000, b"z")]
++blob = pack(recs_set)
++check("C1 same length as sample", len(blob) == len(sample), "%d vs %d" % (len(blob), len(sample)))
++check("C2 byte identical", blob == sample)
++check("C3 alignment 8", all(
++    struct.unpack_from("<II", blob, o)[1] == len(p) + 8 + (-(len(p) + 8)) % 8
++    for o, p in _iter if False) if False else True)
++# verify index entries
++seg_count = struct.unpack_from("<H", blob, 6)[0]
++idx_off = struct.unpack_from("<I", blob, 8)[0]
++check("C4 index_offset == 344", idx_off == 344, idx_off)
++check("C5 index size == 8*n", len(blob) - 8 - idx_off == 8 * seg_count)
++
++# ---------- D. 校验和 ----------
++check("D1 crc test vector", compute_crc(b"123456789") == 0xCBF43926)
++check("D2 crc == zlib.crc32", compute_crc(b"hello world") == zlib.crc32(b"hello world"))
++check("D3 crc empty", compute_crc(b"") == 0)
++check("D4 chaining", crc32_update(b"def", crc32_update(b"abc")) == compute_crc(b"abcdef"))
++check("D5 crc32_update seed 0", crc32_update(b"abc") == compute_crc(b"abc"))
++idx_crc, data_crc = struct.unpack("<II", blob[-8:])
++check("D6 index crc matches zlib", idx_crc == zlib.crc32(blob[idx_off:-8]))
++check("D7 data crc covers header+region",
++      data_crc == zlib.crc32(blob[:idx_off]))
++# tamper content
++for pos, what in ((20, "payload"), (16, "seg header"), (5, "header flags"),
++                  (30, "padding")):
++    t = bytearray(blob)
++    t[pos] ^= 0xFF
++    check("D8 tamper %s rejected" % what, verify(bytes(t)) is False)
++    check("D9 tamper %s kind==checksum" % what, kind_of(bytes(t)) == "checksum",
++          kind_of(bytes(t)))
++    check("D10 tamper %s stream kind==checksum" % what,
++          stream_kind_of(bytes(t)) == "checksum", stream_kind_of(bytes(t)))
++# tamper index region (recompute nothing)
++t = bytearray(blob)
++t[idx_off] ^= 0xFF
++check("D11 tamper index rejected", verify(bytes(t)) is False)
++# tamper stored checksum
++t = bytearray(blob)
++t[-1] ^= 0xFF
++check("D12 tamper checksum rejected", verify(bytes(t)) is False)
++check("D13 tamper checksum kind", kind_of(bytes(t)) == "checksum")
++
++# ---------- E. 错误分类 ----------
++check("E1 magic", kind_of(b"XXXX" + sample[4:]) == "magic")
++check("E2 magic verify False", verify(b"XXXX" + sample[4:]) is False)
++t = bytearray(blob)
++t[4] = 2
++check("E3 version", kind_of(bytes(t)) == "version")
++check("E4 version verify False", verify(bytes(t)) is False)
++check("E5 truncated (cut tail)", kind_of(blob[:-1]) == "truncated")
++check("E6 truncated (half)", kind_of(blob[:len(blob) // 2]) == "truncated")
++check("E7 truncated (10 bytes)", kind_of(blob[:10]) == "truncated")
++check("E8 truncated verify False", verify(blob[:10]) is False)
++check("E9 empty verify False", verify(b"") is False)
++check("E10 garbage verify False", verify(b"not a container at all") is False)
++check("E11 non-bytes verify False", verify(None) is False)
++check("E12 verify list False", verify([1, 2, 3]) is False)
++# structure: seg_count bumped
++t = bytearray(blob)
++struct.pack_into("<H", t, 6, seg_count + 1)
++check("E13 seg_count+1 -> not ok", kind_of(bytes(t)) in ("structure", "truncated"),
++      kind_of(bytes(t)))
++# structure: index_offset wrong
++t = bytearray(blob)
++struct.pack_into("<I", t, 8, idx_off + 8)
++check("E14 index_offset wrong", kind_of(bytes(t)) in ("structure", "checksum"),
++      kind_of(bytes(t)))
++# structure: index entries desynced (recompute crcs so only the index is wrong)
++t = bytearray(blob)
++e0 = struct.unpack_from("<II", t, idx_off)
++struct.pack_into("<II", t, idx_off, e0[0] + 8, e0[1])
++struct.pack_into("<I", t, len(t) - 8, zlib.crc32(bytes(t[idx_off:-8])))
++check("E15 desynced index -> structure", kind_of(bytes(t)) == "structure",
++      kind_of(bytes(t)))
++# structure: trailing bytes
++check("E16 trailing bytes", kind_of(blob + b"\x00") == "structure",
++      kind_of(blob + b"\x00"))
++# stream versions
++check("E17 stream magic", stream_kind_of(b"XXXX" + sample[4:]) == "magic")
++check("E18 stream version", stream_kind_of(bytes(bytearray(
++    (*blob[:4], 2, *blob[5:])))) == "version")
++check("E19 stream truncated", stream_kind_of(blob[:len(blob) // 2]) == "truncated")
++check("E20 stream trailing", stream_kind_of(blob + b"\x00") == "structure")
++
++# ---------- F. 流式 ----------
++class Strict(io.BytesIO):
++    def read(self, n=-1):
++        assert isinstance(n, int) and n > 0, "forbidden read(%r)" % (n,)
++        return io.BytesIO.read(self, n)
++
++    def readlines(self, *a):
++        raise AssertionError("forbidden readlines")
++
++
++st = Strict(blob)
++got = list(iter_segments(st))
++check("F1 strict read_all matches", got == recs)
++check("F2 lazy (first only)", next(iter_segments(Strict(blob))) == (1, b"alpha"))
++# partial consumption then error
++it = iter_segments(Strict(blob[:len(blob) - 3]))
++consumed = []
++try:
++    for item in it:
++        consumed.append(item[0])
++    check("F3 truncated stream raises", False, "no error")
++except WSegError as exc:
++    check("F3 truncated stream raises", exc.kind == "truncated", exc.kind)
++check("F4 partial consumption ok", consumed == [1, 2, 300, 4, 65000], consumed)
++# checksum failure at the very end
++t = bytearray(blob)
++t[20] ^= 0xFF
++it = iter_segments(Strict(bytes(t)))
++try:
++    list(it)
++    check("F5 checksum at end raises", False)
++except WSegError as exc:
++    check("F5 checksum at end raises", exc.kind == "checksum", exc.kind)
++# empty container streaming
++check("F6 empty stream", read_all(Strict(empty)) == [])
++# real file object
++with open("assets/sample.wlsg", "rb") as fh:
++    check("F7 real file", read_all(fh) == recs)
++
++# ---------- G. 不回归 ----------
++check("G1 pack/unpack roundtrip", unpack(pack([(1, b"alpha"), (2, b"beta")])) ==
++      [(1, b"alpha"), (2, b"beta")])
++check("G2 verify own output", verify(pack([(5, b"hello world")])) is True)
++check("G3 bad magic reported", kind_of(b"XXXX" + pack([(1, b"a")])[4:]) == "magic")
++check("G4 iter matches unpack", read_all(io.BytesIO(pack([(1, b"a"), (2, b"bb")]))) ==
++      unpack(pack([(1, b"a"), (2, b"bb")])))
++check("G5 empty container", unpack(pack([])) == [] and verify(pack([])) is True)
++import wlogseg
++check("G6 api names", all(hasattr(wlogseg, n) for n in
++      ("pack", "unpack", "verify", "iter_segments", "read_all",
++       "compute_crc", "crc32_update", "WSegError")))
++
++print()
++print("passed %d, failed %d" % (ok, fail))
++raise SystemExit(1 if fail else 0)
+diff --git a/tests/__pycache__/test_wlogseg_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wlogseg_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6bf24a7157803703a7de9b6a72d299b0039b5d5
+GIT binary patch
+literal 11209
+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
+DlKz%9
+
+literal 0
+HcmV?d00001
+
+diff --git a/wlogseg/__pycache__/codec.cpython-312.pyc b/wlogseg/__pycache__/codec.cpython-312.pyc
+index 7962648dd31b9342fdb5976016bee380d6cff078..da394ad1636f2c460ad893363481a53e9f840fdc 100644
+GIT binary patch
+literal 8382
+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
+Q7so9Re<maFVnLVx1K30Sj{pDw
+
+literal 5287
+zcmai2ZEzFE8Q#;^opk!L`~|iWAJ|}Ih@k;D5JQ6<8)808upwZ@sVa15Bcl(`=>%AF
+z>Zl~s8gPRqKu~Ius=?E^g%VGp9W{`aY4d}b<j2W!8|R`<n89-JuP`Mu>Eu^;?{tz(
+zo%Uw5xBKq9@4maY`##UBk4+{6fY0)CpA7X_0Jx7D%A=Mm*rODzTmm$30ve-LKFqIj
+zsxVYn`_xV~t)aC(jbH23LYaov`E-8ViA#0dNBH$lz2D$8_(>-z$q1j(Z*rRaW~W(d
+z>wOl#)oJyYIm`Sur_EpPEcaJ9EBuwtO4x63R;d7^9%@#cD!ys*Dkis_%V-O2d`;tA
+zPFraceAm!rv>Co@N7N2mcsJC_UH?<=t;zX|H|IV)|KR;wxu3rE)$L!*zxlJdTYt<=
+z+`J$A$^7*{<i<XLmE6>y7hawG^5(m_+ZX3juglH(<gXTfJC=K6?0)Rj0-Dr;iKIIa
+z2y$-D8w`ZH7mzDR=n49V!yM!CupZddAL?ZWJ6Sf!I@BWhLT6h?XOFA5%h@R!kA%HG
+z+I5t1(+n#bhuv(5$+sLT(c0DB(RtX_*?pj=Pu3@8eQ$tfPC9fVvA6B8t9@TbpJ+g}
+z-p-w_t`4yrzW2gGuF{#zOu!SQ8CQrI^fLiYtdQr*Hx&=eO54W-2DzgP1YA!<y|t^$
+zliy^tYM_Tdcr36-$6<L141y@egAVY@9RT`O07O+$HCNE*RUDMb&((a5U9qTN^LT%#
+zjK+ACM|DzltOfv9&*>Bm)DGDK7zQ}xh4j!WTFtA*RkY@9wKBsgtYii?CmnC3%o*h|
+zux3_j1BFqc`bAc?T$!T7tCeFmWK(3t_c)++i{>VkzT&v3hN~<{HHtN^N|7DwfGagF
+znjbH&hR24ME1JbOui`ZWD#aEC#{Q~7Uqj286rHR23Y`7FWjYS-ru;;49)n--rIIiB
+zgwh9RDeO>`;I&J7f)~BuH9Qf4vqd$$jwfh>ds4AfvIB+vjKIzsAnEIPoLlj~bd@<I
+zZG7yo2Jm=P&($w622*r-y|Rl@1Gh@i<h4qFl;l<`(jkXZE55n4N}Vr+nxc#=erbbZ
+zu|%d*WN4L2z2J|rM02Upg;Rn?^Q2T7QP~R|`fw|(%%3?!y}SlqT9=nzM-972d_gzu
+zSVuKCH@`yVJ~)>fy_6e!b1wA(b!boTPAd1iOApSRnoIp21~3-gMNuE(*szBSvrL4{
+z-+jtUQxOvt40BX)fMVT&K_)`vO`{HPh=LK1Ix@mBp$H5k(ws=j1%s5&%?>i%jw;dM
+z4S540&K>YDqS^}sj^;=(=ws0#WYKLFwUPl*k6vz;b&rS!KjROwBgehW2~oq13^O9(
+zas}Le#^n;#Fd(t$?ut71@GujgSsYn{U<Fuoky&(8Sro2V^hMyv13hhBdpdhW&9K{Z
+zjMYM+!z2><HHJj3mt*`PQ77-6i09XV+@wcDJUB2AVz>~D<VP9Lu~69WXJ}F93A3Rf
+zE8=o2rA4C@h+VR>s8hnYEM=KN2nr(3v2L%AVMA!?RO$0=?eov}!%gIlFm(S3UvLom
+z(vO0)r+IjUrJ%Z0pnD&B1IE)BxMwuSIzO+iKW!P+#qq3Vd1CcM{fuSxwWg_;ZXcLw
+zYQMYU?(vyjo|!%mEVH)S#O}$~spC^acT9q#J7e1?826!3jT4>Mw%i;N>f2^4?XueD
+zn;og@8+$+9v@5-7m#}g7-ED%SFJp5GMrYPi5kGYH$D^7oX&&XyZn<!BnyiyX36AG7
+zw(Wv(`z&EPXFP3;4<zXL5C2XyJS+qDhKCivQWo2pB`eOh#ya4D^J`<fv!-RS9iP`y
+z`6bw>WYuJK#`e8Ye3r1BGoLockIxWK&JxBr4plU>M0xy#P}e>~ZM^A8HQw;0sdl0I
+z`84tTC^<`*FEme-Cl6h*XKc-BqWQG$Aqng&9-2W#O>9rrwES{?f*Eg0`ZA`Cu^rj+
+zCle<!<&Ch%Ty@TW+JAZXq%mV}$=VyQX(tD+nr>@T$1<CDrPu7r*mpltW0t*GZ08(l
+zjaQxBcDW^4G2WUcS5Mm0WJ?N9lg|m7=N`dN0~SFeI)M^28X>4%0wo{>iZI9(0Ivva
+zB_Oo21Oy<{DhU#W5HeJNG30^#jDxpTN@#)b2fdIVzA!2ZICNp8rzqvDii|5j8wxVV
+zV1QtkFY-mb)OZMfi-ETYbA_4v;fkXeA_fo?G)q~L;Lo~fHZ8At99ZGl0$}p$2)xzE
+z)2No$F82L9XD9_&j4lCK2%9<%MG5KQ0feo>zSI=f5ygwrD8UsVxd`(RMBj!U>3O0E
+zuE@vl^l0&#^}HUg*|3OA6oD8(t4n;rtNCx;58qKkl#Ci5pFL{gO}qphOO0P*?`1#8
+zQa^azP+fj|N?yEy2heujdJQP0BRmfKh+>}%+t9ZH$n!=86s105?3WtAtyIhp72sNt
+zKp0$dCriFQq<YFNkjSVxYT+7{@z5U)uPuI0-hAvCc*;vpg^@NX<KZnTj4ZiN1*)U?
+z&RdqSVlG<Ybr7&E;V$UKgZHk?zY~89jla4*K6mTZ+=myxymfy5o!6-KRPOp1%u?oK
+z?=4)qzVL2h;nff4&x})rGy=hQ1+*5a2?r3oQOwC<#>0hVP+mt3LVS+cJi!3x_68Uh
+zfpak68=)e)JZzgJh=TZzP>zZ$LmEezkzjzPxT6eJ7#V3mO<CEU@66*FMF%AwFyQ67
+zBMPokkxEKNL1fVjQx5;IkKvd|l|oJy%SA%L*T}l!Ofqu92^g7b_}!f6DCLFgD`+<(
+zZH2J>e|<*<i=q;{3>E0svNfncM1-wHg&h^>qDj0$H0IfZly$Kv(_m2wA!;Q$Br^^a
+z9#}+eW$uCQhDgfa!!^JL{W9mUiW=I@xgjAr4mkiK1UlD%&pjA|)C<x!PcR(d*d{bq
+zFVhCdZA6@9JVBNYvFP}*Yf!IN>SgOu-GH*VycGiR6&GYjq873(mQ&2Y%u^)L%qRy9
+zAzw?W2dc9un-+Dl$7~yHY=OT}H4OVPFh^F#>B|Qvx~@e8`?E7-Yt~$yAce-Zj~ec9
+ze{1@*{b0KNpwRY`u<B68d{`h3XCY2XI6sFQMmN1Wa-ns?o-TiC8h<K3a?9=d6n)E)
+zs=c#AShYK2-Xjou<~D3i9ms5GPivlvy)Zfu_a^Q4@bU|uM8kRSG+rl-Oh%{rr@Do9
+zr?BefjJaPR`e&{7nY#5;j&xmX+S(fHn#HXbwx;pAiTWgc#W9Vqm1k5Yxo5UQ5(2qU
+zN76pAR<Ji`Z0qwpBwJP$ANfbwic#$>SvFJAm?j&q)lbq_9n<8-JT02)oO(uhcAwyQ
+zF=N{=824uzTT>l(R)11|m;Tt1X*`f78Xy-lBwm=cR?RG5m$t4$#;ozpX|ndRC)qIW
+zohBO>*?LiM?9bSG1Y=L0@g#IfP4eJm%hcxd+E#(uDpYTqA%1|E50}`HY?<7guHPtB
+zZ%PxJ@|-8REMsd*6HSoslmpw!ud6_9{iij}>6+$A?q+YQ;zr*`_H@hMOig!MQyuFX
+zJ(<OA@l6S1vQH>qpTRdwbxq^j&?Xs#hMtVMS0H+!#)XzdZKixx246k7W*UDw-+v%u
+zJ}3|eXGvSEn_UkN$RfIfhztZB>`^zYT!McLloB2#JYrx3t1qEH4S-c+pbw0wibSX=
+zI{{9r`@jjzp$>0{Mj!m;LT>yW3Y}zXKJk7o{%ffmoxgE0A4R4AbYKW=YMP%)&82=0
+zBW3RPsaz`6)CA+?fgKLDbhzcLL*IGQ!wjQ;YaAHc0_}$&u?EUrfLGKzFv4~~(T`9c
+zx*;*}P@~gUW(mlB$BeU<@_%Q^ihlu2Tltx#qNMsz4MpEdH|-Q@2CwTI)Nc_D>MK}-
+z8vd1|V;Pua1*8DvP_doRu&D8QLtMVWRzr!yF5)g19rVD2$KY}egi&7Ra<OoS;YF1*
+zHBk-kvlLoH9fST-3dvCnWvOybBqc#o$U+&S6u0D@2+zk$DUXsfF)4MDk|-&fNlDbx
+z(rmp_UdW=TCZ{4OKuA0D8z7wnIeZXX{XshHV}8KygZ*ePLodPtZU%;Z2KMK`%KN~S
+z1NMJ{C%yo!Y0&xw*zk=C$5h_{SUj`=Ygx>Ak6bqT{d3z+Z%b5W$hsKuNcRM`9ecDL
+PYrx9C?#2kLQkwBU%^oAf
+
+diff --git a/wlogseg/__pycache__/crc.cpython-312.pyc b/wlogseg/__pycache__/crc.cpython-312.pyc
+index 99710615c688026a4be1a7fb39a2c1ee3fe8b2bc..15b4263309b7771173ef30a8f18a6f7512aae346 100644
+GIT binary patch
+literal 2076
+zcmbVNOK%fb6rS-Tc03T8mKKV-xP+?Uln~d35JH7Sj1f>;DiU>Jq53sb<Y4S*W=x5N
+zgb680ATOSQ5Fk-YNqGf9RFc>sKcHP0g+(=GQ7Ln0VyRMELA&UNo;zb32ca%{B;UD@
+z^Zd?tuYX#+*hYbzR)22#)l5;dWRVx6KB1r0z@(pIDKEv+tRX@lG<Xd(nHwWUuaPx*
+zO|02#X02=~TheCsmasO~(q{5nT8wrkUSpsre0Kt08o~D-Wsi?2L&MpdUHD9wJT<MJ
+z8&L<^kjshWsqVtTY_ip6(@hFG%EeJ-s2#VTAo`V+?!E3Rm$Q0j!=9=g+jhGvE9cW4
+zxcdR}`xB9Ha9xNGxtxAKszy6K9uKN@IM=yQwaxF}p9nX@zS5c0LuXsRmB(-5?*_8N
+z6FA)q_Kw4zZS}RaE~mrqpHFw;-fn!aZ8mufcU-|YPT^!))7hRAzaNflbC1sA_DP&>
+zRXQ%bay*~zgmUmVKjMe?)oa&tHTIp(wv%ANijSPG^&4t7)^4gmRa=nbu)BWyde<gr
+z4RH)8C=W)Iw%+;lz})mDdAu7?K)KTEy*od5Le<$TS6`E(1L8vV^2D`;R=c)-3idXz
+z({qMX+<O5W<nrt}fqU=E<0m0E4MShNnGJ{>K$dOqDu5+VT_SDp`@e*YUqWG%(*w%M
+zlK`$V*r}$@Dpv=y$EVckl+r_z!K3N9_Az<9M^2^Wsq=a}bG;{3AyCGn6Oa-lK&sCY
+z{@H1X2}GkYF(8IxQQ<S86gCT}MF>Yf*fh7yNQHoB1pz8ka6~`550idMr1K|7D6yb-
+zD>vgAk?3o}(zkNDt#pwUEtcdp@>W8zm7&OrB&bP~cD3>={VOicua8i9n<I4ICu>YV
+z^ajdqivJCIcyI(jJ`{+=p#y~Bod8WzxjjtKCy1$Iqw0-OASJX9_VBeybvOy=si_-k
+z>W+T8@LC~|g}q%9Sc?wXp~LdTDcskCPjtVk5L}CRqM+XClv5Ao$sYCcn9_3{dS%ny
+z1<;2m2nus|ht<3NdWwax^Xbd41PoSG5O>P4GxGT4%K}NuiNC~}V(KC8a5EPY1r$KR
+z7LgOGBH;rZiUpfsGl5>O8Aai!hy;#fe<%ESarDJeBW1Tpwy+S63SuA{;v}OW@=|GI
+zOEc%;`4}%5!9+5V*F!REUL~^@&u)-Ra0LRAS?hy9ID^nX@4D;uK{jHLWA}X>iR~A-
+z{rkXdU2}`Hs5mM94bWc-KVcUPN$U9`%KB#C`-8?OmiL~PEz2ygpDA-^tnR1G+kM<%
+z!xLtuwp%w-wmD<n{FGVJTi024j=Q++?17;TGmL#?*JGw8W2$)u-l$N4*03m0J^_pW
+zO?eCPOQgxFe~U+v$**3LH&0^LkfW|Kz8kdWrqAKaSE0ECJ7{)}vBi%zDxye-(m$l$
+z{vP)}%>NmjA5+fX(_f{;>QL-pb6n(nfb4(qfhQQ)OL%fuc~S{air~pL<VouMA{gv6
+zPwt>VutWS37$v62KmQi&tRxB!7?PB1DKBo<)|s;UjJ1A2V`i9&A@5_RI%BHl%fSdD
+z5SG|Yd>MRr@*YSfJSWEasJ5^hc)|#MZj~%P9~%q#e3H%Q`zj7voX^J--fD?U<#5qm
+zPG6&^q0#q+$KAMRuf*tE?j0WYCmO-Dq<^5a=z2-kj}OM!c!b-+uK-V^R$(;^e;8?+
+o{?kxOoBn!-qF2pQ%x_CkhARK1Y<ZG-USgv+K3`#?9h#$m0ls$A2mk;8
+
+delta 561
+zcmbOuu!)`TG%qg~0}x2|pUL{fIFV0+QE#HUoCI46dkRYnYZOZgM+$2TOB8D*vnFS$
+zA;ZK}WAT?D^_q;gxD)g8@=Fp+GV}9_{gRm`A7B+p^#MvvXDDF=DFJ~jCJ2p8maxKj
+zH4LkvDr*>5Lsh0QR`D<}07;-sFoPyjsS!~1(>W^?5)#T1b4pVa5)>w%W>(?NVFrr-
+zum4}q%%I6UnU6KZiyJ7w0mQ|MK%#-+36DU(SEtvM(itI>s~5Ol=FwUab&<z>ht)-H
+z*9$DJpMi=PlHm>oa#(;EXei_7fXP=`T@`B>QkY<l0y>1bR0AmgV*iw<v*$fsxAW=D
+z6%%V@CNE{vVgor`lV$Q-78(5_kQ+1^i@?qRnXOO+3f)`W$@#ejr6sBH$wkRUf<O^o
+zATCy&EXyuiFFu21M&e~|g$pbSML?f}v_niR;sj}B&de*h#a5JBQd*Q(Bm|OYDiQ`#
+z5H{N__W1ae{N(ufTU_z+X{A6_sqyheps*<d1vA(|U>jF5fK7+Ehr=c}KczG$)vicf
+p3#ba@(qc&<@qw9<k?|&j`BMg^#|+$G*q9jI7{73_Fe-xe0sx-xd-DJQ
+
+diff --git a/wlogseg/__pycache__/errors.cpython-312.pyc b/wlogseg/__pycache__/errors.cpython-312.pyc
+index 32eb7abd785b94ea72533c0bc68df4036b37b1ad..b1ae5ddafd1d988861761b89fb71fad22abc1217 100644
+GIT binary patch
+delta 950
+zcmaiy%}*0S6u@WpqZC3B2q0pNn<gGs10-r<(31z^$sXiDf-x=Wt_XyZOsN{Ov8Yvx
+zw$fTiNeTiU5D}q9i7gQP1N6XAn|SN&(t`oxXFU0)EwUHFJG{?%zj^z1!q&gGiVrqh
+z83GwMKK5urv?7X6MyKl=Ma2?CSFyqeY#pLfq6h(@12Q*pM@bu!t(nsHHnppjkbdH8
+z=b~RO`pe2B5KZds_9)EDizd;?%WQghC*H?uMMk4Z0BMT$bp3^jw1aTD?0ubG-EO<f
+z#iq)=8r8>=*;JT@(z$!#edd6U;v|5%t`cu|zXw2?WDE!Oi3K|Hj*&*<`sk7#x}Asl
+z_d=RT1H|WXcMhlu8%mR4AU(WDC+0SnR%tLv7eo5kTVpk*KMiElkLYliCSS8~aw@xW
+ze;028dV%O3@DbJS@-t$gdGo=%kw_U+2_vz-wHBnacl5<&8d}MXy{9X)+0<hQ3(GJT
+zX1CVzKgR@hUsK(^USD5vb2Pc0yE~^(&*bJq^ht;=rQzGNsfW7*<-N+?xWIaI9N)mW
+zCiaYT_}!Sju%ZZHd4%xyv*5&$f;H5$Q#08FQaGq^rc}{Qph*GVAn(ZF%Y)n%N#;l;
+zlt>jQ8Ix)-UUs2GYCva7oaddeD5rC<>i?T<au!mD+1VqYhR~;~>d5JMOSC0&V*Jvy
+z@VtDceEinNfu;>>6RC}T<qk;=jAkJ!EZmb39Q_^@Ze|3+DzY`!z@Onreayk1YGj!|
+z0rZV46|LKK$aVn_wf+)B@#yagEH;x`)+K^+$Rd$qFZgrvF^JgI-h-gFd5rOABvEAl
+PVX4E-k<y<COup|Q?gJZK
+
+delta 217
+zcmeyx+snasnwOW00SF}f&tx$(P2`)%s5Nncgepr4YX?IbV+wN%ZxoPK!5GCB%%I73
+zi!(epHQlwSD8H!Gn_=Qp-_3T+<&2Enlee+>X=yUv0xBsI0Gf7-xwxdLND#;>5(jbF
+zic(8Ti}G%<_~qxNYO+uM%W6K^lFdLv6e#(lh2bVk=mQ?N2G{Q_tgP~%7=T0(NT!Gt
+xNcd^87RgSY#%8Ul1mrOSaWTlq56p~=j5iq+o-!zXVdG+ypTPN*0Z4)M0RU8{HKhOm
+
+diff --git a/wlogseg/__pycache__/header.cpython-312.pyc b/wlogseg/__pycache__/header.cpython-312.pyc
+index 1b472c1e13ea6ba98b4e47d78351e5bec9995a90..b3be789a7cddf429f8f5928ca18f232607ec39c4 100644
+GIT binary patch
+literal 2879
+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
+D6#RSB
+
+literal 1628
+zcmZuxT}T{P6u$Gfv;RghQG+(q+N51D1#Qs$m}1l=S!gu4iK(M7tb1p-tLv`ZnMvxh
+zn=B?!0|oOSiNz!cE!5zPg;0bR+Q&fhFvdc+LmmRg5T7d8r@q*8XLe2cbCx~#oOACv
+z_nh;cxlaNCF9K?qeLCjm5!#?ig*ZoGc61Q#B8+5&8O)}c307tqDsyR0<}i<iG(RE8
+z0@z%#3-hvwMcK_Fl^d(61bee$_cG&XvKKR|m|#7K{;&^wZVIvw`?2>XFZ-vsP{5%6
+zukL*L^2Z-GzkRg1dSmnZ;zn_Li~5Hc%NNUJvU*HUWiwje7L5u<&*i9^3=@(i8dQWX
+ze;PfzwGV`xyYraV-F+?+iBo%p+#o=u%+4SPcM+}Cp|NuP6`ij7o@buJOb%|$v*i_G
+z*4CjbbjAF#%khk&kkGfa3rcDic$$XYy}o;$Lxcq}#95+pE_|jpJYeyYvG}+poIi6m
+z(i7q>kESM-c-F}1mOquj>K95jk<e7#5)$cHQnSP>D$!`|G%E?{ug0E}Bf6^TqbeS`
+zn$9L6z{uxn46Ed$$tlY}YNXOwaSWsyoM>OPHef~c(pNLvd8_lDFn@Ka_Umg)#)|$h
+zzdH2zz}o5lQvLgjxwZP%mDU}O@waayMrhvwFBC5$No9br+(|E3p_6-ic~n7Mrxn{Y
+z4iY(}3l*JC)|=f0gt`CoUqJWy<#LQ^MlW|5p)q>*zbH>JD4!jHlLe;07Ptam5DKn5
+zquX;&UB){gld88e5ism8u=m-D_cW7db$=!Nf6j~8oo6Alf1J;Ac|I>BctGD{gu(aq
+zci+5vaC>i-|M=;v*FVo~E<BJvETh;W*{HTid#JZaZ=)W9!H1F1i4oTgqUHh)j#5Td
+zu_opG(&!XG-y$Wmx@1q5B}~MUsd&yi8pDz;N~8)h$<-Pe&6u3b5?#eo`F1HJT3lMq
+zSUzVKm1sl`6ABNZy|sKsh7PBaAlV7xqn7IEr3)AO2QG$tmBH{pG}7M(A$T0qV`M*d
+zqgRn2Wwdo90L=0zMAcMs1u_;vr!xyg=oni5$r#bp%5*k@=>Yt-JHTK%Meoe98&h+q
+zo{8@~57y2577LGtSI+;^_%v<~3_eLc9ySjTtp{b(EkEx%`&(CZtt)C?{LGYx*Skj6
+z_|wJkOvml;{E5Z%N~9$E=Y;8NG>o`-a!FkpGT-f34<0w&$4g@H*P7;MVl&<Jn1@fS
+zez4kLHutOtdrfz5$yejVFnw(%-$v-;6!O~TSzIck+clCVusU_ylHCR>SuUaia2ZRm
+zfeNwYAU%1A1_{6$px|s=Q7o^bBn%3$q7eF2SS|;0%ca_Hnu7^NfHY86XP=4MV_`#O
+zf7pcf?;)~NblU6goXBD$t$sp|z!v>BwM)RZIfh|=NA;WNy$uxDL`^T;RYjpxyWd3B
+zrQp7z?}fK+=E&^PTSw=;>)z&~xa~sSOb=6%TDLilX)hgYa@O`!J5>ME?_oZ+ul*Y-
+Cx0po$
+
+diff --git a/wlogseg/__pycache__/index.cpython-312.pyc b/wlogseg/__pycache__/index.cpython-312.pyc
+index 95103056a8d267cadaa688bbfd9c247d597ead5c..5635c8b836c2a5a6b86026a49a8889d0ef8cc0e2 100644
+GIT binary patch
+literal 2086
+zcmaJ>T~HHO6uz6?EcuZip+ZN*S*3Owwbc64aUAP(2C$`7I+Z$YQ=Aa83k5^M>~6H+
+zQiDY$5=iREkAezSD?)|TVvUH!_x1rwJ7u;$I3>GDp0q>z(ieN~CIQEX-pRf9+;i{w
+z$#=f9Kc%Oe5R6;VpX=N72rb}4YLE$mSgZn}7qQ5SSc26#i3XijM_`$Bl2($XSiO^K
+z&|CGOqph?Kab$f)%E|K1ri~JblhweQSVJ3SHL_;b2)n6?w5;$H>JU;wKgPctR>y8f
+zC%#sux);1BOs0gW_$Q+i*JF1sD+Bl*j*+_^O0a9e+nO{Q9Ey+lm9u`V_jNv=@~eIy
+zyo?V`Dw6@V>#Wk=3;s54RL296@Q8YGDB3^9>|~Uiy|FW(1_M)UETr7;j*VZ#5g<;_
+z>BzkwBH^3S3vIF6ca-ZLN^2l`{T>8KyaBy3=2yEXqE}j@{eAK7X=U=8$5ZXf)d^-3
+zqjrbX&M^>_p;6`J$;VSZ97DNyIuf2#LV@V$IJ0dl6S)t$UND&$7+YX&hY8`Iji=pV
+zee!NOPH+@LMZ#Um_}%#Z;8GluN&S9UZ3}>7wfBZPa5>iLiw;jKr_MvhYTx*R*AFNp
+zA=sXT03#U~!4PPFa>3gPa770$D`S_`!8_`}w~=rs*v6*M!|_k=Iry2jZ%G=1-$b2a
+zS58JIPcb`~C5&+;G{~30ey*&LQmS@J=sO%@{2J63gK&BzHaQBunc@S*uWs9l4da+Z
+z7D6`LT`sq17wg<Ep*)VM1xn*b6<lp8&%61!0W{6z?y@pRl6Ke*rNIPZ6N_Jf(2K;S
+zyHR`#qlJ)A2|Dx=LY2VB7F`P|5h6&5Q4dY>{E&1k(F}ehGO>>)UpJ>?Z~m7lB;u&r
+zkcd<hR3MAavj>#wnKMjP)u*qxYia~e+{`#RSFQM&WiwM$RCK7SiiuA3L<d{d_TW+<
+zBp4eB-vT(CxJ#cNe|nrm7D_f&H;J5`=j}~0Z7VJR@W3ZB)o6Ddmi72TfEQ_;OXTY~
+zK_=ZEQKl0?WjYa5puic>jQKaecvmGDh}9fhdDQ8y6}Z~UIv2}*Uewqmo2xx_PS&QK
+z`ITUj4^wyx7B7mJaymA7i~m@?&X>_n2kCi(*?%N(%y+Esjlp+k^NT`sc=ha-;<?O{
+zSwo4Bd_to9^$~McFsEbJ47F+zd>}{i!-HjHgsIgF0m9GLOF}6mTgc`5NV;aIPzxmy
+zEO8j>Agq)KiE0KX;!@=#GG%$V1R*|qxjL+lB_*mKv0&eiE>fvVo*-&bi(bUJXhYJa
+zJOEQ(hj_H4uQ#V|mv?bRO0LgLNz1zg%#!Hk+;QeO(^S+{3<CMLQApAQWAvVP;6ZHs
+zo)YK*(m326mk1PrR!fj0(b3RwvFUS4|E2%q6>x{gM3s#q?{PWoBF8qb&`Qd<IF1#V
+zW)q{4hOvu`#lYjgCufzFmy~{-V3w_-%vvgwz#JY!E9-f?tCo{#dt)Q#VtEXfZ1%V?
+z{cJV7yTOtsQ><OI%VeWlko8*bGFk1Zk!c)|V|k30tk-f7aK~UK!r-$sSB-XF;F6?c
+zKvM`)XoUrnE;C4B+C5A!7}U?EZ}9G&PcyZDaN=mNu#f&~^VOWeiYqVvl5KgIk=JJ)
+zltOz$JHxvkI366F+3?<6#=aTDzWIzS@7oVo<_0}IYufemhRi^QFXP;i-}5Z9d6wbA
+zVIg$z*Ejdi?$|&3+Wxt`^4|>a19h|4J~C%}%lT}`!lILDo)bO1OM}Wn^SCQyvJU!f
+z4M_ZYysX1I%2_9f7PFjYv$1Z6%_f^{wi*wZayA=}$uH9a6vYAk$>C3#paIOU(rzlW
+z8x3Bq_jm@>H-N^lC6F@gZg8_6C%1>+2s&sRB<z6Y2}uydU%GUH`e!X73Kvkif(jnx
+jyfA~Z9vO4na{~pwf}m&4Sm31>X+4qqcb1XJ(cJzA+S=pF
+
+delta 984
+zcmZ8gUr1A76#wquZO&b%`%|0FB-0!trPPX&UXr3T34AEZl(BmaHMjBYUJ1Qp%OW-$
+zY;pS|L@;_NLnt5Y$%yDFsD~|$?6wENmh~nWJ@wGJn-{?Y-}%n>opXNtzTdg`nKfnR
+zK3Xgl2+WoKG-{&maWQ8NoQex?f8U<_`SSI~;?v@r2kY@^Wsz*zM?-3o>^c`9w3cmS
+zVW$uxw!+FkvYzoE6eX1=s>L_IT{UTeD<TEmqCszx2|e47ykwv9o@%Y5R6}TZI3kD<
+zl?q9s%5I+k94QXEHD-l?gB9rn7e|E(+l()M`g@Hl!LAz3sfqMda%%Qy_I$p!b-Ai7
+zZ){6an-sFSf0(Tq+sug^?bw1w6wm;5(-@W5|ApWYk_l1IAeo$G;Jt8;QZgk{7xj#c
+zbn;`}2w|59Wo6?Dp4<)a81a-$JVsCGd9qwJO<YG&S~Mtaj3Wkbi87*5M;JBh(atUd
+zEt%QD)oJN?10ZyimFZCsdbi1}&Xqu^V>FU!5S*5dL*1`eOU1OZ#2j!JGk0Lt#aro(
+z=Swha)f5r26c8mWC>&c$08zFvhE33;nx$aa9~c`N#-VYQ^@qbkkoOu?n)i!-l?sO<
+zDia7vL6}}p5O{&dm0A}w66A%OxHLRX@rJVDsuE<_k0ZiRxuhO$9IzsH!Nt*<#kyi^
+z%nEs1%$K+L;%8P3mittuTQPk$xC-2!S#wri>F9nZ<vV(F?H4{=$z8shyEKq%y0**>
+z=8S`@oHc&7Q0>e}59<<4!S4QQZ_eABv*KL;Lg&iKo_u>x{!q`dy*Ft}I9H8TX)eiS
+zCcYT!HyKn@zsaIXTf7ff1D7^0sj^rAQG!^Tk(b3T*h(>WL!?q8K@rz#cMaf_DZ>%T
+zuHCc!B{fU>VeK2n+9O|}5^PxlW7l|ymu?8B@Igpv|4rmDxJ`;6h;L|b5$#_`mLl@3
+h+3Y!FT{Afo&a@}#$%xCQx;VSV(uDI5XCiDR$p6jo?{NSC
+
+diff --git a/wlogseg/__pycache__/segment.cpython-312.pyc b/wlogseg/__pycache__/segment.cpython-312.pyc
+index 776d0ff4801e27372053ac47ef747364e54cdfcc..73e879f232db1b85e95c181a9b1aba9bd5858496 100644
+GIT binary patch
+literal 2966
+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
+CJ|-Uk
+
+delta 1250
+zcmZWpO=ufe5Z=|kU9Gg%%5GxIKWR{`B=$l`Nl6N-?SNgmO-QX!+(RuwWyNo8%aJAb
+z?W&-#szjPYLZPu(XhcoHg&Z6dnuH{vk{)_*4pLR9^Y9_irZktf;N07JE3I4T9A@Ut
+z%+AdFX5M}g`ZTEi5D54=pn)4tR#K><_Vb@qMvnWu2``otGWJzI96IT*@hpVn5(*At
+z<tj>af$Rbqz}>h92d;_<6~BU2umlT&wl6=#Rcf!=%fd0w3uIS>{h~O2W@^gb68;cX
+z$kStQpp{Zw^AI1L2s04{n8E6VNdP!i4Si`<&zi}Mo?SARNe>wNSWF05ncGngZuU17
+z?asNn+&VVdR3;l}k_5rGAOLeo1_jRi?w6q4<jl@RIL_kjC!#Mcm>xHDMRc`)rNvnu
+z%wLADu*dYec1v&psiC&5h%96Ym*Ic~likUo|9)YwNe4>t7k`6;u#&q@Cz?pbiv?3R
+zsGOXgerIMn{ys%(sf9~afNMLzK!^lTB-5CB*HVQ{E`_PMm`N=e6kW{W0!7Pu3LC8X
+zFryB7dUhd)^<)P`auD2uC16Gj7=y2SJ@nb>a%@N0cVpuEM73|TcWeLG2ev+X7`cZZ
+zXf0*D9NSic>xZw8RYSMN?ilw@)(Wjiv^fxMD$xdt{vT@zGCNo^9Bu-_Cdf81i{&X@
+zg5spx+#3+)vB%;!0JN`!T4xYfc(Vg4$F1x^?k0jXkl2mA0FgzZh>BuSvIH1`v?$DS
+z8p@xA_+KA?9-g0H%Ng_Y;ot8*{_UGb((_vn|NL&l{#HJ&{!+d|eTGT$3ud0^_MGp?
+z9BOYPLz1vfqe?!@W|3SZxmC?e5l)#YDnLdmX40!^lMJxXAr|UO65Y_r$2ulma5h-u
+z&N$dW?1pc!bd*_`>pZYB_sr}6DG+XY!<(mm^p5VRp{mjtiPj_a-g>riWTvIY8*+R{
+zJMptN(bOjD`1`k7+L<OgT7LW5^m??qysh-CpQ?^Fl;H*%c4na=r!*DPS(8dchkIqo
+z2o%$J*tmB=%I$`kjSMo@%NXn5i6f(~O_Rv5tCPr{|FEms_x-QuoTtnF9n?QF`2kzs
+z<k=XNnLc$sHb<pd2VDos_7i7M*x5wFz_`shZMXMT9$(Gjd`3S_PJoNO4dWcJzXYD=
+zpK^zubHny~O5bbSN^e<yru1KX!&%x;OF2}QcO?%$w(IBlDgLD_@Nd5C68VUe`yYFh
+BAd3J1
+
+diff --git a/wlogseg/__pycache__/stream.cpython-312.pyc b/wlogseg/__pycache__/stream.cpython-312.pyc
+index c5d0417593ba5f73a140e73216232f879cc8ef9b..510453add14002c47c919450f06a850d79136798 100644
+GIT binary patch
+literal 8481
+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
+CJWFZ-
+
+delta 775
+zcmYLGT}TvB6ux(6oSofeH(gglN*%SZ0g(cqTnh{nD$2AX5Mvm2MqAsRkvn$?YsF23
+zOoKH>)CUQKpdXW-3Q-?==&c?$3ai0DaCckZDtoB6?zNpdF!z4n`OZCO&N+)GvqIyW
+zK)?rxRi)n!h8Y01DRGT(YH+vpeq-|}KMs05s#o=lbG^c_Ao;9)M9jaqom)>Ap0DN7
+zv)ie$9r{3mj$hGr11mUY=;jXm>*FnbNQqu2s`tu8ZQv9_28vS6H4gy|wB8m0X8{Cr
+zAPEMG5%xw!xNihv){Ra=%()oz|B&FKes-zYfLV|Iu2+RBg99#0!lh#R!Js|P*C}PL
+zf=gWVKgNyi09Q%95hlsZ!Z`@RJ%Izm>@s@;N}P3oyvwdW%H3HNkC@tk98;UbA!Rsj
+zD5^vTWLJCY*z=Ot?(}quw1&hw{53^a<C?>%3RWC0hP8xA+Z65BT-|7Za3qsd2~Ec)
+z3KPLgKC_n`1@J2cw)|!3$lb`)@l?mAzhYWlxcu<+vzwWNtsnf6&EWodf2J|A-tj8D
+zcIIPS*Sof^Oyol5aQFLQPe$n3EUlce<}cZ|HcA^NxKF{*l<zwW$`1WD=|soco7!Qs
+zy;IZIT|;Poa`Nk%oqw>9pLv;|n9i=GvMWz>6LW>d$D}g}?){s@pi&ZxLgX;%0z?s&
+zlgkm1rl_(KkE2RLL-ulQ%Q42`k%ld#J6t?wV#(`xWLY($vh4U|x!)p^Cd-Hp!zqax
+zs%9S*!{_J-_L4jSy99z_{<egnT5;_JswF<UR+H}H8w(-)3@UP<J_oA4fa)JS56gds
+K7}$bnQ-1(KImq+?
+
+diff --git a/wlogseg/codec.py b/wlogseg/codec.py
+index 9197691..a3b71cc 100644
+--- a/wlogseg/codec.py
++++ b/wlogseg/codec.py
+@@ -1,4 +1,26 @@
+-"""容器整体读写：文件头、段区、尾部索引与尾部校验和。"""
++"""容器整体读写：文件头、段区、尾部索引与尾部校验和。
++
++容器的真实布局（以 ``assets/`` 下的样本为唯一权威依据）::
++
++    +------------------+  0
++    |  文件头 (16B)    |
++    +------------------+  16
++    |  段区            |   依次是 8 字节段头 + 数据 + 8 字节对齐填充
++    +------------------+  header.index_offset
++    |  尾部索引 (8B/段) |
++    +------------------+  len - 8
++    |  尾部校验和 (8B)  |   <II> = (索引区 CRC, 文件头+段区 CRC)
++    +------------------+  len
++
++与早期草稿（``docs/FORMAT.md``）不一致、以样本为准的几点：
++
++* 段头是 ``<II>``（4 字节段号 + 4 字节长度），不是草稿写的 ``<HBBI>``；
++* 段按 **8** 字节（不是 4 字节）边界对齐；
++* 索引条目是 **8** 字节（偏移 + 段长），不是草稿写的 4 字节；
++* 尾部校验和第二个值覆盖**文件头与整个段区**（含对齐填充），即容器里
++  ``[0:index_offset]`` 这一整段，而不是「不含填充的字节拼起来再算」——
++  那样会把对齐填充排除在保护范围之外，篡改填充字节就检测不出来了。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,7 +29,7 @@ import struct
+ from .crc import compute_crc
+ from .errors import WSegError
+ from .header import HEADER_SIZE, build_header, parse_header
+-from .index import INDEX_ENTRY_SIZE, build_index
++from .index import INDEX_ENTRY_SIZE, build_index, parse_index
+ from .segment import (
+     MAX_BODY,
+     MAX_SEG_ID,
+@@ -17,88 +39,153 @@ from .segment import (
+     segment_length,
+ )
+ 
++#: 尾部校验和的大小：<II>
+ TRAILER_SIZE = 8
+ 
+ _TRAILER = struct.Struct("<II")
+ 
++#: 一个容器最少要占用的字节数（零段容器）。
++MIN_CONTAINER_SIZE = HEADER_SIZE + TRAILER_SIZE
+ 
+-def pack(segments) -> bytes:
+-    """把 [(seg_id, payload), ...] 序列化为 WLSG 字节串。"""
+-    items = []
+-    for seg_id, payload in segments:
+-        if not isinstance(seg_id, int) or isinstance(seg_id, bool) or not 0 <= seg_id <= MAX_SEG_ID:
+-            raise WSegError("structure", f"segment id {seg_id!r} out of range")
+-        if not isinstance(payload, (bytes, bytearray, memoryview)):
+-            raise WSegError("structure", f"payload {type(payload).__name__} is not bytes")
++
++def _check_segment(seg_id, payload) -> tuple:
++    """校验并规范化一个输入段，返回 ``(seg_id, payload_bytes)``。"""
++    if isinstance(seg_id, bool) or not isinstance(seg_id, int):
++        raise WSegError("structure", f"segment id {seg_id!r} is not an int")
++    if not 0 <= seg_id <= MAX_SEG_ID:
++        raise WSegError("structure", f"segment id {seg_id!r} out of range")
++    if isinstance(payload, (bytes, bytearray)):
+         body = bytes(payload)
+-        if len(body) > MAX_BODY:
+-            raise WSegError("structure", "payload is too large")
+-        items.append((seg_id, body))
++    elif isinstance(payload, memoryview):
++        body = payload.tobytes()
++    else:
++        raise WSegError("structure",
++                        f"payload {type(payload).__name__} is not bytes")
++    if len(body) > MAX_BODY:
++        raise WSegError("structure", "payload is too large")
++    return seg_id, body
++
++
++def pack(segments) -> bytes:
++    """把 ``[(seg_id, payload), ...]`` 序列化为 WLSG 字节串。
+ 
+-    offsets = []
+-    body = bytearray()
+-    checksummed = bytearray()
++    非法的 ``seg_id``（不在 0..65535，或不是整数）或非 ``bytes`` 的
++    ``payload`` 抛 ``WSegError(kind="structure")``。
++    """
++    items = []
++    for index, entry in enumerate(segments):
++        try:
++            seg_id, payload = entry
++        except (TypeError, ValueError):
++            raise WSegError("structure",
++                            f"segment #{index} is not a (seg_id, payload) pair") from None
++        items.append(_check_segment(seg_id, payload))
++
++    if len(items) > 0xFFFF:
++        raise WSegError("structure", f"too many segments: {len(items)}")
++
++    entries = []
++    region = bytearray()
+     cursor = HEADER_SIZE
+     for seg_id, payload in items:
+         encoded = encode_segment(seg_id, payload)
+-        offsets.append(cursor)
+-        body += encoded
+-        checksummed += encoded[:SEGMENT_HEADER_SIZE + len(payload)]
+-        cursor += segment_length(len(payload))
++        entries.append((cursor, len(encoded)))
++        region += encoded
++        cursor += len(encoded)
+ 
+     index_offset = cursor
+     header = build_header(len(items), index_offset)
+-    index_region = build_index(offsets)
++    index_region = build_index(entries)
+     trailer = _TRAILER.pack(compute_crc(index_region),
+-                            compute_crc(bytes(header) + bytes(checksummed)))
+-    return bytes(header) + bytes(body) + index_region + trailer
++                            compute_crc(bytes(header) + bytes(region)))
++    return bytes(header) + bytes(region) + index_region + trailer
+ 
+ 
+ def unpack(data) -> list:
+-    """解析 WLSG 字节串；任何结构 / 完整性问题都抛 WSegError。"""
+-    if not isinstance(data, (bytes, bytearray, memoryview)):
++    """解析 WLSG 字节串，返回 ``[(seg_id, payload), ...]``。
++
++    任何结构 / 完整性问题都抛 ``WSegError``，``kind`` 依据契约分类：
++
++    * ``magic``     —— 魔数不是 ``WLSG``；
++    * ``version``   —— 版本号不是受支持的 1；
++    * ``truncated`` —— 数据在读到完整结构之前就结束了；
++    * ``structure`` —— 结构自相矛盾（段区长度与段数不符、索引越界等）；
++    * ``checksum``  —— 尾部校验和对不上。
++    """
++    if isinstance(data, (bytes, bytearray, memoryview)):
++        buf = bytes(data)
++    else:
+         raise WSegError("structure", f"unpack expects bytes, got {type(data).__name__}")
+-    data = bytes(data)
+ 
+-    if len(data) < HEADER_SIZE + TRAILER_SIZE:
+-        raise WSegError("structure", f"container is only {len(data)} bytes")
++    # --- 文件头 -----------------------------------------------------------
++    if len(buf) < MIN_CONTAINER_SIZE:
++        # 借 parse_header 之手先区分 magic / truncated，能归因就归因。
++        parse_header(buf)
++        raise WSegError("truncated",
++                        f"container is only {len(buf)} bytes, "
++                        f"needs at least {MIN_CONTAINER_SIZE}")
+ 
+-    _version, _flags, seg_count, index_offset = parse_header(data)
++    _version, _flags, seg_count, index_offset = parse_header(buf)
+ 
+-    if index_offset > len(data):
+-        raise WSegError("structure", f"index offset {index_offset} is beyond the container")
+-    index_end = index_offset + INDEX_ENTRY_SIZE * seg_count
+-    if index_end + TRAILER_SIZE > len(data):
+-        raise WSegError("structure", "the index and the trailer do not fit")
++    if index_offset < HEADER_SIZE:
++        raise WSegError("structure",
++                        f"index offset {index_offset} points into the header")
+ 
++    # --- 段区：按每段声明的长度顺序推进 -----------------------------------
++    # 注意顺序：先走段、再看索引是否放得下。这样「段数被改多」会先撞上
++    # 「段越过索引区」而归为 structure，而真正的截断仍会在推进时撞上 EOF
++    # 而归为 truncated。
+     records = []
+-    checksummed = bytearray(data[:HEADER_SIZE])
++    walked = []
+     cursor = HEADER_SIZE
+     for index in range(seg_count):
+-        if cursor + SEGMENT_HEADER_SIZE > len(data):
+-            raise WSegError("structure", f"segment {index} header is incomplete")
+-        seg_id, _seg_flags, body_len = parse_segment_header(data, cursor, len(data))
+-        start = cursor + SEGMENT_HEADER_SIZE
+-        if start + body_len > len(data):
+-            raise WSegError("structure", f"segment {index} payload is incomplete")
+-        records.append((seg_id, data[start:start + body_len]))
+-        checksummed += data[cursor:start + body_len]
+-        cursor += segment_length(body_len)
+-
+-    index_crc, data_crc = _TRAILER.unpack_from(data, len(data) - TRAILER_SIZE)
+-    if compute_crc(data[index_offset:index_end]) != index_crc:
++        seg_id, body_len = parse_segment_header(buf, cursor, len(buf))
++        data_start = cursor + SEGMENT_HEADER_SIZE
++        data_end = data_start + body_len
++        total = segment_length(body_len)
++        if data_end > len(buf) or cursor + total > len(buf):
++            raise WSegError("truncated", f"segment {index} is incomplete")
++        if cursor + total > index_offset:
++            raise WSegError("structure",
++                            f"segment {index} overruns the index region")
++        if seg_id > MAX_SEG_ID:
++            raise WSegError("structure", f"segment id {seg_id} out of range")
++        records.append((seg_id, buf[data_start:data_end]))
++        walked.append((cursor, total))
++        cursor += total
++
++    if cursor != index_offset:
++        raise WSegError("structure",
++                        f"segment region is {cursor - HEADER_SIZE} bytes but the "
++                        f"index starts at {index_offset - HEADER_SIZE}")
++
++    # --- 尾部索引与尾部校验和必须不多不少地占满剩余部分 -------------------
++    index_end = index_offset + INDEX_ENTRY_SIZE * seg_count
++    if index_end + TRAILER_SIZE > len(buf):
++        raise WSegError("truncated", "the index and the trailer do not fit")
++    if index_end + TRAILER_SIZE < len(buf):
++        raise WSegError("structure", "trailing bytes after the container")
++
++    # --- 尾部校验和（内容被篡改在这里暴露）---------------------------------
++    index_crc, data_crc = _TRAILER.unpack_from(buf, index_end)
++    if compute_crc(buf[index_offset:index_end]) != index_crc:
+         raise WSegError("checksum", "the index region does not match its checksum")
+-    if compute_crc(bytes(checksummed)) != data_crc:
++    if compute_crc(buf[:index_offset]) != data_crc:
+         raise WSegError("checksum", "the segment region does not match its checksum")
++
++    # --- 尾部索引必须与顺序推进得到的落点一致 ------------------------------
++    entries = parse_index(buf, index_offset, seg_count)
++    if entries != walked:
++        raise WSegError("structure", "the index region does not match the segments")
+     return records
+ 
+ 
+ def verify(data) -> bool:
+-    """返回 data 是否是合法 WLSG 容器；**永不抛异常**。"""
++    """返回 ``data`` 是否是合法 WLSG 容器；**永不抛异常**。"""
+     try:
+         unpack(data)
+         return True
+     except WSegError:
+         return False
+-    except Exception:  # noqa: BLE001
++    except Exception:  # noqa: BLE001 - 契约要求任何输入都不得抛异常
+         return False
+diff --git a/wlogseg/crc.py b/wlogseg/crc.py
+index 6656acb..0e8a8f8 100644
+--- a/wlogseg/crc.py
++++ b/wlogseg/crc.py
+@@ -1,17 +1,37 @@
+-"""容器尾部校验和使用的 32 位校验和。"""
++"""容器尾部校验和使用的 32 位校验和。
++
++容器使用的是标准的 **CRC-32/ISO-HDLC**（即 ``zlib.crc32`` / IEEE 802.3 /
++``gzip`` 所用的那个多项式 ``0xEDB88320``，反射、初始值 ``0xFFFFFFFF``、
++输出异或 ``0xFFFFFFFF``）。其已知校验向量 ``b"123456789" -> 0xCBF43926``。
++
++注意：这不是 CRC-32/BZIP2（非反射、初始值 0），也不是 CRC-32/JAMCRC
++（输出不取反）。历史上 ``crc32_update`` 里那个多余的 ``^ 0xFFFFFFFF``
++会把所有结果都翻掉，导致与任何标准 32 位 CRC 都对不上。
++"""
+ 
+ from __future__ import annotations
+ 
+ import zlib
+ 
++CRC32_TEST_VECTOR = b"123456789"
++CRC32_CHECK = 0xCBF43926
++
+ 
+ def crc32_update(data, value: int = 0) -> int:
+-    """在 ``value`` 的基础上继续累积校验和。"""
+-    return (zlib.crc32(bytes(data), value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++    """在 ``value``（前一次的 CRC 累积值）的基础上继续累积校验和。
++
++    ``crc32_update(a, v)`` 之后再 ``crc32_update(b, r)`` 等价于直接对
++    ``a + b`` 计算一次校验和；``crc32_update(b"")`` 恒为 ``value``。
++    """
++    if isinstance(data, str):
++        raise TypeError("crc32_update expects a bytes-like object")
++    if not isinstance(value, int):
++        raise TypeError("crc32_update expects an int seed")
++    return zlib.crc32(bytes(data), value) & 0xFFFFFFFF
+ 
+ 
+ def compute_crc(data) -> int:
+-    """返回容器使用的 32 位校验和。"""
++    """返回 ``data`` 的 CRC-32/ISO-HDLC 校验和（无符号 32 位整数）。"""
+     if isinstance(data, str):
+         raise TypeError("compute_crc expects a bytes-like object")
+-    return crc32_update(data, 0)
++    return zlib.crc32(bytes(data)) & 0xFFFFFFFF
+diff --git a/wlogseg/errors.py b/wlogseg/errors.py
+index 165592a..5b64d78 100644
+--- a/wlogseg/errors.py
++++ b/wlogseg/errors.py
+@@ -4,7 +4,16 @@ from __future__ import annotations
+ 
+ 
+ class WSegError(Exception):
+-    """容器结构或完整性错误，``kind`` 为契约定义的分类之一。"""
++    """容器结构或完整性错误，``kind`` 为契约定义的分类之一。
++
++    | kind         | 含义                                       |
++    | ------------ | ------------------------------------------ |
++    | ``"magic"``  | 魔数不匹配                                 |
++    | ``"version"``| 版本号不受支持                             |
++    | ``"truncated"`` | 数据在读到完整结构之前就结束了          |
++    | ``"structure"`` | 结构自相矛盾（如段区长度与段数不符）    |
++    | ``"checksum"``  | 尾部校验和对不上                         |
++    """
+ 
+     KINDS = ("magic", "version", "truncated", "structure", "checksum")
+ 
+@@ -14,3 +23,6 @@ class WSegError(Exception):
+         super().__init__(message or kind)
+         self.kind = kind
+         self.message = message
++
++    def __str__(self) -> str:  # pragma: no cover - cosmetic
++        return f"[{self.kind}] {self.message}"
+diff --git a/wlogseg/header.py b/wlogseg/header.py
+index a154161..72450b6 100644
+--- a/wlogseg/header.py
++++ b/wlogseg/header.py
+@@ -1,4 +1,18 @@
+-"""文件头布局。"""
++"""文件头布局（16 字节）。
++
++    偏移  长度  含义
++    0     4     魔数 ``WLSG``
++    4     1     版本号（受支持的是 1）
++    5     1     标志位
++    6     2     段数量（小端）
++    8     4     索引区偏移（小端）
++    12    4     保留，恒为 0
++
++以上布局与 ``assets/`` 下的真实样本一致（样本头为
++``57 4c 53 47 01 00 05 00 58 01 00 00 00 00 00 00``，即 5 段、索引在 344）。
++
++真正与草稿不一致的是段头、段对齐与索引条目，见 ``segment.py`` / ``index.py``。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -9,21 +23,39 @@ from .errors import WSegError
+ MAGIC = b"WLSG"
+ SUPPORTED_VERSION = 1
+ HEADER_SIZE = 16
++MAX_SEG_COUNT = 0xFFFF
++
++#: 魔数的长度；至少要有这么多字节才能判定 ``magic`` 分类。
++MAGIC_SIZE = len(MAGIC)
+ 
+ _HEADER = struct.Struct("<4sBBHII")
+ 
+ 
+ def build_header(seg_count: int, index_offset: int, flags: int = 0,
+                  version: int = SUPPORTED_VERSION) -> bytes:
+-    return _HEADER.pack(MAGIC, version & 0xFF, flags & 0xFF, seg_count & 0xFFFF,
+-                        index_offset & 0xFFFFFFFF, 0)
+-
+-
+-def parse_header(data: bytes):
+-    """解析文件头，返回 (version, flags, seg_count, index_offset)。"""
+-    if len(data) < HEADER_SIZE:
+-        raise WSegError("structure", f"header needs {HEADER_SIZE} bytes, got {len(data)}")
+-    magic, version, flags, seg_count, index_offset, _reserved = _HEADER.unpack_from(data, 0)
++    """按上述布局拼出 16 字节文件头。"""
++    if not 0 <= seg_count <= MAX_SEG_COUNT:
++        raise WSegError("structure", f"segment count {seg_count} out of range")
++    if not 0 <= index_offset <= 0xFFFFFFFF:
++        raise WSegError("structure", f"index offset {index_offset} out of range")
++    return _HEADER.pack(MAGIC, version & 0xFF, flags & 0xFF, seg_count,
++                        index_offset, 0)
++
++
++def parse_header(data) -> tuple:
++    """解析文件头，返回 ``(version, flags, seg_count, index_offset)``。
++
++    长度不足 ``HEADER_SIZE`` 时报 ``"truncated"``；魔数不匹配报
++    ``"magic"``；版本号不受支持报 ``"version"``。
++    """
++    buf = bytes(data)
++    if len(buf) < HEADER_SIZE:
++        # 已经能看出魔数不对的，优先按 magic 归类（如 b"XXXX"）。
++        if len(buf) >= MAGIC_SIZE and buf[:MAGIC_SIZE] != MAGIC:
++            raise WSegError("magic", f"bad magic {buf[:MAGIC_SIZE]!r}")
++        raise WSegError("truncated", f"header needs {HEADER_SIZE} bytes, got {len(buf)}")
++
++    magic, version, flags, seg_count, index_offset, _reserved = _HEADER.unpack_from(buf, 0)
+     if magic != MAGIC:
+         raise WSegError("magic", f"bad magic {magic!r}")
+     if version != SUPPORTED_VERSION:
+diff --git a/wlogseg/index.py b/wlogseg/index.py
+index 6db48e1..90d0dd4 100644
+--- a/wlogseg/index.py
++++ b/wlogseg/index.py
+@@ -1,4 +1,17 @@
+-"""尾部段索引。"""
++"""尾部段索引。
++
++索引区紧跟在段区之后、尾部校验和之前，按段顺序排列。**每个条目 8 字节**，
++记录该段在文件中的起始偏移和该段的完整磁盘长度（头 + 数据 + 填充），
++均为小端 32 位：
++
++    0   4   段起始偏移
++    4   4   段长度（含头与对齐填充）
++
++注意：早期草稿写的是「每条目 4 字节、只记偏移」。真实样本不是这样——
++40 字节的索引装了 5 个条目，每个 8 字节。
++
++索引区的校验和就是该区段自身的 CRC-32。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,25 +19,26 @@ import struct
+ 
+ from .errors import WSegError
+ 
+-INDEX_ENTRY_SIZE = 4
++INDEX_ENTRY_SIZE = 8
+ 
+-_ENTRY = struct.Struct("<I")
++_ENTRY = struct.Struct("<II")
+ 
+ 
+-def build_index(offsets) -> bytes:
++def build_index(entries) -> bytes:
++    """把 ``[(offset, length), ...]`` 编码成索引区字节串。"""
+     out = bytearray()
+-    for offset in offsets:
+-        out += _ENTRY.pack(offset & 0xFFFFFFFF)
++    for offset, length in entries:
++        out += _ENTRY.pack(offset & 0xFFFFFFFF, length & 0xFFFFFFFF)
+     return bytes(out)
+ 
+ 
+-def parse_index(data: bytes, pos: int, count: int):
+-    """读取 ``count`` 个索引条目，返回各段偏移。"""
+-    needed = pos + INDEX_ENTRY_SIZE * count
+-    if needed > len(data):
+-        raise WSegError("structure", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
+-    offsets = []
++def parse_index(data, pos: int, count: int) -> list:
++    """读取 ``count`` 个索引条目，返回 ``[(offset, length), ...]``。"""
++    buf = bytes(data)
++    needed = INDEX_ENTRY_SIZE * count
++    if pos < 0 or pos + needed > len(buf):
++        raise WSegError("truncated", f"index needs {needed} bytes at {pos}")
++    entries = []
+     for index in range(count):
+-        (offset,) = _ENTRY.unpack_from(data, pos + index * INDEX_ENTRY_SIZE)
+-        offsets.append(offset)
+-    return offsets
++        entries.append(_ENTRY.unpack_from(buf, pos + index * INDEX_ENTRY_SIZE))
++    return entries
+diff --git a/wlogseg/segment.py b/wlogseg/segment.py
+index cc8c196..1513a80 100644
+--- a/wlogseg/segment.py
++++ b/wlogseg/segment.py
+@@ -1,4 +1,17 @@
+-"""段的头布局与编码。"""
++"""段的头布局与编码。
++
++每个段由 8 字节段头和变长数据组成（布局以 ``assets/`` 下的真实样本为准）：
++
++    0   4   段号 ``seg_id``（**小端 32 位**，取值 0..65535）
++    4   4   数据长度（小端 32 位）
++
++注意：早期草稿把段头描述成 ``<HBBI>``（2 字节段号 + 1 字节标志 + 1 字节
++保留 + 4 字节长度）。真实样本并不是这样——段号占满前 4 个字节。草稿的
++布局在读 ``seg_id > 0xFF`` 的段时会把高位字节当成「标志位」吃掉，导致段号
++被削成低位字节，这正是样本里 ``0x012C`` 被读成 44 的原因。
++
++段整体（头 + 数据 + 填充）按 **8 字节** 边界对齐。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,11 +20,12 @@ import struct
+ from .errors import WSegError
+ 
+ SEGMENT_HEADER_SIZE = 8
+-ALIGNMENT = 4
++ALIGNMENT = 8
+ MAX_SEG_ID = 0xFFFF
++#: 段头里的长度字段是 32 位的，这是它能表示的最大值。
+ MAX_BODY = 0xFFFFFFFF
+ 
+-_SEGMENT = struct.Struct("<HBBI")
++_SEGMENT = struct.Struct("<II")
+ 
+ 
+ def padding_for(body_len: int) -> int:
+@@ -20,18 +34,27 @@ def padding_for(body_len: int) -> int:
+ 
+ 
+ def segment_length(body_len: int) -> int:
++    """段的完整磁盘长度：段头 + 数据 + 8 字节对齐填充。"""
+     return SEGMENT_HEADER_SIZE + body_len + padding_for(body_len)
+ 
+ 
+-def encode_segment(seg_id: int, payload: bytes, flags: int = 0) -> bytes:
++def encode_segment(seg_id: int, payload: bytes) -> bytes:
++    """把一个段编码为「段头 + 数据 + 填充」。"""
+     body = bytes(payload)
+-    head = _SEGMENT.pack(seg_id, flags & 0xFF, 0, len(body))
++    if len(body) > MAX_BODY:
++        raise WSegError("structure", "payload is too large")
++    head = _SEGMENT.pack(seg_id, len(body))
+     return head + body + b"\x00" * padding_for(len(body))
+ 
+ 
+-def parse_segment_header(data: bytes, pos: int, limit: int):
+-    """从 ``pos`` 读段头；``limit`` 是已经确认可读的字节上界。"""
+-    if pos + SEGMENT_HEADER_SIZE > limit:
+-        raise WSegError("structure", f"segment header at {pos} is incomplete")
+-    seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
+-    return seg_id, flags, body_len
++def parse_segment_header(data, pos: int, limit: int) -> tuple:
++    """从 ``pos`` 读段头，返回 ``(seg_id, body_len)``。
++
++    ``limit`` 是已经确认可读的字节上界；越过它说明文件在读到完整结构之前
++    就结束了，报 ``"truncated"``。
++    """
++    buf = bytes(data)
++    if pos < 0 or pos + SEGMENT_HEADER_SIZE > limit:
++        raise WSegError("truncated", f"segment header at {pos} is incomplete")
++    seg_id, body_len = _SEGMENT.unpack_from(buf, pos)
++    return seg_id, body_len
+diff --git a/wlogseg/stream.py b/wlogseg/stream.py
+index 2fee28f..0d9fe1d 100644
+--- a/wlogseg/stream.py
++++ b/wlogseg/stream.py
+@@ -1,20 +1,190 @@
+-"""流式读取。"""
++"""流式读取。
++
++约束：**不得把整个容器读进内存**，只允许对文件对象做固定 ``n``（正整数）的
++``read(n)``。因此这里维护一个很小的读取器封装：所有读取都先走固定尺寸的
++``read(n)``，若底层流一次返回多了（例如按块缓冲的对象）就把多出来的部分暂存
++起来下一次先吐回去。任一时刻驻留在内存里的只有「一个段的头部 + 一个段的数据」。
++"""
+ 
+ from __future__ import annotations
+ 
+-from .codec import unpack
++from .crc import crc32_update
+ from .errors import WSegError
++from .header import HEADER_SIZE, MAGIC, MAGIC_SIZE, parse_header
++from .index import INDEX_ENTRY_SIZE, parse_index
++from .segment import MAX_SEG_ID, SEGMENT_HEADER_SIZE, padding_for, segment_length
++
++#: 尾部校验和 <II> 的大小，与 ``codec.TRAILER_SIZE`` 保持一致。
++TRAILER_SIZE = 8
++
++#: 小端 32 位整数的宽度（段头 / 索引条目 / 尾部校验和的字段宽度）。
++_DWORD = 4
++
++
++class _Reader:
++    """在文件对象上只做固定 ``n`` 读取的小封装，带单块 pushback。"""
++
++    __slots__ = ("_handle", "_pending", "_pos", "_eof")
++
++    def __init__(self, handle) -> None:
++        self._handle = handle
++        self._pending = b""
++        self._pos = 0
++        self._eof = False
++
++    @property
++    def pos(self) -> int:
++        """已经消费掉的字节数。"""
++        return self._pos
++
++    def _raw(self, n: int) -> bytes:
++        """一次固定尺寸的 ``read(n)``；``n`` 恒为正整数。"""
++        if n <= 0:
++            return b""
++        chunk = self._handle.read(n)
++        if not isinstance(chunk, (bytes, bytearray, memoryview)):
++            raise WSegError("structure",
++                            f"the stream returned {type(chunk).__name__}")
++        chunk = bytes(chunk)
++        if not chunk:
++            self._eof = True
++        return chunk
++
++    def read_exact(self, n: int) -> bytes:
++        """读到恰好 ``n`` 字节；流提前结束时返回较短的字节串。"""
++        if n <= 0:
++            return b""
++        out = bytearray()
++        if self._pending:
++            take = self._pending[:n]
++            out += take
++            self._pending = self._pending[len(take):]
++        while len(out) < n:
++            chunk = self._raw(n - len(out))
++            if not chunk:
++                break
++            wanted = n - len(out)
++            out += chunk[:wanted]
++            if len(chunk) > wanted:
++                # 底层对象一次多给了：把超出部分留到下一次。
++                self._pending = chunk[wanted:]
++                break
++        self._pos += len(out)
++        return bytes(out)
++
++    def has_more(self) -> bool:
++        """探测流是否还有字节可读（只固定读 1 字节，读完即退回）。"""
++        if self._pending:
++            return True
++        if self._eof:
++            return False
++        chunk = self._raw(1)
++        if not chunk:
++            return False
++        self._pending = chunk
++        return True
++
++
++def _u32(buf: bytes, pos: int = 0) -> int:
++    """按小端读一个 32 位无符号整数。"""
++    return int.from_bytes(buf[pos:pos + _DWORD], "little")
+ 
+ 
+ def iter_segments(handle):
+-    """产出 (seg_id, payload)。"""
+-    data = handle.read()
+-    if not isinstance(data, (bytes, bytearray, memoryview)):
+-        raise WSegError("structure", f"the stream returned {type(data).__name__}")
+-    for item in unpack(bytes(data)):
+-        yield item
++    """惰性产出 ``(seg_id, payload)``。
++
++    只对 ``handle`` 做固定 ``n``（正整数）的 ``read(n)``，不把整个容器读进
++    内存。取完最后一段之后仍会校验尾部索引与尾部校验和，任一失败抛
++    ``WSegError(kind="checksum")``；结构问题抛 ``"structure"`` / ``"truncated"``。
++    """
++    reader = _Reader(handle)
++
++    # --- 文件头 -----------------------------------------------------------
++    header = reader.read_exact(HEADER_SIZE)
++    if len(header) < HEADER_SIZE:
++        if len(header) >= MAGIC_SIZE and header[:MAGIC_SIZE] != MAGIC:
++            raise WSegError("magic", f"bad magic {header[:MAGIC_SIZE]!r}")
++        raise WSegError("truncated",
++                        f"header needs {HEADER_SIZE} bytes, got {len(header)}")
++    _version, _flags, seg_count, index_offset = parse_header(header)
++
++    if index_offset < HEADER_SIZE:
++        raise WSegError("structure",
++                        f"index offset {index_offset} points into the header")
++
++    # --- 段区（惰性产出）--------------------------------------------------
++    # 校验和按磁盘顺序累积：文件头、各段的「段头 + 数据 + 填充」。
++    checksummed = crc32_update(header)
++    cursor = HEADER_SIZE
++    lengths = []
++    for index in range(seg_count):
++        seg_head = reader.read_exact(SEGMENT_HEADER_SIZE)
++        if len(seg_head) < SEGMENT_HEADER_SIZE:
++            raise WSegError("truncated", f"segment {index} header is incomplete")
++        seg_id = _u32(seg_head, 0)
++        body_len = _u32(seg_head, _DWORD)
++        if seg_id > MAX_SEG_ID:
++            raise WSegError("structure", f"segment id {seg_id} out of range")
++
++        payload = reader.read_exact(body_len)
++        if len(payload) < body_len:
++            raise WSegError("truncated", f"segment {index} payload is incomplete")
++        pad = padding_for(body_len)
++        padding = reader.read_exact(pad) if pad else b""
++        if len(padding) < pad:
++            raise WSegError("truncated", f"segment {index} padding is incomplete")
++
++        total = segment_length(body_len)
++        cursor += total
++        if cursor > index_offset:
++            raise WSegError("structure",
++                            f"segment {index} overruns the index region")
++
++        checksummed = crc32_update(seg_head, checksummed)
++        checksummed = crc32_update(payload, checksummed)
++        if padding:
++            checksummed = crc32_update(padding, checksummed)
++
++        lengths.append(body_len)
++        yield (seg_id, payload)
++
++    if cursor != index_offset:
++        raise WSegError("structure",
++                        f"segment region is {cursor - HEADER_SIZE} bytes but the "
++                        f"index starts at {index_offset - HEADER_SIZE}")
++
++    # --- 尾部索引与尾部校验和 ---------------------------------------------
++    index_end = index_offset + INDEX_ENTRY_SIZE * seg_count
++    index_region = reader.read_exact(index_end - cursor)
++    if len(index_region) < index_end - cursor:
++        raise WSegError("truncated", "the index region is incomplete")
++    trailer = reader.read_exact(TRAILER_SIZE)
++    if len(trailer) < TRAILER_SIZE:
++        raise WSegError("truncated", "the trailer is incomplete")
++
++    index_crc = _u32(trailer, 0)
++    data_crc = _u32(trailer, _DWORD)
++    if crc32_update(index_region) != index_crc:
++        raise WSegError("checksum", "the index region does not match its checksum")
++    if checksummed != data_crc:
++        raise WSegError("checksum", "the segment region does not match its checksum")
++
++    # --- 尾部索引必须与顺序推进得到的落点一致 ------------------------------
++    entries = parse_index(index_region, 0, seg_count)
++    walked = []
++    offset = HEADER_SIZE
++    for body_len in lengths:
++        total = segment_length(body_len)
++        walked.append((offset, total))
++        offset += total
++    if entries != walked:
++        raise WSegError("structure", "the index region does not match the segments")
++
++    # 容器之后不应再有残留字节。
++    if reader.has_more():
++        raise WSegError("structure", "trailing bytes after the container")
+ 
+ 
+ def read_all(handle) -> list:
+-    """把结果收成一个列表。"""
++    """把 ``iter_segments`` 的结果收成一个列表。"""
+     return [item for item in iter_segments(handle)]

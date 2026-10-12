@@ -18,7 +18,21 @@ if ([string]::IsNullOrWhiteSpace($TaskRoot)) {
     $TaskRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 }
 $TaskRoot = (Resolve-Path -LiteralPath $TaskRoot).Path
-if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) { $WorkspaceRoot = Join-Path $TaskRoot 'environment\workspace' }
+if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+    # Harbor runs the verifier without arguments: the candidate workspace is the
+    # image workdir (C:\testbed); local runs keep environment\workspace.
+    $wsCandidates = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace($env:WLOGSEG_WORKSPACE_ROOT)) { [void]$wsCandidates.Add($env:WLOGSEG_WORKSPACE_ROOT) }
+    [void]$wsCandidates.Add((Join-Path $TaskRoot 'environment\workspace'))
+    [void]$wsCandidates.Add('C:\testbed')
+    $resolved = ''
+    foreach ($candidate in $wsCandidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if (Test-Path -LiteralPath (Join-Path $candidate 'wlogseg\__init__.py')) { $resolved = $candidate; break }
+    }
+    if ([string]::IsNullOrWhiteSpace($resolved)) { $resolved = Join-Path $TaskRoot 'environment\workspace' }
+    $WorkspaceRoot = $resolved
+}
 if ([string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath = Join-Path (Join-Path $TaskRoot 'results') ('result' + '.json') }
 
 $resultsDirectory = Split-Path -Parent $OutputPath
