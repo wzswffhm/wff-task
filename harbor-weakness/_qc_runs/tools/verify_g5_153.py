@@ -22,6 +22,7 @@ RUNS = {
     "oracle": H / "_qc_runs/g4-153/trials/oracle-153/verifier",
     "gpt-5.6-sol": H / "_qc_runs/g5-153-gpt/trials/gpt56sol-153/verifier",
     "qwen3.8-max-0902": H / "_qc_runs/g5-153-qwen/trials/qwen38max-153-reg1/verifier",
+    "claude-opus-4-8": H / "_qc_runs/g5-153-opus/trials/opus48-153-reg1/verifier",
 }
 
 

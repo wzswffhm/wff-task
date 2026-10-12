@@ -12,7 +12,9 @@ GW=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p')
 if [ -n "${GW:-}" ]; then
   export http_proxy="http://$GW:18080" https_proxy="http://$GW:18080"
   export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy"
-  export no_proxy="localhost,127.0.0.1,::1"
+  # 2026-10-12：4router（opus-5）与阿里云 MaaS 均须直连——经 :18080 代理会超时，
+  # 故把这些域名排除在代理之外（容器内流量不受此处影响）。
+  export no_proxy="localhost,127.0.0.1,::1,4router.net,.4router.net,llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com,.aliyuncs.com,fanrenapi.com,.fanrenapi.com"
 fi
 
 # 2026-10-12：本机 docker compose（2.40.3）默认用 Bake 构建，但 docker 未装 buildx 插件

@@ -27,7 +27,8 @@ RUNS = [
     ("qwen3.8-max-0902", Q / "g5-153-qwen" / "trials",
      ["qwen38max-153-reg1", "qwen38max-153"]),
     ("gpt-5.6-sol", Q / "g5-153-gpt" / "trials", ["gpt56sol-153"]),
-    ("claude-opus-4-8", Q / "g5-153-opus" / "trials", ["opus48-153"]),
+    ("claude-opus-4-8", Q / "g5-153-opus" / "trials",
+     ["opus48-153-reg1", "opus48-153"]),
 ]
 
 
