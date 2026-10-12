@@ -1,60 +1,61 @@
-# Windows Bench 派生镜像 —— wfflab__wfmt-215
+# Windows Bench derived image - wfflab__wfmt-215
 #
-# 硬性要求（规范 5.3 + 7.x）：
-#   1. 真实 Windows Runtime，不用 Linux Mock 或普通容器替代
-#   2. 依赖版本锁定，断网可复现
-#   3. 从 HEAD 建立可回放的基线 commit（固定提交时间，不使用 wall-clock）
-#   4. environment/ 严禁泄漏 Solution 与隐藏测试
+# Hard requirements (spec 5.3 + 7.x):
+#   1. real Windows runtime, no Linux mock or cross-platform substitute
+#   2. dependency versions pinned and the build performs NO network access
+#   3. replayable baseline commit from HEAD (fixed timestamp, no wall clock)
+#   4. environment/ never leaks the solution or the hidden tests
 #
-# 说明：本题的被测包是自包含的纯 Python 库；被测语义（长度前缀分帧、
-# LEB128 变长整数、按记录对齐填充、尾部 32 位校验和、流式读取）都是确定性
-# 字节级行为，不依赖任何外部服务。
+# Build inputs are vendored under environment/vendor/ (see vendor/INVENTORY.json):
+# the Python embed distribution, a pinned MinGit archive and the wheelhouse the
+# test runner needs. The base image is addressed by immutable digest.
 
-FROM mcr.microsoft.com/windows/servercore:ltsc2022
+FROM mcr.microsoft.com/windows/servercore:ltsc2022@sha256:76cf422c98ca437b308374d0498280541fa42ac7061bb44015a6c8b70cf4db6a
 
 SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
-# --- 1. Git：模型补丁捕获与回放必需 ---
-RUN if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) { \
-      Set-ExecutionPolicy Bypass -Scope Process -Force; \
-      [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; \
-      iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')); \
-      choco install git -y --no-progress; \
-    }
+# --- 1. Git (MinGit 2.56.0.2, vendored; no package manager, no network) ------
+COPY ["vendor/MinGit-2.56.0.2-64-bit.zip", "C:/vendor/mingit.zip"]
+RUN Expand-Archive -LiteralPath C:\vendor\mingit.zip -DestinationPath C:\Git -Force; \
+    Remove-Item C:\vendor\mingit.zip -Force; \
+    & C:\Git\cmd\git.exe --version
 
-# --- 2. Python 3.12.9（embed 包，版本锁定） ---
-RUN $pythonDir = 'C:\Python312'; \
-    Invoke-WebRequest -UseBasicParsing -Uri 'https://www.python.org/ftp/python/3.12.9/python-3.12.9-embed-amd64.zip' -OutFile C:\python.zip; \
-    Expand-Archive C:\python.zip -DestinationPath $pythonDir; \
-    Remove-Item C:\python.zip -Force; \
-    (Get-Content "$pythonDir\python312._pth") -replace '#import site', 'import site' | Set-Content "$pythonDir\python312._pth"; \
-    # The embed distribution isolates sys.path through python312._pth and therefore
-    # ignores PYTHONPATH. Register the two fixed locations the task needs directly
-    # in the ._pth: the build-time copy and the runtime mount point.
-    Add-Content "$pythonDir\python312._pth" 'C:\testbed'; \
-    Add-Content "$pythonDir\python312._pth" 'C:\task\environment\workspace'; \
-    Invoke-WebRequest -UseBasicParsing -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile C:\get-pip.py; \
-    & "$pythonDir\python.exe" C:\get-pip.py; \
-    Remove-Item C:\get-pip.py -Force
+# --- 2. Python 3.12.9 (embed distribution, vendored) -------------------------
+COPY ["vendor/python-3.12.9-embed-amd64.zip", "C:/vendor/python.zip"]
+RUN Expand-Archive -LiteralPath C:\vendor\python.zip -DestinationPath C:\Python312 -Force; \
+    Remove-Item C:\vendor\python.zip -Force; \
+    (Get-Content 'C:\Python312\python312._pth') -replace '#import site', 'import site' | Set-Content 'C:\Python312\python312._pth'; \
+    Add-Content 'C:\Python312\python312._pth' 'C:\testbed'; \
+    Add-Content 'C:\Python312\python312._pth' 'C:\task\environment\workspace'
 
-ENV PATH="C:/Python312;C:/Python312/Scripts;C:/Program Files/Git/cmd;C:/Windows/System32;C:/Windows;C:/Windows/System32/WindowsPowerShell/v1.0"
+ENV PATH="C:/Python312;C:/Python312/Scripts;C:/Git/cmd;C:/Windows/System32;C:/Windows;C:/Windows/System32/WindowsPowerShell/v1.0"
 
-# --- 3. 测试依赖（版本锁定，与题包本机验证环境一致） ---
-RUN & 'C:\Python312\python.exe' -m pip install --no-cache-dir \
-      'pytest==8.3.5' 'pytest-json-report==1.5.0'
+# --- 3. Test dependencies, installed strictly from the vendored wheelhouse ---
+# pip itself comes from the wheelhouse too: the embed distribution ships no
+# installer, and get-pip.py would need the network. Unpacking the pip wheel into
+# site-packages is enough for `python -m pip` to run offline.
+COPY ["vendor/wheels/", "C:/vendor/wheels/"]
+RUN Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+    $sitePackages = 'C:\Python312\Lib\site-packages'; \
+    New-Item -ItemType Directory -Force $sitePackages | Out-Null; \
+    $pipWheel = (Get-ChildItem C:\vendor\wheels\pip-*.whl | Select-Object -First 1).FullName; \
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($pipWheel, $sitePackages); \
+    & 'C:\Python312\python.exe' -m pip --version; \
+    & 'C:\Python312\python.exe' -m pip install --no-index --find-links C:\vendor\wheels --no-cache-dir --no-warn-script-location 'pytest==8.3.5' 'pytest-json-report==1.5.0'; \
+    Remove-Item C:\vendor -Recurse -Force
 
-# --- 4. 评分产物目录 ---
+# --- 4. Verifier output directory -------------------------------------------
 RUN New-Item -ItemType Directory -Force C:\logs\verifier | Out-Null
 
-# --- 5. 注入工作区（task-build 以 environment/ 为构建上下文） ---
+# --- 5. Workspace injection (build context is environment/) ------------------
 COPY ["workspace/", "C:/testbed/"]
 
-# --- 6. 环境预检：证明被测包与测试框架真的可用 ---
+# --- 6. Build-time smoke check ----------------------------------------------
 RUN Set-Location C:\testbed; \
     $env:PYTHONPATH = 'C:\testbed'; \
     & 'C:\Python312\python.exe' -c 'import pytest, wfmt'
 
-# --- 7. 基线 commit（固定提交时间 → 确定性 sha，不用 wall-clock） ---
+# --- 7. Baseline commit (fixed timestamps -> deterministic sha) --------------
 RUN $env:GIT_AUTHOR_DATE = '2026-10-03T00:00:00+00:00'; \
     $env:GIT_COMMITTER_DATE = '2026-10-03T00:00:00+00:00'; \
     if (-not (Test-Path C:\testbed)) { throw 'C:\testbed is missing from the base image' }; \

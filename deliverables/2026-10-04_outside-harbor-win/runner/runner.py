@@ -299,13 +299,34 @@ def wait_for_engine(max_wait: int = 900, poll: int = 10) -> bool:
     return False
 
 
-def start_container(image: str, mount_dir: Path, name: str) -> None:
+def resolve_verifier_mount(task_dir: Path) -> list[tuple[Path, str]]:
+    """Locate the verifier-side material for a task and bind it at C:\\verifier\\<task>.
+
+    Hidden assertions and the oracle payload deliberately live outside the task
+    tree, so a task that ships them as a sibling directory gets that directory
+    mounted at the documented injection point. Tasks that still carry their own
+    hidden suite simply resolve to no extra mount.
+    """
+    bases = [WORKSPACE_ROOT, WORKSPACE_ROOT.parent, task_dir.parent, task_dir.parent.parent]
+    for base in bases:
+        candidate = base / "outside_harbor-verifier" / task_dir.name
+        if (candidate / "tests").is_dir() or (candidate / "oracle").is_dir():
+            log(f"  verifier mount: {candidate} -> C:\\verifier\\{task_dir.name}")
+            return [(candidate, f"C:\\verifier\\{task_dir.name}")]
+    return []
+
+
+def start_container(image: str, mount_dir: Path, name: str,
+                    extra_mounts: list[tuple[Path, str]] | None = None) -> None:
     docker(["rm", "-f", name])
     last_error = ""
+    mounts: list[str] = ["-v", f"{Path(mount_dir).resolve()}:{CONTAINER_TASK_ROOT}"]
+    for host, guest in (extra_mounts or []):
+        mounts += ["-v", f"{Path(host).resolve()}:{guest}"]
     for attempt in range(1, 4):
         proc = docker([
             "run", "-d", "--name", name,
-            "-v", f"{Path(mount_dir).resolve()}:{CONTAINER_TASK_ROOT}",
+            *mounts,
             image, "ping", "-t", "127.0.0.1",
         ])
         if proc.returncode == 0:
@@ -1030,11 +1051,12 @@ def run_once(task_dir: Path, image: str, mode: str, cfg: dict | None,
     run_dir.mkdir(parents=True, exist_ok=True)
     capture_run_identity(run_dir)
     copy_tree(task_dir, case_dir)
+    verifier_mounts = resolve_verifier_mount(task_dir)
 
     agent_info: dict = {}
     try:
         if mode == "golden":
-            start_container(image, case_dir, container)
+            start_container(image, case_dir, container, verifier_mounts)
             proc = ps_exec(container,
                            f"& '{CONTAINER_TASK_ROOT}\\solution\\solve.ps1' -TaskRoot '{CONTAINER_TASK_ROOT}'",
                            timeout=900)
@@ -1044,7 +1066,7 @@ def run_once(task_dir: Path, image: str, mode: str, cfg: dict | None,
         elif mode == "candidate":
             assert cfg is not None
             build_agent_view(case_dir, view_dir)
-            start_container(image, view_dir, container)
+            start_container(image, view_dir, container, verifier_mounts)
             agent_info = run_agent(cfg, view_dir, container, run_dir / "agent.log")
             stop_container(container)
             mirror_workspace(view_dir, case_dir)
@@ -1056,7 +1078,7 @@ def run_once(task_dir: Path, image: str, mode: str, cfg: dict | None,
             raise DockerError(f"unsupported mode {mode}")
 
         # ---- verification ---------------------------------------------------
-        start_container(image, case_dir, container)
+        start_container(image, case_dir, container, verifier_mounts)
         proc = ps_exec(container,
                        f"& '{CONTAINER_TASK_ROOT}\\environment\\run.ps1' -TaskRoot '{CONTAINER_TASK_ROOT}'",
                        timeout=7200)
@@ -1155,6 +1177,17 @@ def main() -> int:
     if not candidate.exists():
         raise SystemExit(f"task not found: {args.task}")
     task_dir = candidate.resolve()
+    # tasks/<id> may be a one-line pointer file instead of a copied task tree.
+    if task_dir.is_file():
+        lines = [ln.strip() for ln in task_dir.read_text(encoding="utf-8-sig").splitlines() if ln.strip()]
+        if not lines:
+            raise SystemExit(f"task pointer is empty: {task_dir}")
+        target = Path(lines[0])
+        if not target.is_absolute():
+            target = task_dir.parent / target
+        if not target.is_dir():
+            raise SystemExit(f"task pointer {task_dir} does not resolve to a directory: {lines[0]}")
+        task_dir = target.resolve()
 
     TASK_PROFILE.update(resolve_task_profile(task_dir))
     log(f"task profile: module={TASK_PROFILE['module_rel'].as_posix()} "

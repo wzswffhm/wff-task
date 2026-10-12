@@ -1,8 +1,13 @@
-# Generated for wfflab__wfmt-215 by the task authoring pipeline. Do not edit by hand.
+# Generated for wfflab__wfmt-215 by the task authoring pipeline.
 #
 # Readiness probe: answers whether this machine can host the task. It reports on
 # the platform, the PowerShell runtime, the interpreter, the candidate package
 # and the authoritative samples, and it never scores the candidate.
+#
+# It also proves the isolation claim: withheld material (the oracle reference
+# payload and the hidden behavioural suite) must not be reachable from the
+# agent-visible tree. A hit fails the probe instead of being reported as a
+# warning.
 #
 # Exit codes:
 #   0  the environment is ready
@@ -57,10 +62,34 @@ foreach ($sample in @((Join-Path 'assets' 'sample.wfmt'), (Join-Path 'assets' 's
     }
 }
 
+# ---- isolation audit --------------------------------------------------------
+# 1. Inside the agent-visible workspace nothing may look like an answer or a
+#    hidden suite.
+$leaked = New-Object System.Collections.ArrayList
+foreach ($item in @(Get-ChildItem -LiteralPath $workspace -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+    $name = $item.Name.ToLowerInvariant()
+    if ($name -match 'oracle|golden|reference|hidden|rubric|solution|reward') {
+        [void]$leaked.Add($item.FullName)
+    }
+}
+foreach ($item in $leaked) { [void]$problems.Add("agent workspace contains withheld material: $item") }
+
+# 2. The verifier-side and oracle-side roots must be outside the agent-visible
+#    tree. They are injected for grading only; if they resolve inside the
+#    workspace the packaging is wrong.
+foreach ($forbidden in @('C:\verifier', 'C:\solution')) {
+    if (-not (Test-Path -LiteralPath $forbidden)) { continue }
+    $resolved = (Resolve-Path -LiteralPath $forbidden).Path
+    if ($resolved.ToLowerInvariant().StartsWith($workspace.ToLowerInvariant())) {
+        [void]$problems.Add("withheld root is inside the agent workspace: $resolved")
+    }
+}
+
 if ($problems.Count -gt 0) {
     foreach ($problem in $problems) { Write-Host "NOT READY: $problem" }
     exit 1
 }
 
 Write-Host "ready: $env:COMPUTERNAME / PowerShell $($PSVersionTable.PSVersion) / task root $TaskRoot"
+Write-Host 'isolation: agent workspace is free of oracle, reference and hidden-suite material'
 exit 0

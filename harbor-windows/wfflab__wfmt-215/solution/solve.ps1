@@ -1,19 +1,32 @@
-# Generated for wfflab__wfmt-215 by the task authoring pipeline. Do not edit by hand.
+# Generated for wfflab__wfmt-215 by the task authoring pipeline.
 #
-# Golden entry point: mirrors the reference wfmt payload over the candidate
-# workspace so the Oracle control can be reproduced from a clean checkout.
+# Golden entry point. The reference payload is deliberately NOT shipped inside
+# the task package: it is injected by the evaluation side into a verifier-side
+# directory, so the agent-visible tree never contains the answer.
 #
-# The script is idempotent, performs no network access and leaves no temporary
-# logs. It only replaces files inside environment/workspace/wfmt.
+# This script only locates that injected payload and mirrors it over the
+# candidate workspace.
+#
+# Payload resolution order (first hit wins):
+#   1. -ReferenceRoot <dir>
+#   2. $env:WFMT_REFERENCE_ROOT
+#   3. <script dir>\reference\wfmt                   (verifier-side sibling)
+#   4. C:\verifier\wfflab__wfmt-215\oracle\reference\wfmt   (verifier injection)
+#   5. C:\solution\reference\wfmt                    (platform injection point)
+#   6. <package>\outside_harbor-verifier\wfflab__wfmt-215\oracle\reference\wfmt
+#      (sibling of the agent-visible package; local reproduction only)
+#
+# The script is idempotent, performs no network access and leaves no logs.
 #
 # Exit codes:
 #   0  the reference payload is in place
-#   1  the payload could not be installed
+#   1  the payload could not be located or installed
 
 [CmdletBinding()]
 param(
     [string]$TaskRoot = '',
-    [string]$WorkspaceRoot = ''
+    [string]$WorkspaceRoot = '',
+    [string]$ReferenceRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,22 +36,41 @@ if ([string]::IsNullOrWhiteSpace($TaskRoot)) {
 }
 $TaskRoot = (Resolve-Path -LiteralPath $TaskRoot).Path
 
-# Two layouts share this entry point:
-#   * local runner: workspace lives at <TaskRoot>\environment\workspace;
-#   * standard Harbor: the image bakes it at C:\testbed and passes -WorkspaceRoot.
 if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
     $WorkspaceRoot = Join-Path $TaskRoot 'environment\workspace'
 } else {
     $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 }
 
-$sourcePayload = Join-Path (Join-Path $PSScriptRoot 'reference') 'wfmt'
-$targetPayload = Join-Path $WorkspaceRoot 'wfmt'
+function Test-Payload([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    return (Test-Path -LiteralPath (Join-Path $Path '__init__.py'))
+}
 
-if (-not (Test-Path -LiteralPath $sourcePayload)) {
-    Write-Host "solve: reference payload not found at $sourcePayload"
+$candidates = New-Object System.Collections.ArrayList
+if (-not [string]::IsNullOrWhiteSpace($ReferenceRoot)) { [void]$candidates.Add($ReferenceRoot) }
+if (-not [string]::IsNullOrWhiteSpace($env:WFMT_REFERENCE_ROOT)) { [void]$candidates.Add($env:WFMT_REFERENCE_ROOT) }
+[void]$candidates.Add((Join-Path $PSScriptRoot 'reference\wfmt'))
+[void]$candidates.Add('C:\verifier\wfflab__wfmt-215\oracle\reference\wfmt')
+[void]$candidates.Add('C:\solution\reference\wfmt')
+$packageRoot = Split-Path -Parent $TaskRoot
+if (-not [string]::IsNullOrWhiteSpace($packageRoot)) {
+    [void]$candidates.Add((Join-Path $packageRoot 'outside_harbor-verifier\wfflab__wfmt-215\oracle\reference\wfmt'))
+}
+
+$sourcePayload = ''
+foreach ($candidate in $candidates) {
+    if (Test-Payload $candidate) { $sourcePayload = $candidate; break }
+}
+
+if ([string]::IsNullOrWhiteSpace($sourcePayload)) {
+    Write-Host 'solve: no injected reference payload was found; the Oracle control cannot run'
     exit 1
 }
+
+$sourcePayload = (Resolve-Path -LiteralPath $sourcePayload).Path
+$targetPayload = Join-Path $WorkspaceRoot 'wfmt'
 if (-not (Test-Path -LiteralPath $targetPayload)) {
     Write-Host "solve: candidate payload not found at $targetPayload"
     exit 1
@@ -52,11 +84,10 @@ if ($LASTEXITCODE -ge 8) {
 }
 $global:LASTEXITCODE = 0
 
-$workspace = $WorkspaceRoot
 $python = (Get-Command python -ErrorAction SilentlyContinue)
 if (-not $python) { $python = (Get-Command python3 -ErrorAction SilentlyContinue) }
 if ($python) {
-    $env:PYTHONPATH = "$workspace;$env:PYTHONPATH"
+    $env:PYTHONPATH = "$WorkspaceRoot;$env:PYTHONPATH"
     & $python.Source -c "import wfmt" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host 'solve: the reference payload did not import'

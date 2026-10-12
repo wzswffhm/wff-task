@@ -1,9 +1,15 @@
-# Generated for wfflab__wfmt-215 by the task authoring pipeline. Do not edit by hand.
+# Generated for wfflab__wfmt-215 by the task authoring pipeline.
 #
 # Maps the raw check results onto the authoritative rubric and writes the
 # machine readable task result consumed by the evaluation runner.
 #
-# The reported `score` is a gate: 1 only when every rubric item is satisfied.
+# The rubric is split: programmatic items (0.5) gate the run, llm_judge items
+# (0.5) are scored by the reviewer against the conditions shipped on the
+# verifier side. Only programmatic items take part in the binary gate, so the
+# candidate score stays 0/1 and never turns into a partial credit.
+#
+# NOTE: keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less files as
+# ANSI, and multi-byte comments can swallow the following newline.
 
 [CmdletBinding()]
 param(
@@ -32,11 +38,20 @@ $rubric = Get-Content -LiteralPath $RubricPath -Raw -Encoding UTF8 | ConvertFrom
 $statusById = @{}
 foreach ($check in @($checks.checks)) { $statusById[[string]$check.test_id] = [string]$check.status }
 
+$programmaticItems = @(@($rubric.items) | Where-Object { [string]$_.type -eq 'programmatic' })
+$llmItems = @(@($rubric.items) | Where-Object { [string]$_.type -ne 'programmatic' })
+$programmaticBudget = 0.0
+foreach ($item in $programmaticItems) { $programmaticBudget += [double]$item.weight }
+$llmBudget = 0.0
+foreach ($item in $llmItems) { $llmBudget += [double]$item.weight }
+$programmaticBudget = [Math]::Round($programmaticBudget, 6)
+$llmBudget = [Math]::Round($llmBudget, 6)
+
 $itemResults = New-Object System.Collections.ArrayList
 $weightedScore = 0.0
 $allPassed = $true
 
-foreach ($item in @($rubric.items)) {
+foreach ($item in $programmaticItems) {
     $missing = New-Object System.Collections.ArrayList
     $failed = New-Object System.Collections.ArrayList
     foreach ($id in @($item.test_ids)) {
@@ -50,6 +65,7 @@ foreach ($item in @($rubric.items)) {
     if ($passed) { $weightedScore += [double]$item.weight } else { $allPassed = $false }
     [void]$itemResults.Add([pscustomobject][ordered]@{
             rubric_id = [string]$item.rubric_id
+            type      = 'programmatic'
             weight    = [double]$item.weight
             passed    = $passed
             failed    = @($failed.ToArray())
@@ -62,21 +78,20 @@ $score = if ($allPassed) { 1 } else { 0 }
 $total = @($checks.checks).Count
 $failedTotal = @($checks.checks | Where-Object { [string]$_.status -ne 'PASS' }).Count
 
-if ($score -eq 1) { $reason = 'All rubric items satisfied.' }
+if ($score -eq 1) { $reason = 'All programmatic rubric items satisfied.' }
 else {
     $names = @($itemResults | Where-Object { -not $_.passed } | ForEach-Object { $_.rubric_id })
     $reason = "Unsatisfied rubric items: $($names -join ', ')"
 }
 
 # ---- Reviewer aggregate-v1 contract (bundled QC checker) --------------------
-# cases cover every testcase declared by the rubric; a terminal status other than
-# PASS or FAIL counts as invalid, and any invalid>0 makes run_validity=INVALID
-# (incomplete evidence / infrastructure failure is never a legitimate 0).
-# NOTE: keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less files as
-# ANSI, and multi-byte comments can swallow the following newline.
+# cases cover every testcase declared by the programmatic rubric; a terminal
+# status other than PASS or FAIL counts as invalid, and any invalid>0 makes
+# run_validity=INVALID (incomplete evidence / infrastructure failure is never a
+# legitimate 0).
 $cases = New-Object System.Collections.ArrayList
 $invalidTotal = 0
-foreach ($item in @($rubric.items)) {
+foreach ($item in $programmaticItems) {
     foreach ($id in @($item.test_ids)) {
         $bareId = ([string]$id) -replace '^(f2p|p2p)-', ''
         $st = ''
@@ -110,6 +125,12 @@ $result = [pscustomobject][ordered]@{
     mode           = $null
     verdict        = $score
     reason         = $reason
+    rubric_split   = [pscustomobject][ordered]@{
+        programmatic_weight = $programmaticBudget
+        llm_judge_weight    = $llmBudget
+        programmatic_items  = @($programmaticItems).Count
+        llm_judge_items     = @($llmItems).Count
+    }
     test           = [pscustomobject][ordered]@{
         report = [pscustomobject][ordered]@{
             status       = 'VALID'
@@ -121,7 +142,7 @@ $result = [pscustomobject][ordered]@{
         summary        = [pscustomobject][ordered]@{
             checks_total  = $total
             checks_failed = $failedTotal
-            items_total   = @($rubric.items).Count
+            items_total   = @($programmaticItems).Count
             items_failed  = @($itemResults | Where-Object { -not $_.passed }).Count
         }
         rubric_items = @($itemResults.ToArray())

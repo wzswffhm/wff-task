@@ -1,9 +1,12 @@
-# Generated for wfflab__wfmt-215 by the task authoring pipeline. Do not edit by hand.
+# Generated for wfflab__wfmt-215 by the task authoring pipeline.
 #
 # Objective checks for the wfmt container-format behaviour contract. The hidden
-# semantic suite is executed against the candidate package with pytest and its
-# per-test outcome is mapped onto stable check ids. Scoring is delegated to
-# aggregate_results.ps1.
+# semantic suite is injected by the evaluation side and executed against the
+# candidate package with pytest; its per-test outcome is mapped onto stable
+# check ids. Scoring is delegated to aggregate_results.ps1.
+#
+# The suite is deliberately NOT part of this package: it is resolved from a
+# verifier-side root. See agent_visible_paths.json.
 #
 # Exit codes:
 #   0  every check passed
@@ -14,7 +17,8 @@
 param(
     [string]$WorkspaceRoot = '',
     [string]$ChecksPath = '',
-    [string]$TaskRoot = ''
+    [string]$TaskRoot = '',
+    [string]$VerifierRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,17 +30,41 @@ $TaskRoot = (Resolve-Path -LiteralPath $TaskRoot).Path
 if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) { $WorkspaceRoot = Join-Path $TaskRoot 'environment\workspace' }
 if ([string]::IsNullOrWhiteSpace($ChecksPath)) { $ChecksPath = Join-Path (Join-Path $TaskRoot 'results') ('checks' + '.json') }
 
-$hiddenSuite = Join-Path $TaskRoot 'tests\hidden\test_wfmt_semantics.py'
+function Resolve-HiddenSuite([string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($Root)) { return '' }
+    foreach ($relative in @('tests\test_wfmt_semantics.py', 'test_wfmt_semantics.py')) {
+        $candidate = Join-Path $Root $relative
+        if (Test-Path -LiteralPath $candidate) { return (Resolve-Path -LiteralPath $candidate).Path }
+    }
+    return ''
+}
+
+$verifierCandidates = New-Object System.Collections.ArrayList
+if (-not [string]::IsNullOrWhiteSpace($VerifierRoot)) { [void]$verifierCandidates.Add($VerifierRoot) }
+if (-not [string]::IsNullOrWhiteSpace($env:WFMT_VERIFIER_ROOT)) { [void]$verifierCandidates.Add($env:WFMT_VERIFIER_ROOT) }
+[void]$verifierCandidates.Add('C:\verifier\wfflab__wfmt-215')
+[void]$verifierCandidates.Add('C:\verifier')
+$packageRoot = Split-Path -Parent $TaskRoot
+if (-not [string]::IsNullOrWhiteSpace($packageRoot)) {
+    [void]$verifierCandidates.Add((Join-Path $packageRoot 'outside_harbor-verifier\wfflab__wfmt-215'))
+}
+
+$hiddenSuite = ''
+foreach ($candidate in $verifierCandidates) {
+    $hiddenSuite = Resolve-HiddenSuite $candidate
+    if (-not [string]::IsNullOrWhiteSpace($hiddenSuite)) { break }
+}
 
 # ---- infrastructure preconditions -----------------------------------------
 if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $WorkspaceRoot 'wfmt') '__init__.py'))) {
     Write-Host "INVALID: candidate package not found under $WorkspaceRoot"
     exit 2
 }
-if (-not (Test-Path -LiteralPath $hiddenSuite)) {
-    Write-Host "INVALID: hidden semantic suite not found at $hiddenSuite"
+if ([string]::IsNullOrWhiteSpace($hiddenSuite)) {
+    Write-Host 'INVALID: the verifier-side hidden semantic suite was not injected'
     exit 2
 }
+Write-Host "verifier: hidden suite resolved to $hiddenSuite"
 
 # The graded suite runs against a scratch copy so that pytest artefacts never
 # touch the (possibly read-only) workspace and so a stale cache cannot leak in.
@@ -142,7 +170,7 @@ if _root not in sys.path:
 
     $payload = [pscustomobject][ordered]@{
         task_id      = 'wfflab__wfmt-215'
-        task_version = '2.0.0'
+        task_version = '2.1.0'
         checks       = @($results.ToArray())
     }
     $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ChecksPath -Encoding UTF8

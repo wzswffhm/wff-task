@@ -240,7 +240,7 @@ R['window_rule_read'] = ('窗口起点取 rules_windows.csv 明示的「情景�
 # ============================ 6. 压力测试（正式 32 条 + 当前持仓基准单列）============================
 def cgb_pnl(w_cgb, shock_str):
     d = {kv.split(':')[0].strip().lower(): float(kv.split(':')[1]) for kv in shock_str.split(',')}
-    return sum(-w_dur[t] * d[t] / 100.0 for t in d if t in w_dur) if w_cgb else 0.0
+    return sum(-w_dur[t] * d[t] / 10000.0 for t in d if t in w_dur) if w_cgb else 0.0
 stress = {}
 for _, s in shocks.iterrows():
     for tag in ['committee', 'historical']:
@@ -250,11 +250,13 @@ for _, s in shocks.iterrows():
         else:
             h = hist.get(s.scenario_id, {}).get('calib', {})
             sh = {'EQ_000300': h.get('EQ_000300', 0), 'EQ_000905': h.get('EQ_000905', 0), 'EQ_399006': h.get('EQ_399006', 0),
-                  'SPX_USD': h.get('SPX', 0) / (1 + h.get('USD_CASH', 0)) if h.get('SPX') is not None else 0,
+                  'SPX_USD': (((1 + h.get('SPX', 0)) / (1 + h.get('USD_CASH', 0)) - 1)
+                              if h.get('SPX') is not None else 0),
                   'CNH': h.get('USD_CASH', 0), 'CGB_DIRECT': h.get('CGB', 0)}
         for pn, w in planw.items():
             spx_cny = (1 + sh['SPX_USD']) * (1 + sh['CNH']) - 1
-            parts = {'境内权益': (w['EQ_000300'] + w['EQ_000905'] + w['EQ_399006']) * sh['EQ_000300'],
+            parts = {'境内权益': (w['EQ_000300'] * sh['EQ_000300'] + w['EQ_000905'] * sh['EQ_000905']
+                                + w['EQ_399006'] * sh['EQ_399006']),
                      '标普500': w['SPX'] * spx_cny, '美元现金': w['USD_CASH'] * sh['CNH'],
                      '国债': w['CGB'] * sh['CGB_DIRECT']}
             stress[(pn, s.scenario_id, tag)] = dict(parts=parts, total=sum(parts.values()))

@@ -5,7 +5,7 @@
 ```
 wfmt/
   errors.py     # WFormatError（kind 标记）
-  varint.py     # uvarint（LEB128）编解码
+  varint.py     # 无符号变长整数编解码
   crc.py        # 尾部校验和
   header.py     # 文件头
   codec.py      # 记录编解码 + 整份容器 pack/unpack/verify
@@ -39,5 +39,4 @@ python -m pytest tests\test_wfmt_basic.py
 
 可见冒烟测试只验证「自己写的数据自己能读回来」，**它全绿不代表格式正确**。
 
-题面契约见任务 instruction.md；判分使用隐藏测试
-`tests/test_wfmt_semantics.py`。修复时不要改动公开 API 的签名。
+修复时不要改动公开 API 的名称与签名。

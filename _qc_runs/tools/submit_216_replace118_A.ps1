@@ -1,4 +1,4 @@
-﻿# submit_216_replace118.ps1 —— 用 wfflab__wchunk-216 v1.1.0 替换飞书 118 号（原 217）附件
+# submit_216_replace118.ps1 —— 用 wfflab__wchunk-216 v1.1.0 替换飞书 118 号（原 217）附件
 #
 # 权限顺序（不可颠倒）：记录在状态变为「待质检」的瞬间即失去标注员写权限，
 # 故：清空旧附件 -> 上传新 zip -> 上传两张新截图 -> 读回校验 -> 改文本字段 -> 最后才改状态。
@@ -19,8 +19,9 @@ $BaseToken = 'EsJebL8JJaf7g4sIbItcnMFgnvg'
 $TableId   = 'tblRDxcGkblflMBA'
 $RecordId  = 'reczz28KQU8reW2k'
 $Repo      = 'C:\Users\Administrator\Desktop\wff-task'
-$Deliver   = Join-Path $Repo 'deliverables\2026-10-10_wchunk216-交付'
-$ZipPath   = Join-Path $Deliver 'package\wfflab__wchunk-216-v1.1.0-delivery.zip'
+# v1.2.0 返修包：题包整改 + 14 轮重跑后的交付物
+$Deliver   = Join-Path $Repo 'deliverables\2026-10-11_wchunk216-返修'
+$ZipPath   = Join-Path $Deliver 'package\wfflab__wchunk-216-v1.2.0-delivery.zip'
 $ImgCtl    = Join-Path $Deliver 'evidence\images\oracle_nop_controls.png'
 $ImgScore  = Join-Path $Deliver 'evidence\images\score_summary.png'
 
@@ -47,12 +48,12 @@ function Get-Cells {
     return $cells
 }
 
-# 0) 状态必须是「待提交」
+# 0) 状态必须是标注员可写的状态（待提交 / 待返修）
 $cells = Get-Cells
 $current = @($cells['状态']) -join ','
 Write-Host "current status : $current"
-if ($current -ne '待提交') {
-    throw "状态为「$current」，标注员此时无写权限。请先在飞书界面改回「待提交」再运行。"
+if ($current -notin @('待提交', '待返修')) {
+    throw "状态为「$current」，标注员此时无写权限。请在飞书界面改回「待提交」或「待返修」再运行。"
 }
 Write-Host "old zip        : " ((@($cells['作业压缩包']) | ForEach-Object { "$($_.name)($($_.size))" }) -join ', ')
 Write-Host "old score img  : " ((@($cells['分数截图']) | ForEach-Object { "$($_.name)($($_.size))" }) -join ', ')
