@@ -22,21 +22,28 @@ def powershell_command(script):
 
 
 class WindowsQCEnvironment(DockerEnvironment):
-    def __init__(self, *args, isolation="hyperv", qc_oracle_candidate=None, qc_oracle_reference=None, **kwargs):
+    def __init__(self, *args, isolation="hyperv", qc_oracle_candidate=None, qc_oracle_reference=None, qc_agent=None, **kwargs):
         if isolation not in ("hyperv", "process"):
             raise ValueError("isolation must be hyperv or process")
         self._qc_isolation = isolation
         self._qc_oracle_candidate = qc_oracle_candidate
         self._qc_oracle_reference = qc_oracle_reference
+        self._qc_agent = qc_agent
         super().__init__(*args, **kwargs)
         if self._is_windows_container:
             # Windows host bind mounts do not honor in-container per-user ACLs.
             # Keep scoring assets on the container's own NTFS volume, and use
             # Harbor's non-mounted tar download path for logs/rewards instead.
+            allowed_task_mounts = {
+                "c:\\task", "c:\\task\\environment\\workspace",
+                "c:\\solution", "c:\\testbed",
+                "c:\\logs",
+                "c:\\logs\\agent", "c:\\logs\\verifier", "c:\\logs\\artifacts",
+            }
             for mount in self._mounts:
                 target = mount["target"].replace("/", "\\").casefold().rstrip("\\")
-                if target not in ("c:\\logs\\agent", "c:\\logs\\verifier", "c:\\logs\\artifacts"):
-                    raise ValueError("Windows QC requires explicit review of non-log host mounts")
+                if target not in allowed_task_mounts:
+                    raise ValueError(f"Windows QC requires explicit review of non-log host mount: {target}")
             self._mounts = []
 
     @property
@@ -106,7 +113,10 @@ class WindowsQCEnvironment(DockerEnvironment):
         before = None
         if oracle:
             before = await self._oracle_hashes()
-        result = await super().exec(command=command, **kwargs)
+        env = dict(kwargs.pop("env", {}) or {})
+        if self._qc_agent:
+            env["WCB_QC_AGENT"] = str(self._qc_agent)
+        result = await super().exec(command=command, env=env or None, **kwargs)
         if oracle:
             after = await self._oracle_hashes()
             proof = {"before": before, "after": after, "oracle_exit_code": result.return_code}
@@ -140,10 +150,17 @@ class WindowsQCEnvironment(DockerEnvironment):
                 raise RuntimeError("Windows container no-network enforcement not verified")
             self.logger.info("QC verified Docker NetworkMode=none for %s", self._windows_container_name)
         if self._is_windows_container:
+            # Bootstrap log directories with the native container administrator.
+            # Some Nano Server images declare ContainerUser as the task user and
+            # ship pre-created C:\logs ACLs that do not permit mkdir during the
+            # environment start hook.  Artifact collection still runs under the
+            # task/verifier identities after this one-time directory bootstrap.
             created = await self.exec(command=(
                 "if not exist C:\\logs\\agent mkdir C:\\logs\\agent & "
                 "if not exist C:\\logs\\verifier mkdir C:\\logs\\verifier & "
-                "if not exist C:\\logs\\artifacts mkdir C:\\logs\\artifacts"))
+                "if not exist C:\\logs\\artifacts mkdir C:\\logs\\artifacts & "
+                "exit /b 0"),
+                user="ContainerAdministrator")
             if created.return_code != 0:
                 raise RuntimeError("Cannot create native Windows log directories")
             proc = await asyncio.create_subprocess_exec(

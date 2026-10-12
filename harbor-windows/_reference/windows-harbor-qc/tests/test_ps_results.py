@@ -43,6 +43,38 @@ class PowerShellResultTests(unittest.TestCase):
         self.assertEqual(self.evaluate(report,1)['validity'],'INVALID')
         self.assertEqual(self.evaluate(self.report(),0)['validity'],'INVALID')
 
+    def manifest_dict(self, report, reward):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            save(root/'tests/required_testcases.json', [
+                {'id':'f','group':'F2P'}, {'id':'p','group':'P2P'}])
+            save(root/'verifier/report.json', report)
+            return formal_result(
+                {'trial_root':str(root),'rewards':{'reward':reward}},
+                {'root':str(root)})
+
+    def test_required_manifest_accepts_strict_testcase_dictionary(self):
+        report={'status':'VALID','score':1,'f2p':['f'],'p2p':['p'],
+                'testcases':{'f':'PASS','p':'PASS'}}
+        result=self.manifest_dict(report,1)
+        self.assertEqual(result['validity'],'VALID')
+        self.assertEqual(result['score'],1)
+        self.assertEqual(result['cases'][0],{'id':'f','group':'F2P','status':'PASS'})
+
+    def test_required_manifest_rejects_incomplete_or_forged_dictionary(self):
+        base={'status':'VALID','score':1,'f2p':['f'],'p2p':['p'],
+              'testcases':{'f':'PASS','p':'PASS'}}
+        for mutation in ('missing','extra','group','status','reward'):
+            report=copy.deepcopy(base)
+            reward=1
+            if mutation=='missing': del report['testcases']['p']
+            elif mutation=='extra': report['testcases']['x']='PASS'
+            elif mutation=='group': report['f2p'],report['p2p']=[],['f','p']
+            elif mutation=='status': report['testcases']['f']='SKIP'
+            else: reward=0
+            with self.subTest(mutation=mutation):
+                self.assertEqual(self.manifest_dict(report,reward)['validity'],'INVALID')
+
     def aggregate(self, report, reward):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

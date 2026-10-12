@@ -1,0 +1,432 @@
+# Windows Harbor 完整质检报告
+
+结论：**FAIL**
+
+- 交付目录：`FAIL`
+- 四模型门禁：`FAIL`
+- 四模型原始 jobs：`FAIL`
+- Oracle/NOP：`FAIL`
+- 十项人工质量复核：`BLOCKED`
+
+## 交付目录
+
+- 错误：invalid environment/adapter.toml: Cannot overwrite a value (at line 38, column 9)
+- 警告：source.json is absent; this is allowed and does not block QC
+
+## 模型门禁
+
+- 错误：qwen run 1 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：qwen run 1 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：qwen run 2 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：qwen run 3 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：opus run 1 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：opus run 1 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：opus run 2 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：opus run 2 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：opus run 3 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：opus run 3 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：glm run 1 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：glm run 1 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：kimi run 1 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+
+## 模型 jobs
+
+- 错误：task0__dS5Anlm is missing verifier/verifier.log
+- 错误：task0__dS5Anlm is missing agent/trajectory.jsonl
+- 错误：task0__dS5Anlm has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__dS5Anlm was run against a different Task checksum
+- 错误：task0__dS5Anlm testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task0__dS5Anlm testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx is missing verifier/verifier.log
+- 错误：task0__Hf3bZRx is missing agent/trajectory.jsonl
+- 错误：task0__Hf3bZRx has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__Hf3bZRx was run against a different Task checksum
+- 错误：task0__Hf3bZRx testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task0__Hf3bZRx testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN is missing verifier/verifier.log
+- 错误：task0__iiGcUTN is missing agent/trajectory.jsonl
+- 错误：task0__iiGcUTN has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__iiGcUTN was run against a different Task checksum
+- 错误：task0__iiGcUTN testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task0__iiGcUTN testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 is missing verifier/verifier.log
+- 错误：task0__je8YHt0 is missing agent/trajectory.jsonl
+- 错误：task0__je8YHt0 has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__je8YHt0 was run against a different Task checksum
+- 错误：task0__je8YHt0 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task0__je8YHt0 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task0__srtAmMD is missing verifier/verifier.log
+- 错误：task0__srtAmMD is missing agent/trajectory.jsonl
+- 错误：task0__srtAmMD has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__srtAmMD was run against a different Task checksum
+- 错误：task0__srtAmMD testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task0__srtAmMD testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr is missing verifier/verifier.log
+- 错误：task0__VGwsfjr is missing agent/trajectory.jsonl
+- 错误：task0__VGwsfjr has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__VGwsfjr was run against a different Task checksum
+- 错误：task0__VGwsfjr testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task0__VGwsfjr testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 is missing verifier/verifier.log
+- 错误：task__0FH0XP7 was run against a different Task checksum
+- 错误：task__0FH0XP7 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__0FH0XP7 model-result.json provenance is incomplete
+- 错误：task__AcS15S5 is missing verifier/verifier.log
+- 错误：task__AcS15S5 was run against a different Task checksum
+- 错误：task__AcS15S5 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__AcS15S5 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__AcS15S5 model-result.json provenance is incomplete
+- 错误：task__er1BSiC is missing verifier/verifier.log
+- 错误：task__er1BSiC was run against a different Task checksum
+- 错误：task__er1BSiC testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__er1BSiC testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__er1BSiC model-result.json provenance is incomplete
+- 错误：task__ExgEksN is missing verifier/verifier.log
+- 错误：task__ExgEksN was run against a different Task checksum
+- 错误：task__ExgEksN testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__ExgEksN testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__ExgEksN model-result.json provenance is incomplete
+- 错误：task__FxsRb9M is missing verifier/verifier.log
+- 错误：task__FxsRb9M was run against a different Task checksum
+- 错误：task__FxsRb9M testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__FxsRb9M testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__FxsRb9M model-result.json provenance is incomplete
+- 错误：task__hfKbOF8 is missing verifier/verifier.log
+- 错误：task__hfKbOF8 was run against a different Task checksum
+- 错误：task__hfKbOF8 testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__hfKbOF8 model-result.json provenance is incomplete
+- 错误：task__LcGAvlP is missing verifier/verifier.log
+- 错误：task__LcGAvlP was run against a different Task checksum
+- 错误：task__LcGAvlP testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__LcGAvlP testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__LcGAvlP model-result.json provenance is incomplete
+- 错误：task__O55X5AZ is missing verifier/verifier.log
+- 错误：task__O55X5AZ was run against a different Task checksum
+- 错误：task__O55X5AZ testcase f2p-sample-verifies has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-sample-roundtrip-is-byte-identical has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-sample-records-match-expected has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-crc-matches-standard-check-value has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-tampered-content-is-rejected has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-checksum-covers-header-and-records has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-truncated-container-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-bad-magic-is-reported-as-magic has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-verify-never-raises has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase f2p-iter-records-is-streaming has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-truncated-stream-is-reported-as-truncated has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-read-all-matches-unpack has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-self-roundtrip-small-records has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-empty-payload-roundtrip has non-terminal status 'NONE'
+- 错误：task__O55X5AZ testcase p2p-pack-verify-agrees-for-generated-data has non-terminal status 'NONE'
+- 错误：task__O55X5AZ model-result.json provenance is incomplete
+- 错误：jobs/ contains 0 oracle jobs; exactly 3 required
+- 错误：jobs/ contains 0 nop jobs; exactly 3 required
+
+## 十项人工质量硬门禁
+
+- **Golden/NOP 得分和逐 testcase 终态符合预期**：`BLOCKED`
+  - 说明：Golden/NOP 得分和逐 testcase 终态符合预期
+- **每项评分标准和每个 testcase 判分正确**：`BLOCKED`
+  - 说明：每项评分标准和每个 testcase 判分正确
+- **Testcase 严格对应题面并检查功能而非固定写法**：`BLOCKED`
+  - 说明：Testcase 严格对应题面并检查功能而非固定写法
+- **模型没有联网取答案、搜索 Golden 或绕过评分**：`BLOCKED`
+  - 说明：模型没有联网取答案、搜索 Golden 或绕过评分
+- **题目具备真实 Windows 反事实价值**：`BLOCKED`
+  - 说明：题目具备真实 Windows 反事实价值
+- **范围、版本、公式和全部执行资产身份已冻结**：`BLOCKED`
+  - 说明：范围、版本、公式和全部执行资产身份已冻结
+- **WIP 94 项已逐项登记并提供证据或 N/A 依据**：`BLOCKED`
+  - 说明：WIP 94 项已逐项登记并提供证据或 N/A 依据
+- **采购手册 D01-D20 已逐项完成动态审计**：`BLOCKED`
+  - 说明：采购手册 D01-D20 已逐项完成动态审计
+- **已从 required testcase 和冻结公式独立复算正式分数**：`BLOCKED`
+  - 说明：已从 required testcase 和冻结公式独立复算正式分数
+- **原始证据、历史版本、整改和干净复验已闭环**：`BLOCKED`
+  - 说明：原始证据、历史版本、整改和干净复验已闭环
+- 错误：未提供十项人工质量复核；自动检查通过也不能签发最终 PASS
+
+## 原始证据
+
+- `harbor/`：真实 Oracle/NOP 报告、命令、job 和 CLI 日志
+- `delivery-layout.json`：目录与 task_id/version/hash 绑定
+- `model-gate.json`：四模型次数、分数和区分度
+- `model-jobs.json`：14 个 Harbor jobs（8 个模型、3 个 Oracle、3 个 NOP）交叉校验
+- 人工证据：WIP 94 项、D01-D20、逐项证据链、Hack 事件和独立复算文件

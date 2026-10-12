@@ -90,12 +90,58 @@ def formal_result(trial, task):
     manifest = Path(task["root"]) / "tests" / "required_testcases.json"
     if manifest.is_file():
         expected = read(manifest)
-        cases = report.get("testcases", [])
-        ids = [c.get("id") for c in cases]
+        if (
+            not isinstance(expected, list)
+            or not expected
+            or any(
+                not isinstance(c, dict)
+                or not isinstance(c.get("id"), str)
+                or c.get("group") not in ("F2P", "P2P")
+                for c in expected
+            )
+        ):
+            return {"validity": "INVALID", "score": None, "reason": "Malformed fixed required testcase set"}
         expected_ids = [c["id"] for c in expected]
-        if not ids or len(set(ids)) != len(ids) or sorted(ids) != sorted(expected_ids) or sorted(report.get("required", [])) != sorted(ids):
+        if len(set(expected_ids)) != len(expected_ids):
             return {"validity": "INVALID", "score": None, "reason": "Missing/duplicate required testcase"}
         groups = {c["id"]: c["group"] for c in expected}
+        reported_groups = {
+            test_id: group.upper()
+            for group in ("f2p", "p2p")
+            for test_id in report.get(group, [])
+            if isinstance(test_id, str)
+        }
+        raw_cases = report.get("testcases", [])
+        if isinstance(raw_cases, dict):
+            ids = list(raw_cases)
+            if (
+                any(not isinstance(test_id, str) for test_id in ids)
+                or len(ids) != len(expected_ids)
+                or set(ids) != set(expected_ids)
+                or reported_groups != groups
+                or any(status not in ("PASS", "FAIL") for status in raw_cases.values())
+            ):
+                return {"validity": "INVALID", "score": None, "reason": "Missing/duplicate required testcase"}
+            cases = [
+                {"id": test_id, "group": groups[test_id], "status": raw_cases[test_id]}
+                for test_id in expected_ids
+            ]
+        elif isinstance(raw_cases, list):
+            if any(not isinstance(c, dict) for c in raw_cases):
+                return {"validity": "INVALID", "score": None, "reason": "Malformed required testcase"}
+            ids = [c.get("id") for c in raw_cases]
+            declared = report.get("required")
+            if (
+                not ids
+                or len(set(ids)) != len(ids)
+                or set(ids) != set(expected_ids)
+                or (declared is not None and set(declared) != set(ids))
+                or (reported_groups and reported_groups != groups)
+            ):
+                return {"validity": "INVALID", "score": None, "reason": "Missing/duplicate required testcase"}
+            cases = raw_cases
+        else:
+            return {"validity": "INVALID", "score": None, "reason": "Malformed required testcase"}
         if any(c.get("status") not in ("PASS", "FAIL") or c.get("group") != groups[c["id"]] for c in cases):
             return {"validity": "INVALID", "score": None, "reason": "Invalid testcase status or group"}
     else:

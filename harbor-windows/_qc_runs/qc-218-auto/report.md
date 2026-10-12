@@ -1,0 +1,238 @@
+# Windows Harbor 完整质检报告
+
+结论：**FAIL**
+
+- 交付目录：`FAIL`
+- 四模型门禁：`FAIL`
+- 四模型原始 jobs：`FAIL`
+- Oracle/NOP：`FAIL`
+- 十项人工质量复核：`BLOCKED`
+
+## 交付目录
+
+- 错误：invalid environment/adapter.toml: Cannot overwrite a value (at line 38, column 9)
+- 警告：source.json is absent; this is allowed and does not block QC
+
+## 模型门禁
+
+- 错误：qwen run 1 is not VALID; infrastructure failures cannot count as zero
+- 错误：qwen run 1 does not have binary score 0/1
+- 错误：qwen run 1 has no testcase evidence
+- 错误：qwen run 2 is not VALID; infrastructure failures cannot count as zero
+- 错误：qwen run 2 does not have binary score 0/1
+- 错误：qwen run 2 has no testcase evidence
+- 错误：qwen run 3 is not VALID; infrastructure failures cannot count as zero
+- 错误：qwen run 3 does not have binary score 0/1
+- 错误：qwen run 3 has no testcase evidence
+- 错误：opus run 1 is not VALID; infrastructure failures cannot count as zero
+- 错误：opus run 1 does not have binary score 0/1
+- 错误：opus run 1 has no testcase evidence
+- 错误：opus run 2 is not VALID; infrastructure failures cannot count as zero
+- 错误：opus run 2 does not have binary score 0/1
+- 错误：opus run 2 has no testcase evidence
+- 错误：opus run 3 is not VALID; infrastructure failures cannot count as zero
+- 错误：opus run 3 does not have binary score 0/1
+- 错误：opus run 3 has no testcase evidence
+- 错误：glm run 1 is not VALID; infrastructure failures cannot count as zero
+- 错误：glm run 1 does not have binary score 0/1
+- 错误：glm run 1 has no testcase evidence
+- 错误：kimi run 1 is not VALID; infrastructure failures cannot count as zero
+- 错误：kimi run 1 does not have binary score 0/1
+- 错误：kimi run 1 has no testcase evidence
+
+## 模型 jobs
+
+- 错误：task0__8Bwpgdp is missing lock.json
+- 错误：task0__8Bwpgdp is missing artifacts/manifest.json
+- 错误：task0__8Bwpgdp is missing verifier/test-stdout.txt
+- 错误：task0__8Bwpgdp is missing verifier/verifier.log
+- 错误：task0__8Bwpgdp is missing agent/model-result.json
+- 错误：task0__8Bwpgdp is missing agent/trajectory.jsonl
+- 错误：task0__8Bwpgdp has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__8Bwpgdp was run against a different Task checksum
+- 错误：task0__8Bwpgdp verifier status is not VALID
+- 错误：task0__8Bwpgdp verifier score is not binary 0/1
+- 错误：task0__8Bwpgdp testcase set does not match tests/required_testcases.json
+- 错误：task0__8Bwpgdp verifier/result/reward values are inconsistent
+- 错误：task0__9XeiAhR is missing lock.json
+- 错误：task0__9XeiAhR is missing artifacts/manifest.json
+- 错误：task0__9XeiAhR is missing verifier/test-stdout.txt
+- 错误：task0__9XeiAhR is missing verifier/verifier.log
+- 错误：task0__9XeiAhR is missing agent/model-result.json
+- 错误：task0__9XeiAhR is missing agent/trajectory.jsonl
+- 错误：task0__9XeiAhR has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__9XeiAhR was run against a different Task checksum
+- 错误：task0__9XeiAhR verifier status is not VALID
+- 错误：task0__9XeiAhR verifier score is not binary 0/1
+- 错误：task0__9XeiAhR testcase set does not match tests/required_testcases.json
+- 错误：task0__9XeiAhR verifier/result/reward values are inconsistent
+- 错误：task0__dijRIwT is missing lock.json
+- 错误：task0__dijRIwT is missing artifacts/manifest.json
+- 错误：task0__dijRIwT is missing verifier/test-stdout.txt
+- 错误：task0__dijRIwT is missing verifier/verifier.log
+- 错误：task0__dijRIwT is missing agent/model-result.json
+- 错误：task0__dijRIwT is missing agent/trajectory.jsonl
+- 错误：task0__dijRIwT has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__dijRIwT was run against a different Task checksum
+- 错误：task0__dijRIwT verifier status is not VALID
+- 错误：task0__dijRIwT verifier score is not binary 0/1
+- 错误：task0__dijRIwT testcase set does not match tests/required_testcases.json
+- 错误：task0__dijRIwT verifier/result/reward values are inconsistent
+- 错误：task0__JN4U05R is missing lock.json
+- 错误：task0__JN4U05R is missing artifacts/manifest.json
+- 错误：task0__JN4U05R is missing verifier/test-stdout.txt
+- 错误：task0__JN4U05R is missing verifier/verifier.log
+- 错误：task0__JN4U05R is missing agent/model-result.json
+- 错误：task0__JN4U05R is missing agent/trajectory.jsonl
+- 错误：task0__JN4U05R has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__JN4U05R was run against a different Task checksum
+- 错误：task0__JN4U05R verifier status is not VALID
+- 错误：task0__JN4U05R verifier score is not binary 0/1
+- 错误：task0__JN4U05R testcase set does not match tests/required_testcases.json
+- 错误：task0__JN4U05R verifier/result/reward values are inconsistent
+- 错误：task0__SIs1Erf is missing lock.json
+- 错误：task0__SIs1Erf is missing artifacts/manifest.json
+- 错误：task0__SIs1Erf is missing verifier/test-stdout.txt
+- 错误：task0__SIs1Erf is missing verifier/verifier.log
+- 错误：task0__SIs1Erf is missing agent/model-result.json
+- 错误：task0__SIs1Erf is missing agent/trajectory.jsonl
+- 错误：task0__SIs1Erf has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__SIs1Erf was run against a different Task checksum
+- 错误：task0__SIs1Erf verifier status is not VALID
+- 错误：task0__SIs1Erf verifier score is not binary 0/1
+- 错误：task0__SIs1Erf testcase set does not match tests/required_testcases.json
+- 错误：task0__SIs1Erf verifier/result/reward values are inconsistent
+- 错误：task0__W857Ilx is missing lock.json
+- 错误：task0__W857Ilx is missing artifacts/manifest.json
+- 错误：task0__W857Ilx is missing verifier/test-stdout.txt
+- 错误：task0__W857Ilx is missing verifier/verifier.log
+- 错误：task0__W857Ilx is missing agent/model-result.json
+- 错误：task0__W857Ilx is missing agent/trajectory.jsonl
+- 错误：task0__W857Ilx has no recognized Qwen/Opus/GLM/Kimi alias
+- 错误：task0__W857Ilx was run against a different Task checksum
+- 错误：task0__W857Ilx verifier status is not VALID
+- 错误：task0__W857Ilx verifier score is not binary 0/1
+- 错误：task0__W857Ilx testcase set does not match tests/required_testcases.json
+- 错误：task0__W857Ilx verifier/result/reward values are inconsistent
+- 错误：task__Gh0ADMC is missing lock.json
+- 错误：task__Gh0ADMC is missing artifacts/manifest.json
+- 错误：task__Gh0ADMC is missing verifier/test-stdout.txt
+- 错误：task__Gh0ADMC is missing verifier/verifier.log
+- 错误：task__Gh0ADMC is missing agent/model-result.json
+- 错误：task__Gh0ADMC was run against a different Task checksum
+- 错误：task__Gh0ADMC verifier status is not VALID
+- 错误：task__Gh0ADMC verifier score is not binary 0/1
+- 错误：task__Gh0ADMC testcase set does not match tests/required_testcases.json
+- 错误：task__Gh0ADMC verifier/result/reward values are inconsistent
+- 错误：task__Gh0ADMC model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__Gh0ADMC\\agent\\model-result.json'
+- 错误：task__lBlN7vk is missing lock.json
+- 错误：task__lBlN7vk is missing artifacts/manifest.json
+- 错误：task__lBlN7vk is missing verifier/test-stdout.txt
+- 错误：task__lBlN7vk is missing verifier/verifier.log
+- 错误：task__lBlN7vk is missing agent/model-result.json
+- 错误：task__lBlN7vk was run against a different Task checksum
+- 错误：task__lBlN7vk verifier status is not VALID
+- 错误：task__lBlN7vk verifier score is not binary 0/1
+- 错误：task__lBlN7vk testcase set does not match tests/required_testcases.json
+- 错误：task__lBlN7vk verifier/result/reward values are inconsistent
+- 错误：task__lBlN7vk model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__lBlN7vk\\agent\\model-result.json'
+- 错误：task__LP86F2g is missing lock.json
+- 错误：task__LP86F2g is missing artifacts/manifest.json
+- 错误：task__LP86F2g is missing verifier/test-stdout.txt
+- 错误：task__LP86F2g is missing verifier/verifier.log
+- 错误：task__LP86F2g is missing agent/model-result.json
+- 错误：task__LP86F2g was run against a different Task checksum
+- 错误：task__LP86F2g verifier status is not VALID
+- 错误：task__LP86F2g verifier score is not binary 0/1
+- 错误：task__LP86F2g testcase set does not match tests/required_testcases.json
+- 错误：task__LP86F2g verifier/result/reward values are inconsistent
+- 错误：task__LP86F2g model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__LP86F2g\\agent\\model-result.json'
+- 错误：task__rGwCJg1 is missing lock.json
+- 错误：task__rGwCJg1 is missing artifacts/manifest.json
+- 错误：task__rGwCJg1 is missing verifier/test-stdout.txt
+- 错误：task__rGwCJg1 is missing verifier/verifier.log
+- 错误：task__rGwCJg1 is missing agent/model-result.json
+- 错误：task__rGwCJg1 was run against a different Task checksum
+- 错误：task__rGwCJg1 verifier status is not VALID
+- 错误：task__rGwCJg1 verifier score is not binary 0/1
+- 错误：task__rGwCJg1 testcase set does not match tests/required_testcases.json
+- 错误：task__rGwCJg1 verifier/result/reward values are inconsistent
+- 错误：task__rGwCJg1 model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__rGwCJg1\\agent\\model-result.json'
+- 错误：task__ruPoniZ is missing lock.json
+- 错误：task__ruPoniZ is missing artifacts/manifest.json
+- 错误：task__ruPoniZ is missing verifier/test-stdout.txt
+- 错误：task__ruPoniZ is missing verifier/verifier.log
+- 错误：task__ruPoniZ is missing agent/model-result.json
+- 错误：task__ruPoniZ was run against a different Task checksum
+- 错误：task__ruPoniZ verifier status is not VALID
+- 错误：task__ruPoniZ verifier score is not binary 0/1
+- 错误：task__ruPoniZ testcase set does not match tests/required_testcases.json
+- 错误：task__ruPoniZ verifier/result/reward values are inconsistent
+- 错误：task__ruPoniZ model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__ruPoniZ\\agent\\model-result.json'
+- 错误：task__SToQv6C is missing lock.json
+- 错误：task__SToQv6C is missing artifacts/manifest.json
+- 错误：task__SToQv6C is missing verifier/test-stdout.txt
+- 错误：task__SToQv6C is missing verifier/verifier.log
+- 错误：task__SToQv6C is missing agent/model-result.json
+- 错误：task__SToQv6C was run against a different Task checksum
+- 错误：task__SToQv6C verifier status is not VALID
+- 错误：task__SToQv6C verifier score is not binary 0/1
+- 错误：task__SToQv6C testcase set does not match tests/required_testcases.json
+- 错误：task__SToQv6C verifier/result/reward values are inconsistent
+- 错误：task__SToQv6C model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__SToQv6C\\agent\\model-result.json'
+- 错误：task__yen3cDM is missing lock.json
+- 错误：task__yen3cDM is missing artifacts/manifest.json
+- 错误：task__yen3cDM is missing verifier/test-stdout.txt
+- 错误：task__yen3cDM is missing verifier/verifier.log
+- 错误：task__yen3cDM is missing agent/model-result.json
+- 错误：task__yen3cDM was run against a different Task checksum
+- 错误：task__yen3cDM verifier status is not VALID
+- 错误：task__yen3cDM verifier score is not binary 0/1
+- 错误：task__yen3cDM testcase set does not match tests/required_testcases.json
+- 错误：task__yen3cDM verifier/result/reward values are inconsistent
+- 错误：task__yen3cDM model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__yen3cDM\\agent\\model-result.json'
+- 错误：task__ZPTIj6v is missing lock.json
+- 错误：task__ZPTIj6v is missing artifacts/manifest.json
+- 错误：task__ZPTIj6v is missing verifier/test-stdout.txt
+- 错误：task__ZPTIj6v is missing verifier/verifier.log
+- 错误：task__ZPTIj6v is missing agent/model-result.json
+- 错误：task__ZPTIj6v was run against a different Task checksum
+- 错误：task__ZPTIj6v verifier status is not VALID
+- 错误：task__ZPTIj6v verifier score is not binary 0/1
+- 错误：task__ZPTIj6v testcase set does not match tests/required_testcases.json
+- 错误：task__ZPTIj6v verifier/result/reward values are inconsistent
+- 错误：task__ZPTIj6v model provenance is unreadable: [Errno 2] No such file or directory: 'C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\qc-218-auto\\input\\wfflab__wlogseg-218-v1.0.0-delivery\\jobs\\task__ZPTIj6v\\agent\\model-result.json'
+- 错误：jobs/ contains 0 oracle jobs; exactly 3 required
+- 错误：jobs/ contains 0 nop jobs; exactly 3 required
+
+## 十项人工质量硬门禁
+
+- **Golden/NOP 得分和逐 testcase 终态符合预期**：`BLOCKED`
+  - 说明：Golden/NOP 得分和逐 testcase 终态符合预期
+- **每项评分标准和每个 testcase 判分正确**：`BLOCKED`
+  - 说明：每项评分标准和每个 testcase 判分正确
+- **Testcase 严格对应题面并检查功能而非固定写法**：`BLOCKED`
+  - 说明：Testcase 严格对应题面并检查功能而非固定写法
+- **模型没有联网取答案、搜索 Golden 或绕过评分**：`BLOCKED`
+  - 说明：模型没有联网取答案、搜索 Golden 或绕过评分
+- **题目具备真实 Windows 反事实价值**：`BLOCKED`
+  - 说明：题目具备真实 Windows 反事实价值
+- **范围、版本、公式和全部执行资产身份已冻结**：`BLOCKED`
+  - 说明：范围、版本、公式和全部执行资产身份已冻结
+- **WIP 94 项已逐项登记并提供证据或 N/A 依据**：`BLOCKED`
+  - 说明：WIP 94 项已逐项登记并提供证据或 N/A 依据
+- **采购手册 D01-D20 已逐项完成动态审计**：`BLOCKED`
+  - 说明：采购手册 D01-D20 已逐项完成动态审计
+- **已从 required testcase 和冻结公式独立复算正式分数**：`BLOCKED`
+  - 说明：已从 required testcase 和冻结公式独立复算正式分数
+- **原始证据、历史版本、整改和干净复验已闭环**：`BLOCKED`
+  - 说明：原始证据、历史版本、整改和干净复验已闭环
+- 错误：未提供十项人工质量复核；自动检查通过也不能签发最终 PASS
+
+## 原始证据
+
+- `harbor/`：真实 Oracle/NOP 报告、命令、job 和 CLI 日志
+- `delivery-layout.json`：目录与 task_id/version/hash 绑定
+- `model-gate.json`：四模型次数、分数和区分度
+- `model-jobs.json`：14 个 Harbor jobs（8 个模型、3 个 Oracle、3 个 NOP）交叉校验
+- 人工证据：WIP 94 项、D01-D20、逐项证据链、Hack 事件和独立复算文件

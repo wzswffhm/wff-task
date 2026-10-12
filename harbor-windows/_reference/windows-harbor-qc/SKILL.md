@@ -1,61 +1,84 @@
 ---
 name: windows-harbor-qc
-description: 对 Outside Harbor Windows 题包或 ZIP 做本地真实 Harbor 质检，检查 Demo 目录、Windows 环境、测试与二值评分，并运行 Oracle/NOP 生成可审计报告。
+description: 质检直接 Harbor Windows 作业目录或 ZIP，执行标准 Task/14 jobs/四模型/Oracle/NOP 门禁，并按 Windows 采购质检手册完成 WIP 94 项、D01–D20、逐 testcase 证据链、Hack 和独立复算审计。用于交付验收；不用于出题、调用模型或自动返修。
 ---
 
 # Windows Harbor QC
 
-用于质检 Windows 专项 Harbor 题包。输入应是一个题目目录或交付 ZIP；默认只在本地生成证据，不修改题包、不修改飞书、不上传外部系统。
+对正式作业包执行完整只读质检。默认不修改题包、不返修、不操作飞书，也不调用模型 API。
 
-> ⚠️ **旧版动态质检入口已于 2026-10-12 移除**
->
-> 本参考包原有的唯一入口 `scripts/run_qc.py`，连同它的 PowerShell 包装 `scripts/run_qc.ps1`
-> 与单元测试 `tests/test_run_qc.py`，已按用户指示删除（判定为旧版）。因此本目录**不再提供**
-> 一条命令跑完「静态检查 + Windows 容器动态 Oracle/NOP」的入口。
->
-> 动态 Oracle/NOP 门禁现由 `harbor-windows/skills/harbor-windows/` 下的校验脚本承担
-> （`validate_package.py`、`run_model_validation.py`、`run_trials.py` 等）。
-> 本文件与 [references/checklist.md](references/checklist.md) 中关于 `run_qc.py` 的**判定口径**
-> 仍作为门禁标准的历史依据保留，用于复核已归档在 `harbor-windows/_qc_runs/` 的既有证据。
-
-保留的可用件：
-
-| 文件 | 用途 |
-|---|---|
-| `scripts/validate_model_gate.py` | 模型区分度准入校验（见下文） |
-| `scripts/run_trials.py` | 批量跑模型 trial |
-| `scripts/windows_qc_env.py` | Windows 容器环境扩展（`--environment windows_qc_env:WindowsQCEnvironment`） |
-| `scripts/qc_utils.py` | 上述脚本共用的读写/hash 工具 |
-| `references/checklist.md` | 静态+动态门禁清单（判定标准） |
-
-## 门禁判定标准（历史口径，继续有效）
-
-每个 Agent 默认独立运行 3 次；需要严格稳定性复验时用 `--attempts 6`。每轮固定使用：
-
-```text
---n-attempts 1 --n-concurrent 1 --max-retries 0
-```
-
-判定门禁是硬条件：
-
-- Oracle 每一轮必须是完整 `VALID/1`；
-- NOP 每一轮必须是完整 `VALID/0`；
-- NOP 的每一轮 P2P 必须全部 PASS，且至少一个核心 F2P FAIL；
-- 缺 testcase、重复 testcase、SKIP、ERROR、NOT_RUN、解析错误、Harbor 异常或基础设施故障必须是 `INVALID/BLOCKED`，不能把 `reward=0` 当作有效模型 0 分；
-- 测试必须验证真实 Windows 行为并允许等价实现，不能用源码关键词、Diff、文件存在、日志字符串或模型自报替代核心断言。
-
-结果目录包含 `report.md`、`report.json`、`inventory.json`、`hashes.json`、`commands.json`、`preflight.json`、`runs.json`、`jobs/`、`staged/` 和每轮 Harbor CLI 原始日志。Oracle CLI 日志是 Oracle 成功的直接文字证据；需要截图时，应从对应 CLI 日志或 Harbor 控制台截取，不得用手工分数截图代替原始结果。
-
-## 模型区分度准入
-
-若要完成正式模型准入，对本地模型运行证据执行：
+先读 [references/standard-layout.md](references/standard-layout.md)、
+[references/checklist.md](references/checklist.md) 和
+[references/quality-gates.md](references/quality-gates.md)。需要快速确认某项是否应当驳回时，查阅
+[references/rule-matrix.md](references/rule-matrix.md)。每次正式质检还必须阅读
+[references/procurement-manual-integration.md](references/procurement-manual-integration.md)，并按其中
+链接的 2026-09-27 采购质检手册原文完成 WIP 94 项与 D01–D20 审计。然后从 Skill 根目录执行：
 
 ```powershell
-python scripts\validate_model_gate.py --input model-evidence.json
+.\scripts\run_delivery_qc.ps1 `
+  -InputPath D:\path\delivery.zip `
+  -OutPath D:\path\qc-result
 ```
 
-该校验器要求 Qwen 与 Opus 各 3 次 `VALID` 二值运行，并按“Opus 总分严格更高；或双方总分均为 0 且 Opus testcase PASS 总数严格更高”判定；GLM、Kimi 各至少 1 次有效运行。无效运行不能按 0 分计入。
+首次运行会在结果目录生成 `quality-review-template.json`，且在十项人工证据未提供前最终结论为
+`BLOCKED`。填完模板后必须换一个新的空结果目录重新执行：
 
-退出码：`0` 为全部门禁通过，`1` 为题包或动态质量不通过，`2` 为本机依赖/Windows Docker/输入证据不足而无法完成真实质检。
+```powershell
+.\scripts\run_delivery_qc.ps1 `
+  -InputPath D:\path\delivery.zip `
+  -OutPath D:\path\qc-final `
+  -QualityReview D:\path\quality-review.json
+```
 
-必须使用真实 Windows 容器模式、可用的 Docker 和 Harbor CLI。不要通过减少 required 清单、改写测试、跳过 Oracle/NOP、复用旧 jobs 或修改输入题包来消除失败。若需要修复题包，应另行复制到新的版本目录，修复后用新的空结果目录重新运行。
+Python 等价入口：
+
+```powershell
+python scripts\run_delivery_qc.py --input D:\path\delivery.zip --out D:\path\qc-result
+```
+
+总入口按顺序完成以下硬门禁：
+
+1. 安全解压；ZIP 内必须只有一个最外层作业文件夹，且其名称与 ZIP 文件名去掉 `.zip` 后完全一致。该文件夹本身就是 Harbor Task 根目录，必须直接包含 `task.toml`、`instruction.md`、`environment/`、`solution/`、`tests/`、`jobs/`。不接受 `outside_harbor/`、`outside_harbor-assets/` 等 Demo 包装层。
+2. 检查 Task 的 `instruction.md + task.toml + environment/ + solution/ + tests/`、所有入口实际引用文件、固定镜像和测试协议。`source.json` 可有可无；存在时必须有效且身份一致。required testcase 少于 5 条失败，5–27 条正常，超过 27 条只提示人工复核。
+3. 直接读取 `jobs/` 中 14 个 Harbor job：Qwen 3 次、Opus 3 次、GLM 1 次、Kimi 1 次、Oracle 3 次、NOP 3 次。模型 job 必须含 `agent/model-result.json` 与 `agent/trajectory.jsonl`；所有 job 必须含原始 `result.json`、verifier 结果、reward 和日志。
+4. 模型准入先拒绝过易满分题：Qwen 三次和 Opus 三次同时全部 `VALID/1` 时直接失败；8 次规定模型运行全部满分时也必须明确记录为全模型满分失败。其余情况比较三次正式分数总和：`Opus model_score_sum > Qwen model_score_sum` 时通过；两者总分相等时，继续比较逐 testcase 的累计通过数，只有 `Opus testcase_pass_sum > Qwen testcase_pass_sum` 才通过。规定的 8 次模型运行全部 `VALID/0` 时，即使 testcase 累计通过数也未拉开差距，零分平局仍允许通过。Opus 总分低于 Qwen，或总分相等且 Opus testcase 累计通过数没有严格高于 Qwen（且不满足全模型有效零分例外）时失败。GLM/Kimi 不参与主分差，GLM 高于 Opus本身不触发返修，但必须纳入全模型结果分布分析，且所有原始轨迹必须完整有效。
+5. 在 Windows Containers 模式下真实调用 Harbor。Oracle 默认独立 3 次且全部 `VALID/1`；NOP 默认独立 3 次且全部 `VALID/0`，每轮 P2P 全 PASS、至少一个核心 F2P FAIL。
+
+每轮 Harbor 参数固定为 `--n-attempts 1 --n-concurrent 1 --max-retries 0`。缺测试、零测试、构建失败、`SKIP/ERROR/NOT_RUN`、解析错误、权限或环境故障必须判为 `INVALID/BLOCKED`，不能生成正式 0 分。不得减少 required 清单、替换原始 jobs、复用旧 Task 轨迹或通过修改输入消除失败。
+
+模型 jobs 必须保留模型/提供商、中文口语化原始提示词、原始响应、候选代码或补丁、`trajectory.jsonl`、`verifier/result.json`、`reward.txt`、逐 testcase 终态、时间和 Task checksum。提示词不得添加“中文口语化提示：”前缀。发现凭据、Solution/测试泄漏、Hash 不一致或缺少原始文件时失败。
+
+以下项目不得单独作为返修理由：Dockerfile 的 `FROM` 未 pin SHA-256 digest；缺少顶层 `evidence/` 或 `metadata/`；`task.toml` 缺 network policy 字段；全部规定模型运行均有效且全 0；泛化的“每模型运行次数不足”；GLM 为 1 而 Opus 为 0。这里的“运行次数不足”豁免不取消标准目录门禁：`jobs/` 少于规定的 14 个原生 Harbor job，仍按目录/证据缺件判定失败。
+
+写不通过原因时只写真实触发的硬门禁，附文件、job 和 testcase 证据。不要把建议项包装成必改项，也不要因为另一个门禁已经失败就追加未经验证的模板化原因。
+
+结果目录必须为空或不存在。最终读取 `report.md` 和 `report.json`；`harbor/` 下保留真实命令、CLI 日志和 job/verifier 原文。Oracle 截图应从 Harbor CLI/控制台原始输出截取。
+
+自动入口完成后，必须按 [references/quality-gates.md](references/quality-gates.md)、
+[references/manual-review.md](references/manual-review.md) 和采购手册完成十项人工硬门禁，并提交
+结构化 `quality-review.json`。原有五项分别是：Golden/NOP 是否按预期得分；每项评分标准和每个 testcase
+是否判分正确；testcase 是否严格对应题面并检查功能；是否存在联网取答案、搜索 Golden、修改
+测试/Verifier 等 Hack；是否具备真实 Windows 价值。每项都必须逐项给出 job、轨迹、testcase 或
+日志证据。新增五项分别是：范围/版本/公式和资产身份冻结；WIP 94 项完整登记；D01–D20 动态审计；
+从 required testcase 独立复算分数；证据、历史与整改复验闭环。缺少任一项时，自动门禁即使全部
+通过，最终结论也只能是 `BLOCKED`；任一人工项
+失败则最终为 `FAIL`。人工复核不能把自动脚本的 `FAIL/BLOCKED` 改成 `PASS`。
+
+十项人工门禁之外还必须执行全模型区分度硬门禁：分析 Qwen、Opus、GLM、Kimi 的全部规定运行；
+Qwen 与 Opus 同时三轮满分或 8 次模型运行全部满分时，题目过易，最终不得通过。
+
+运行时必须分开记录质检项、testcase 观察和运行有效性。环境、依赖、权限、解析、零测试或证据
+故障为 `INVALID/BLOCKED` 且可信分数为 `null`，不得按模型 0 分处理。核心测试必须接受等价实现；
+每个得分和扣分都要闭合“实际下发要求 → assertion/rubric → 候选 SHA → Windows 实际执行 →
+testcase 终态 → 完整轨迹 → 独立复算”。
+
+返修原因必须使用口语化描述：先说明实际发生了什么、为什么影响结果，再说明应怎样修复；技术
+路径、job 名和 testcase ID 作为证据附在描述中，不能只堆字段名、Hash 或错误代码。
+
+结论只有：
+
+- `PASS`：直接 Harbor 目录、测试、14 个 jobs、模型准入、Oracle/NOP、WIP 94 项、D01–D20 和人工语义复核全部通过；
+- `FAIL`：作业包、测试或模型准入不满足；
+- `BLOCKED`：Docker/Harbor/Windows 运行依赖或必要证据不足，无法完成真实质检。
+
+修改题面、环境、solution、tests、required testcase 或评分后，旧模型轨迹全部作废。提升版本和 Hash，在新的空结果目录重跑完整质检。
