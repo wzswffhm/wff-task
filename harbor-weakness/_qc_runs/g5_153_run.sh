@@ -15,6 +15,12 @@ if [ -n "${GW:-}" ]; then
   export no_proxy="localhost,127.0.0.1,::1"
 fi
 
+# 2026-10-12：本机 docker compose（2.40.3）默认用 Bake 构建，但 docker 未装 buildx 插件
+# （且 ~/.docker/buildx/current 曾被 root 占用、报 permission denied），
+# 会使 `docker compose build` 直接失败、trial 秒退（EXIT=0 + RuntimeError）。
+# 固定关闭 Bake，回退传统 builder。
+export COMPOSE_BAKE=false
+
 TASK_ROOT=/mnt/c/Users/Administrator/Desktop/wff-task
 Q=$TASK_ROOT/harbor-weakness/_qc_runs
 CREDS=/mnt/c/Users/Administrator/.wff-creds

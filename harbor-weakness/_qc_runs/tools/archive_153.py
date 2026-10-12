@@ -145,9 +145,10 @@ def build_summary(rewards):
         if "claude-opus-4-8" in missing:
             parts.append("claude-opus-4-8：端点不可用，按甲方 2026-10-12 指示暂不跑。")
         if "qwen3.8-max-0902" in missing:
-            parts.append("qwen3.8-max-0902：三次尝试均因判官侧故障未取得有效判分"
+            parts.append("qwen3.8-max-0902：前三次尝试均因判官侧故障未取得有效判分"
                          "（① 网关 socket 断连；② 单条判官工具循环停滞逾 30 分钟，人工终止后 fail-closed；"
-                         "③ 单条判官再次停滞逾 21 分钟，终止后 fail-closed）。")
+                         "③ 单条判官再次停滞逾 21 分钟，终止后 fail-closed）；"
+                         "该无效读数已按指示于 2026-10-12 19:00 清理，第 4 次重跑进行中。")
         parts.append("三模型均分与难度定档待补齐执行体后计算；不以单模型或两模型结果替代定档。")
         blocker = "".join(parts)
     summary = {
