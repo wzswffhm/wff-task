@@ -47,64 +47,27 @@ import sys
 import time
 import traceback
 
-# ------------------------------------------------------------------ 默认模型配置
-# 注意：API Key 优先从环境变量读取；此处仅为便于本地跑通的默认值。
-# 生产环境请用 HARBOR_WINDOWS_ENDPOINTS_JSON 指向不受版本管理的凭据文件。
+# ------------------------------------------------------------------ 端点配置
+# 端点与凭据统一由仓库根的 models.local.json 提供：脚本从自身位置逐级上溯查找。
+# 该文件含明文凭据，按甲方要求纳入版本控制，请勿外发。也可用 --config 或
+# 环境变量 HARBOR_WINDOWS_ENDPOINTS_JSON 指向别的凭据文件。
 
-DEFAULT_ENDPOINTS = [
-    {
-        "key": "qwen3.8-max",
-        "label": "Qwen3.8-Max-0902",
-        "dir": "qwen3.8-max-0902",
-        "runs": 3,
-        "role": "primary",
-        "base_url": "https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        "model": "qwen3.8-max",
-        "api_key_env": "HARBOR_WINDOWS_ALIYUN_KEY",
-        "api_key": "sk-ws-H.PIDYYYX.gJ1X.MEQCIAS8rCwaANl1voz83TDM6AHmQB_a433KQGaBlQdQnyYNAiAssJCXyeegO7ZSrpTZ4KfEjEkXVvGNW1v8UIyfSZ82qg",
-        "auth": "x-api-key",
-        "protocol": "anthropic",
-    },
-    {
-        "key": "opus-5",
-        "label": "Opus 5",
-        "dir": "opus-5",
-        "runs": 3,
-        "role": "primary",
-        "base_url": "https://api.blvr.top",
-        "model": "claude-opus-5",
-        "api_key_env": "HARBOR_WINDOWS_BLVR_KEY",
-        "api_key": "sk-l8hraN17mCfgGZc2En6ecsHnQKYBRHMWZGMltWApY8KzRNoD",
-        "auth": "x-api-key",
-        "protocol": "anthropic",
-    },
-    {
-        "key": "glm-5.3",
-        "label": "GLM-5.3",
-        "dir": "glm-5.3",
-        "runs": 1,
-        "role": "auxiliary",
-        "base_url": "https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        "model": "GLM-5.3",
-        "api_key_env": "HARBOR_WINDOWS_ALIYUN_KEY",
-        "api_key": "sk-ws-H.PIDYYYX.gJ1X.MEQCIAS8rCwaANl1voz83TDM6AHmQB_a433KQGaBlQdQnyYNAiAssJCXyeegO7ZSrpTZ4KfEjEkXVvGNW1v8UIyfSZ82qg",
-        "auth": "x-api-key",
-        "protocol": "anthropic",
-    },
-    {
-        "key": "kimi-k3",
-        "label": "Kimi K3",
-        "dir": "kimi-k3",
-        "runs": 1,
-        "role": "auxiliary",
-        "base_url": "https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        "model": "Kimi K3",
-        "api_key_env": "HARBOR_WINDOWS_ALIYUN_KEY",
-        "api_key": "sk-ws-H.PIDYYYX.gJ1X.MEQCIAS8rCwaANl1voz83TDM6AHmQB_a433KQGaBlQdQnyYNAiAssJCXyeegO7ZSrpTZ4KfEjEkXVvGNW1v8UIyfSZ82qg",
-        "auth": "x-api-key",
-        "protocol": "anthropic",
-    },
-]
+CONFIG_FILENAME = "models.local.json"
+
+
+def find_config():
+    """定位端点配置：从脚本所在目录逐级上溯，直到找到 models.local.json。"""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        cand = os.path.join(cur, CONFIG_FILENAME)
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
 
 MAX_TOKENS = int(os.environ.get("HARBOR_WINDOWS_MAX_TOKENS", "8192"))
 REQUEST_TIMEOUT = float(os.environ.get("HARBOR_WINDOWS_TIMEOUT_SEC", "600"))
@@ -475,14 +438,19 @@ def score_task(out_root, tid, endpoints):
     """读取已有 model_runs 结果，计算 model_score_sum / testcase_pass_sum 与准入结论。"""
     result = {"task_id": tid, "models": {}, "validity": {}, "admission": None}
     for ep in endpoints:
-        d = os.path.join(task_base(out_root, tid), "model_runs", ep["dir"])
+        # 端点配置里可能夹带非验证用途的条目（无 dir/runs），跳过而不是崩掉。
+        edir = ep.get("dir")
+        runs = ep.get("runs")
+        if not edir or not isinstance(runs, int) or runs <= 0:
+            continue
+        d = os.path.join(task_base(out_root, tid), "model_runs", edir)
         score_sum = 0
         pass_sum = 0
         valid = 0
         invalid = 0
         pending = 0
         scores = []
-        for n in range(1, ep["runs"] + 1):
+        for n in range(1, runs + 1):
             meta_p = os.path.join(d, f"run-{n}", "meta.json")
             if not os.path.isfile(meta_p):
                 pending += 1
@@ -662,22 +630,23 @@ def main():
 
     LAYOUT = args.layout
 
-    endpoints = DEFAULT_ENDPOINTS
-    env_cfg = os.environ.get("HARBOR_WINDOWS_ENDPOINTS_JSON")
-    cfg_path = args.config or env_cfg
-    if cfg_path:
-        if not os.path.isfile(cfg_path):
-            print(f"错误: 配置文件不存在 {cfg_path}", file=sys.stderr)
-            return 2
-        try:
-            cfg = json.load(open(cfg_path, encoding="utf-8"))
-            # 支持裸数组 或 {"endpoints": [...]} 两种形态
-            endpoints = cfg.get("endpoints", cfg) if isinstance(cfg, dict) else cfg
-            if not isinstance(endpoints, list) or not endpoints:
-                raise ValueError("配置中未找到非空 endpoints 列表")
-        except Exception as e:
-            print(f"错误: 配置解析失败 {e}", file=sys.stderr)
-            return 2
+    cfg_path = args.config or os.environ.get("HARBOR_WINDOWS_ENDPOINTS_JSON") or find_config()
+    if not cfg_path or not os.path.isfile(cfg_path):
+        print("错误: 未找到端点配置 models.local.json。请用 --config 指定路径，"
+              "或设置 HARBOR_WINDOWS_ENDPOINTS_JSON，"
+              "或把 models.local.json 放在仓库根（脚本会逐级上溯查找）。",
+              file=sys.stderr)
+        return 2
+    try:
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        # 支持裸数组 或 {"endpoints": [...]} 两种形态
+        endpoints = cfg.get("endpoints", cfg) if isinstance(cfg, dict) else cfg
+        if not isinstance(endpoints, list) or not endpoints:
+            raise ValueError("配置中未找到非空 endpoints 列表")
+    except Exception as e:
+        print(f"错误: 配置解析失败 {e}", file=sys.stderr)
+        return 2
+    print(f"[配置] 端点来自 {cfg_path}")
 
     if args.smoke:
         endpoints = [dict(e, runs=1) for e in endpoints]

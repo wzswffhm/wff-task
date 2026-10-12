@@ -111,6 +111,19 @@ description: >
 **题面写法**：
 - **要写**：背景/现象、目标、功能边界、约束、允许修改范围、用户可见验收标准
 - **不得写**：Golden Patch、答案路径、隐藏测试、精确修改位置、可照抄的实现步骤
+- **答案不上题面**：题面只写**现象 + 公开契约 + 验收标准**。必须给出的公开契约
+  （API 名称与签名、错误 `kind` 取值表、异常类型）照常写；但**不得**写根因诊断，
+  **不得**写出正确的常量/布局/字段/校验和变体，也**不得**给"先改哪、再改哪"的
+  修复顺序 —— 这些必须由 Agent 从样本与运行结果自行推导
+
+**初始态代码写法**（`environment/workspace/`）：
+- **不得有引导性注释**：不得出现 `TODO` / `FIXME` / `XXX` / `HACK` / `BUG` 之类标记，
+  也不得出现「这里不对」「应该改成…」「注意此处」「修复点」「待修复」之类指认；
+  更不得用注释复述题面、标注被植入缺陷的位置或暗示正确实现与正确参数。
+  注释只描述代码**当前**在做什么（也就是那些缺陷行为本身）
+- 允许保留**中性的、与真实历史一致的**文档与注释（例如过时的草稿设计文档），
+  但它们只能描述**曾经以为的样子**，不得反向给出正确布局或"照这个改"的指引
+- 判断标准：缺陷必须靠**读样本 / 跑测试 / 读运行时错误**才能定位，不能靠注释直接指名
 
 ### 4. 题面与 testcase 双向审查
 
@@ -177,7 +190,7 @@ python scripts/run_model_validation.py \
 python scripts/run_model_validation.py --score-only --out delivery-extras/tasks
 ```
 
-前提：`pip install httpx`。端点与模型名见 `scripts/model_endpoints.template.json`。
+前提：`pip install httpx`。端点与模型名的唯一来源是仓库根 `models.local.json`（脚本从自身位置逐级上溯自动定位）。
 
 > **⚠️ 分工边界**：该脚本是**模型调用与记录层**，只负责发起调用、保存轨迹与补丁、
 > 区分 VALID/INVALID、计算区分度；**不负责**在真实 Windows Runtime 中执行 F2P/P2P。
@@ -333,7 +346,7 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `scripts/package_task_zip.py` | **打交付 ZIP**：含 `solution/`、`source.json`、`tests/`、`jobs/`；仅排除 `extras/` 与缓存；ZIP 名 = `<task_id>-v<版本>-delivery`，缺必备件即拒发 |
 | `scripts/hash_package.py` | 身份三元组 `task_hash` 的计算与四处回写（公式只含 instruction / test_patch / oracle_patch / Dockerfile） |
 | `scripts/run_model_validation.py` | **4 模型自动化验证 + 区分度准入计算** |
-| `scripts/model_endpoints.template.json` | 模型端点与凭据配置模板 |
+| 仓库根 `models.local.json` | 模型端点与凭据的**唯一来源**（脚本自动上溯定位；含明文凭据，按甲方要求纳入版本控制） |
 | `scripts/README.md` | 六个脚本的完整用法说明 |
 | `assets/harbor-skeleton/` | 标准 Harbor 五件套骨架（含可直接复用的 grade.py / test.ps1 / Dockerfile） |
 | `assets/metadata-templates/` | 伴随材料 JSON 模板（source_and_license / labels / lineage / manifest） |

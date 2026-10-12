@@ -74,28 +74,24 @@ python run_model_validation.py --tasks outside_harbor-assets --out delivery-extr
 python run_model_validation.py --score-only --out delivery-extras/tasks
 ```
 
-### 默认模型配置
+### 端点与凭据配置
 
-| key | label | 端点 | 模型名 | 次数 | 角色 |
-|---|---|---|---|---|---|
-| `qwen3.8-max` | Qwen3.8-Max-0902 | aliyun MaaS `/apps/anthropic` | `qwen3.8-max` | 3 | primary |
-| `opus-5` | Opus 5 | `api.blvr.top` | `claude-opus-5` | 3 | primary |
-| `glm-5.3` | GLM-5.3 | aliyun MaaS `/apps/anthropic` | `GLM-5.3` | 1 | auxiliary |
-| `kimi-k3` | Kimi K3 | aliyun MaaS `/apps/anthropic` | `Kimi K3` | 1 | auxiliary |
+端点与凭据的**唯一来源**是仓库根 `models.local.json`：脚本从自身位置逐级上溯自动定位，
+不内置任何端点或密钥。按甲方要求该文件纳入版本控制（含明文凭据，禁止外发）。
+
+| key | label | 模型名 | 次数 | 角色 |
+|---|---|---|---|---|
+| `qwen3.8-max` | Qwen3.8-Max-0902 | `qwen3.8-max-0902` | 3 | primary |
+| `opus-5` | Opus 5 | `claude-opus-5` | 3 | primary |
+| `glm-5.3` | GLM-5.3 | `glm-5.3` | 1 | auxiliary |
+| `kimi-k3` | Kimi K3 | `kimi-k3` | 1 | auxiliary |
 
 协议均为 **Anthropic Messages**（`POST {base_url}/v1/messages`，header `x-api-key` + `anthropic-version: 2023-06-01`）。
 
-### 凭据管理（推荐用环境变量）
+### 凭据回落
 
-```bash
-export HARBOR_WINDOWS_ALIYUN_KEY=<aliyun key>   # 供 qwen / glm / kimi 共用
-export HARBOR_WINDOWS_BLVR_KEY=<blvr key>       # 供 opus
-```
-
-或复制 `model_endpoints.template.json` → `model_endpoints.local.json` 填 Key，
-然后 `--config model_endpoints.local.json`（该文件名已在 `.gitignore` 中）。
-
-> ⚠️ **不要把明文 Key 提交到仓库。**
+需要指向别处的凭据文件时用 `--config <路径>` 或环境变量 `HARBOR_WINDOWS_ENDPOINTS_JSON`；
+某项的 `api_key` 为空时，回落到它自己声明的 `api_key_env` 环境变量。
 
 ### 可调环境变量
 

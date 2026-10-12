@@ -312,10 +312,11 @@ delivery-extras/
     └── badcase_attribution.md       # 失败归因
 ```
 
-### 7.7 权限配置模板
+### 7.7 端点与凭据配置
 
-`scripts/model_endpoints.template.json` 提供端点和凭据字段模板。
-复制为 `model_endpoints.local.json` 并填 Key（该名已在 `.gitignore` 中，不会入库）。
+端点与模型名的**唯一来源**是仓库根 `models.local.json`：脚本从自身位置逐级上溯查找，
+不内置任何端点或密钥。如需指向别处的凭据文件，用 `--config <路径>` 或环境变量
+`HARBOR_WINDOWS_ENDPOINTS_JSON`。`api_key` 为空时回落到该项声明的 `api_key_env` 环境变量。
 
 ### 7.8 断点续跑与存活判定（长耗时运行的必备操作）
 
