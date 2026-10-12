@@ -68,7 +68,9 @@ BATCH_FILES = {
         "| 镜像 Digest 另存 | TODO | delivery-extras/EXTERNAL_IMAGES.json |\n"
         "| delivery-extras 齐全 | TODO | delivery-extras/ |\n\n"
         "## 一票否决项复查\n\n"
-        "TODO：逐条对照 references/06-acceptance-gates.md 的 14 条。\n"
+        "TODO：逐条对照 references/06-acceptance-gates.md 的 15 条。\n"
+        "  —— 其中第 15 条「未过甲方自检即开跑 / 跑分后改包致 task_checksum 失效」\n"
+        "  属阶段 4.5 硬性前置门，必须在跑分**之前**确认，不能拖到交付前。\n"
     ),
     "model_summary.csv": (
         "task_id,model,model_identity,runs_total,runs_valid,runs_invalid,"

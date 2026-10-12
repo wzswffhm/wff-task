@@ -4,7 +4,55 @@
 
 ---
 
-## 一、14 条一票否决
+## 零、跑分前置门（硬性 · 最先执行 · 2026-10-12 起）
+
+**本节在流程顺序上先于其余各节**：它是**唯一一道在花掉模型预算之前**执行的验收门。
+
+### 规则
+
+1. 在真实 Windows Runtime 中开跑**任何**一轮之前（环境验证 / Golden / no-change / 模型验证），
+   必须先对待交付形态的题包执行甲方 `windows-harbor-qc` 自检，且**退出码必须为 `0`（PASS）**。
+2. 退出码 `1`（FAIL）或 `2`（BLOCKED）时**一律禁止开跑**：先修包 → 重新自检 → 直到 PASS。
+3. 自检对象必须是**交付 ZIP**，不是源码目录 —— 只有 ZIP 形态才等价于甲方真正拿到的那份包。
+4. 自检 PASS 后题包内容**冻结**；跑分期间只允许新增 `jobs/` 与 `extras/`。
+
+### 必须 PASS 的四类门
+
+| 门 | 判据 |
+|---|---|
+| 交付布局门 | `environment/adapter.toml` 可被 TOML 解析；`environment/` 七个必备脚本齐全；ZIP 内层根目录名 = `<task_id>-v<版本>-delivery`；不得手改目录名 |
+| Harbor 静态门 | 五件套齐全；`.ps1` / `.bat` 内被引用的路径真实存在；无自定义必需字段；无 Solution / 隐藏 Tests / 凭据泄漏 |
+| jobs 门 | 每个 job 必备文件齐全：`config.json`、`lock.json`、`result.json`、`trial.log`、`artifacts/manifest.json`、`verifier/{result.json,reward.txt,test-stdout.txt,verifier.log}`；模型轮另需 `agent/model-result.json` + `agent/trajectory.jsonl`；Oracle 轮另需 `agent/oracle.txt` + `agent/qc-oracle-application.json` |
+| 身份门 | 全部 job 的 `task_checksum` = 交付包的 **Harbor dirhash** |
+
+> 判分证据（`verifier/result.json` 的协议字段、有效性、二值分数、testcase 集合）以自检脚本
+> `report.md` 的报错为准，**不要凭记忆自拟协议字段名**。
+
+### 冻结铁律
+
+Harbor dirhash 覆盖除顶层 `jobs/` 以外的**全部**文件。因此：
+
+- ✅ 跑分**之后**组装 `jobs/` 是安全的（不改变 checksum）
+- ❌ 跑分**之后**动 `task.toml` / `instruction.md` / `environment/` / `solution/` /
+  `tests/` / `verifier/` 的任何一个字节 → 全部 `task_checksum` 失效，**必须整批重跑**
+
+**顺序恒为**：定稿 → 预打包 → 自检 PASS → 冻结 → 跑分 → 组装 `jobs/` → 交付。
+
+### 违反即一票否决
+
+见第一节第 **15** 条 —— **未经甲方自检 PASS 即开跑**，或**跑分后修改题包内容**。
+
+> **实例（2026-10-12）**：218 号包跑满 14 轮（8 轮模型 + 6 轮对照）后，甲方自检仍 FAIL ——
+> `adapter.toml` 第 38 行 TOML 非法、`solution/reference/wlogseg` 与
+> `tests/test_wlogseg_semantics.py` 被脚本引用却不存在、job 缺 `lock.json` /
+> `verifier/verifier.log` / `artifacts/manifest.json`、`task_checksum` 与交付包不符。
+> 这些**全部**在跑第一轮之前就能查出来。215 v2.1.0 与 216 v1.2.0 也带着同一个
+> `adapter.toml` 缺陷交付。三个包的既有结论归档在
+> `harbor-windows/_qc_runs/qc-{215,216,218}-auto/`。
+
+---
+
+## 一、15 条一票否决
 
 出现任一情况，单题**不得进入正式集**：
 
@@ -24,6 +72,7 @@
 | 12 | 重复题、表面变体题、冷门薄题，或与申报 Windows 能力实质不符 |
 | 13 | 不满足模型区分度要求，整改后仍无有效区分 |
 | 14 | 无法在约定时间和资源预算内稳定完成判分 |
+| 15 | **未经甲方自检 PASS 即开跑**，或**跑分后修改题包内容**（导致 `task_checksum` 与交付包不符） |
 
 ---
 
@@ -137,7 +186,14 @@
 
 ## 八、快速验收自检表
 
+> **前四项必须在跑分之前完成**（阶段 4.5 硬门）；其余各项在跑分之后逐条核对。
+
 ```
+[ ] ① 已预打包为交付 ZIP（此时尚未跑分）
+[ ] ② 甲方 windows-harbor-qc 自检退出码 = 0（PASS）
+[ ] ③ environment/adapter.toml 可被 TOML 解析（无扁平 key / 同名 [table] 冲突）
+[ ] ④ 自检 PASS 后题包内容已冻结，跑分期间只新增 jobs/ 与 extras/
+---- 以下为跑分后核对 ----
 [ ] 反事实判定通过（附理由）
 [ ] 标准 Harbor 五件套齐全，无自定义必需字段
 [ ] instruction.md 不泄解法

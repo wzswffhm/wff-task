@@ -27,13 +27,21 @@ description: >
 | 构建 delivery-extras 伴随材料 | `references/05-delivery-structure.md` |
 | 理解某条规则的原文依据 | `references/01-spec-requirements.md` |
 
-## 三条不可妥协的底线
+## 四条不可妥协的底线
 
 生产前先记住，任何情况下不得违反：
 
 1. **Windows 价值**：换 Linux/macOS 后主要实现、错误根因、Evaluator 若基本不变 → 不是 Windows 专项题
 2. **二值判分**：required F2P + P2P 全过 = 1，否则 = 0；异常 = INVALID（**不得伪装成 0 分**）。无权重、无部分分、无 LLM Judge
 3. **身份唯一**：全包统一 `task_id + task_version + task_hash`；镜像 tag 不是身份，必须另存 Digest
+4. **跑分前必须先过甲方自检**（2026-10-12 起，硬性前置门）：在真实 Windows Runtime 中开跑
+   **任何**一轮（环境验证、Golden/no-change 对照、模型验证）之前，必须先对待交付形态的题包
+   执行甲方 `windows-harbor-qc` 自检并达到退出码 `0`（PASS）。**自检未过就开跑 = 整批白跑**：
+   待检缺陷全是静态可查的（TOML 能否解析、引用文件是否存在、文件命名、Task dirhash），
+   而一轮完整验证要花 8 轮模型调用 + 6 轮对照。
+   自检 PASS 后题包内容即**冻结**，任何后续改动（哪怕只改一个注释）都会改变 Harbor dirhash，
+   使已跑出的 `task_checksum` 全部失效、必须全部重跑。
+   → 详见「4.5 跑分前置门（硬性）」与 `references/06-acceptance-gates.md`
 
 > 详细展开见 `references/01-spec-requirements.md` 与 `references/06-acceptance-gates.md`。
 
@@ -47,6 +55,7 @@ description: >
    → 2. 来源/授权/污染/重复检查
    → 3. 标准 Harbor 构题
    → 4. 题面与 testcase 双向审查
+   → 4.5 🚦【硬性前置门】预打包 + 甲方 windows-harbor-qc 自检（不 PASS 禁止开始任何跑分）
    → 5. Windows 环境验证
    → 6. Golden / no-change / 反例验证
    → 7. 多模型验证（Qwen/Opus 各 3 + GLM/Kimi 各 ≥1）
@@ -54,6 +63,9 @@ description: >
    → 9. 身份与材料一致性校验
    → 10. 版本冻结与交付
 ```
+
+> **4.5 是硬门，不是建议**。它必须在 5/6/7 之前完成，且 PASS 之后题包内容冻结。
+> 顺序恒为：**定稿 → 预打包 → 自检 PASS → 冻结 → 跑分 → 组装 `jobs/` → 交付**。
 
 ### 0. 冻结基线
 
@@ -138,6 +150,75 @@ testcase → 题面要求/公开契约 → 预期行为
 → `references/04-testcase-mapping.md`
 
 **产出**：`delivery-extras/tasks/<task-id>/testcase_mapping.csv`
+
+### 4.5 🚦 跑分前置门（硬性）
+
+**规则**：在真实 Windows Runtime 中开跑**任何**一轮之前（阶段 5 的环境验证、
+阶段 6 的 Golden/no-change 对照、阶段 7 的模型验证），必须先对**待交付形态**的题包
+执行甲方 `windows-harbor-qc` 自检，并达到退出码 `0`。
+退出码 `1`（FAIL）或 `2`（BLOCKED）时**一律不得开始跑分** —— 先修包、再自检，直到 PASS。
+
+**自检包位置**：`harbor-windows/_reference/windows-harbor-qc/`
+（甲方最新版；2026-10-12 版共 34 个文件，可用包内 `MANIFEST.sha256` 自校。
+甲方换版后按同一路径整体替换，并把旧版 `report.md` 归档到 `_qc_runs/`。）
+
+**调用方式**（先预打包，再对 ZIP 自检）：
+
+```powershell
+$SKILL = "<skill目录>"
+$QC    = "<仓库根>/harbor-windows/_reference/windows-harbor-qc"
+
+# 1) 预打包（此时还没跑分，jobs/ 为空或仅含对照轮）
+python "$SKILL/scripts/package_task_zip.py" `
+    --task-dir <题包目录> --out-dir <出包目录> --verify
+
+# 2) 甲方自检 —— 必须对 ZIP，而不是对源码目录：
+#    只有 ZIP 形态才等价于甲方真正拿到的那份包
+powershell -NoProfile -ExecutionPolicy Bypass `
+    -File "$QC/scripts/run_delivery_qc.ps1" `
+    -InputPath <出包目录>/<task_id>-v<版本>-delivery.zip `
+    -OutPath   <出包目录>/qc-report
+
+# 3) 只看退出码
+#    0 = PASS      → 允许进入跑分
+#    1 = FAIL      → 禁止跑分；按 qc-report/report.md 逐条修包后重跑本步骤
+#    2 = BLOCKED   → 禁止跑分；先补齐十项人工复核证据
+```
+
+**必须 PASS 的静态门**（逐项见自检包内 `references/quality-gates.md`）：
+
+| 门 | 检查内容 |
+|---|---|
+| 交付布局 | `environment/adapter.toml` **必须能被 TOML 解析器解析**；`environment/` 七个必备脚本齐全；ZIP 内层根目录名 = `<task_id>-v<版本>-delivery` |
+| Harbor 静态 | 五件套齐全；`.ps1` / `.bat` 中被引用的路径**必须真实存在**；无自定义必需字段；无 Solution / 隐藏 Tests 泄漏 |
+| jobs 结构 | 每个 job 含 `config.json` + `lock.json` + `result.json` + `trial.log` + `artifacts/manifest.json` + `verifier/{result.json,reward.txt,test-stdout.txt,verifier.log}`；模型轮另有 `agent/model-result.json` + `agent/trajectory.jsonl`；Oracle 轮另有 `agent/oracle.txt` + `agent/qc-oracle-application.json` |
+| 判分证据 | `verifier/result.json` 的有效性、二值分数与 testcase 集合必须被自检脚本认可；`tests/required_testcases.json` 存在，且与各 job 的 testcase 集合**逐字一致**（以 `report.md` 报错为准，不要凭记忆自拟协议） |
+| 身份 | 全部 job 的 `task_checksum` 与交付包的 **Harbor dirhash 完全一致** |
+
+> ⚠️ **`adapter.toml` 的经典坑**：甲方 `inspect_delivery.py` 读的是**扁平 key**
+> （`prepare` / `validate` / `run` / `restore` / `cleanup` / `workspace`）。
+> 若同一文件里又写了同名的 `[prepare]` / `[validate]` / `[test]` / `[restore]` /
+> `[cleanup]` / `[exec_agent]` 表，TOML 会直接解析失败
+> （`Cannot overwrite a value (at line N, column M)`）。
+> **扁平 key 必须保留，冲突的表名必须改掉。**
+
+**第二条铁律：跑分对象必须与最终交付包同一份内容。**
+Harbor dirhash 覆盖除顶层 `jobs/` 以外的全部文件，因此：
+
+- ✅ 跑分**之后**组装 `jobs/` 是安全的 —— 它不影响 checksum
+- ❌ 跑分**之后**再动 `task.toml` / `instruction.md` / `environment/` / `solution/` /
+  `tests/` / `verifier/` 的任何字节，都会使全部 `task_checksum` 失效，**必须整批重跑**
+
+**与人工复核的关系**：十项人工复核（`quality-review.json`，见自检包内
+`references/manual-review.md`）与自动静态门**相互独立**；自动门全绿也只是
+`BLOCKED` 可解除的前提之一，人工项必须逐条留证。
+
+> **代价对比（为什么定成硬门）**：218 号包在**旧版内容**上跑满 14 轮（8 轮模型 + 6 轮对照）
+> 之后，甲方自检依然 FAIL：`adapter.toml` 第 38 行 TOML 非法、`solution/reference/wlogseg`
+> 与 `tests/test_wlogseg_semantics.py` 被脚本引用却不存在、job 缺 `lock.json` /
+> `verifier/verifier.log` / `artifacts/manifest.json`，且 `task_checksum` 与交付包不一致。
+> 这些**全部**在跑第一轮之前就能查出来。215 v2.1.0 与 216 v1.2.0 也已带着同一个
+> `adapter.toml` 缺陷交付甲方。**先自检，再花钱。**
 
 ### 5. Windows 环境验证
 
@@ -308,15 +389,18 @@ wfflab__wfmt-215-v2.1.0-delivery/      # ← wfflab__wfmt-215-v2.1.0-delivery.zi
 | 9 | 大文件全挪出题包 | 离线依赖/fixture 保留在 `environment/` 或 `tests/` 允许位置，保离线可复现 |
 | 10 | `.ap-tools` 或含 Oracle 的 `harbor/` 进 Agent 可见环境 | 两者均**不得进入** Agent 可见环境或评测镜像 |
 | 11 | 交付 ZIP 缺 `jobs/`，或把上游故障轮记成 0 分 | `jobs/<job-id>/{agent,verifier}` 必须齐全；故障轮标 `excluded` 并写明原因；原始轨迹未留存时**显式声明缺口，不得伪造** |
+| 12 | **先跑分、后自检**（或拖到交付前才自检） | 阶段 4.5 是硬性前置门：预打包 → 甲方 `windows-harbor-qc` 自检 PASS → 内容冻结 → 才允许跑任何一轮。跑完再改包 = 全部 `task_checksum` 失效，整批重跑 |
+| 13 | `adapter.toml` 同时写扁平 key 与同名 `[table]` | 甲方读扁平 key；同名表会让 TOML 直接解析失败。**保留扁平 key，改掉冲突的表名** |
 
 ---
 
-## 14 条一票否决（速查）
+## 15 条一票否决（速查）
 
 反事实不通过 / 题面不可解 / Golden≠1 或 no-change≠0 / P2P 在 base 失败或 F2P 无关 /
 testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分或 LLM Judge /
 环境缺陷记 0 分 / Solution 或答案泄漏 / 环境不可恢复 / 来源授权不清 /
-重复或表面变体题 / 区分度不足 / 无法在预算内判分
+重复或表面变体题 / 区分度不足 / 无法在预算内判分 /
+**未过甲方自检即开跑，或跑分后改包致 `task_checksum` 失效**
 
 > 完整定义 → `references/06-acceptance-gates.md`
 
@@ -327,6 +411,7 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | 文件 | 内容 |
 |---|---|
 | `references/01-spec-requirements.md` | 规范原文要求（采购目标、五大原则、题目要求） |
+| `<仓库根>/harbor-windows/_reference/windows-harbor-qc/` | **甲方交付自检包（阶段 4.5 硬性前置门）**：`scripts/run_delivery_qc.ps1` 对交付 ZIP 执行交付布局门 + Harbor 静态门 + jobs 门 + 人工复核门；退出码 `0`=PASS / `1`=FAIL / `2`=BLOCKED；结论落在 `report.md` / `report.json` / `harbor/` |
 | `references/02-windows-value.md` | Windows 价值反事实判定 + 12 方向 + 误判案例 |
 | `references/03-harbor-task.md` | 标准 Harbor 结构、task.toml 字段、Windows 镜像要求 |
 | `references/04-testcase-mapping.md` | 题面↔testcase 双向映射 + F2P/P2P 规范 |

@@ -198,6 +198,10 @@ delivery-<batch>-<version>/
 
 ## 五、交付前自检
 
+> ⚠️ **本节的静态检查项必须在跑分之前就做完**（阶段 4.5 硬性前置门），
+> 不要拖到交付前才第一次跑。这里是交付前的**最终复核**，不是首次检查 ——
+> 跑完分才发现静态缺陷 = 整批白跑。
+
 - [ ] `outside_harbor/` 与 `outside_harbor-assets/` 引用**同一身份三元组**
 - [ ] Task 目录内**无**自定义必需字段
 - [ ] `outside_harbor-assets/jobs/` 存在；每个 `<job-id>/` 同时含 `agent/` 与 `verifier/`，
@@ -205,7 +209,11 @@ delivery-<batch>-<version>/
 - [ ] `jobs/` 内剔除轮已标 `excluded` 并写明原因；无 `solution/`、答案、隐藏用例、凭据
 - [ ] 交付 ZIP **含** `source.json`、`solution/`（`README.md` + `solve.ps1`/`solve.bat`）、
       `tests/required_testcases.json`（含 F2P 与 P2P）、`jobs/`；**不含** `extras/`、`*.pyc`
-- [ ] 已用甲方 `windows-harbor-qc` 的静态门禁跑过检查（`run_qc.py` 已于 2026-10-12 移除，改用 `harbor-windows/skills/harbor-windows/` 下的校验脚本），除已知误报外无 error
+- [ ] **已用甲方最新版 `windows-harbor-qc` 对交付 ZIP 跑过自检**
+      （`harbor-windows/_reference/windows-harbor-qc/scripts/run_delivery_qc.ps1`；
+      注意 `run_qc.py` 在 2026-10-12 版中**已回归**，是该套件的标准入口之一，
+      旧文档里"已移除"的说法作废），退出码 = `0`（PASS），
+      结论归档到 `harbor-windows/_qc_runs/`
 - [ ] `delivery-extras/tasks/<task-id>/` 六个子项齐全（metadata/evidence/model_runs/testcase_mapping/quality_review/remediation）
 - [ ] 批次级 7 个汇总文件齐全
 - [ ] `checksums.sha256` 覆盖全部交付物
