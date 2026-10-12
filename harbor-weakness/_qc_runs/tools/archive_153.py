@@ -129,23 +129,27 @@ def build_summary(rewards):
     cand = [(r["model"], r["reward"]) for r in runs
             if r["model"] in MODELS and r.get("verifier_error") in (0, 0.0)
             and r.get("reward") is not None]
+    effective = [m for m, _v in cand]
     partial = round(sum(v for _m, v in cand) / len(cand), 6) if len(cand) >= 2 else None
     mean = (round(sum(v for _m, v in cand) / len(cand), 6)
             if len(cand) == len(MODELS) else None)
-    missing = [m for m in MODELS if m not in {r["model"] for r in runs}]
+    missing = [m for m in MODELS if m not in effective]
     band = measure_band(mean)
     gate = None
     if oracle is not None and mean is not None:
         gate = bool(oracle > 0.85 and mean < 0.70)
     blocker = None
     if mean is None:
+        parts = [f"G5 未完成：有效执行体 {len(effective)}/{len(MODELS)}"
+                 f"（{effective or '无'}）；待补 {missing}。"]
         if "claude-opus-4-8" in missing:
-            blocker = ("G5 未完成：claude-opus-4-8 端点不可用（甲方 2026-10-12 指示暂不跑），"
-                       f"已取得 {len(cand)}/{len(MODELS)} 个执行体"
-                       f"（两模型参考均值 {partial}）；三模型均分与难度定档待补跑后计算")
-        else:
-            blocker = (f"G5 未完成：尚缺 {missing}" if missing else
-                       "G5 执行体存在 verifier_error≠0，须重跑后再定档")
+            parts.append("claude-opus-4-8：端点不可用，按甲方 2026-10-12 指示暂不跑。")
+        if "qwen3.8-max-0902" in missing:
+            parts.append("qwen3.8-max-0902：三次尝试均因判官侧故障未取得有效判分"
+                         "（① 网关 socket 断连；② 单条判官工具循环停滞逾 30 分钟，人工终止后 fail-closed；"
+                         "③ 单条判官再次停滞逾 21 分钟，终止后 fail-closed）。")
+        parts.append("三模型均分与难度定档待补齐执行体后计算；不以单模型或两模型结果替代定档。")
+        blocker = "".join(parts)
     summary = {
         "task_id": TASK,
         "task_version": "1.0.0",
@@ -155,7 +159,7 @@ def build_summary(rewards):
         "oracle_reward": oracle,
         "three_model_mean": mean,
         "partial_two_model_mean": partial,
-        "partial_models": [m for m, _v in cand],
+        "effective_models": effective,
         "three_model_gate": "<0.70",
         "three_model_complete": mean is not None,
         "measured_band": band,
