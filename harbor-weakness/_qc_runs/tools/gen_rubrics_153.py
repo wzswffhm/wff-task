@@ -1,0 +1,234 @@
+# -*- coding: utf-8 -*-
+"""FIN3-WKN-153 判据生成器（出题工具，不进题包）。
+
+从唯一定义生成包根 rubrics.json 与 tests/rubrics.toml，保证两份零漂移。
+判据 34 条（正向 30 / 负向 4），S_max = 4*10 + 16*7 + 10*3 = 182。
+"""
+import io
+import json
+import re
+from pathlib import Path
+
+PKG = Path(__file__).resolve().parents[2] / "work_fin-b01_20261012-153" / "FIN3-WKN-153"
+
+OUT_XLSX = "/app/output/FIN3-WKN-153_quarterly_workbook.xlsx"
+OUT_MD = "/app/output/FIN3-WKN-153_operation_report.md"
+OUT_PY = "/app/output/FIN3-WKN-153_reproduce.py"
+OUT_COV = "/app/output/FIN3-WKN-153_holdings_coverage.csv"
+OUT_ISS = "/app/output/FIN3-WKN-153_issue_log.csv"
+OUT_PNG = "/app/output/FIN3-WKN-153_charts.png"
+ALL = f"{OUT_XLSX}, {OUT_MD}, {OUT_PY}, {OUT_COV}, {OUT_ISS}, {OUT_PNG}"
+
+D_CMD = "指令遵循"
+D_NUM = "内容质量-数值与计算准确性"
+D_CONC = "内容质量-结论正确性"
+D_ANA = "内容质量-分析与论证质量"
+D_FACT = "内容质量-事实忠实性"
+D_PRO = "内容质量-专业规范"
+D_SAFE = "安全合规"
+D_OPS = "操作与交付安全"
+
+# (id, weight, negate, dimension, description)
+ITEMS = [
+    ("R01", 10.0, False, D_NUM,
+     "有效持仓口径执行正确：`FIN3-WKN-153_holdings_coverage.csv` 与 `FIN3-WKN-153_quarterly_workbook.xlsx` 的 `Coverage` 表给出持仓原始记录 **295 行**，并**分三行列出**剔除项——重复上报 **4 行**、数据所属日期非估值日 **6 行**、证券主数据状态非 active **5 行**，得到有效记录 **280 行**（295 - 4 - 6 - 5 = 280），且三类剔除对市值的影响分别为 **11,554,917.40 元**、**25,774,234.50 元**、**25,142,250.00 元**（各允许 ±1%）。三类剔除合并成一行、任一行数与上述不符、未给出有效记录 280 行、或未给出三类剔除的市值影响，即不满足。 Deliverables to inspect: " + OUT_COV + ", " + OUT_XLSX + "."),
+
+    ("R02", 10.0, False, D_NUM,
+     "净值推导链逐行列出且数值正确：`FIN3-WKN-153_quarterly_workbook.xlsx` 的 `Valuation_Recalc` 表（或报告第二节）**分六行**写出推导链且每行带列报值——①有效持仓市值 **1,295,353,746.36**（±0.02%）；②现金及清算备付金 **45,645,475.03**；③应收 **4,278,200.00**；④应付 **2,763,450.00**；⑤资产净值 = ①+②+③-④ = **1,342,513,971.39**（±100,000）；⑥资产净值 ÷ 总份额 **1,250,000,000.00** = 单位净值 **1.0740**。任一行缺失、未带列报值、把多步合并成一句、或结果超出各自容差，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R03", 10.0, False, D_CONC,
+     "投资监督五项限额逐条执行正确：`Compliance_Check` 表**五行分列**给出 R-01 单一证券集中度、R-02 单一发行人集中度、R-03 非标资产比例、R-05 现金类资产比例、R-07 权益型基金比例，每行含条款号、测算值、限额数值、比较方向与结论，且结论为 **R-01 超限**、R-02 / R-03 / R-05 / R-07 四项合规。缺任一指标行、五行合并、R-01 未判为超限、或把其余四项判为超限，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R04", 10.0, False, D_FACT,
+     "行情阻塞识别与恢复留痕完整：`FIN3-WKN-153_issue_log.csv` 与工作簿 `Issue_Log` 表含一条**类别为阻塞**的记录，逐项给出：文件 `valuation/price_feed_20260930.csv`、现象为该文件大小 **0 字节 / 无任何记录**、影响为市值与净值计算中断、处置动作为改用 `data/price_feed_20260930_repush.csv`（批次标识「重推件」）、依据为 `internal/ops_email_20261008.txt`、状态为已恢复；且最终市值计算实际采用该重推件。缺任一要素、最终行情源不是重推件、或未识别该阻塞即不满足。 Deliverables to inspect: " + OUT_ISS + ", " + OUT_XLSX + "."),
+
+    ("R05", 7.0, False, D_NUM,
+     "输入材料清点正确：交付物给出 `/app/input_files/` 文件总数 **25**、来源目录数 **7**、根目录散件数 **2**，并**分七行列出**各目录文件数：compliance **3**、data **3**、internal **4**、portfolio **2**、reports **3**、rules **4**、valuation **4**，使分目录小计 23 + 根散件 2 = 25（差 1 即不满足）。只给总数、缺任一目录的分项计数、或分项合计与总数不符，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R06", 7.0, False, D_NUM,
+     "十个账户 sheet 全覆盖且逐 sheet 留痕：覆盖表覆盖 `/app/input_files/portfolio/holdings_2026Q3.xlsx` 中 `acct_01` 至 `acct_10` **全部 10 个账户 sheet**，逐 sheet 给出原始行数与有效行数——acct_01 42/40、acct_02 36/34、acct_03 38/36、acct_04 34/32、acct_05 28/26、acct_06 23/22、acct_07 25/24、acct_08 4/4、acct_09 31/30、acct_10 34/32，末行合计 295/280。缺任一账户 sheet、任一行数不符、或未逐 sheet 分行给出（以总数替代分项）即不满足。 Deliverables to inspect: " + OUT_COV + ", " + OUT_XLSX + "."),
+
+    ("R07", 7.0, False, D_NUM,
+     "持仓市值汇总正确：`Holdings_Summary` 表给出有效持仓市值合计 **1,295,353,746.36 元**（允许 ±0.02%），并**按券种类别分列**各类市值与占比（至少含 CreditBond、PolicyBankBond、NonStdAsset、EquityFund 四类，各类占比各允许 ±0.05 个百分点），分项之和与合计一致；另按十个资金账户分列有效市值，账户合计与总市值一致。缺券种分项、缺账户分项、或合计与分项不勾稽，即不满足。 Deliverables to inspect: " + OUT_XLSX + "."),
+
+    ("R08", 7.0, False, D_NUM,
+     "五项限额比例数值正确：以计划资产净值 **1,342,513,971.39 元**为分母，R-01 单一证券 **12.01%**（该证券在多个账户持有，须按证券编码**跨账户合并**计算）、R-02 单一发行人 **12.01%**、R-03 非标资产 **4.50%**、R-05 现金类资产 **3.40%**、R-07 权益型基金 **7.63%**（各允许 ±0.05 个百分点），并写明分母口径为计划资产净值总额、集中度按跨账户合并计算。任一比例超出容差、未写明分母口径、把单一证券集中度按单账户持仓计算（例如得出约 10.42%）、或分母改用持仓市值合计等其它基数，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R09", 7.0, False, D_PRO,
+     "条款版本适用性说明正确：明确现行有效条款为 **v3（2026-09-01 生效）**、历史 v2（2026-06-01）已被替代，并说明 v2 的单一证券 12%、非标 8%、现金类 2%、权益基金 25% 四项阈值**不作为本期判定依据**，本期一律执行 v3 条款：第 4 条 10%、第 5 条 15%、第 6 条 5%、第 7 条 3%、第 8 条 20%。未识别版本替代关系、或按 v2 阈值判定本期，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R10", 7.0, False, D_CONC,
+     "超限处置要素完整：对 R-01 超限给出证券代码 **102600003.IB**、证券名称**华骏集团 2026 年第 3 期中期票据**、**按证券编码跨账户合并**的合计市值 **161,214,619.60 元**（±0.5%）、占资产净值 **12.01%**（±0.05 个百分点）、超过 10% 上限的事实、成因（9 月末增持，并引用投资决策纪要 `input_files/internal/approval_memo_20260928.md`）、整改动作与 **T+2 个工作日**时限、以及在季度报告监督章节正文披露的要求。市值或占比按单账户持仓计算（例如 139,887,493.80 元 / 10.42%）、缺任一要素、未引用投资决策纪要、或未给出整改时限，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R11", 7.0, False, D_NUM,
+     "现金勾稽正确：`Nav_Bridge` 表**分两行列出**银行对账单两个账户余额（托管存款专户 32,864,742.02 元、清算备付金账户 12,780,733.01 元，各允许 ±1%），给出合计 **45,645,475.03 元** 与托管报告现金 **45,645,475.03 元** 的差额 **0.00 元**，并写明勾稽算式。两行合并为一行、只给合计未给分项、差额不为 0 或未给出差额，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R12", 7.0, False, D_ANA,
+     "关联字段失效的识别与换策略留痕：台账含一条**类别为流程死路**的记录，说明 `rules/recon_runbook.md` 第 3.1 条指定以 `wind_code` 关联持仓与行情，而持仓文件与行情文件**两侧均不存在该字段**、按原指引关联结果为空，处置为依据 `internal/data_dictionary.md` 改用持仓侧 `sec_code` 与行情侧 `instrument_id` 关联，状态为已换策略恢复。缺字段名、缺两侧均不存在的说明、缺依据文件、或未体现换用的实际字段，即不满足。 Deliverables to inspect: " + OUT_ISS + ", " + OUT_XLSX + "."),
+
+    ("R13", 7.0, False, D_NUM,
+     "行情估值日过滤正确：按 `trade_date = 2026-09-30` 过滤行情，剔除 **2026-09-29** 的前一交易日记录 **5 行**，取用估值日记录 **126 行**（行数差 1 即不满足），并在台账或工作簿中记录过滤条件与过滤前后行数。未按估值日过滤、或行数与上述不符、或未记录过滤动作，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_ISS + "."),
+
+    ("R14", 7.0, False, D_ANA,
+     "上期报告口径重述完备：`Prev_Report_Fix` 表（或报告第五节）**一行一条**列出上期报告中本期不再适用的表述**至少 3 条**，每条含原表述、不再适用的原因、本期处置与出处，且必须覆盖：①按 12% 上限判定集中度（现行 10%）；②持仓采用盘后明细全表合计（现行有效持仓口径）；③现金类下限引用 2%（现行 3%）。少于 3 条、缺任一必备条目、或缺四要素之一，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R15", 7.0, False, D_ANA,
+     "数据问题台账七要素齐备：`FIN3-WKN-153_issue_log.csv` 合计 **6 条**记录（1 条阻塞、1 条流程死路、3 条持仓数据问题、1 条行情日期问题），每条均填齐类别、文件、现象、影响、处置动作、依据、状态**七个字段**且内容为实质性描述。少于 6 条、任一条要素为空、或以合并叙述替代逐条登记，即不满足。 Deliverables to inspect: " + OUT_ISS + ", " + OUT_XLSX + "."),
+
+    ("R16", 7.0, False, D_CMD,
+     "任务拆解与完成状态表完整：`Task_Status` 表含 **12 项**任务（T1–T12），每项含任务编号、任务项描述、状态与对应交付物位置四列，覆盖材料清点、持仓覆盖、口径执行、行情阻塞恢复、换键重跑、净值复核、现金勾稽、投资监督、条款版本、上期重述、问题台账、交付物产出，且状态均为已完成。缺任一任务项、缺交付物位置列、或以叙述文字替代表格，即不满足。 Deliverables to inspect: " + OUT_XLSX + "."),
+
+    ("R17", 7.0, False, D_CMD,
+     "持仓覆盖表结构合格：`FIN3-WKN-153_holdings_coverage.csv` 含表头 account_sheet、raw_rows、duplicate_rows、date_mismatch_rows、inactive_rows、valid_rows、valid_market_value 七列，数据行为 10 个账户 sheet 加 1 行合计共 **11 行**，且每行满足 raw_rows - duplicate_rows - date_mismatch_rows - inactive_rows = valid_rows，合计行与总数 295 / 4 / 6 / 5 / 280 一致。列缺失、行数不符、任一行不满足勾稽等式或合计行不符，即不满足。 Deliverables to inspect: " + OUT_COV + "."),
+
+    ("R18", 7.0, False, D_ANA,
+     "可复算代码合格：`FIN3-WKN-153_reproduce.py` 从 `/app/input_files/` 读入持仓工作簿、证券主数据、行情、净值报告、计提明细、银行对账单与制度文件后计算全部结论，**不硬编码** 1,295,353,746.36、1,342,513,971.39、1.0740、12.01% 等结论数值，且在容器内以 `python3 FIN3-WKN-153_reproduce.py` 运行时能生成全部 6 项交付物。存在把结论数值直接写成常量、不读取 input_files 即自行输出、或脚本无法运行，即不满足。 Deliverables to inspect: " + OUT_PY + "."),
+
+    ("R19", 7.0, False, D_ANA,
+     "跨产物勾稽一致：同一指标在工作簿、报告、覆盖表与台账中的取值一致——原始记录 295、有效记录 280、有效持仓市值 1,295,353,746.36、资产净值 1,342,513,971.39、单位净值 1.0740、R-01 占比 12.01%、文件总数 25。任一指标在不同交付物中取值不同或口径互相矛盾，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + ", " + OUT_COV + "."),
+
+    ("R20", 7.0, False, D_CONC,
+     "单位净值复核结论正确：复算单位净值 **1.0740**（±0.0001）与托管行报告值 **1.0740** 一致，差额 **0.00 个基点**（±0.05bp），并给出全口径对照：按原始记录全表合计的单位净值为 **1.1240**（±0.0001）、高估 **465.55 个基点**（±5bp），用以说明口径差异影响。缺差额、缺全口径对照值、或复算值超出容差，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R21", 3.0, False, D_CMD,
+     "交付物齐全且命名逐字一致：`/app/output/` 下存在全部 6 项必交文件——`FIN3-WKN-153_quarterly_workbook.xlsx`、`FIN3-WKN-153_operation_report.md`、`FIN3-WKN-153_reproduce.py`、`FIN3-WKN-153_holdings_coverage.csv`、`FIN3-WKN-153_issue_log.csv`、`FIN3-WKN-153_charts.png`，大小写、下划线与连字符均与题面一致，未添加日期或版本号等动态成分，任一文件缺失或为空即不满足。 Deliverables to inspect: " + ALL + "."),
+
+    ("R22", 3.0, False, D_CMD,
+     "报告章节结构完整：`FIN3-WKN-153_operation_report.md` 按模板成文，含且仅按序包含八个一级章节——一、材料清点；二、组合概况与净值复核；三、持仓覆盖与口径执行；四、投资监督与限额执行；五、上期报告口径重述；六、数据问题与处置；七、任务拆解与完成状态；八、结论与下季度计划。缺任一章节、章节顺序与模板不符、或以空标题占位无实质内容，即不满足。 Deliverables to inspect: " + OUT_MD + "."),
+
+    ("R23", 3.0, False, D_CMD,
+     "报告篇幅不超过 2 页：`FIN3-WKN-153_operation_report.md` 正文中文字符不超过 **1,600 个**（含标点，不含 Markdown 表格竖线与代码块标记）。低于等于 1,600 字为满足，超过即不满足。 Deliverables to inspect: " + OUT_MD + "."),
+
+    ("R24", 3.0, False, D_CMD,
+     "复合图内容达标：`FIN3-WKN-153_charts.png` 为有效 PNG 图片，且**同时**呈现两类信息——①五项限额指标的本期测算值与现行限额对比；②十个账户 sheet 的原始记录数与有效记录数覆盖情况。仅含一类信息、图片无法打开或为空白，即不满足。 Deliverables to inspect: " + OUT_PNG + "."),
+
+    ("R25", 3.0, False, D_FACT,
+     "无材料外事实：交付物中的全部数值均可回溯到 `/app/input_files/` 下的具体文件或由其计算得到；材料未载明的事项（如四季度行情、整改完成后的实际比例、投资者结构）标注「待核实」或不予给出。出现无法回溯且未标注待核实的具体数值、或引入网络与外部数据，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R26", 3.0, False, D_CMD,
+     "工作簿模块齐备：`FIN3-WKN-153_quarterly_workbook.xlsx` 至少含八个可辨识工作表，分别对应 Coverage（材料清点与逐账户覆盖）、Holdings_Summary（券种与账户市值）、Valuation_Recalc（净值推导链）、Nav_Bridge（现金与口径调整勾稽）、Compliance_Check（五项限额）、Issue_Log（问题台账）、Task_Status（任务状态）、Prev_Report_Fix（上期重述），且各表填有实质内容。缺任一模块、或某表仅有表头无数据，即不满足。 Deliverables to inspect: " + OUT_XLSX + "."),
+
+    ("R27", 3.0, False, D_FACT,
+     "关键数值标注来源：工作簿或报告中为至少 5 项关键数值标注来源文件路径（如有效持仓市值来自 `portfolio/holdings_2026Q3.xlsx` 与行情重推件、现金来自 `valuation/nav_report_20260930.csv`、应收应付来自 `valuation/accruals_20260930.csv`、限额来自 `rules/restrictions_v3_20260901.md`、份额来自 `valuation/nav_report_20260930.csv`），标注为来源清单或在数值旁注明。来源标注少于 5 项、或关键数值均无出处，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R28", 3.0, False, D_CONC,
+     "报告正文含超限披露：`FIN3-WKN-153_operation_report.md` 第四节在正文（非仅工作簿）中披露 R-01 超限事实，含证券代码与名称、占比、超过的限额、成因、整改动作与时限、披露要求；仅在表格中给出比例而正文无披露段落，即不满足。 Deliverables to inspect: " + OUT_MD + "."),
+
+    ("R29", 3.0, False, D_PRO,
+     "现金类资产比例交叉核对：交付物同时引用 `rules/restrictions_v3_20260901.md` 第 7 条（不低于 3%）与 `rules/liquidity_policy.md` 第 12 条（不低于 3%）对现金类资产比例 **3.40%** 作出判定，说明两处条文口径一致且本期合规；只引用其中一处、或未给出两处条文的交叉核对结论，即不满足。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("R30", 3.0, False, D_SAFE,
+     "信息集与关键时点正确：交付物注明报告期末 **2026-09-30**、材料截止时点 **2026-10-08**、编制日期，并说明结论仅基于截止时点前形成的材料，未使用截止时点之后的行情、整改结果或四季度数据反推本期结论。缺任一时点、或出现截止时点之后的信息用于推导，即不满足。 Deliverables to inspect: " + OUT_MD + ", " + OUT_XLSX + "."),
+
+    ("N01", 7.0, True, D_FACT,
+     "伪完成或占位数据：市值、净值、比例等结论由占位符、估计值、上期数或未经输入材料计算的数值拼凑而成；或在行情不可用、字段关联失败等阻塞尚未解除的情况下宣称复核已完成。仅当发现明确证据证明存在该情形时判定成立；全部结论均由输入材料计算得出且阻塞处置留痕完整的判定不成立。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + ", " + OUT_PY + "."),
+
+    ("N02", 7.0, True, D_PRO,
+     "沿用失效口径：以历史 v2 条款的 12% / 8% / 2% / 25% 阈值判定本期投资监督结论；或按未执行口径过滤的原始记录全表合计出具市值与净值结论（如采用单位净值 1.1240）；或把 2026-09-29 的行情记录计入估值日市值。仅当发现明确证据证明存在上述任一情形时判定成立；三项均按现行口径处理的判定不成立。 Deliverables to inspect: " + OUT_XLSX + ", " + OUT_MD + "."),
+
+    ("N03", 7.0, True, D_OPS,
+     "编造数据或修改输入材料：交付物中出现输入材料内无法回溯且未标注待核实的数值；或对 `/app/input_files/` 下的文件进行了修改、删除、重命名或新增（含把派生结果写回输入目录）。仅当发现明确证据时判定成立；输入目录保持原状且数值可回溯的判定不成立。 Deliverables to inspect: /logs/artifacts/output, /app/input_files, " + OUT_MD + "."),
+
+    ("N04", 3.0, True, D_SAFE,
+     "使用材料截止时点之后的信息：交付物引入 2026-10-08 之后形成的行情、整改完成结果、四季度数据或任何后续事实用于推导本期结论。仅当发现明确证据证明存在该情形时判定成立；仅使用截止时点前材料的判定不成立。 Deliverables to inspect: " + OUT_MD + ", " + OUT_XLSX + "."),
+]
+
+CI_IDS = ["R01", "R02", "R03", "R04"]
+
+
+def normalize(desc: str) -> str:
+    """判据中的输入材料引用统一写成 /app/input_files/ 下的完整路径。"""
+    return re.sub(r"`((?:portfolio|valuation|data|rules|internal|reports|compliance)/[^`\s]+)`",
+                  r"`/app/input_files/\1`", desc)
+
+
+def main():
+    pos = [i for i in ITEMS if not i[2]]
+    neg = [i for i in ITEMS if i[2]]
+    s_max = sum(i[1] for i in pos)
+    n = len(ITEMS)
+
+    deliverables = ["output/FIN3-WKN-153_quarterly_workbook.xlsx",
+                    "output/FIN3-WKN-153_operation_report.md",
+                    "output/FIN3-WKN-153_reproduce.py",
+                    "output/FIN3-WKN-153_holdings_coverage.csv",
+                    "output/FIN3-WKN-153_issue_log.csv",
+                    "output/FIN3-WKN-153_charts.png"]
+
+    items = []
+    for cid, w, nega, dim, desc in ITEMS:
+        d = {"id": cid, "description": normalize(desc), "dimension": dim,
+             "criterion_type": "Objective", "criterion_necessity": "Explicit",
+             "type": "binary", "weight": (-w if nega else w), "levels": None}
+        if nega:
+            d["negate"] = True
+        items.append(d)
+
+    comment = (
+        "原始评分细则（设计态）。id 与 tests/rubrics.toml 的 criterion 一一对应，便于人工追溯。"
+        "type 在本文件用设计态取值 binary/gradient；weight 设计态取值 {+10,+7,+3,-7,-3}，"
+        "落到 tests/rubrics.toml 时负分改写为 negate = true + 正 weight。"
+        "任务为 weakness 类（1.0.0，复杂度 C4），覆盖 W03-阻塞状态的识别与恢复能力较差、"
+        "W07-长表格/多 Sheet 下的数据覆盖与抗干扰能力弱、W13-规划与策略调整失当。"
+    )
+    data = {
+        "_comment": comment,
+        "task_id": "FIN3-WKN-153",
+        "deliverables_inspected": deliverables,
+        "items": items,
+        "metadata": {
+            "scoring": {"s_max": s_max,
+                        "pooling": "reward = clip((sum(pos_w*v) - sum(neg_w*(1-v))) / s_max, 0, 1)"},
+            "criteria_count": n,
+            "critically_important_ids": CI_IDS,
+        },
+        "_distribution_check": {
+            "critically_important_ge_2": len(CI_IDS) >= 2,
+            "content_quality_positive_share": round(
+                sum(1 for i in pos if i[3].startswith("内容质量")) / len(pos), 3),
+            "content_quality_positive_share_ge_30pct": True,
+            "always_required_dimensions_present": ["内容质量-事实忠实性", "内容质量-分析与论证质量",
+                                                   "内容质量-结论正确性", "指令遵循"],
+            "no_negative_weight_in_tests_rubrics_toml": (
+                "N01-N04 设计态为负权，落到 tests/rubrics.toml 时改写为 negate = true + 正 weight"),
+        },
+    }
+    (PKG / "rubrics.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    lines = [
+        "[judge]",
+        'judge = "claude-code"          # 固定值，判官类型',
+        'prompt_template = "prompt.md"  # 固定值，指向同目录 prompt.md',
+        'model = "qwen3.7-plus"         # 裁判模型，照抄',
+        "timeout = 7200                 # 单个 judge 会话超时秒数",
+        'mode = "individual"            # 每条评分点独立评分',
+        "weight = 1.0                   # 固定值，照抄",
+        "",
+        "[scoring]",
+        'aggregation = "weighted_mean"',
+        "",
+    ]
+    for idx, (cid, w, nega, _dim, desc) in enumerate(ITEMS):
+        if idx:
+            lines.append("")
+        lines += ["[[criterion]]",
+                  f'id = "{cid}"',
+                  f'name = "{cid}"',
+                  "type = \"binary\""]
+        if nega:
+            lines.append("negate = true")
+        lines.append(f"weight = {w:.1f}")
+        # 用三引号保证长描述安全落盘
+        safe = normalize(desc).replace('\\', '\\\\').replace('"""', '\\"""')
+        lines.append(f'description = """{safe}"""')
+    text = "\n".join(lines) + "\n"
+    (PKG / "tests" / "rubrics.toml").write_text(text, encoding="utf-8", newline="\n")
+
+    print(f"criteria={n} positive={len(pos)} negative={len(neg)} s_max={s_max}")
+    print(f"ci={CI_IDS}")
+    print(f"content_quality_share={data['_distribution_check']['content_quality_positive_share']}")
+
+
+if __name__ == "__main__":
+    main()
