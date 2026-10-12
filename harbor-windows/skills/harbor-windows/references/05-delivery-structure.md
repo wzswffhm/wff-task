@@ -10,6 +10,10 @@
 > 即 `wfflab__<task>-v<版本>-delivery/`。**禁止**用 `task_id`（`wfflab__<task>`）当目录名——
 > 它不含版本，无法区分 v1.1.0 / v1.2.0。拉取方式固定为：下载附件 zip → 解压到 `harbor-windows/`。
 >
+> **核对口径（2026-10-12 核定）**：一致性只比对飞书 `作业压缩包` 字段的附件名与本地目录名；
+> 同表的 `zhang质检` / `分数截图` / `oracle/nop截图` 等附件字段属过程证据，不参与判定。
+> 需要内容级复核时：重新下载 `作业压缩包` 附件 → 比对 SHA256 → 解压 → 与本地题包目录逐文件比对 SHA256。
+>
 > **结构演进**：v1.2.0（含）之后交付包改为**平铺式**，顶层直接是
 > `environment/ jobs/ solution/ tests/ verifier/ instruction.md task.toml`；
 > 下述 `outside_harbor-assets/` 嵌套式结构属 ≤ v1.1.0 历史形态。

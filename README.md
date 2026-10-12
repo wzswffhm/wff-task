@@ -128,6 +128,11 @@ deliverables/     2026-09-29_windwos-第二版/     # 日期 + 材料主名（�
 4. **换版即换目录**：拉取新版后移除旧目录，类型目录下与飞书当前附件**一一对应**，不留历史版本副本。
 5. **拉取方式固定**：`base +record-download-attachment` 下载附件 zip → 解压到类型目录本身，
    让包内顶层目录自然落地；禁止手工拼目录、手工改名。
+6. **一致性核对只认交付附件字段**：harbor-windows 看飞书 `作业压缩包` 字段，harbor-weakness 看
+   `交付物` 字段。同表的 `zhang质检` / `分数截图` / `oracle/nop截图`（windows）与
+   `题目附件信息` / `标准答案附件信息` / `质检报告`（weakness）属**过程证据或输入素材**，
+   不参与一致性判定，本地也不需要镜像——它们的缺失不等于落地不一致。
+   需要内容级复核时走「重下附件 → 比对 SHA256 → 解压 → 与本地目录逐文件比对 SHA256」。
 
 当前对应关系：
 
@@ -144,6 +149,10 @@ harbor-weakness 的批次目录内固定为 `<批次目录>/FIN3-WKN-<序号>/` 
 harbor-windows 的题包目录内固定为 `environment/ jobs/ solution/ tests/ verifier/ instruction.md task.toml`。
 两类型 skill 中已写入同口径规则（`harbor-weakness/skills/harbor-weakness/`、
 `harbor-windows/skills/harbor-windows/`）。
+
+**2026-10-12 逐字复核**：按第 6 条口径重下上表 6 个交付附件比对 SHA256，再解压与本地目录
+逐文件比对 SHA256，合计 **1247 个文件 0 差异**（216=386、215=393、149=115、150=117、
+151=103、152=133），无缺件、无多件、无同名异内容。
 
 ### 落点判定表（速查）
 

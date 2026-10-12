@@ -269,6 +269,11 @@ wfflab__wfmt-215-v2.1.0-delivery/      # ← wfflab__wfmt-215-v2.1.0-delivery.zi
 | 4 | 题包换版时目录名随之更换（`...-v1.2.0-delivery`），`harbor-windows/` 下**不得**留存旧版本目录 |
 | 5 | `task_id` / `task_version` / `task_hash` / 镜像 Digest 仍以包内 `task.toml` 与 `_index/` 为准，不因目录名改写 |
 
+> **一致性核对只认 `作业压缩包` 字段（2026-10-12 核定）**：飞书该表另有 `zhang质检`、
+> `分数截图`、`oracle/nop截图` 等附件字段，它们是**过程证据**，不属于题包交付内容，
+> **不参与**「本地与飞书一致」的判定。核对只比对 `作业压缩包` 字段的附件名（去 `.zip`）与
+> `harbor-windows/` 下的题包目录名。
+
 > 交付包**内部**结构以新版（v1.2.0 / v2.1.0）平铺式为准：顶层直接是
 > `environment/ jobs/ solution/ tests/ verifier/ instruction.md task.toml`；
 > 上方「题包本体 / 伴随材料」的 `outside_harbor-assets/` 嵌套式属旧版（≤ v1.1.0）历史形态。
