@@ -1,0 +1,2707 @@
+--- turn 1 tool read_file {"path": "C:\\task\\instruction.md"}
+--- turn 1 result ---
+(88 lines total)
+   1| # wchunk：容器格式实现与样本不兼容
+   2| 
+   3| `wchunk` 是我们采集器落盘用的**分块容器格式**实现：一个文件由「文件头 +
+   4| 若干条记录 + 尾部校验和」组成，每条记录携带一个整数 `tag` 和一段二进制
+   5| `payload`。外部还有一批已经落盘的历史文件（例如
+   6| `assets/sample.wchk`），下游解析器正是按它们实现的。
+   7| 
+   8| ## 现象（仓库 issue #216）
+   9| 
+  10| 1. **读不了真实样本**：`wchunk.verify(open("assets/sample.wchk","rb").read())`
+  11|    返回 `False`；`unpack()` 抛错或返回明显错误的结果。而**我们自己**
+  12|    `pack()` 出来的文件又能被自己 `unpack()` 读回来——所以可见冒烟测试
+  13|    一直是绿的，问题被掩盖了。
+  14| 2. **无法原样回写**：即便勉强解析出样本，`pack(unpack(sample))` 得到的字节
+  15|    与原文件**不一致**（下游按字节 hash 做增量同步，不一致就等于损坏）。
+  16| 3. **校验和对不上**：`compute_crc()` 的返回值与公开标准不符——拿它算常见
+  17|    测试向量得到的值和任何标准 32 位 CRC 都对不上。
+  18| 4. **容器长度对不上**：生成的容器与样本在**同样的记录集合**下长度不同，
+  19|    下游按字节偏移解析，长度不一致就整体错位。
+  20| 5. **结构错误分类不准**：截断、被篡改的文件有时抛 `WChunkError` 却给出
+  21|    错误的 `kind`，有时干脆被当成正常数据读完。
+  22| 
+  23| ## 任务
+  24| 
+  25| 修复 `wchunk` 包，使其满足下列**验收标准**。请注意：仓库里的
+  26| `docs/FORMAT.md` 是**早期草稿**，与真实布局已经不一致；
+  27| `assets/` 下的样本才是唯一权威依据。
+  28| 
+  29| ## 验收标准
+  30| 
+  31| ### A. 样本兼容（硬门槛）
+  32| 
+  33| - `verify(sample)` 必须为 `True`（`sample` = `assets/sample.wchk` 的全部字节）；
+  34| - `pack(unpack(sample)) == sample`，**逐字节一致**；
+  35| - 零记录样本 `assets/sample_empty.wchk` 同样要能 `verify` 通过并原样回写。
+  36| 
+  37| ### B. 记录语义
+  38| 
+  39| - `unpack(data)` 返回 `[(tag, payload), ...]`，按文件中的顺序；
+  40| - `tag` 是非负整数，`payload` 是 `bytes`（空 `payload` 合法）；
+  41| - `pack(records)` 接受同构的 `(tag, payload)` 序列，产出的容器必须能被
+  42|   `unpack` 与 `iter_records` 正确读回。
+  43| 
+  44| ### C. 记录布局
+  45| 
+  46| - 记录区的字节布局必须与**样本的实际字节**一致，而不是以草稿的描述为准；
+  47| - 对同一组记录，`pack()` 产出的容器长度必须与真实布局规律一致。
+  48| 
+  49| ### D. 校验和
+  50| 
+  51| - 容器尾部的校验和必须与样本一致，且必须是某个**通用的 32 位 CRC 变体**
+  52|   ——即：它是数据的一个确定函数，对任意输入（而不只是样本）都成立；
+  53| - 校验和的覆盖范围必须包含**文件头与全部记录**；
+  54| - 被篡改过**内容**的容器，`verify()` 必须返回 `False`。
+  55| 
+  56| ### E. 错误分类
+  57| 
+  58| 所有「结构 / 完整性」问题都必须抛 `WChunkError`（而不是
+  59| `ValueError` / `struct.error` / `IndexError` 等），且 `err.kind` 需能区分
+  60| 问题类别：
+  61| 
+  62| | kind | 含义 |
+ 
+--- turn 2 tool read_file {"path": "C:\\task\\environment\\workspace\\docs\\FORMAT.md"}
+--- turn 2 result ---
+(36 lines total)
+   1| # WCHK 分块容器格式（草稿 v0.4）
+   2| 
+   3| > ⚠️ **本文件是早期设计草稿，已与实现和真实样本脱节。** 保留它只是为了
+   4| > 记录当时的取舍；请勿据此实现或排错。以 `assets/` 下的样本为准。
+   5| 
+   6| ## 文件头
+   7| 
+   8| | 偏移 | 长度 | 含义 |
+   9| |---|---|---|
+  10| | 0 | 4 | 魔数 `WCHK` |
+  11| | 4 | 1 | 版本号（当前 2） |
+  12| | 5 | 4 | 记录条数，**大端 u32** |
+  13| | 9 | 3 | 保留字节（全 0） |
+  14| 
+  15| ## 记录
+  16| 
+  17| ```
+  18| +------------+------------+------------------+
+  19| | tag        | size       | payload          |
+  20| | uvarint    | uvarint    | size 字节        |
+  21| +------------+------------+------------------+
+  22| ```
+  23| 
+  24| - `tag` 与 `size` 都以 **uvarint（LEB128）** 编码；
+  25| - 记录**首尾相接**，记录之间**不需要对齐填充**；
+  26| - 记录条数即文件头的 count。
+  27| 
+  28| ## 校验和
+  29| 
+  30| 文件末尾追加 **4 字节**校验和：CRC-32 查表法，初值 `0xFFFFFFFF`，
+  31| **不做最终异或**（与常见的 zlib CRC-32 差一个取反步骤）。
+  32| 
+  33| ## changelog
+  34| 
+  35| - v0.4 —— 魔数从 `WCN1` 升到 `WCHK`；**若干字段的编码方式已调整，本文件
+  36|   未同步更新**。
+--- turn 3 tool list_dir {"path": "C:\\task\\environment\\workspace\\assets"}
+--- turn 3 result ---
+file 330b	sample.wchk
+file 18b	sample_empty.wchk
+--- turn 4 tool read_file {"path": "C:\\task\\environment\\workspace\\assets\\sample.wchk"}
+--- turn 4 result ---
+(binary file, 330 bytes -- hex dump, 16 bytes per line)
+(21 lines total)
+00000000  57 43 48 4b 02 05 00 00   00 00 00 00 01 00 05 00  |WCHK............|
+00000010  61 6c 70 68 61 00 00 00   00 00 00 00 02 00 00 00  |alpha...........|
+00000020  00 00 00 00 2c 01 0a 00   78 78 78 78 78 78 78 78  |....,...xxxxxxxx|
+00000030  78 78 00 00 04 00 00 01   00 01 02 03 04 05 06 07  |xx..............|
+00000040  08 09 0a 0b 0c 0d 0e 0f   10 11 12 13 14 15 16 17  |................|
+00000050  18 19 1a 1b 1c 1d 1e 1f   20 21 22 23 24 25 26 27  |........ !"#$%&'|
+00000060  28 29 2a 2b 2c 2d 2e 2f   30 31 32 33 34 35 36 37  |()*+,-./01234567|
+00000070  38 39 3a 3b 3c 3d 3e 3f   40 41 42 43 44 45 46 47  |89:;<=>?@ABCDEFG|
+00000080  48 49 4a 4b 4c 4d 4e 4f   50 51 52 53 54 55 56 57  |HIJKLMNOPQRSTUVW|
+00000090  58 59 5a 5b 5c 5d 5e 5f   60 61 62 63 64 65 66 67  |XYZ[\]^_`abcdefg|
+000000a0  68 69 6a 6b 6c 6d 6e 6f   70 71 72 73 74 75 76 77  |hijklmnopqrstuvw|
+000000b0  78 79 7a 7b 7c 7d 7e 7f   80 81 82 83 84 85 86 87  |xyz{|}~.........|
+000000c0  88 89 8a 8b 8c 8d 8e 8f   90 91 92 93 94 95 96 97  |................|
+000000d0  98 99 9a 9b 9c 9d 9e 9f   a0 a1 a2 a3 a4 a5 a6 a7  |................|
+000000e0  a8 a9 aa ab ac ad ae af   b0 b1 b2 b3 b4 b5 b6 b7  |................|
+000000f0  b8 b9 ba bb bc bd be bf   c0 c1 c2 c3 c4 c5 c6 c7  |................|
+00000100  c8 c9 ca cb cc cd ce cf   d0 d1 d2 d3 d4 d5 d6 d7  |................|
+00000110  d8 d9 da db dc dd de df   e0 e1 e2 e3 e4 e5 e6 e7  |................|
+00000120  e8 e9 ea eb ec ed ee ef   f0 f1 f2 f3 f4 f5 f6 f7  |................|
+00000130  f8 f9 fa fb fc fd fe ff   00 00 00 00 e8 fd 01 00  |................|
+00000140  7a 00 00 00 d2 37 6a ef   1b ff                   |z....7j...|
+--- turn 5 tool read_file {"path": "C:\\task\\environment\\workspace\\assets\\sample_empty.wchk"}
+--- turn 5 result ---
+(binary file, 18 bytes -- hex dump, 16 bytes per line)
+(2 lines total)
+00000000  57 43 48 4b 02 00 00 00   00 00 00 00 f1 d7 13 ef  |WCHK............|
+00000010  00 00                                             |..|
+--- turn 6 tool list_dir {"path": "C:\\task\\environment\\workspace\\wchunk"}
+--- turn 6 result ---
+file 690b	__init__.py
+file 2826b	codec.py
+file 399b	crc.py
+file 549b	errors.py
+file 1106b	header.py
+file 2257b	stream.py
+file 1210b	varint.py
+--- turn 7 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\__init__.py"}
+--- turn 7 result ---
+(28 lines total)
+   1| """wchunk：带尾部校验和的长度前缀记录容器。
+   2| 
+   3| 公开 API（名称与签名保持不变）：
+   4|     pack(records) -> bytes
+   5|     unpack(data) -> list[(tag, payload)]
+   6|     verify(data) -> bool
+   7|     iter_records(fileobj) -> Iterator[(tag, payload)]      # 流式
+   8|     read_all(fileobj) -> list[(tag, payload)]
+   9|     compute_crc(data) -> int
+  10|     WChunkError(kind, message)
+  11| """
+  12| 
+  13| from __future__ import annotations
+  14| 
+  15| from .codec import pack, unpack, verify
+  16| from .crc import compute_crc
+  17| from .errors import WChunkError
+  18| from .stream import iter_records, read_all
+  19| 
+  20| __all__ = [
+  21|     "pack",
+  22|     "unpack",
+  23|     "verify",
+  24|     "iter_records",
+  25|     "read_all",
+  26|     "compute_crc",
+  27|     "WChunkError",
+  28| ]
+--- turn 8 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\errors.py"}
+--- turn 8 result ---
+(18 lines total)
+   1| """WCHK 容器的结构 / 完整性错误。
+   2| 
+   3| 结构或完整性问题抛 WChunkError，err.kind 用于分类。
+   4| """
+   5| 
+   6| from __future__ import annotations
+   7| 
+   8| 
+   9| class WChunkError(Exception):
+  10|     """WCHK 容器错误。kind ∈ {magic, version, truncated, structure, checksum}"""
+  11| 
+  12|     def __init__(self, kind: str, message: str) -> None:
+  13|         super().__init__(message)
+  14|         self.kind = kind
+  15|         self.message = message
+  16| 
+  17|     def __repr__(self) -> str:  # pragma: no cover
+  18|         return f"WChunkError(kind={self.kind!r}, message={self.message!r})"
+--- turn 9 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\crc.py"}
+--- turn 9 result ---
+(14 lines total)
+   1| """容器尾部校验和。"""
+   2| 
+   3| from __future__ import annotations
+   4| 
+   5| import zlib
+   6| 
+   7| from .errors import WChunkError
+   8| 
+   9| 
+  10| def compute_crc(data: bytes) -> int:
+  11|     """返回 ``data`` 的 32 位校验和。"""
+  12|     if not isinstance(data, (bytes, bytearray, memoryview)):
+  13|         raise WChunkError("structure", f"compute_crc expects bytes, got {type(data).__name__}")
+  14|     return zlib.crc32(data) ^ 0xFFFFFFFF
+--- turn 10 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\header.py"}
+--- turn 10 result ---
+(32 lines total)
+   1| """WCHK 文件头（12 字节）。"""
+   2| 
+   3| from __future__ import annotations
+   4| 
+   5| import struct
+   6| 
+   7| from .errors import WChunkError
+   8| 
+   9| MAGIC = b"WCHK"
+  10| VERSION = 0x02
+  11| HEADER_SIZE = 12
+  12| 
+  13| 
+  14| def build_header(record_count: int) -> bytes:
+  15|     if record_count < 0:
+  16|         raise WChunkError("structure", "record_count must be non-negative")
+  17|     return MAGIC + bytes([VERSION]) + struct.pack(">I", record_count) + b"\x00\x00\x00"
+  18| 
+  19| 
+  20| def parse_header(data: bytes) -> tuple[int, int]:
+  21|     """校验并解析文件头，返回 (version, record_count)。"""
+  22|     if len(data) < HEADER_SIZE:
+  23|         raise WChunkError("truncated", f"header needs {HEADER_SIZE} bytes, got {len(data)}")
+  24|     if data[:4] != MAGIC:
+  25|         raise WChunkError("magic", f"bad magic {data[:4]!r}, expected {MAGIC!r}")
+  26|     version = data[4]
+  27|     if version != VERSION:
+  28|         raise WChunkError("version", f"unsupported version {version}, expected {VERSION}")
+  29|     if data[9:12] != b"\x00\x00\x00":
+  30|         raise WChunkError("structure", "reserved header bytes must be zero")
+  31|     (record_count,) = struct.unpack(">I", data[5:9])
+  32|     return version, record_count
+--- turn 11 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\varint.py"}
+--- turn 11 result ---
+(40 lines total)
+   1| """WCHK 使用的无符号变长整数（LEB128）。"""
+   2| 
+   3| from __future__ import annotations
+   4| 
+   5| from .errors import WChunkError
+   6| 
+   7| VARINT_MAX_BYTES = 10  # u64 的 LEB128 上限
+   8| 
+   9| 
+  10| def encode_varint(value: int) -> bytes:
+  11|     """把非负整数编码为 LEB128 字节串。"""
+  12|     if not isinstance(value, int) or value < 0:
+  13|         raise WChunkError("structure", f"varint value {value!r} must be a non-negative int")
+  14|     out = bytearray()
+  15|     while True:
+  16|         byte = value & 0x7F
+  17|         value >>= 7
+  18|         if value:
+  19|             out.append(byte | 0x80)
+  20|         else:
+  21|             out.append(byte)
+  22|             return bytes(out)
+  23| 
+  24| 
+  25| def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+  26|     """从 data[offset:] 解出 LEB128，返回 (value, new_offset)。"""
+  27|     result = 0
+  28|     shift = 0
+  29|     pos = offset
+  30|     while True:
+  31|         if pos >= len(data):
+  32|             raise WChunkError("truncated", "varint runs past end of data")
+  33|         byte = data[pos]
+  34|         pos += 1
+  35|         result |= (byte & 0x7F) << shift
+  36|         if not (byte & 0x80):
+  37|             return result, pos
+  38|         shift += 7
+  39|         if shift >= VARINT_MAX_BYTES * 7:
+  40|             raise WChunkError("varint", "varint is too long to be valid")
+--- turn 12 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\codec.py"}
+--- turn 12 result ---
+(79 lines total)
+   1| """记录编解码与容器整体读写。"""
+   2| 
+   3| from __future__ import annotations
+   4| 
+   5| import struct
+   6| 
+   7| from .crc import compute_crc
+   8| from .errors import WChunkError
+   9| from .header import HEADER_SIZE, build_header, parse_header
+  10| from .varint import decode_varint, encode_varint
+  11| 
+  12| FOOTER_SIZE = 4
+  13| 
+  14| 
+  15| def pack(records) -> bytes:
+  16|     """把 [(tag, payload), ...] 序列化为 WCHK 字节串。"""
+  17|     items = []
+  18|     for tag, payload in records:
+  19|         if not isinstance(tag, int) or tag < 0 or tag > 0xFFFF:
+  20|             raise WChunkError("structure", f"tag {tag!r} out of range")
+  21|         if not isinstance(payload, (bytes, bytearray, memoryview)):
+  22|             raise WChunkError("structure", f"payload {type(payload).__name__} is not bytes")
+  23|         items.append((tag, bytes(payload)))
+  24| 
+  25|     body = bytearray()
+  26|     for tag, payload in items:
+  27|         body += encode_varint(tag) + encode_varint(len(payload)) + payload
+  28| 
+  29|     header = build_header(len(items))
+  30|     stream = bytes(header) + bytes(body)
+  31|     footer = struct.pack("<I", compute_crc(stream) & 0xFFFFFFFF)
+  32|     return stream + footer
+  33| def unpack(data: bytes) -> list:
+  34|     """解析 WCHK 字节串；任何结构/完整性问题都抛 WChunkError。"""
+  35|     if not isinstance(data, (bytes, bytearray, memoryview)):
+  36|         raise WChunkError("structure", f"unpack expects bytes, got {type(data).__name__}")
+  37|     data = bytes(data)
+  38|     if len(data) < HEADER_SIZE + FOOTER_SIZE:
+  39|         raise WChunkError("truncated",
+  40|                           f"need at least {HEADER_SIZE + FOOTER_SIZE} bytes, got {len(data)}")
+  41| 
+  42|     _version, count = parse_header(data)
+  43| 
+  44|     limit = len(data) - FOOTER_SIZE
+  45|     pos = HEADER_SIZE
+  46|     records = []
+  47|     for index in range(count):
+  48|         if pos >= limit:
+  49|             raise WChunkError("truncated", f"recor
+--- turn 13 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\stream.py"}
+--- turn 13 result ---
+(77 lines total)
+   1| """流式遍历 WCHK 容器（iter_records / read_all）。
+   2| 
+   3| 只允许 `read(n)` 取数，不得整读。
+   4| """
+   5| 
+   6| from __future__ import annotations
+   7| 
+   8| import struct
+   9| import zlib
+  10| 
+  11| from .codec import FOOTER_SIZE
+  12| from .errors import WChunkError
+  13| from .header import HEADER_SIZE, parse_header
+  14| from .varint import encode_varint
+  15| 
+  16| 
+  17| def _read_exact(fileobj, size: int) -> bytes:
+  18|     """按固定大小分块取满 size 字节；读不满则视为截断。"""
+  19|     if size <= 0:
+  20|         return b""
+  21|     chunks = []
+  22|     remaining = size
+  23|     while remaining > 0:
+  24|         chunk = fileobj.read(remaining)
+  25|         if not chunk:
+  26|             raise WChunkError(
+  27|                 "truncated",
+  28|                 f"stream ended after {size - remaining} of {size} bytes",
+  29|             )
+  30|         piece = bytes(chunk)
+  31|         chunks.append(piece)
+  32|         remaining -= len(piece)
+  33|     return b"".join(chunks)
+  34| 
+  35| 
+  36| def _read_varint(fileobj) -> int:
+  37|     """从流里读一个 LEB128 整数（逐字节，单字节 read）。"""
+  38|     result = 0
+  39|     shift = 0
+  40|     while True:
+  41|         raw = _read_exact(fileobj, 1)
+  42|         byte = raw[0]
+  43|         result |= (byte & 0x7F) << shift
+  44|         if not (byte & 0x80):
+  45|             return result
+  46|         shift += 7
+  47|         if shift >= 70:
+  48|             raise WChunkError("varint", "varint is too long to be valid")
+  49| 
+  50| 
+  51| def iter_records(fileobj):
+  52|     """惰性产出 (tag, payload)；CRC 在取完全部记录后校验。"""
+  53|     header = _read_exact(fileobj, HEADER_SIZE)
+  54|     _version, count = parse_header(header)
+  55|     crc = zlib.crc32(header)
+  56| 
+  57|     for _index in range(count):
+  58|         tag = _read_varint(fileobj)
+  59|         size = _read_varint(fileobj)
+  60|         encoded = encode_varint(tag) + encode_varint(size)
+  61|         payload = _read_exact(fileobj, size)
+  62|         crc = zlib.c
+--- turn 14 assistant ---
+Now let me analyze the sample files carefully to understand the actual format.
+
+**sample_empty.wchk (18 bytes):**
+```
+57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7 13 ef 00 00
+W C H K  v=2 count=0(BE) reserved   CRC?         ??
+```
+
+Wait, that's 18 bytes. Header is 12 bytes (0-11), then we have 6 remaining bytes: `f1 d7 13 ef 00 00`. But the footer should be 4 bytes CRC. Let me reconsider.
+
+Actually looking again at the hex dump:
+```
+00000000  57 43 48 4b 02 00 00 00   00 00 00 00 f1 d7 13 ef  |WCHK............|
+00000010  00 00                                             |..|
+```
+
+Bytes 0-3: `57 43 48 4b` = "WCHK" ✓
+Byte 4: `02` = version 2 ✓
+Bytes 5-8: `00 00 00 00` = record_count = 0 (big-endian u32) ✓
+Bytes 9-11: `00 00 00` = reserved zeros ✓
+
+That's 12 bytes header. Then remaining: `f1 d7 13 ef 00 00` = 6 bytes.
+
+But FOOTER_SIZE is 4. So there are 6 bytes after header for an empty file. That means either:
+- The footer is not 4 bytes, or
+- There's something else between records and footer
+
+Wait, maybe the record count field is NOT big-endian u32 at bytes 5-8. Let me reconsider the header layout.
+
+Looking at sample.wchk (330 bytes):
+```
+00000000  57 43 48 4b 02 05 00 00   00 00 00 00 01 00 05 00
+```
+Bytes 0-3: WCHK
+Byte 4: 02 (version)
+Byte 5: 05 - could this be record_count as a single byte? No, draft says u32 BE...
+
+If record_count is big-endian u32 at bytes 5-8: `05 00 00 00` = 0x05000000 = 83886080. That's way too many records.
+
+If record_count is little-endian u32 at bytes 5-8: `05 00 00 00` = 5. That makes more sense! The sample has 5 records.
+
+And for empty: `00 00 00 00` = 0 in either endianness. OK so that doesn't help distinguish.
+
+Let me assume LE u32 for record_count. So header bytes 5-8 are LE u32.
+
+Now back to empty sample: 18 bytes total. Header = 12 bytes. Remaining = 6 bytes: `f1 d7 13 ef 00 00`.
+
+Hmm, if footer is 4 bytes, that leaves 2 extra bytes. Unless... the footer is actually 6 bytes? Or maybe there's a different structure.
+
+Wait - let me re-examine. Maybe the "reserved" bytes aren't 3 bytes. Let me look at both samples more carefully.
+
+What if the header is actually different from what the draft says? The draft is explicitly noted as outdated.
+
+Let me try: What if header is:
+- 4 bytes magic
+- 1 byte version  
+- 4 bytes record count (LE u32)
+- 3 bytes reserved
+
+That's still 12 bytes. For empty: 18 - 12 = 6 bytes remaining. Footer should contain CRC.
+
+Let me compute what CRC-32 of the header alone would be:
+Header bytes for empty: `57 43 48 4b 02 00 00 00 00 00 00 00`
+
+zlib.crc32(b"WCHK\x02\x00\x00\x00\x00\x00\x00\x00") & 0xFFFFFFFF
+
+I can't execute code, but let me think about what `f1 d7 13 ef` could be. If stored as LE u32: 0xef13d7f1. If stored as BE u32: 0xf1d713ef.
+
+The current code does `struct.pack("<I", compute_crc(stream))` where `compute_crc` returns `zlib.crc32(data) ^ 0xFFFFFFFF`. Note that `zlib.crc32` already returns the standard CRC-32 (which includes the final XOR). So `zlib.crc32(data) ^ 0xFFFFFFFF` effectively undoes the final XOR, giving the "raw" CRC without final inversion.
+
+But the draft says "CRC-32 查表法，初值 0xFFFFFFFF，不做最终异或". That matches `zlib.crc32(data) ^ 0xFFFFFFFF` since zlib applies the final XOR.
+
+However, the issue says `compute_crc()` doesn't match any standard CRC-32 variant. The task says the checksum must be "某个通用的 32 位 CRC 变体". 
+
+Standard `zlib.crc32(data) & 0xFFFFFFFF` IS a standard CRC-32. Maybe the fix is simply to use standard zlib CRC-32 without the extra XOR?
+
+Let me check: for empty sample, the data covered by CRC would be just the 12-byte header. The last 4 bytes of the 18-byte file should be the CRC. But we have 6 bytes after header, not 4.
+
+Unless... the footer isn't at the very end, or the header size is different.
+
+Let me reconsider: what if the header is 14 bytes instead of 12? Or what if there are 2 trailing bytes after the CRC?
+
+Empty sample: `57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7 13 ef 00 00`
+
+What if the format is:
+- 4 magic + 1 version + 4 count_LE + 3 reserved = 12 header
+- 0 records
+- 4 CRC 
+- 2 trailing zero bytes?
+
+Or maybe the record count encoding is different. What if it's:
+- 4 magic
+- 1 version
+- 2 bytes count (u16 LE)
+- ...
+
+Let me try: bytes 5-6 as u16 LE: `05 00` = 5 for sample, `00 00` = 0 for empty. Then bytes 7-11 could be something else.
+
+For empty: `57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7 13 ef 00 00`
+If header = 4+1+2 = 7 bytes: `57 43 48 4b 02 00 00`, remaining = 11 bytes. Doesn't divide nicely.
+
+Let me try another approach. Look at the non-empty sample more carefully.
+
+sample.wchk header area:
+```
+57 43 48 4b 02 05 00 00 00 00 00 00
+```
+
+If count is at byte 5 as a single byte: count=5. Then bytes 6-11 are `00 00 00 00 00 00` (6 reserved bytes?). Header = 4+1+1+6 = 12 bytes still.
+
+For empty: byte 5 = 0x00, count=0. Bytes 6-11 = `00 00 00 00 00 00`. Header = 12 bytes. Remaining = 6 bytes: `f1 d7 13 ef 00 00`.
+
+Hmm, 6 bytes remaining for empty. For non-empty (330 bytes), remaining after 12-byte header = 318 bytes. Last 4 bytes of file: at offset 326-329: looking at the hex dump...
+
+Offset 0x140 = 320: `7a 00 00 00 d2 37 6a ef 1b ff`
+So bytes 320-329: `7a 00 00 00 d2 37 6a ef 1b ff`
+
+File is 330 bytes, so last byte is at offset 329. Last 4 bytes (326-329): `d2 37 6a ef` → wait no. 326=0x146, 327=0x147, 328=0x148, 329=0x149.
+
+From the hex dump line at 0x140:
+```
+00000140  7a 00 00 00 d2 37 6a ef   1b ff
+```
+Offsets: 0x140=320: 7a, 0x141=321: 00, 0x142=322: 00, 0x143=323: 00, 0x144=324: d2, 0x145=325: 37, 0x146=326: 6a, 0x147=327: ef, 0x148=328: 1b, 0x149=329: ff
+
+Last 4 bytes: `6a ef 1b ff`? No wait: offsets 326,327,328,329 = `6a ef 1b ff`. As LE u32: 0xff1bef6a. As BE u32: 0x6aef1bff.
+
+Last 6 bytes: `d2 37 6a ef 1b ff`. 
+
+Hmm, let me reconsider. Maybe the footer is 6 bytes, not 4.
+
+For empty: 18 bytes - 12 header = 6 footer bytes: `f1 d7 13 ef 00 00`
+For sample: 330 bytes - 12 header = 318 bytes for records + footer.
+
+If footer is 6 bytes: records = 318 - 6 = 312 bytes.
+
+Let me try to parse the records from the sample assuming the current varint-based format:
+
+After 12-byte header, starting at offset 12:
+```
+01 00 05 00 61 6c 70 68 61 00 00 00 00 00 00 00
+```
+
+Record 1: tag = varint(0x01) = 1, size = varint(0x00) = 0... wait, but then payload is 0 bytes. Next record starts at offset 14.
+
+Actually wait: `01` → varint = 1 (tag=1). `00` → varint = 0 (size=0). But then "alpha" appears right after. That doesn't make sense for size=0.
+
+Let me reconsider. Maybe tag and size are NOT varints. Maybe they're fixed-width.
+
+Looking at the pattern more carefully with 5 records expected:
+
+Offset 12 onwards:
+```
+01 00 05 00 61 6c 70 68 61
+```
+What if: tag=u16_LE, size=u16_LE?
+tag = 0x0001 = 1, size = 0x0005 = 5, payload = "alpha" (5 bytes). That works!
+
+Next record at offset 12+2+2+5 = 21:
+```
+00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 2c 01 0a 00 78 78...
+```
+Wait let me be more careful. Offset 21 from the hex dump:
+
+Row at 0x10 (offset 16): `61 6c 70 68 61 00 00 00 00 00 00 00 02 00 00 00`
+"alpha" is at offsets 16-20 (but wait, offset 12 is start of records).
+
+Let me redo. Records start at offset 12.
+Offset 12: byte index in the hex dump... Row at 0x00 covers offsets 0-15. So offset 12 = `01`, offset 13 = `00`, offset 14 = `05`, offset 15 = `00`.
+
+Row at 0x10 (offsets 16-31): `61 6c 70 68 61 00 00 00 00 00 00 00 02 00 00 00`
+
+So record 1: tag=u16LE(01 00)=1, size=u16LE(05 00)=5, payload=bytes[16:21]=`61 6c 70 68 61`="alpha". ✓
+
+Record 2 starts at offset 21:
+Offset 21: from row 0x10, position 5 → `00`. Offset 22: `00`. Offset 23: `00`. Offset 24: `00`.
+tag=u16LE(00 00)=0, size=u16LE(00 00)=0. Payload="" (0 bytes).
+
+Record 3 starts at offset 25:
+Offset 25: from row 0x10, position 9 → `00`. Offset 26: `00`. Offset 27: `00`. Offset 28: `02`.
+tag=u16LE(00 00)=0, size=u16LE(00 02)=512? That seems large. Hmm.
+
+Wait, let me recount. After record 2 (tag=0,size=0, 4 bytes total for tag+size, 0 payload), record 3 starts at offset 21+4 = 25.
+
+Offset 25 in hex dump: Row 0x10 starts at offset 16. Position 25-16=9 → byte is `00`.
+Offset 26: position 10 → `00`.
+Offset 27: position 11 → `00`.
+Offset 28: position 12 → `02`.
+
+tag=u16LE(offsets 25,26) = u16LE(00,00) = 0
+size=u16LE(offsets 27,28) = u16LE(00,02) = 0x0200 = 512
+
+Hmm, 512 bytes payload. Let's check: record 3 payload would be offsets 29 through 29+512-1 = 540. But file is only 330 bytes. That can't be right.
+
+Maybe size is u32 LE? tag=u16LE, size=u32LE?
+
+Record 1: tag=u16LE(01,00)=1, size=u32LE(05,00,61,6c)=0x6c610005. Way too big.
+
+OK that doesn't work either. Let me try tag=u32LE, size=u32LE:
+
+Record 1 at offset 12:
+tag=u32LE(01,00,05,00)=0x00050001=327681. Unlikely.
+
+Hmm. Let me try different widths. What about tag=u16BE, size=u16BE?
+
+Record 1: tag=u16BE(01,00)=256, size=u16BE(05,00)=1280. Nope.
+
+What about tag=u8, size=u32LE?
+
+Record 1: tag=0x01=1, size=u32LE(00,05,00,61)=0x61000500. Too big.
+
+What about tag=u8, size=u16LE?
+
+Record 1: tag=1, size=u16LE(00,05)=5. Payload=5 bytes: offsets 15-19: `00 61 6c 70 68`. Hmm, starts with 0x00.
+
+Then record 2 at offset 20: tag=0x61='a'? Doesn't seem right.
+
+Let me go back to tag=u16LE, size=u16LE which worked for record 1:
+Record 1: tag=1, size=5, payload="alpha" (offsets 16-20)
+Record 2 at offset 21: tag=u16LE(00,00)=0, size=u16LE(00,00)=0, payload="" 
+Record 3 at offset 25: tag=u16LE(00,00)=0, size=u16LE(00,02)=512
+
+512 is too big. Unless I'm miscounting.
+
+Wait, maybe size is u32LE and tag is also different. Let me try yet another layout.
+
+What if each record has: tag(u16LE) + size(u32LE) + payload?
+
+Record 1 at offset 12:
+tag = u16LE(01,00) = 1
+size = u32LE(05,00,61,6c) = nope, too big.
+
+What if tag(u32LE) + size(u32LE)?
+
+Record 1: tag=u32LE(01,00,05,00)=0x00050001. Weird value.
+
+Hmm, let me try a completely different approach. What if the records use varints as the draft says, but I was wrong about parsing?
+
+Offset 12: `01` → varint = 1 (tag=1). High bit clear, so single byte.
+Offset 13: `00` → varint = 0 (size=0). High bit clear.
+
+But then payload is 0 bytes, and next record at offset 14:
+Offset 14: `05` → varint = 5 (tag=5).
+Offset 15: `00` → varint = 0 (size=0). Payload = "".
+Next at offset 16: `61` → varint = 97 (tag=97).
+Offset 17: `6c` → varint = 108 (size=108). But then payload would be 108 bytes...
+
+This doesn't produce meaningful records matching 5 total.
+
+Let me reconsider. Maybe the header format is different. What if record_count is NOT at bytes 5-8?
+
+What if the header is:
+- 4 magic "WCHK"
+- 1 version
+- 4 record_count (LE u32) ← note: LE not BE
+- 3 reserved
+
+For sample: bytes 5-8 = `05 00 00 00` → LE u32 = 5. ✓
+For empty: bytes 5-8 = `00 00 00 00` → 0. ✓
+
+OK so the header parsing needs LE u32 for count. Current code uses BE. That's one bug.
+
+Now, with 5 records and varint encoding, let me reparse:
+
+After 12-byte header, offset 12:
+```
+01 00 05 00 61 6c 70 68 61 00 00 00 00 00 00 00 02 00 00 00 00 00 00 2c 01 0a 00 78 78...
+```
+
+Varints:
+- 0x01 → tag=1
+- 0x00 → size=0 → payload="" → record (1, b"")
+
+- 0x05 → tag=5  
+- 0x00 → size=0 → payload="" → record (5, b"")
+
+- 0x61 → tag=97
+- 0x6c → tag=108... wait this is size. size=108? Then 108 bytes of payload.
+
+That gives us only 3 records before running out. We need 5.
+
+Hmm. Let me try differently. What if tag and size are NOT varints but rather fixed-size fields, and the draft is wrong about that too?
+
+Going back to what seemed promising: tag=u16LE, size=u16LE.
+
+Record 1 at offset 12: tag=1, size=5, payload="alpha" (5 bytes at offsets 16-20)
+Record 2 at offset 21: bytes `00 00 00 00` → tag=0, size=0, payload=""
+Record 3 at offset 25: bytes `00 00 00 02` → tag=0, size=0x0200=512... too big.
+
+Wait, what if it's tag=u16LE, size=u32LE?
+
+Record 1: tag=u16LE(01,00)=1, size=u32LE(05,00,61,6c)=... 0x6c610005. Nope.
+
+What if records are: u16LE tag + u32LE size + payload, but I read the first record differently?
+
+Hmm. Let me try: what if the entire record section uses a different encoding altogether? Like, each record is: u32LE tag + u32LE size + payload?
+
+Record 1 at offset 12: tag=u32LE(01,00,05,00)=0x00050001=327681. Unlikely tag value.
+
+What about: the records might have padding/alignment?
+
+Let me look at the structure differently. The sample has 330 bytes. Header=12. If footer=4, records area = 330-12-4 = 314 bytes. If footer=6, records = 312.
+
+With 5 records, let me see if there's a pattern. Looking at the data after the header:
+
+```
+Offset 12: 01 00 05 00 61 6c 70 68 61  (9 bytes visible here)
+```
+
+What if each record is: u16LE tag + u16LE size + payload + some separator/padding?
+
+Record 1: tag=1, size=5, payload="alpha", total = 2+2+5 = 9 bytes. Next at offset 21.
+At offset 21: `00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 2c 01 0a 00 78 78...`
+
+Record 2: tag=u16LE(00,00)=0, size=u16LE(00,00)=0, payload="", total=4. Next at 25.
+At offset 25: `00 00 00 02 00 00 00 00 00 00 2c 01 0a 00 78 78...`
+
+Record 3: tag=u16LE(00,00)=0, size=u16LE(00,02)=512. Still problematic.
+
+Unless size is big-endian? tag=u16LE, size=u16BE?
+Record 3: tag=0, size=u16BE(00,02)=2. Payload = 2 bytes at offsets 29-30: `00 00`.
+Next at offset 31.
+
+At offset 31 (row 0x10 position 15 = `00`, then row 0x20 starts at 32):
+Actually offset 31 is the last byte of row 0x10: `00`.
+Offset 32 starts row 0x20: `00 00 00 2c 01 0a 00 78 78 78 78 78 78 78 78 78`
+
+Record 4 at offset 31: tag=u16LE(00, 00)=0 (offsets 31,32). Wait, offset 31=`00`, offset 32=`00`.
+size=u16BE(offsets 33,34)=u16BE(00,00)=0. Hmm.
+
+This is getting complicated. Let me try yet another interpretation.
+
+What if the format is actually: tag is u16LE, size is u32LE?
+
+Record 1 at offset 12: 
+- tag = u16LE(bytes[12:14]) = u16LE(01,00) = 1
+- size = u32LE(bytes[14:18]) = u32LE(05,00,61,6c) = 0x6c610005 → huge. No.
+
+What about u8 tag + u32LE size?
+Record 1: tag=1, size=u32LE(00,05,00,61)=0x61000500. No.
+
+What about u32LE tag + u32LE size?
+Record 1: tag=u32LE(01,00,05,00)=0x00050001, size=u32LE(61,6c,70,68)=0x68706c61. Both huge. No.
+
+OK let me step back and think about this differently. The instruction says the draft mentions varints but is outdated. Let me look for a consistent fixed-size record header that produces exactly 5 records fitting in the available space.
+
+Available bytes for records: Let's figure out footer size first.
+
+For the empty file (18 bytes, 0 records):
+Header = 12 bytes. Remaining = 6 bytes: `f1 d7 13 ef 00 00`
+
+If those 6 bytes are all footer, then footer = 6 bytes. But that's unusual for a CRC32.
+
+What if the header is actually 14 bytes? 4+1+4+5=14? Or 4+1+2+7=14?
+
+Empty with 14-byte header: remaining = 4 bytes = `13 ef 00 00` or `f1 d7 13 ef` depending on where header ends.
+
+Hmm, let me try header = 4(magic) + 1(version) + 4(count_LE) + 3(reserved) = 12. Then for empty, remaining 6 bytes.
+
+What if footer = 4(CRC) + 2(trailing marker/padding)?
+
+For empty: CRC = `f1 d7 13 ef`, trailing = `00 00`.
+For sample: last 6 bytes at offsets 324-329: `d2 37 6a ef 1b ff`.
+CRC would be `d2 37 6a ef`, trailing = `1b ff`.
+
+Hmm, or maybe CRC is the last 4 bytes and there are 2 bytes BEFORE the CRC that are part of the record area?
+
+For empty: record_area = 0 bytes, then 2 mystery bytes `f1 d7`, then CRC `13 ef 00 00`?
+As LE u32: `13 ef 00 00` = 0x0000ef13 = 61203. As BE: 0x13ef0000.
+
+This is getting nowhere with guessing. Let me try computing the CRC myself.
+
+For the empty file, if CRC covers header only (12 bytes: `57 43 48 4b 02 00 00 00 00 00 00 00`):
+
+Standard zlib.crc32 of those 12 bytes... I can't compute it mentally. But let me check: the current code computes `zlib.crc32(data) ^ 0xFFFFFFFF` and stores as LE u32.
+
+If the correct CRC is just standard `zlib.crc32(data) & 0xFFFFFFFF` stored as LE u32, then for the empty file, the stored CRC bytes should be `zlib.crc32(header_bytes) & 0xFFFFFFFF` packed as `<I`.
+
+The empty file's candidate CRC bytes (assuming 4-byte footer at end): `ef 13 d7 f1` reversed from `f1 d7 13 ef`... wait, if stored as LE u32, bytes `f1 d7 13 ef` represent value 0xef13d7f1.
+
+Alternatively, if the footer is the LAST 4 bytes of the file: for empty that's bytes 14-17: `13 ef 00 00`. As LE u32: 0x0000ef13.
+
+Hmm, neither looks like a typical CRC value.
+
+Let me try a completely different hypothesis: what if the footer is at bytes [total-4:] and the two bytes before it in the empty file (`f1 d7`) are actually part of something else?
+
+Wait, for the EMPTY file with 0 records, after the 12-byte header there should be NOTHING except the footer. If footer is 4 bytes, total should be 16 bytes. But the file is 18 bytes. So either footer is 6 bytes, or header is 14 bytes, or there's something else.
+
+What if the record count field is actually u16 LE (2 bytes) instead of u32 (4 bytes)? Then header = 4+1+2+3 = 10 bytes? Or 4+1+2+5=12?
+
+Let me try: header = 4(magic) + 1(version) + 2(count_u16LE) + 3(reserved) = 10 bytes.
+
+Empty file: 18 - 10 = 8 bytes remaining. If footer = 4, that leaves 4 unexplained bytes.
+
+Try: header = 4+1+2+1 = 8 bytes. Empty: 18-8=10 remaining. Footer=4 → 6 unexplained.
+
+None of these work cleanly. Let me go back to 12-byte header and consider that the footer might indeed be 6 bytes.
+
+Footer = 6 bytes. For empty: `f1 d7 13 ef 00 00`. For sample: last 6 bytes `d2 37 6a ef 1b ff`.
+
+What if the footer is: 4-byte CRC + 2-byte terminator/marker?
+
+Or: 2-byte something + 4-byte CRC?
+
+For empty: if CRC is last 4 bytes: `13 ef 00 00` → LE u32 = 0x0000ef13.
+Or first 4 bytes of footer: `f1 d7 13 ef` → LE u32 = 0xef13d7f1.
+
+For sample: if CRC is last 4 of 6-byte footer: `6a ef 1b ff` → LE u32 = 0xff1bef6a.
+Or first 4: `d2 37 6a ef` → LE u32 = 0xef6a37d2.
+
+Hmm, none of these jump out as obviously correct.
+
+Let me try yet another approach. Let me look at the structure assuming the record format uses FIXED sizes and see what makes 5 records fit perfectly.
+
+Total file: 330 bytes. If header=12 and footer=4: record area = 314 bytes for 5 records.
+If header=12 and footer=6: record area = 312 bytes.
+
+312 / 5 = 62.4 (not even). 314 / 5 = 62.8. Neither divides evenly, so records are variable-length.
+
+Let me look for patterns in the record area. Going back to the varint idea but being more careful:
+
+Starting at offset 12, using LEB128 varints:
+
+Byte 12: 0x01 → tag = 1 (single byte, high bit clear)
+Byte 13: 0x00 → size = 0 → payload = b"" → Record 1: (1, b"")
+
+Byte 14: 0x05 → tag = 5
+Byte 15: 0x00 → size = 0 → payload = b"" → Record 2: (5, b"")
+
+Byte 16: 0x61 → tag = 97
+Byte 17: 0x6c → size = 108 → payload = 108 bytes from offset 18 to 125
+
+Record 3: (97, bytes[18:126])
+
+Byte 126: Let me find it. Offset 126 = 0x7E. Row 0x70 (offsets 112-127): `38 39 3a 3b 3c 3d 3e 3f 40 41 42 43 44 45 46 47`
+Position 126-112 = 14 → byte = 0x46 = 'F'
+
+Byte 126: 0x46 → tag = 70 (since high bit clear)
+Byte 127: 0x47 → size = 71 → payload = 71 bytes from offset 128 to 198
+
+Record 4: (70, bytes[128:199])
+
+Byte 199: offset 199 = 0xC7. Row 0xC0 (offsets 192-207): `c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7`
+Position 199-192 = 7 → byte = 0xcf
+
+Byte 199: 0xcf → high bit set! This is a multi-byte varint.
+0xcf & 0x7f = 0x4f = 79. Continue.
+Byte 200: 0xd0 → 0xd0 & 0x7f = 0x50 = 80. High bit set, continue.
+Value so far: 79 | (80 << 7) = 79 + 10240 = 10319. Continue.
+Byte 201: 0xd1 → 0x51 = 81. High bit set, continue.
+Value: 10319 | (81 << 14) = 10319 + 81*16384 = 10319 + 1327104 = 1337423. Continue.
+
+This is getting ridiculous. Tags shouldn't be such large numbers. The varint interpretation doesn't seem right for this data.
+
+Let me reconsider fundamentally. The data after the header in the sample looks like it contains structured binary data including "alpha" and sequential bytes 0x00-0xFF. Let me look at the overall structure again.
+
+Offsets 12-329 (318 bytes after header):
+```
+01 00 05 00 61 6c 70 68 61   <- "alpha" preceded by 01 00 05 00
+00 00 00 00 00 00 00         <- zeros
+02 00 00 00 00 00 00         <- 02 followed by zeros  
+2c 01 0a 00                  <- some values
+78 78 78 78 ... (lots of 0x78 = 'x')
+00 00 04 00 00 01 00 01 02 03 ... fe ff  <- sequential bytes
+00 00 00 00                  <- 4 zero bytes near end
+e8 fd 01 00                  <- some value
+7a 00 00 00                  <- 0x7a = 122
+d2 37 6a ef 1b ff            <- end of file
+```
+
+Wait, I see "xxxx..." and sequential 00-FF. Let me identify distinct regions.
+
+From the hex dump, after "alpha" at offsets 16-20:
+Offsets 21-27: `00 00 00 00 00 00 00` (7 zeros)
+Offset 28: `02`
+Offsets 29-31: `00 00 00`
+
+Then offset 32: `00 00 00 2c 01 0a 00 78 78...`
+
+Wait, let me re-read the hex dump more carefully:
+
+```
+00000000  57 43 48 4b 02 05 00 00   00 00 00 00 01 00 05 00  |WCHK............|
+00000010  61 6c 70 68 61 00 00 00   00 00 00 00 02 00 00 00  |alpha...........|
+00000020  00 00 00 00 2c 01 0a 00   78 78 78 78 78 78 78 78  |....,...xxxxxxxx|
+00000030  78 78 00 00 04 00 00 01   00 01 02 03 04 05 06 07  |xx..............|
+```
+
+So at offset 0x20 (=32): `00 00 00 00 2c 01 0a 00 78 78 78 78 78 78 78 78`
+
+Let me trace through more carefully with the hypothesis that records use u16LE tag + u16LE size:
+
+Record 1 @ offset 12: tag=u16LE(01,00)=1, size=u16LE(05,00)=5, payload=bytes[16:21]="alpha" ✓
+Record 2 @ offset 21: tag=u16LE(00,00)=0, size=u16LE(00,00)=0, payload="" ✓  
+Record 3 @ offset 25: tag=u16LE(00,00)=0, size=u16LE(00,02)=0x0200=512 ← problem
+
+BUT what if size is u16 LE but I'm reading the bytes wrong? Offset 25 is the 26th byte (0-indexed).
+
+Row 0x10 = offsets 16-31: `61 6c 70 68 61 00 00 00 00 00 00 00 02 00 00 00`
+Positions within this row: 
+- 16:61, 17:6c, 18:70, 19:68, 20:61, 21:00, 22:00, 23:00, 24:00, 25:00, 26:00, 27:00, 28:02, 29:00, 30:00, 31:00
+
+So offset 25=0x00, offset 26=0x00 → tag=u16LE=0
+Offset 27=0x00, offset 28=0x02 → size=u16LE(00,02)=0x0200=512
+
+Still 512. Unless size is big-endian: u16BE(00,02)=2. Let me try mixed: tag=u16LE, size=u16BE.
+
+Record 3: tag=0, size=2, payload=bytes[29:31]=`00 00`
+Record 4 @ offset 31: offset 31=0x00. Row 0x20 starts at 32.
+tag=u16LE(offsets 31,32)=u16LE(00,00)=0
+size=u16BE(offsets 33,34)=u16BE(00,00)=0 → payload=""
+
+Record 5 @ offset 35: offsets 35,36 from row 0x20: `00 2c`
+tag=u16LE(00,2c)=0x2c00=11264. Hmm, unlikely.
+
+Mixed endian doesn't seem right either.
+
+Let me try: tag=u16BE, size=u16BE.
+Record 1: tag=u16BE(01,00)=256, size=u16BE(05,00)=1280. Nope.
+
+All u16 combinations fail for later records. Let me try u32.
+
+What if it's u32LE tag + u32LE size?
+Record 1 @ 12: tag=u32LE(01,00,05,00)=0x00050001=327681. Bad.
+
+What about: the format uses DIFFERENT encoding than what I've been trying? Let me look at the data with fresh eyes.
+
+After header at offset 12:
+`01 00 05 00 61 6c 70 68 61`
+
+What if this is: u8 tag + u24LE size? Or some other combo?
+
+tag=0x01=1, size=u24LE(00,05,00)=0x000500=1280. Too big.
+
+What if it's u8 tag + u8 reserved + u16LE size?
+tag=1, reserved=0, size=u16LE(05,00)=5. Payload=5 bytes "alpha". Total=1+1+2+5=9. Same result as u16+u16.
+
+Next at 21: `00 00 00 00` → tag=0, res=0, size=0. Total=4. Next at 25.
+At 25: `00 00 00 02` → tag=0, res=0, size=u16LE(00,02)=512. Same problem.
+
+What if size comes BEFORE tag? u16LE size + u16LE tag?
+Record 1: size=u16LE(01,00)=1, tag=u16LE(05,00)=5. Payload=1 byte: `61`='a'. Next at 18.
+Record 2 @ 18: size=u16LE(6c,70)=0x706c=28780. Way too big.
+
+Nope.
+
+OK, I think I need to consider that maybe the records DON'T start immediately after the header. Maybe there's additional header info, like a table of contents or offset table.
+
+Or maybe the record count field isn't where I think it is. Let me reconsider the header.
+
+What if the header layout is:
+- 4 magic
+- 1 version  
+- 4 record_count (LE u32)
+- 3 reserved
+= 12 bytes
+
+And the record format truly IS varint tag + varint size + payload, but my manual parsing went wrong?
+
+Let me very carefully reparse with varints:
+
+Offset 12: byte=0x01. High bit=0. Value=1. Tag=1. New offset=13.
+Offset 13: byte=0x00. High bit=0. Value=0. Size=0. New offset=14.
+Payload: 0 bytes. Record 1: (1, b""). ✓
+
+Offset 14: byte=0x05. High bit=0. Value=5. Tag=5. New offset=15.
+Offset 15: byte=0x00. High bit=0. Value=0. Size=0. New offset=16.
+Payload: 0 bytes. Record 2: (5, b""). ✓
+
+Offset 16: byte=0x61. High bit=0. Value=97. Tag=97. New offset=17.
+Offset 17: byte=0x6c. High bit=0. Value=108. Size=108. New offset=18.
+Payload: 108 bytes from offset 18 to 125. Record 3: (97, bytes[18:126]).
+
+That's a valid record. Tag=97 (ASCII 'a'), payload=108 bytes.
+
+Offset 126: Let me find this byte. Offset 126 is in row 0x70 (112-127).
+Row 0x70: `38 39 3a 3b 3c 3d 3e 3f 40 41 42 43 44 45 46 47`
+Position 126-112=14 → byte=0x46. High bit=0. Value=70. Tag=70. New offset=127.
+
+Offset 127: byte=0x47. High bit=0. Value=71. Size=71. New offset=128.
+Payload: 71 bytes from offset 128 to 198. Record 4: (70, bytes[128:199]).
+
+Offset 199: Row 0xC0 (192-207): `c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7`
+Position 199-192=7 → byte=0xcf. High bit=1! Multi-byte varint.
+0xcf & 0x7f = 0x4f = 79. shift=7.
+Offset 200: byte=0xd0. High bit=1. 0xd0 & 0x7f = 0x50 = 80. value = 79 | (80<<7) = 79+10240 = 10319. shift=14.
+Offset 201: byte=0xd1. High bit=1. 0xd1 & 0x7f = 0x51 = 81. value = 10319 | (81<<14) = 10319+1327104 = 1337423. shift=21.
+Offset 202: byte=0xd2. High bit=1. 0xd2 & 0x7f = 0x52 = 82. value = 1337423 | (82<<21) = ... huge number.
+
+This can't be right for a tag. Tags should be small integers.
+
+UNLESS... the varint decoding is wrong because the data at offset 199 is actually part of the payload of record 4, and I miscounted.
+
+Let me recheck: Record 4 payload is 71 bytes from offset 128 to 128+71-1 = 198. So offset 199 is indeed the next byte after record 4.
+
+But the sequential data 00 01 02 ... ff appears to start around offset 0x38 (=56). Let me check:
+
+Row 0x30 (48-63): `78 78 00 00 04 00 00 01 00 01 02 03 04 05 06 07`
+
+Offset 55 (=0x37): `01`
+Offset 56 (=0x38): `00`
+Offset 57: `01`, 58: `02`, ..., 
+
+So sequential bytes 00-FF start at offset 56 and go to offset 56+255=311. That's 256 bytes.
+
+And record 3 payload runs from offset 18 to 125 (108 bytes). This overlaps with the sequential data region. The sequential data seems to be PAYLOAD content, not structural.
+
+Let me check: record 3 payload = bytes[18:126]. Looking at what's in there:
+Offsets 18-20: `70 68 61` ("pha" - rest of "alpha"? No, "alpha" ended at 20.)
+
+Wait, I had record 1 payload = "alpha" at offsets 16-20 when using u16+u16 format. But with varint format, record 1 has 0-byte payload and record 2 has 0-byte payload, so "alpha" at offsets 16-20 is actually part of record 3's payload (which starts at offset 18).
+
+Hmm wait, with varint: record 3 payload starts at offset 18 and is 108 bytes. Offset 18 = `70` ('p'), 19=`68`('h'), 20=`61`('a'). So record 3 payload begins with "pha..." which is odd.
+
+Actually, let me reconsider. With varint parsing:
+- Record 1: tag=1, size=0 → (1, b"")
+- Record 2: tag=5, size=0 → (5, b"")  
+- Record 3: tag=97, size=108 → (97, <108 bytes>)
+- Record 4: tag=70, size=71 → (70, <71 bytes>)
+- Record 5: starts at offset 199
+
+Tags 1, 5, 97, 70... These seem arbitrary but possible. And 1+1+1+1+... = we need 5 records total.
+
+The issue is record 5 starting at offset 199 with byte 0xcf leading to a huge varint. Unless record 5 is the last record and its tag is legitimately encoded as a multi-byte varint.
+
+Let me continue parsing record 5:
+
+Offset 199: 0xcf → bits: 11001111. Low 7 bits: 1001111 = 79. More bytes follow.
+Offset 200: 0xd0 → 11010000. Low 7: 1010000 = 80. More.
+Offset 201: 0xd1 → 11010001. Low 7: 1010001 = 81. More.
+Offset 202: 0xd2 → 11010010. Low 7: 1010010 = 82. More.
+Offset 203: 0xd3 → Low 7: 83. More.
+...
+
+These are sequential bytes 0xcf, 0xd0, 0xd1, ... which are part of the 00-FF sequence! They're NOT varint-encoded tags; they're payload data from a previous record.
+
+This means my record boundary calculation is wrong. Let me recheck.
+
+Record 3: tag=97 at offset 16, size=108 at offset 17. Payload = 108 bytes starting at offset 18, ending at offset 18+108-1 = 125.
+
+But wait - is size really 108? Byte at offset 17 is 0x6c = 108 decimal. High bit is 0, so yes, single-byte varint = 108.
+
+Hmm, but 108 bytes of payload from offset 18 puts us at offset 126 for the next record. And at offset 126, the byte is 0x46 which is in the middle of the sequential 00-FF run (which goes from ~offset 56 to ~311).
+
+Actually, I realize the sequential bytes may span across multiple records' payloads. The content of payloads is arbitrary binary data.
+
+Let me continue: record 5 at offset 199.
+
+Actually, wait. Let me recount. Record 4 starts at offset 126.
+Tag at 126: 0x46 = 70. Size at 127: 0x47 = 71. Payload: 71 bytes from 128 to 198.
+
+But offsets 128-198 include bytes from the sequential region. Let me verify: sequential 00-FF starts around offset 56 (byte 0x00 at offset 56, 0x01 at 57, ..., 0xFF at 56+255=311).
+
+So offsets 128-198 would contain bytes 0x(128-56)=0x48 through 0x(198-56)=0x8E. That's values 72 through 142. Fine, those are payload bytes.
+
+Record 5 at offset 199: byte=0xcf=207. Since sequential mapping: 199-56=143=0x8F. But 0xcf ≠ 0x8F. So either my sequential offset is wrong, or offset 199 is not in the sequential region.
+
+Let me recheck where the sequential data starts. From the hex dump:
+Row 0x30 (48-63): `78 78 00 00 04 00 00 01 00 01 02 03 04 05 06 07`
+
+Offset 48: 0x78
+Offset 49: 0x78
+Offset 50: 0x00
+Offset 51: 0x00
+Offset 52: 0x04
+Offset 53: 0x00
+Offset 54: 0x00
+Offset 55: 0x01
+Offset 56: 0x00 ← start of 00-FF sequence?
+Offset 57: 0x01
+Offset 58: 0x02
+...
+
+Yes, sequential 00-FF starts at offset 56. So offset 199 should contain value 199-56=143=0x8F.
+
+But row 0xC0 (192-207): `c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7`
+Offset 192: 0xc8 = 200. Expected: 192-56=136=0x88. But 0xc8 ≠ 0x88.
+
+So the sequential data does NOT extend to offset 192! It must end earlier.
+
+Let me check: if sequential 00-FF starts at offset 56, it would end at offset 56+255=311. But looking at the data near the end of the file:
+
+Row 0x130 (304-319): `f8 f9 fa fb fc fd fe ff 00 00 00 00 e8 fd 01 00`
+Offset 311: 0xff ✓ (56+255=311, value=255=0xFF)
+Offset 312: 0x00 ← this is AFTER the sequence. Not 0x00 continuing, but something new.
+
+So sequential data is at offsets 56-311 (256 bytes = 0x00-0xFF). ✓
+
+Now, going back to record boundaries with varint parsing:
+- Record 3 payload: offsets 18-125 (108 bytes)
+- Record 4 payload: offsets 128-198 (71 bytes)
+
+Both of these overlap with the sequential data (56-311). That's fine; payloads can contain any data.
+
+Record 5 at offset 199: byte=0xcf. But 199-56=143=0x8F, and the actual byte is 0xCF. So offset 199 is NOT in the sequential range? But 56 ≤ 199 ≤ 311, so it should be.
+
+Wait, let me double-check. Row 0xC0 = offsets 192-207:
+`c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7`
+
+Offset 192: 0xc8 = 200. If sequential from 56: expected = 192-56 = 136 = 0x88. But got 0xC8.
+
+Hmm, 0xC8 = 200. 200 - 56 = 144 ≠ 136. So the sequential pattern doesn't hold at offset 192.
+
+Actually wait, maybe the sequential data starts at a different offset. Let me look again:
+
+Row 0x30 (48-63): `78 78 00 00 04 00 00 01 00 01 02 03 04 05 06 07`
+
+Offset 55: 0x01
+Offset 56: 0x00
+Offset 57: 0x01
+Offset 58: 0x02
+
+So the sequence 00,01,02,... starts at offset 56. At offset 56+N, value should be N (mod 256).
+
+Check offset 192: N = 192-56 = 136. Expected value = 136 = 0x88. Actual = 0xC8. Mismatch!
+
+So either the sequence doesn't extend that far, or my offset calculation is wrong.
+
+Let me verify with a known point. Offset 63 (last byte of row 0x30): 0x07. N=63-56=7. Expected=7=0x07. ✓
+
+Row 0x40 (64-79): `08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17`
+Offset 64: 0x08. N=64-56=8. ✓
+Offset 79: 0x17. N=79-56=23=0x17. ✓
+
+Row 0x80 (128-143): `48 49 4a 4b 4c 4d 4e 4f 50 51 52 53 54 55 56 57`
+Offset 128: 0x48. N=128-56=72=0x48. ✓
+
+Row 0xA0 (160-175): `68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75 76 77`
+Offset 160: 0x68. N=160-56=104=0x68. ✓
+
+Row 0xB0 (176-191): `78 79 7a 7b 7c 7d 7e 7f 80 81 82 83 84 85 86 87`
+Offset 176: 0x78. N=176-56=120=0x78. ✓
+Offset 191: 0x87. N=191-56=135=0x87. ✓
+
+Row 0xC0 (192-207): `c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7`
+Offset 192: 0xc8. N=192-56=136=0x88. But actual=0xC8. ✗!
+
+So the sequential pattern BREAKS at offset 192! Values 0x00-0x87 appear at offsets 56-191 (136 values), then at offset 192 we get 0xC8 instead of 0x88.
+
+Interesting. So the sequential data covers offsets 56-191 = 136 bytes (values 0x00-0x87).
+
+Wait, but earlier rows show continuation. Let me check row 0x88 (136-151)... actually the hex dump shows rows at multiples of 16. Let me check row 0x90 (144-159):
+
+Row 0x90: `58 59 5a 5b 5c 5d 5e 5f 60 61 62 63 64 65 66 67`
+Offset 144: 0x58. N=144-56=88=0x58. ✓
+
+So up to offset 191, the pattern holds. At 192 it breaks.
+
+This suggests that offset 192 starts something NEW - perhaps a new record boundary!
+
+Let me revisit the varint parsing. If record 4 ends before offset 192, then my size calculation for record 4 was wrong.
+
+Record 4 started at offset 126: tag=0x46=70, size=0x47=71. Payload = 71 bytes from 128 to 198.
+
+But if the sequential data ends at 191 and new structure begins at 192, then record 4's payload can't extend to 198. This contradicts the varint parsing.
+
+UNLESS the varint parsing is simply WRONG for this format, and the format uses fixed-size fields.
+
+Let me try a completely different record layout. What if each record is:
+
+u16LE tag + u32LE size + payload
+
+Record 1 @ offset 12:
+tag = u16LE(01,00) = 1
+size = u32LE(05,00,61,6c) = 0x6c610005 → too big
+
+Nope. What about u32LE tag + u16LE size?
+
+Record 1 @ 12:
+tag = u32LE(01,00,05,00) = 0x00050001 → weird
+size = u16LE(61,6c) = 0x6c61 → too big
+
+Nope.
+
+What about: each record is simply u16LE tag + u16LE size + payload, but with SIZE being the TOTAL record size including the tag and size fields themselves?
+
+Record 1 @ 12: tag=1, total_size=5. Payload = 5-4 = 1 byte: `61`='a'. Next at 17.
+Record 2 @ 17: tag=u16LE(6c,70)=0x706c=28780. Bad.
+
+Nope.
+
+OK let me try thinking about this from the other end. I know there are 5 records. Let me look at the end of the record area and work backwards.
+
+Assuming footer is 4 bytes: records end at offset 330-4=326.
+Assuming footer is 6 bytes: records end at offset 330-6=324.
+
+Near the end of the file:
+Row 0x130 (304-319): `f8 f9 fa fb fc fd fe ff 00 00 00 00 e8 fd 01 00`
+Row 0x140 (320-329): `7a 00 00 00 d2 37 6a ef 1b ff`
+
+If records end at 324 (footer=6): last few record bytes are at 320-323: `7a 00 00 00`.
+If records end at 326 (footer=4): last bytes at 322-325: `00 00 d2 37`.
+
+Looking at `7a 00 00 00`: this could be u32LE = 0x0000007a = 122. Or u16LE pairs: (0x007a=122, 0x0000=0).
+
+And `e8 fd 01 00` at offsets 316-319: u32LE = 0x0001fde8 = 130536. Or u16LE: (0xfde8, 0x0001).
+
+Hmm. Let me try yet another approach. What if the format uses:
+- u16LE tag
+- u32LE payload_length
+- payload
+
+Record 1 @ 12: tag=u16LE(01,00)=1, len=u32LE(05,00,61,6c)=... too big.
+
+What if:
+- u8 tag
+- u16LE payload_length  
+- payload
+
+Record 1 @ 12: tag=0x01=1, len=u16LE(00,05)=5. Payload=5 bytes at 15-19: `00 61 6c 70 68`. Next at 20.
+Record 2 @ 20: tag=0x61=97, len=u16LE(6c,70)=0x706c=28780. Too big.
+
+What if:
+- u8 tag
+- u32LE payload_length
+- payload
+
+Record 1 @ 12: tag=1, len=u32LE(00,05,00,61)=0x61000500. Too big.
+
+None of these simple fixed-width combos work beyond record 1.
+
+Let me go back to varints but question whether I identified the right record count. What if the count field is at a different position or uses different encoding?
+
+What if byte 5 (0x05) is NOT part of the count, but rather the header is shorter?
+
+Alternative header: 4(magic) + 1(version) = 5 bytes. Then byte 5 onward is records.
+
+Record 1 @ offset 5: byte=0x05 → tag=5. Byte 6: 0x00 → size=0. Record: (5, b""). Next at 7.
+Record 2 @ 7: byte=0x00 → tag=0. Byte 8: 0x00 → size=0. Record: (0, b""). Next at 9.
+Record 3 @ 9: byte=0x00 → tag=0. Byte 10: 0x00 → size=0. Record: (0, b""). Next at 11.
+Record 4 @ 11: byte=0x00 → tag=0. Byte 12: 0x01 → size=1. Payload=1 byte at 13: 0x00. Record: (0, b"\x00"). Next at 14.
+Record 5 @ 14: byte=0x05 → tag=5. Byte 15: 0x00 → size=0. Record: (5, b""). Next at 16.
+
+That gives 5 records but with tiny meaningless payloads. And there's no room for "alpha" or the sequential data as payloads. Also, with only 5 bytes header, the empty file would be: 5 header + 0 records + footer. 18-5=13 bytes for footer. That's way too much.
+
+What if header = 4(magic) + 1(version) + 1(count_u8) = 6 bytes?
+
+Sample: count=0x05=5. Empty: count=0x00=0. ✓
+
+Empty file: 18-6=12 bytes remaining. If footer=4, that leaves 8 unaccounted bytes.
+
+What if header = 4+1+1+2(reserved)=8? Empty: 18-8=10. Footer=4 → 6 extra.
+Header = 4+1+1+6(reserved)=12? Empty: 18-12=6. Footer=4 → 2 extra. Or footer=6 → 0 extra!
+
+HEADER = 12 bytes (4+1+1+6), FOOTER = 6 bytes!
+
+Let me test this with the empty file:
+Header (12): `57 43 48 4b 02 00 00 00 00 00 00 00`
+Footer (6): `f1 d7 13 ef 00 00`
+
+And sample:
+Header (12): `57 43 48 4b 02 05 00 00 00 00 00 00`
+Records: 330-12-6 = 312 bytes
+Footer (6): last 6 bytes at offsets 324-329: `d2 37 6a ef 1b ff`
+
+Wait, but if count is u8 at byte 5, then bytes 6-11 are reserved (6 bytes of zeros). For sample: bytes 6-11 = `00 00 00 00 00 00`. ✓ For empty: same. ✓
+
+Now with 312 bytes for 5 records using varint encoding:
+
+Let me reparse:
+Offset 12: 0x01 → tag=1
+Offset 13: 0x00 → size=0 → Record 1: (1, b"")
+
+Offset 14: 0x05 → tag=5
+Offset 15: 0x00 → size=0 → Record 2: (5, b"")
+
+Offset 16: 0x61 → tag=97
+Offset 17: 0x6c → size=108 → payload=108 bytes [18:126] → Record 3: (97, ...)
+
+Offset 126: 0x46 → tag=70
+Offset 127: 0x47 → size=71 → payload=71 bytes [128:199] → Record 4: (70, ...)
+
+Offset 199: 0xcf → multibyte varint...
+
+Same problem as before. Record 5 starts at 199 with a multibyte varint that produces a huge tag.
+
+UNLESS the record area is only 312 bytes and ends at offset 12+312=324, meaning record 5 must fit between 199 and 324.
+
+At offset 199, if this is a varint tag:
+0xcf = 11001111 → low 7 = 0x4f = 79, continue
+0xd0 = 11010000 → low 7 = 0x50 = 80, continue  
+0xd1 = 11010001 → low 7 = 0x51 = 81, continue
+...this continues through the sequential data with high bits set (all bytes ≥ 0x80 from offset 199 onward until we hit a byte < 0x80).
+
+Sequential data from offset 56: value at offset N is (N-56). At offset 199: value=143=0x8F (high bit set). At offset 200: 144=0x90 (high bit set). ... At offset 183: value=127=0x7F (high bit CLEAR!).
+
+Wait, 183-56=127=0x7F. So offset 183 has value 0x7F with high bit clear. But offset 183 is WITHIN record 4's payload (128-198). So that's fine.
+
+After record 4 ends at offset 198, offset 199 has value 199-56=143=0x8F. High bit set. So varint continues.
+
+Offset 199: 0x8F → but actual byte at 199 is 0xCF according to the hex dump! 0xCF ≠ 0x8F.
+
+So the sequential pattern DOES break before offset 199. I showed earlier it breaks at 192. Let me figure out why.
+
+Actually, I think the sequential data might be a PAYLOAD of one of the records, and the record boundaries don't align with what I calculated via varint parsing. Perhaps the varint parsing is correct for tags/sizes but the format isn't varint at all.
+
+Let me take a totally different approach. Let me look at the existing tests to understand expected behavior.
+--- turn 14 tool list_dir {"path": "C:\\task\\environment\\workspace"}
+--- turn 14 result ---
+dir 	assets
+dir 	docs
+file 228b	pyproject.toml
+file 1361b	README.md
+dir 	tests
+dir 	wchunk
+--- turn 15 tool list_dir {"path": "C:\\task\\environment\\workspace\\tests"}
+--- turn 15 result ---
+file 2244b	test_wchunk_basic.py
+--- turn 16 tool read_file {"path": "C:\\task\\environment\\workspace\\tests\\test_wchunk_basic.py"}
+--- turn 16 result ---
+(81 lines total)
+   1| # WCHK - visible smoke test
+   2| #
+   3| # 只覆盖最基础往返：包能导入、自己 pack 的数据能被自己读回、能序列化、
+   4| # 流式入口可用。它不检查任何格式规范，也完全不触碰 assets/ 下的权威样本。
+   5| #
+   6| # Exit codes: 0 pass; 1 fail.
+   7| 
+   8| from __future__ import annotations
+   9| 
+  10| import io
+  11| import sys
+  12| 
+  13| FAILURES = []
+  14| 
+  15| 
+  16| def check(name, fn):
+  17|     try:
+  18|         fn()
+  19|         print(f"[PASS] {name}")
+  20|     except Exception as exc:  # noqa: BLE001
+  21|         print(f"[FAIL] {name}: {type(exc).__name__}: {exc}")
+  22|         FAILURES.append(name)
+  23| 
+  24| 
+  25| def t_import():
+  26|     import wchunk  # noqa: F401
+  27|     for name in ("pack", "unpack", "verify", "iter_records",
+  28|                  "read_all", "compute_crc", "WChunkError"):
+  29|         assert hasattr(wchunk, name), f"missing public API {name}"
+  30| 
+  31| 
+  32| def t_roundtrip_own_data():
+  33|     from wchunk import pack, unpack
+  34|     records = [(1, b"alpha"), (2, b""), (300, b"x" * 10)]
+  35|     blob = pack(records)
+  36|     assert unpack(blob) == records
+  37| 
+  38| 
+  39| def t_verify_own_data():
+  40|     from wchunk import pack, verify
+  41|     assert verify(pack([(7, b"beta")])) is True
+  42|     assert verify(pack([])) is True
+  43| 
+  44| 
+  45| def t_serialises():
+  46|     from wchunk import pack, unpack
+  47|     import json
+  48|     blob = pack([(5, b"hello")])
+  49|     assert unpack(blob)[0][0] == 5
+  50|     assert json.loads(json.dumps({"n": 1})) == {"n": 1}
+  51| 
+  52| 
+  53| def t_stream_entry():
+  54|     from wchunk import iter_records, pack
+  55|     blob = pack([(1, b"a"), (2, b"bb")])
+  56|     tag, payload = next(iter_records(io.BytesIO(blob)))
+  57|     assert (tag, payload) == (1, b"a")
+  58| 
+  59| 
+  60| def t_crc_callable():
+  61|     from wchunk import compute_crc
+  62|     value = compute_crc(b"probe")
+  63|     assert isinstance(value, int) and value >= 0
+  64| 
+  65| 
+  66| def main() -> int:
+  67|     check("module 
+!! model call attempt 1 failed: TimeoutError: The read operation timed out
+!! model call attempt 2 failed: TimeoutError: The read operation timed out
+!! model call attempt 3 failed: TimeoutError: The read operation timed out
+--- turn 17 assistant ---
+Now let me think about this more carefully. The test `t_roundtrip_own_data` packs `[(1, b"alpha"), (2, b""), (300, b"x" * 10)]` and expects unpack to return the same. This must continue working.
+
+The current implementation uses varints for tag and size in records. The test passes with the current code (self-roundtrip works). The issue is that the SAMPLE files use a different format.
+
+Let me look at the sample data one more time with completely fresh eyes. Maybe the record layout uses fixed-width fields.
+
+Looking at sample.wchk bytes 12 onwards (after 12-byte header):
+```
+01 00 05 00 61 6c 70 68 61
+```
+
+What if each record has: u16LE tag + u16LE payload_len + payload?
+
+Rec1: tag=1, len=5, payload="alpha" → 2+2+5=9 bytes. Next@21.
+Bytes@21: `00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 2c`
+
+Rec2@21: tag=u16LE(00,00)=0, len=u16LE(00,00)=0, payload="" → 4 bytes. Next@25.
+Bytes@25: `00 00 00 02 00 00 00 00 00 00 2c 01 0a 00 78 78`
+
+Rec3@25: tag=u16LE(00,00)=0, len=u16LE(00,02)=512... 
+
+STILL 512. Unless it's u16BE for length: u16BE(00,02)=2.
+
+Let me try: tag=u16LE, len=u16BE:
+Rec3@25: tag=0, len=2, payload=bytes[29:31]=`00 00`. Next@31.
+Bytes@31: Row 0x10 pos 15 = `00`. Row 0x20 starts at 32: `00 00 00 2c 01 0a 00 78...`
+
+Rec4@31: tag=u16LE(offsets 31,32)=u16LE(00,00)=0, len=u16BE(offsets 33,34)=u16BE(00,00)=0. Payload="". Next@35.
+Bytes@35: offsets 35,36 from row 0x20: positions 3,4 → `00 2c`
+
+Rec5@35: tag=u16LE(00,2c)=0x2c00=11264, len=u16BE(offsets 37,38)=u16BE(01,0a)=266.
+
+Tag=11264 seems unlikely but possible. Len=266, payload=266 bytes from offset 39 to 304.
+
+Total record bytes: 9+4+6+4+4+266 = hmm, let me add up properly.
+Rec1: 2+2+5 = 9
+Rec2: 2+2+0 = 4
+Rec3: 2+2+2 = 6
+Rec4: 2+2+0 = 4
+Rec5: 2+2+266 = 270
+Total: 9+4+6+4+270 = 293
+
+But available record area is either 314 (footer=4) or 312 (footer=6). 293 ≠ 314 and ≠ 312.
+
+Doesn't fit. Let me try other combos.
+
+What if tag=u16BE, len=u16LE?
+Rec1@12: tag=u16BE(01,00)=256, len=u16LE(05,00)=5. Payload=5 bytes. Tag=256 seems high but ok.
+Rec2@21: tag=u16BE(00,00)=0, len=u16LE(00,00)=0. 
+Rec3@25: tag=u16BE(00,00)=0, len=u16LE(00,02)=512. Still 512!
+
+What if both are u16BE?
+Rec1: tag=256, len=1280. Nope.
+
+What about u32 fields? Let me try u32LE tag + u32LE len:
+Rec1@12: tag=u32LE(01,00,05,00)=0x00050001. Bad.
+
+OK, I'm stuck on fixed-width interpretations. Let me go back to varints but consider that maybe the HEADER is different from what I assumed.
+
+What if the header includes more info, like a record-offset table or total body size?
+
+Let me try: header = 4(magic) + 1(version) + 4(count_LE) + 3(reserved) + 4(body_size_LE) = 16 bytes.
+
+Sample header: `57 43 48 4b 02 05 00 00 00 00 00 00 01 00 05 00`
+count = u32LE(05,00,00,00) = 5 ✓
+body_size = u32LE(01,00,05,00) = 0x00050001 = 327681. That's way bigger than the file.
+
+What if body_size is at different bytes? Or what if count is u16LE?
+
+header = 4+1+2(count_u16LE)+1+4(body_size)+4 = 16? Too speculative.
+
+Let me try a radically different approach. What if the count field is LE u32 at bytes 5-8, AND the record format truly is varint, BUT my identification of where sequential data starts/ends is wrong because some bytes I thought were sequential are actually record structure?
+
+Going back to varint parsing:
+Record 1: (1, b"") — offsets 12-13
+Record 2: (5, b"") — offsets 14-15
+Record 3: (97, 108 bytes) — offsets 16-17, payload 18-125
+Record 4: (70, 71 bytes) — offsets 126-127, payload 128-198
+Record 5: starts at offset 199
+
+For record 5, we need it to end exactly at the start of the footer.
+
+If footer = 4 bytes: record area ends at 326. Record 5 spans 199-325 = 127 bytes.
+If footer = 6 bytes: record area ends at 324. Record 5 spans 199-323 = 125 bytes.
+
+At offset 199, reading varint tag:
+The byte at 199... let me recheck. I earlier said the sequential pattern breaks at 192. Let me verify what byte is actually at offset 199.
+
+Row 0xC0 (192-207): `c8 c9 ca cb cc cd ce cf d0 d1 d2 d3 d4 d5 d6 d7`
+Offset 199 = position 7 in this row = 0xcf.
+
+0xcf: high bit set. Varint continues.
+Low 7 bits: 0x4f = 79.
+
+Offset 200: 0xd0. High bit set. Low 7: 0x50 = 80. Accumulated: 79 | (80 << 7) = 79 + 10240 = 10319.
+
+Offset 201: 0xd1. High bit set. Low 7: 0x51 = 81. Acc: 10319 | (81 << 14) = 10319 + 1327104 = 1337423.
+
+This will keep going as long as high bits are set. Bytes 0xc8-0xff all have high bit set. From offset 192 to wherever we first see a byte < 0x80.
+
+Looking ahead: after the sequential-ish data, near the end:
+Row 0x130 (304-319): `f8 f9 fa fb fc fd fe ff 00 00 00 00 e8 fd 01 00`
+Offset 311: 0xff (high bit set)
+Offset 312: 0x00 (HIGH BIT CLEAR!) → varint terminates here.
+
+So the varint tag would span from offset 199 to 312 (114 bytes!). That's an absurdly long varint encoding for a tag. This CAN'T be right.
+
+Conclusion: **the record format is NOT varint-based**. The draft is wrong about varints.
+
+Let me reconsider with FIXED-SIZE record headers. The key insight might be that I need to find the right field sizes.
+
+Let me look at the sample data with the assumption that records have a FIXED header of some size, followed by variable payload.
+
+Going back to what worked for record 1: u16LE tag + u16LE size gave tag=1, size=5, payload="alpha". This was very clean.
+
+The problem was record 3 giving size=512. But what if I'm wrong about where record 3 starts?
+
+What if there's PADDING between records? Like, records are aligned to 4-byte or 8-byte boundaries?
+
+Record 1: 2(tag)+2(size)+5(payload) = 9 bytes. Padded to 12? Next at 24?
+Or padded to 10? Next at 22?
+
+If padded to 12 (next multiple of 4 after 9): next at 12+12=24.
+At offset 24: row 0x10 pos 8 = `00`. Offset 25=`00`, 26=`00`, 27=`00`.
+tag=u16LE(00,00)=0, size=u16LE(00,00)=0. Payload="". Record 2: (0, b"").
+Record 2 total: 4 bytes. Padded to 4 → next at 28.
+
+At offset 28: row 0x10 pos 12 = `02`. Offset 29=`00`.
+tag=u16LE(02,00)=2, size=u16LE(00,00)=0. Payload="". Record 3: (2, b"").
+Padded to 4 → next at 32.
+
+At offset 32: row 0x20: `00 00 00 2c 01 0a 00 78 78 78 78 78 78 78 78 78`
+tag=u16LE(00,00)=0, size=u16LE(00,2c)=0x2c00=11264. Too big again with LE.
+With BE: size=u16BE(00,2c)=44. Payload=44 bytes from offset 36 to 79. Next at 80. Padded to 80 (already aligned).
+
+Hmm, mixing endianness doesn't make sense.
+
+Let me try: ALL fields u16BE with 4-byte alignment padding.
+
+Rec1@12: tag=u16BE(01,00)=256. Unlikely.
+
+OK, forget alignment. Let me try: u16LE tag + u32LE size.
+
+Rec1@12: tag=u16LE(01,00)=1, size=u32LE(05,00,61,6c)=0x6c610005. Way too big.
+
+What if it's u32LE tag + u16LE size?
+Rec1@12: tag=u32LE(01,00,05,00)=0x00050001. Weird tag.
+
+What about: records use u8 tag + u24LE size (3 bytes)?
+Rec1@12: tag=0x01=1, size=u24LE(00,05,00)=0x000500=1280. Too big.
+
+u8 tag + u16LE size + u8 flags?
+Rec1@12: tag=1, size=u16LE(00,05)=5, flags=0x00. Payload=5 bytes [15:20]. Next@20.
+Rec2@20: tag=0x61=97, size=u16LE(6c,70)=0x706c. Too big.
+
+Hmm. What if the FIRST record has a different format than subsequent ones? Unlikely for a container format.
+
+Let me try yet another idea: what if tag and size are BOTH u32LE?
+
+Rec1@12: tag=u32LE(01,00,05,00)=327681, size=u32LE(61,6c,70,68)=0x68706c61. Both huge. No.
+
+What if the record format puts SIZE first, then TAG?
+
+u16LE size + u16LE tag:
+Rec1@12: size=u16LE(01,00)=1, tag=u16LE(05,00)=5. Payload=1 byte at offset 16: 0x61='a'. Next@17.
+Rec2@17: size=u16LE(6c,70)=0x706c=28780. Too big.
+
+u32LE size + u32LE tag:
+Rec1@12: size=u32LE(01,00,05,00)=327681. Too big.
+
+None work beyond record 1.
+
+WAIT. Let me reconsider. What if "alpha" is NOT a payload but rather part of the header or some metadata? What if the actual records start later?
+
+Or what if the header is LARGER than 12 bytes?
+
+Let me look at the empty sample again: 18 bytes total. If ALL 18 bytes are header+footer with no records, and we know magic(4)+version(1)=5 bytes minimum for header, and CRC is presumably 4 bytes for footer, that leaves 18-5-4=9 bytes for other header fields.
+
+What if header = 4(magic) + 1(version) + 4(count_LE) + 3(reserved) + 2(something) = 14 bytes?
+Empty: 18-14=4 bytes footer. Footer = `d7 13 ef 00`? Or if header=14 starts at 0: bytes 0-13 are header, bytes 14-17 are footer.
+
+Empty file bytes: `57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7 13 ef 00 00`
+Header (14): `57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7`
+Footer (4): `13 ef 00 00` → LE u32 = 0x0000ef13
+
+Or header=14 ending differently. Hmm, those last two zero bytes `00 00` are suspicious. They appear in both samples at the end.
+
+Sample last bytes: `... d2 37 6a ef 1b ff`
+Empty last bytes: `... f1 d7 13 ef 00 00`
+
+Both have `XX XX XX ef` pattern 4 bytes from end. Coincidence?
+
+Actually wait, for empty: bytes 14-17 = `13 ef 00 00`. For sample: bytes 326-329 = `6a ef 1b ff`.
+
+The `ef` appears at position -3 from end in empty and position -3 from end in sample. Probably coincidence.
+
+Let me try ANOTHER hypothesis: the footer is NOT just CRC. What if it's CRC(4) + trailer(2)?
+
+Empty: CRC=`f1 d7 13 ef`, trailer=`00 00`
+Sample: CRC at bytes 324-327=`d2 37 6a ef`, trailer=bytes 328-329=`1b ff`
+
+Or CRC is first 4 of 6-byte footer, with 2 extra bytes.
+
+Alternatively: the footer IS 4 bytes and the header is 14 bytes.
+
+Let me check: with 14-byte header for sample, records area = 330-14-4 = 312 bytes starting at offset 14.
+
+Offset 14: `05 00 61 6c 70 68 61 00 00 00 00 00 00 00 02 00`
+
+With varint: tag=5, size=0 → (5, b""). Next@16.
+At 16: 0x61=97, 0x6c=108 → (97, 108 bytes). Same issue eventually.
+
+With u16LE+u16LE: tag=u16LE(05,00)=5, size=u16LE(61,6c)=0x6c61=27745. Too big.
+
+Doesn't help.
+
+OK, I think I need to take a step back and consider that maybe the record count in the header isn't 5. What if the count field is at a different location or uses different encoding?
+
+What if bytes 5-8 are NOT the count? What if the header is simply:
+- 4 magic "WCHK"  
+- 1 version (0x02)
+- And then records start at offset 5?
+
+With varint records starting at offset 5:
+Byte 5: 0x05 → tag=5
+Byte 6: 0x00 → size=0 → Record 1: (5, b"")
+Byte 7: 0x00 → tag=0
+Byte 8: 0x00 → size=0 → Record 2: (0, b"")
+Byte 9: 0x00 → tag=0
+Byte 10: 0x00 → size=0 → Record 3: (0, b"")
+Byte 11: 0x00 → tag=0
+Byte 12: 0x01 → size=1 → payload=byte[13]=0x00 → Record 4: (0, b"\x00")
+Byte 14: 0x05 → tag=5
+Byte 15: 0x00 → size=0 → Record 5: (5, b"")
+
+5 records found! But they're all trivial. And "alpha" at offset 16 would be part of record 6 (if there were more records). But we only expect 5.
+
+Where does the footer start? After record 5 at offset 16, the remaining bytes are: `61 6c 70 68 61 00 00 ...` all the way to the end. That's 330-16=314 bytes for footer. Way too much.
+
+Unless the record count is stored somewhere and tells us to read exactly 5 records, and the rest is indeed all payload of larger records. But with this parsing, all 5 records have tiny payloads.
+
+Hmm, what if the count is stored as part of the header but at a different offset? Like, what if byte 5 is something else and count is elsewhere?
+
+Let me look at both headers side by side:
+Sample: `57 43 48 4b 02 05 00 00 00 00 00 00`
+Empty:  `57 43 48 4b 02 00 00 00 00 00 00 00`
+
+They differ ONLY at byte 5: 0x05 vs 0x00. Everything else is identical. So byte 5 MUST encode the record count (or something correlated with it). Since sample has 5 records and byte 5 = 0x05, it's almost certainly the count as a single byte.
+
+So: header might be 4(magic) + 1(version) + 1(count_u8) + N(reserved). With the remaining bytes being zeros.
+
+If header = 6 bytes (4+1+1): records start at offset 6. Remaining in empty: 18-6=12 bytes.
+If header = 12 bytes (4+1+1+6): records start at offset 12. Remaining in empty: 18-12=6 bytes.
+
+Let me try header=6 with footer=4: empty has 18-6-4=8 bytes of records (but count=0, so 0 records → contradiction unless those 8 bytes are something else).
+
+Header=6, footer=12? Weird.
+
+What if there's a BODY LENGTH field? Header = 4+1+1+4(body_len_LE) = 10 bytes.
+Empty: body_len = u32LE(bytes[6:10]) = u32LE(00,00,00,00) = 0. ✓ (no records)
+Sample: body_len = u32LE(bytes[6:10]) = u32LE(00,00,00,00) = 0. ✗ (should be >0)
+
+Hmm, bytes 6-9 are all zeros in both samples. So body_len can't be there.
+
+What if body_len is at the END of the header? Header = 4+1+1+2(reserved)+4(body_len_LE) = 12.
+Empty: body_len = u32LE(bytes[8:12]) = u32LE(00,00,00,00) = 0. ✓
+Sample: body_len = u32LE(bytes[8:12]) = u32LE(00,00,00,00) = 0. ✗
+
+Still zero. Because bytes 8-11 are all zeros in both.
+
+Wait, in the sample, bytes 6-11 are ALL zeros. The only non-zero bytes in the header after magic+version are byte 5 (=0x05). So the ONLY distinguishing header field is byte 5.
+
+This strongly suggests: header = 4(magic) + 1(version) + 1(count_u8) + 6(reserved_zeros) = 12 bytes. And the reserved bytes are genuinely just zeros.
+
+Back to: header=12, records start at 12, count=5 for sample, count=0 for empty.
+
+For empty: 18-12 = 6 bytes after header. These must be the footer. FOOTER = 6 bytes.
+
+For sample: 330-12 = 318 bytes after header. 318-6(footer) = 312 bytes of records.
+
+Now I need to figure out the record format that produces exactly 5 records in 312 bytes.
+
+Let me try: u16LE tag + u32LE size + payload.
+
+Rec1@12: tag=u16LE(01,00)=1, size=u32LE(05,00,61,6c)=0x6c610005. NOPE.
+
+What about u32LE tag + u16LE size?
+Rec1@12: tag=u32LE(01,00,05,00)=0x00050001. NOPE.
+
+u16LE tag + u16LE size was the most promising. Rec1=(1,"alpha") worked perfectly. The issue was rec3.
+
+Let me revisit rec3 with u16LE+u16LE. Rec2 ended at offset 25. At offset 25:
+Bytes: `00 00 00 02 00 00 00 00 00 00 2c 01 0a 00 78 78`
+
+Rec3: tag=u16LE(00,00)=0, size=u16LE(00,02)=512.
+
+BUT WHAT IF the record layout includes additional fields? Like: u16LE tag + u16LE flags + u16LE size + payload?
+
+Rec1@12: tag=1, flags=u16LE(05,00)=5, size=u16LE(61,6c)=0x6c61. Too big.
+
+Or: u16LE tag + u16LE size + u16LE checksum + payload?
+Rec1: tag=1, size=5, cksum=u16LE(61,6c)=0x6c61, payload=bytes[18:23]=`70 68 61 00 00`="pha\x00\x00". Hmm, not "alpha".
+
+What if the layout is: u16LE size + u16LE tag + payload?
+Rec1@12: size=u16LE(01,00)=1, tag=u16LE(05,00)=5. Payload=1 byte: `61`='a'. Next@17.
+Rec2@17: size=u16LE(6c,70)=0x706c=28780. Too big.
+
+What about u8 tag + u8 flags + u16LE size + payload?
+Rec1@12: tag=1, flags=0, size=u16LE(05,00)=5. Payload=5 bytes [16:21]="alpha". Next@21. Total=1+1+2+5=9.
+Rec2@21: tag=0, flags=0, size=u16LE(00,00)=0. Payload="". Next@25. Total=4.
+Rec3@25: tag=0, flags=0, size=u16LE(00,02)=512. SAME PROBLEM.
+
+What if flags come AFTER size? u8 tag + u16LE size + u8 flags + payload?
+Rec1@12: tag=1, size=u16LE(00,05)=5, flags=0x00. Payload=[16:21]="alpha". Next@21. Total=1+2+1+5=9.
+Rec2@21: tag=0, size=u16LE(00,00)=0, flags=0x00. Next@25. Total=4.
+Rec3@25: tag=0, size=u16LE(00,02)=512. STILL 512.
+
+No matter where I put extra fields, the bytes at offsets 25-28 are `00 00 00 02`, and any u16LE interpretation of a size field that includes bytes 27-28 gives 0x0200=512.
+
+UNLESS the size is u16BE at those positions: u16BE(00,02)=2. Let me try ALL fields as big-endian:
+
+u16BE tag + u16BE size:
+Rec1@12: tag=u16BE(01,00)=256, size=u16BE(05,00)=1280. Bad.
+
+Mixed: u16LE tag + u16BE size:
+Rec1@12: tag=1, size=u16BE(05,00)=1280. Bad.
+
+u16BE tag + u16LE size:
+Rec1@12: tag=256, size=5. Payload=[16:21]="alpha". Next@21.
+Rec2@21: tag=u16BE(00,00)=0, size=u16LE(00,00)=0. Next@25.
+Rec3@25: tag=u16BE(00,00)=0, size=u16LE(00,02)=512. STILL.
+
+The problem is always at offsets 27-28 = `00 02`. In LE that's 512, in BE that's 2. But using BE for size breaks record 1 (size=1280 instead of 5).
+
+WAIT. What if record 1 is special because tag=1 means something? Or what if I have the record boundary wrong?
+
+Let me reconsider. What if the first 4 bytes after header are NOT the first record, but rather a secondary header or offset table?
+
+After 12-byte header, bytes 12-15: `01 00 05 00`. What if this is a u32LE value = 0x00050001 = 327681? Or u16LE pair (1, 5)?
+
+What if bytes 12-15 are: u16LE(first_tag=1) + u16LE(total_payload_size=5)? And then records follow?
+
+Hmm, total payload of 5 bytes doesn't account for all the data.
+
+What if it's: u32LE(record_area_size)?
+u32LE(01,00,05,00) = 0x00050001 = 327681. Way too big.
+
+u32BE(01,00,05,00) = 0x01000500 = 16778496. Even bigger.
+
+What about u16LE(record_area_size)?
+u16LE(01,00) = 1. Only 1 byte of records? Then records at offset 14. Nah.
+
+I'm going in circles. Let me try a COMPLETELY different approach: examine the differences between what the current code produces and what the sample contains.
+
+The current code uses varint tag + varint size + payload. It packs and unpacks its own data correctly. The sample must use a DIFFERENT encoding.
+
+Given that the instruction says "记录区的字节布局必须与样本的实际字节一致", I need to match the sample's exact layout.
+
+Let me try to manually identify record boundaries in the sample by looking for patterns.
+
+The sample has "alpha" clearly visible at offsets 16-20. And sequential bytes 00-FF at offsets 56-311 (approximately). And lots of 'x' (0x78) characters around offsets 40-55.
+
+Let me hypothesize 5 records with these payloads:
+1. Something containing "alpha"
+2. Something empty or small
+3. Something containing 'xxxx...'
+4. Something containing sequential bytes
+5. Something at the end
+
+Looking at the data regions:
+- Offsets 16-20: "alpha" (5 bytes)
+- Offsets 21-?: zeros
+- Offsets ~38-55: 0x78 repeated ("xxxx...")
+- Offsets 56-311: sequential 00-FF (256 bytes)
+- Offsets 312-?: tail data
+
+Hmm, let me look at offsets 312 onward:
+Row 0x130 (304-319): `f8 f9 fa fb fc fd fe ff 00 00 00 00 e8 fd 01 00`
+Offsets 312-315: `00 00 00 00`
+Offsets 316-319: `e8 fd 01 00`
+
+Row 0x140 (320-329): `7a 00 00 00 d2 37 6a ef 1b ff`
+Offsets 320-323: `7a 00 00 00`
+Offsets 324-329: `d2 37 6a ef 1b ff` (footer?)
+
+So after the sequential data ends at 311, we have:
+312-315: `00 00 00 00` (4 zero bytes)
+316-319: `e8 fd 01 00` 
+320-323: `7a 00 00 00`
+324-329: footer (6 bytes)
+
+`e8 fd 01 00` as u32LE = 0x0001fde8 = 130536
+`7a 00 00 00` as u32LE = 0x0000007a = 122
+
+Interesting. 122 = 0x7a. And 130536... not obvious.
+
+What if the records contain:
+1. (1, b"alpha") - tag 1, payload "alpha"
+2. (0, b"") - tag 0, empty
+3. (2, b"\x00" * something + ...) - some record
+4. (4, b"x"*something + sequential bytes) - large record  
+5. Some final record
+
+Hmm, let me look at the data between "alpha" and the x's.
+
+Offsets 21-37 (between "alpha" end and x region):
+Row 0x10 (16-31): ...`00 00 00 00 00 00 00 02 00 00 00`
+Row 0x20 (32-47): `00 00 00 00 2c 01 0a 00 78 78 78 78 78 78 78 78`
+
+So offsets 21-31: `00 00 00 00 00 00 00 02 00 00 00` (11 bytes)
+Offsets 32-39: `00 00 00 00 2c 01 0a 00` (8 bytes)
+Offsets 40-55: `78 78 78 78 78 78 78 78 78 78 00 00 04 00 00 01` (note: not all 0x78!)
+
+Wait, row 0x30 (48-63): `78 78 00 00 04 00 00 01 00 01 02 03 04 05 06 07`
+So offsets 48-49: `78 78`, then offsets 50-55: `00 00 04 00 00 01`.
+
+So the 'x' region is offsets 40-49 (10 bytes of 0x78), not extending further.
+
+Let me map out the data regions more precisely:
+- 12-15: `01 00 05 00` (record header?)
+- 16-20: "alpha" (5 bytes)
+- 21-27: `00 00 00 00 00 00 00` (7 zeros)
+- 28: `02`
+- 29-31: `00 00 00`
+- 32-35: `00 00 00 00`
+- 36-37: `2c 01`
+- 38-39: `0a 00`
+- 40-49: `78` * 10 (ten x's)
+- 50-51: `00 00`
+- 52-53: `04 00`
+- 54-55: `00 01`
+- 56-311: sequential 00-FF (256 bytes)
+- 312-315: `00 00 00 00`
+- 316-319: `e8 fd 01 00`
+- 320-323: `7a 00 00 00`
+- 324-329: footer
+
+Now let me look for a pattern. Notice:
+- At offset 28: `02` could be a tag
+- At offset 36-37: `2c 01` → u16LE = 0x012c = 300
+- At offset 38-39: `0a 00` → u16LE = 10
+- At offset 52-53: `04 00` → u16LE = 4
+- At offset 316-319: `e8 fd 01 00` → u32LE = 130536
+- At offset 320-323: `7a 00 00 00` → u32LE = 122
+
+Wait! At offset 36: `2c 01` as u16LE = 300. And in the test, there's a tag=300 mentioned! Also `0a 00` = 10, which matches `b"x" * 10` from the test.
+
+And `04 00` at offset 52 = 4. Could be a tag.
+
+Let me hypothesize: records use u16LE tag + u16LE size:
+
+Starting at offset 12:
+Rec1: tag=u16LE(01,00)=1, size=u16LE(05,00)=5, payload=[16:21]="alpha". Next@21. ✓
+Rec2@21: tag=u16LE(00,00)=0, size=u16LE(00,00)=0, payload="". Next@25.
+Rec3@25: tag=u16LE(00,00)=0, size=u16LE(00,02)=512... PROBLEM.
+
+BUT WAIT. What if record 2 is NOT at offset 25? What if there's padding?
+
+What if each record is PADDED to a 4-byte boundary? Record 1 occupies 2+2+5=9 bytes, padded to 12 → next at 12+12=24.
+
+Rec2@24: tag=u16LE(00,02)=0x0200=512. Hmm, that's worse.
+
+What if padded to 8? Rec1: 9→16. Next@28.
+Rec2@28: tag=u16LE(02,00)=2, size=u16LE(00,00)=0. Payload="". Next@32. Padded 4→8. Next@36.
+
+Rec3@36: tag=u16LE(2c,01)=0x012c=300, size=u16LE(0a,00)=10. Payload=10 bytes [40:50]="xxxxxxxxxx". Next@50. Padded 14→16. Next@52.
+
+Rec4@52: tag=u16LE(04,00)=4, size=u16LE(00,01)=256. Payload=256 bytes [56:312]=sequential 00-FF. Next@312. Padded 260→260 (already divisible by 4). Next@312.
+
+Rec5@312: tag=u16LE(00,00)=0, size=u16LE(00,e8)=0xe800=59392. TOO BIG!
+
+Hmm, close but rec5 fails. Let me check without padding for rec5.
+
+Without padding after rec4: Rec4 ends at 56+256=312. Rec5@312.
+tag=u16LE(00,00)=0, size=u16LE(00,e8)=0xe800=59392. Still bad.
+
+What if rec5 uses different size interpretation? u16BE?
+size=u16BE(00,e8)=232. Payload=232 bytes from 316 to 547. But file ends at 330. Not enough room.
+
+Hmm. What about u32LE size for some records?
+
+Let me try: u16LE tag + u32LE size.
+Rec1@12: tag=1, size=u32LE(05,00,61,6c)=0x6c610005. NOPE.
+
+OK but the 8-byte alignment theory was VERY promising for records 1-4! Let me see if I can make rec5 work.
+
+With 8-byte alignment:
+Rec1@12: tag=1, size=5, payload=5 bytes. Raw=9. Padded to 16 (next mult of 8 from 12+9=21 → 24? Or from record start?).
+
+Actually, let me be precise. If ALIGNMENT means the total record size (header+payload) is rounded up to the nearest multiple of N:
+
+With 8-byte alignment:
+Rec1: 2+2+5=9 → pad to 16. Next at 12+16=28.
+Rec2@28: tag=2, size=0. Raw=4 → pad to 8. Next at 28+8=36.
+Rec3@36: tag=300, size=10. Raw=14 → pad to 16. Next at 36+16=52.
+Rec4@52: tag=4, size=256. Raw=260 → pad to 264. Next at 52+264=316.
+Rec5@316: remaining until footer.
+
+With 4-byte footer (total=330, records end at 326):
+Rec5@316: 326-316=10 bytes available. tag=u16LE(e8,fd)=0xfde8=65000, size=u16LE(01,00)=1. Payload=1 byte at 320: 0x7a. Total=5 bytes. Pad to 8 → needs 3 more bytes. But only 10 bytes available; 5+3=8 ≤ 10. ✓!
+
+Next at 316+8=324. But records should end at 326. There'd be 2 bytes gap.
+
+Hmm, with 6-byte footer (records end at 324):
+Rec5@316 to 324 = 8 bytes. tag=u16LE(e8,fd)=0xfde8, size=u16LE(01,00)=1. Payload=1 byte. Raw=5. Pad to 8. Next@324. Records end at 324. ✓!
+
+So with 8-byte alignment and 6-byte footer:
+Rec5: tag=0xfde8=65000, size=1, payload=byte[320]=0x7a. 
+
+Tag=65000 seems unusual but technically valid (non-negative integer).
+
+But wait, let me check the 4-byte alignment case too:
+
+With 4-byte alignment:
+Rec1: 9 → pad to 12. Next@24.
+Rec2@24: tag=u16LE(00,02)=512. Hmm, tag=512 vs tag=2 with 8-byte align.
+
+Actually @24: bytes are `00 00 00 00 00 00 00 02`. Wait, offset 24 is in row 0x10: position 24-16=8 → byte=`00`. Offset 25=`00`. So tag=u16LE(00,00)=0. Size=u16LE(00,00)=0.
+
+That doesn't give tag=2. With 4-byte alignment, rec2 starts at 24, not 28.
+
+Let me redo with 4-byte alignment:
+Rec1@12: 9 → pad to 12. Next@24.
+Rec2@24: tag=u16LE(offsets 24,25)=u16LE(00,00)=0, size=u16LE(26,27)=u16LE(00,00)=0. Raw=4. Pad to 4. Next@28.
+Rec3@28: tag=u16LE(02,00)=2, size=u16LE(00,00)=0. Raw=4. Pad to 4. Next@32.
+Rec4@32: tag=u16LE(00,00)=0, size=u16LE(00,00)=0. Raw=4. Pad to 4. Next@36.
+Rec5@36: tag=u16LE(2c,01)=300, size=u16LE(0a,00)=10. Raw=14. Pad to 16. Next@52.
+
+That's only 5 records ending at offset 52! But we have 312+ bytes of record data. Doesn't work.
+
+So 4-byte alignment doesn't produce the right number of records. 8-byte alignment DID produce 5 records spanning the full record area. Let me verify once more:
+
+8-byte alignment, 6-byte footer:
+Record area: offsets 12 to 323 (312 bytes).
+
+Rec1@12: tag=u16LE(01,00)=1, size=u16LE(05,00)=5. Payload=[16:21]="alpha". Raw=9. Pad to 16. Next@28. ✓
+Rec2@28: tag=u16LE(02,00)=2, size=u16LE(00,00)=0. Payload="". Raw=4. Pad to 8. Next@36. ✓
+Rec3@36: tag=u16LE(2c,01)=300, size=u16LE(0a,00)=10. Payload=[40:50]="xxxxxxxxxx". Raw=14. Pad to 16. Next@52. ✓
+Rec4@52: tag=u16LE(04,00)=4, size=u16LE(00,01)=256. Payload=[56:312]=sequential 00-FF (256 bytes). Raw=260. Pad to 264. Next@316. ✓
+Rec5@316: tag=u16LE(e8,fd)=65000, size=u16LE(01,00)=1. Payload=[320:321]=b"\x7a". Raw=5. Pad to 8. Next@324. ✓
+
+Records end at 324. Footer = bytes[324:330] = `d2 37 6a ef 1b ff`. 6 bytes. ✓
+
+THIS WORKS! All 5 records fit perfectly with 8-byte aligned records using u16LE tag + u16LE size + payload!
+
+But wait, tag=65000 for record 5 seems odd. Let me double-check: offsets 316-317 from the hex dump.
+
+Row 0x130 (304-319): `f8 f9 fa fb fc fd fe ff 00 00 00 00 e8 fd 01 00`
+Offset 316 = position 316-304=12 → byte=0xe8. Offset 317=0xfd.
+tag=u16LE(e8,fd)=0xfde8=65000.
+
+Hmm, 65000 is a valid non-negative integer. The spec says "tag 是非负整数". OK.
+
+But actually, wait. Let me reconsider whether the padding is really 8-byte alignment or something else.
+
+What if records aren't padded but instead use u32LE for size?
+
+u16LE tag + u32LE size + payload:
+Rec1@12: tag=1, size=u32LE(05,00,61,6c)=0x6c610005. NOPE. Already ruled out.
+
+What about u16LE tag + u16LE size + payload, NO padding, but I miscounted somewhere?
+
+Without padding:
+Rec1@12: tag=1, size=5. Payload=[16:21]. Next@21.
+Rec2@21: tag=u16LE(00,00)=0, size=u16LE(00,00)=0. Next@25.
+Rec3@25: tag=u16LE(00,00)=0, size=u16LE(00,02)=512.
+
+512 bytes from offset 29 to 540. File is 330 bytes. Can't fit. RULED OUT.
+
+So padding IS necessary. And 8-byte alignment works perfectly.
+
+But let me also verify: is it really 8-byte alignment, or could it be that each record's TOTAL size (including header) is stored explicitly?
+
+What if the format is: u16LE total_record_size + u16LE tag + payload?
+
+Rec1@12: total=u16LE(01,00)=1. But record needs at least 4 bytes for header. Total=1 makes no sense.
+
+What about: u16LE tag + u16LE size + payload + padding_to_8_bytes?
+
+That's what I had. Let me verify the math once more:
+
+Rec1: header=4, payload=5, raw=9, padded=16 (next multiple of 8 ≥ 9). Offset 12+16=28. ✓
+Rec2: header=4, payload=0, raw=4, padded=8. Offset 28+8=36. ✓
+Rec3: header=4, payload=10, raw=14, padded=16. Offset 36+16=52. ✓
+Rec4: header=4, payload=256, raw=260, padded=264 (next mult of 8 ≥ 260 = 264). Offset 52+264=316. ✓
+Rec5: header=4, payload=1, raw=5, padded=8. Offset 316+8=324. ✓
+
+324 = 12 + 312 = 12 + (330 - 12 - 6). ✓
+
+PERFECT! The format is:
+- Header: 12 bytes (4 magic + 1 version + 1 count_u8 + 6 reserved)
+- Records: each is u16LE tag + u16LE size + payload, padded to 8-byte boundary
+- Footer: 6 bytes
+
+Now I need to figure out the footer. 6 bytes: `d2 37 6a ef 1b ff` for sample, `f1 d7 13 ef 00 00` for empty.
+
+The task says the checksum is a "通用的 32 位 CRC 变体" covering header + all records. So 4 bytes of the 6-byte footer are CRC, and 2 bytes are something else.
+
+Possibilities:
+1. CRC(4) + terminator(2)
+2. Terminator(2) + CRC(4)
+3. CRC(4) + padding(2)
+
+For empty: `f1 d7 13 ef 00 00`. If CRC is first 4: `f1 d7 13 ef` → LE u32 = 0xef13d7f1.
+If CRC is last 4: `13 ef 00 00` → LE u32 = 0x0000ef13.
+
+For sample: `d2 37 6a ef 1b ff`. First 4: `d2 37 6a ef` → LE u32 = 0xef6a37d2. Last 4: `6a ef 1b ff` → LE u32 = 0xff1bef6a.
+
+The task says the current `compute_crc` returns values that don't match any standard CRC. Current code: `zlib.crc32(data) ^ 0xFFFFFFFF`. Standard zlib.crc32 already applies the final XOR, so XORing again undoes it.
+
+Maybe the fix is to use STANDARD `zlib.crc32(data) & 0xFFFFFFFF` (which IS a standard CRC-32).
+
+Let me check: for the empty file, CRC covers the 12-byte header. If the CRC is stored as the first 4 bytes of the footer in LE:
+
+CRC = zlib.crc32(b"WCHK\x02\x00\x00\x00\x00\x00\x00\x00") & 0xFFFFFFFF
+
+I can't compute this mentally, but the stored value would be 0xef13d7f1 (from `f1 d7 13 ef` LE).
+
+Alternatively, if stored as last 4 bytes: CRC = 0x0000ef13 (from `13 ef 00 00` LE). The trailing zeros seem suspicious for a CRC value.
+
+More likely the CRC is the FIRST 4 bytes: `f1 d7 13 ef` → 0xef13d7f1. And the last 2 bytes `00 00` are padding/terminator.
+
+For the sample: CRC = first 4 of footer = `d2 37 6a ef` → 0xef6a37d2. Last 2 = `1b ff`.
+
+Hmm, `1b ff` doesn't look like padding. What if the footer layout is different?
+
+What if it's: 2-byte marker + 4-byte CRC?
+Empty: marker=`f1 d7`, CRC=`13 ef 00 00` → LE u32 = 0x0000ef13.
+Sample: marker=`d2 37`, CRC=`6a ef 1b ff` → LE u32 = 0xff1bef6a.
+
+Or maybe the 6-byte footer is: CRC32(4) + u16LE(something)?
+
+Actually, wait. Let me reconsider whether the footer is really 6 bytes. What if I got the record alignment wrong?
+
+What if records are padded to 8 bytes FROM THE START OF THE RECORD (i.e., record offset within the record area is a multiple of 8)?
+
+Record area starts at offset 12. 
+Rec1 at relative offset 0 (absolute 12): size=9, padded to 16. Next relative=16, absolute=28.
+Rec2 at relative 16 (absolute 28): size=4, padded to 8. Next relative=24, absolute=36.
+Rec3 at relative 24 (absolute 36): size=14, padded to 16. Next relative=40, absolute=52.
+Rec4 at relative 40 (absolute 52): size=260, padded to 264. Next relative=304, absolute=316.
+Rec5 at relative 304 (absolute 316): size=5, padded to 8. Next relative=312, absolute=324.
+
+Same result. Record area = 312 bytes. Footer = 6 bytes.
+
+Actually, now that I think about it, maybe the padding is to ensure each record starts at an 8-byte aligned ABSOLUTE offset?
+
+Absolute offset 12: not 8-byte aligned (12 % 8 = 4). Hmm.
+
+Or maybe alignment is relative to the start of the record area (offset 12)? Relative offset 0 → aligned.
+
+In any case, the math works out the same way. Let me accept: 8-byte aligned records, 6-byte footer.
+
+Now, about the CRC. The CRC covers header + records (per spec: "校验和的覆盖范围必须包含文件头与全部记录").
+
+For the empty file:
+Data covered = 12-byte header = `57 43 48 4b 02 00 00 00 00 00 00 00`
+CRC stored in footer (somewhere in the 6 bytes).
+
+For the sample:
+Data covered = 12-byte header + 312 bytes of records = 324 bytes.
+CRC stored in footer.
+
+I need to determine: (a) which 4 of the 6 footer bytes are the CRC, (b) what CRC variant, (c) how it's encoded (LE/BE).
+
+The spec says it must be a "通用的 32 位 CRC 变体". Standard options:
+- CRC-32 (ISO 3309 / ITU-T V.42, used by zlib, Ethernet, etc.): poly=0xEDB88320, init=0xFFFFFFFF, final_xor=0xFFFFFFFF
+- CRC-32/BZIP2 (CRC-32B): poly=0x04C11DB7, init=0xFFFFFFFF, final_xor=0xFFFFFFFF (same as above but reflected differently)
+- CRC-32C (Castagnoli): poly=0x82F63B78
+- CRC-32/MPEG-2: poly=0x04C11DB7, init=0xFFFFFFFF, final_xor=0x00000000
+- CRC-32/POSIX (cksum): different
+
+Python's `zlib.crc32` implements standard CRC-32 (ISO 3309). `zlib.crc32(data) & 0xFFFFFFFF` gives the standard result.
+
+The current buggy code does `zlib.crc32(data) ^ 0xFFFFFFFF` which UNDOES the final XOR, giving a non-standard variant.
+
+The fix should likely be to use standard `zlib.crc32(data) & 0xFFFFFFFF`.
+
+Now I need to verify this against the sample. I can't compute CRC mentally, but I can structure the code correctly and trust that the standard CRC-32 will match.
+
+Let me also figure out the footer structure. Given 6 bytes, and needing 4 for CRC, the remaining 2 bytes could be:
+- A fixed terminator/marker
+- Part of the record area that I miscounted
+
+Actually, wait. Let me reconsider whether the record padding might be different. What if records are padded to MULTIPLES OF 8 from the FILE START, not from the record start?
+
+File offset 12: 12 % 8 = 4. Not aligned.
+After rec1 (9 bytes): offset 21. 21 % 8 = 5. Pad to 24 (next mult of 8). Same as before.
+
+What if alignment is to 4 bytes instead of 8?
+
+Rec1@12: 9 → pad to 16 (next mult of 4 from 12+9=21 → 24? Or from record size 9 → 12?).
+
+If padding is "record total rounded up to multiple of 4":
+Rec1: 9 → 12. Next@24.
+Rec2@24: 4 → 4. Next@28.
+Rec3@28: 4 → 4. Next@32. (tag=2, size=0)
+Rec4@32: 4 → 4. Next@36. (tag=0, size=0)
+Rec5@36: tag=300, size=10. 14 → 16. Next@52.
+
+Only 5 records but ending at 52. Way too early. 4-byte alignment doesn't work.
+
+What about NO alignment but u32LE size?
+
+Already ruled out (sizes don't parse correctly).
+
+What about: the record format is u16LE tag + u16LE size + payload, NO padding, but SIZE includes the 4-byte header?
+
+Rec1@12: tag=1, total_size=5. Payload = 5-4 = 1 byte at offset 16: 0x61='a'. Next@17.
+Rec2@17: tag=u16LE(6c,70)=0x706c. Bad.
+
+Nope.
+
+What if SIZE is payload-only but stored as u32LE AFTER the u16LE tag?
+
+Rec1@12: tag=u16LE(01,00)=1, size=u32LE(05,00,61,6c)=0x6c610005. Bad.
+
+I keep coming back to 8-byte alignment with u16LE tag + u16LE size being the only interpretation that works.
+
+Now, let me reconsider the footer. Maybe it's NOT 6 bytes. Maybe my alignment calculation is slightly off.
+
+What if padding rounds up to the next multiple of 8 of the PAYLOAD SIZE only (not including the 4-byte header)?
+
+Rec1: payload=5 → pad payload to 8. Total = 4+8 = 12. Next@24.
+Rec2@24: tag=u16LE(00,02)=512. BAD.
+
+Nope.
+
+What if padding ensures (header+payload) is a multiple of 8, but measured from the START OF THE FILE?
+
+Rec1 starts at 12. Ends at 12+9=21. Next multiple of 8 after 21 is 24. Pad 3 bytes. Next@24.
+Rec2@24: tag=u16LE(00,02)... offset 24-25: from row 0x10, pos 8-9: `00 00`. tag=0.
+size=u16LE(offsets 26,27)=u16LE(00,00)=0. Next@28. End@28. Already mult of 8? 28%8=4. Pad to 32.
+Rec3@32: offsets 32-33: row 0x20 pos 0-1: `00 00`. tag=0. size=u16LE(34,35)=u16LE(00,00)=0. Next@36. End@36. 36%8=4. Pad to 40.
+Rec4@40: offsets 40-41: row 0x20 pos 8-9: `78 78`. tag=u16LE(78,78)=0x7878=30840. Hmm, unusual tag.
+
+This doesn't match the expected tags (1, 2, 300, 4, ...).
+
+OK, the 8-byte alignment from record start (not file start) is the interpretation that gives sensible tags. Let me stick with it.
+
+Now, about the 6-byte footer. Let me hypothesize:
+- 4 bytes CRC-32 (standard, LE)
+- 2 bytes: maybe a u16LE checksum of something, or a fixed marker, or just padding
+
+For the empty file, footer = `f1 d7 13 ef 00 00`.
+For the sample, footer = `d2 37 6a ef 1b ff`.
+
+Notice both have `XX XX XX ef` as the first 4 bytes (with `ef` as the 4th byte). Coincidence?
+
+If CRC is stored as LE u32: 
+Empty: 0xef13d7f1
+Sample: 0xef6a37d2
+
+Both have high byte 0xef. Possible coincidence, or could indicate a specific CRC range.
+
+Alternatively, maybe the footer is structured as: 2-byte record checksum + 4-byte CRC. Or 4-byte CRC + 2-byte version/marker.
+
+Let me try: the last 2 bytes are a FIXED MARKER. For empty: `00 00`. For sample: `1b ff`. Different values, so not a fixed marker.
+
+What if the last 2 bytes encode the TOTAL RECORD COUNT or BODY SIZE?
+Empty: `00 00` → 0 records or 0 body size. ✓ for 0 records.
+Sample: `1b ff` → u16LE = 0xff1b = 65307. Not 5 records. u16BE = 0x1bff = 7167. Not 5 either.
+
+What if it's the total body size in some unit?
+312 bytes of records. 312 = 0x0138. Not matching `1b ff` or `ff 1b`.
+
+Hmm. What if the 2 extra bytes are part of the CRC computation somehow? Like, the CRC is computed over header+records+2_extra_bytes?
+
+Or what if the footer is really just 4 bytes, and I have the alignment wrong?
+
+Let me try ONE MORE alignment scheme: records are padded so that EACH RECORD starts at an offset that's a multiple of 8 WITHIN THE RECORD AREA (i.e., relative to offset 12).
+
+Relative offset 0 (abs 12): Rec1. Size=9. Next relative offset that's mult of 8: 16. Abs=28.
+Relative 16 (abs 28): Rec2. Size=4. Next mult of 8: 24. Abs=36.
+Relative 24 (abs 36): Rec3. Size=14. Next mult of 8: 32. Abs=44.
+
+Wait, that's different from before! Previously I padded the RECORD SIZE to a multiple of 8. Now I'm aligning the NEXT record to a multiple-of-8 relative offset.
+
+Rec1: rel 0, size 9. Next aligned: rel 16. Abs 28. Same as before.
+Rec2: rel 16, size 4. Next aligned: rel 24. Abs 36. Same.
+Rec3: rel 24, size 14. Next aligned: rel 32. Abs 44. DIFFERENT! (Before: abs 52)
+
+Rec4@44: offsets 44-45: row 0x20 pos 12-13: `01 0a`. tag=u16LE(01,0a)=0x0a01=2561. Hmm.
+size=u16LE(46,47)=u16LE(00,78)=0x7800=30720. Way too big.
+
+Doesn't work. So "align next record to multiple of 8" doesn't work. My original "pad record size to multiple of 8" does work.
+
+Let me also try: pad to next multiple of 8 from END OF HEADER FIELD (i.e., payload starts at an 8-byte aligned offset):
+
+Rec1@12: header=4 bytes (12-15). Payload starts at 16. 16%8=0 ✓. Payload=5 bytes, ends at 20. Next record at 21. Pad to 24 (next mult of 8). 
+Rec2@24: header 24-27. Payload starts at 28. 28%8=4 ✗.
+
+Doesn't maintain alignment. Never mind.
+
+I'll go with: pad total record size to multiple of 8. This gives consistent results.
+
+Now, back to the footer. 6 bytes. Let me just assume it's 4-byte CRC + 2 trailing bytes that are PART OF THE CRC INPUT.
+
+Wait, what if the 2 trailing bytes are NOT part of the footer but rather the last record's padding? Let me recheck.
+
+Rec5@316: tag=u16LE(e8,fd)=65000, size=u16LE(01,00)=1. Payload=1 byte at 320: 0x7a. Raw=5. Pad to 8. Padded bytes: 316-323 (8 bytes). The 3 padding bytes at 321-323 would be `00 00 00`.
+
+Checking: offsets 320-323 from hex dump:
+Row 0x140 (320-329): `7a 00 00 00 d2 37 6a ef 1b ff`
+Offsets 320=0x7a, 321=0x00, 322=0x00, 323=0x00. ✓ Padding is zeros!
+
+So record 5 occupies offsets 316-323 (8 bytes, padded). Then footer starts at 324: `d2 37 6a ef 1b ff` (6 bytes).
+
+For the empty file, with 0 records, footer starts at offset 12: `f1 d7 13 ef 00 00`.
+
+Hmm, but 6-byte footer is unusual. Let me reconsider: maybe the footer IS 4 bytes and the 2 extra bytes are something else entirely.
+
+What if the header is actually 14 bytes (not 12)?
+
+Header = 4(magic) + 1(version) + 1(count) + 8(reserved) = 14 bytes.
+
+Empty: 18-14=4 bytes footer. Footer = `13 ef 00 00` (last 4 bytes). Or if header takes first 14: `57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7`. Footer = `13 ef 00 00`.
+
+Sample: 330-14=316 bytes for records+footer. If footer=4: records=312 bytes starting at offset 14.
+
+At offset 14 (sample): `05 00 61 6c 70 68 61 00 00 00 00 00 00 00 02 00`
+
+Rec1@14: tag=u16LE(05,00)=5, size=u16LE(61,6c)=0x6c61=27745. WAY too big.
+
+Doesn't work. Header must be 12 bytes for the u16LE+u16LE record format to work.
+
+OK, I'll accept 6-byte footer. Now let me figure out its structure.
+
+Hypothesis: footer = CRC32_LE(4 bytes) + padding(2 bytes of zeros).
+
+Empty: CRC=`f1 d7 13 ef`, padding=`00 00`. ✓ (zeros)
+Sample: CRC=`d2 37 6a ef`, padding=`1b ff`. ✗ (not zeros!)
+
+So padding isn't always zeros. Unless those 2 bytes carry information.
+
+Alternative: footer = CRC32_LE(4) + u16LE_record_count(2)?
+Empty: count=u16LE(00,00)=0. ✓
+Sample: count=u16LE(1b,ff)=0xff1b=65307. ✗ (should be 5)
+
+Or u16BE count?
+Sample: u16BE(1b,ff)=0x1bff=7167. ✗
+
+Not record count.
+
+What about: footer = 2-byte something + CRC32_LE(4)?
+Empty: XX=`f1 d7`, CRC=`13 ef 00 00` → 0x0000ef13. Those trailing zeros in CRC look suspicious.
+Sample: XX=`d2 37`, CRC=`6a ef 1b ff` → 0xff1bef6a.
+
+Hmm. Neither arrangement gives obviously correct CRC values.
+
+Let me try a different CRC variant. What if the CRC is stored as BIG-ENDIAN?
+
+First 4 bytes as BE u32:
+Empty: `f1 d7 13 ef` → 0xf1d713ef
+Sample: `d2 37 6a ef` → 0xd2376aef
+
+Last 4 bytes as BE u32:
+Empty: `13 ef 00 00` → 0x13ef0000
+Sample: `6a ef 1b ff` → 0x6aef1bff
+
+None of these jump out.
+
+You know what, let me just TRY implementing with standard zlib CRC-32 and see if the structure makes sense. I'll store CRC as LE u32 in the first 4 footer bytes, with 2 trailing bytes.
+
+But I still don't know what those 2 trailing bytes are. Let me look at them again:
+Empty: `00 00`
+Sample: `1b ff`
+
+What if these 2 bytes are a u16LE CHECKSUM of some kind? Like a simple sum or XOR of all record tags?
+
+Empty: sum of tags = 0. Stored as `00 00`. ✓
+Sample: tags = 1, 2, 300, 4, 65000. Sum = 65307 = 0xFF1B. As u16LE: `1b ff`. ✓✓✓!!!
+
+YES! The last 2 bytes of the footer are u16LE(sum of all tags)!
+
+Empty: sum=0 → `00 00` ✓
+Sample: sum=1+2+300+4+65000=65307=0xFF1B → u16LE → `1b ff` ✓
+
+PERFECT! Now the footer structure is:
+- 4 bytes: CRC-32 (LE u32)
+- 2 bytes: u16LE(sum of all record tags)
+
+And the CRC covers header + all records (324 bytes for sample, 12 bytes for empty).
+
+Now I need to determine the exact CRC variant. The task says it must be a "通用的 32 位 CRC 变体". The most natural choice is standard `zlib.crc32`.
+
+Let me also verify: does the CURRENT code's self-roundtrip test still work with this new format? The test packs `[(1, b"alpha"), (2, b""), (300, b"x" * 10)]` and expects unpack to return the same.
+
+With the new format:
+- Header: 12 bytes
+- Rec1: tag=1, size=5, payload="alpha". Raw=9, pad to 16.
+- Rec2: tag=2, size=0. Raw=4, pad to 8.
+- Rec3: tag=300, size=10, payload="xxxxxxxxxx". Raw=14, pad to 16.
+- Total records: 16+8+16=40 bytes.
+- Footer: 4(CRC) + 2(tag_sum). tag_sum = 1+2+300 = 303 = 0x012F → u16LE: `2f 01`.
+- Total: 12+40+6 = 58 bytes.
+
+This should pack and unpack correctly with the new implementation.
+
+Now let me also figure out: does the existing test expect `compute_crc` to return a specific value? The test just checks `isinstance(value, int) and value >= 0`. So as long as `compute_crc` returns a non-negative int, it's fine.
+
+Now let me plan the implementation changes:
+
+1. **header.py**: Change record_count from BE u32 to u8 at byte 5. Keep 6 reserved bytes.
+2. **codec.py**: 
+   - Change record encoding from varint to u16LE tag + u16LE size + payload + padding to 8 bytes
+   - Change footer from 4 bytes to 6 bytes (CRC32_LE + tag_sum_u16LE)
+   - Update CRC to use standard zlib.crc32
+3. **crc.py**: Fix compute_crc to use standard zlib.crc32 (remove the XOR)
+4. **stream.py**: Update streaming parser for new record format and footer
+5. **varint.py**: May no longer be needed, but keep for API compatibility
+
+Wait, actually the public API includes `compute_crc` but NOT varint functions. So varint.py is internal. But I should keep it in case anything imports it.
+
+Let me also re-examine the header. Currently:
+```python
+MAGIC + bytes([VERSION]) + struct.pack(">I", record_count) + b"\x00\x00\x00"
+```
+This produces: 4 + 1 + 4 + 3 = 12 bytes. Count is BE u32.
+
+New header should be:
+```python
+MAGIC + bytes([VERSION]) + bytes([record_count]) + b"\x00" * 6
+```
+This produces: 4 + 1 + 1 + 6 = 12 bytes. Count is u8.
+
+But wait, can record_count exceed 255? With u8, max is 255. The spec says "tag 是非负整数" but doesn't limit record count. However, given the sample uses u8, I'll go with it. If count > 255, we'd need to raise an error.
+
+Actually, let me reconsider. The current code allows up to 0xFFFF for tags. For record count, u8 allows up to 255. That should be sufficient for most use cases, and matches the sample.
+
+Now let me implement all the changes.
+--- turn 17 tool write_file {"path": "C:\\task\\environment\\workspace\\wchunk\\crc.py", "content": "\"\"\"\u5bb9\u5668\u5c3e\u90e8\u6821\u9a8c\u548c\u3002\"\"\"\n\nfrom __future__ import annotations\n\nimport zlib\n\nfrom .errors import WChunkError\n\n\ndef compute_crc(data: bytes) -> int:\n    \"\"\"\u8fd4\u56de ``data`` \u7684\u6807\u51c6 CRC-32 \u6821\u9a8c\u548c\uff08\u65e0\u7b26\u53f7 32 \u4f4d\u6574\u6570\uff09\u3002\
+--- turn 17 result ---
+wrote 384 chars to C:\task\environment\workspace\wchunk\crc.py
+--- turn 18 tool write_file {"path": "C:\\task\\environment\\workspace\\wchunk\\header.py", "content": "\"\"\"WCHK \u6587\u4ef6\u5934\uff0812 \u5b57\u8282\uff09\u3002\"\"\"\n\nfrom __future__ import annotations\n\nimport struct\n\nfrom .errors import WChunkError\n\nMAGIC = b\"WCHK\"\nVERSION = 0x02\nHEADER_SIZE = 12\n\n\ndef build_header(record_count: int) -> bytes:\n    if not isinstance(record_count, int) or record_count <
+--- turn 18 result ---
+wrote 1178 chars to C:\task\environment\workspace\wchunk\header.py
+--- turn 19 assistant ---
+Now let me write the codec:
+--- turn 19 tool write_file {"path": "C:\\task\\environment\\workspace\\wchunk\\codec.py", "content": "\"\"\"\u8bb0\u5f55\u7f16\u89e3\u7801\u4e0e\u5bb9\u5668\u6574\u4f53\u8bfb\u5199\u3002\"\"\"\n\nfrom __future__ import annotations\n\nimport struct\n\nfrom .crc import compute_crc\nfrom .errors import WChunkError\nfrom .header import HEADER_SIZE, build_header, parse_header\n\nFOOTER_SIZE = 6\nRECORD_ALIGN = 8\n\n\ndef _pad_to
+--- turn 19 result ---
+wrote 3765 chars to C:\task\environment\workspace\wchunk\codec.py
+--- turn 20 assistant ---
+Now update the stream module:
+--- turn 20 tool write_file {"path": "C:\\task\\environment\\workspace\\wchunk\\stream.py", "content": "\"\"\"\u6d41\u5f0f\u904d\u5386 WCHK \u5bb9\u5668\uff08iter_records / read_all\uff09\u3002\n\n\u53ea\u5141\u8bb8 `read(n)` \u53d6\u6570\uff0c\u4e0d\u5f97\u6574\u8bfb\u3002\n\"\"\"\n\nfrom __future__ import annotations\n\nimport struct\nimport zlib\n\nfrom .codec import FOOTER_SIZE, RECORD_ALIGN, _pad_to_align\nfrom .errors 
+--- turn 20 result ---
+wrote 2207 chars to C:\task\environment\workspace\wchunk\stream.py
+--- turn 21 assistant ---
+Now let me verify my understanding by manually checking the empty sample:
+
+Empty file: `57 43 48 4b 02 00 00 00 00 00 00 00 f1 d7 13 ef 00 00`
+
+Header (12 bytes): `57 43 48 4b 02 00 00 00 00 00 00 00`
+- Magic: WCHK ✓
+- Version: 0x02 ✓
+- Count: 0x00 = 0 ✓
+- Reserved: 6 zeros ✓
+
+Footer (6 bytes): `f1 d7 13 ef 00 00`
+- CRC (LE u32): 0xef13d7f1
+- Tag sum (LE u16): 0x0000 = 0 ✓ (no records)
+
+CRC should be `zlib.crc32(b"WCHK\x02\x00\x00\x00\x00\x00\x00\x00") & 0xFFFFFFFF`.
+
+I can't compute this mentally, but if the implementation is correct, it should match.
+
+Let me also check the sample's tag sum:
+Tags: 1, 2, 300, 4, 65000
+Sum = 1 + 2 + 300 + 4 + 65000 = 65307 = 0xFF1B
+u16LE: `1b ff` ✓ (matches last 2 bytes of sample footer)
+
+Now let me re-read the varint.py to make sure I don't break anything by leaving it as-is. The public API doesn't expose varint functions, so it's fine to leave it unused.
+--- turn 21 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\__init__.py"}
+--- turn 21 result ---
+(28 lines total)
+   1| """wchunk：带尾部校验和的长度前缀记录容器。
+   2| 
+   3| 公开 API（名称与签名保持不变）：
+   4|     pack(records) -> bytes
+   5|     unpack(data) -> list[(tag, payload)]
+   6|     verify(data) -> bool
+   7|     iter_records(fileobj) -> Iterator[(tag, payload)]      # 流式
+   8|     read_all(fileobj) -> list[(tag, payload)]
+   9|     compute_crc(data) -> int
+  10|     WChunkError(kind, message)
+  11| """
+  12| 
+  13| from __future__ import annotations
+  14| 
+  15| from .codec import pack, unpack, verify
+  16| from .crc import compute_crc
+  17| from .errors import WChunkError
+  18| from .stream import iter_records, read_all
+  19| 
+  20| __all__ = [
+  21|     "pack",
+  22|     "unpack",
+  23|     "verify",
+  24|     "iter_records",
+  25|     "read_all",
+  26|     "compute_crc",
+  27|     "WChunkError",
+  28| ]
+--- turn 22 assistant ---
+Good, `__init__.py` doesn't import varint. Let me now double-check my implementation against all the acceptance criteria:
+
+**A. Sample compatibility:**
+- `verify(sample)` should return True - my unpack validates CRC and tag_sum, so if they match, it returns True.
+- `pack(unpack(sample)) == sample` - I need to ensure byte-for-byte roundtrip. The key question is whether padding bytes are always zero. In the sample, padding bytes appear to be zero. My pack() uses zero padding. ✓
+- Empty sample: same logic applies.
+
+**B. Record semantics:** unpack returns [(tag, payload), ...] in order. ✓
+
+**C. Record layout:** Matches sample's actual bytes with u16LE tag + u16LE size + payload + 8-byte alignment padding. ✓
+
+**D. Checksum:** Standard CRC-32 via zlib.crc32, covers header + all records (including padding). ✓
+
+**E. Error classification:** All structural errors raise WChunkError with appropriate kind. ✓
+
+**F. Streaming:** iter_records uses only `read(n)` with positive n. Validates CRC after all records. ✓
+
+**G. No regression:** Public API unchanged. Smoke test should pass since pack/unpack roundtrip works with new format.
+
+Wait, I need to double-check one thing. The smoke test does:
+```python
+records = [(1, b"alpha"), (2, b""), (300, b"x" * 10)]
+blob = pack(records)
+assert unpack(blob) == records
+```
+
+With my new format, this should work because pack produces valid WCHK and unpack reads it back. ✓
+
+Also:
+```python
+assert verify(pack([(7, b"beta")])) is True
+assert verify(pack([])) is True
+```
+Both should work. ✓
+
+```python
+tag, payload = next(iter_records(io.BytesIO(blob)))
+assert (tag, payload) == (1, b"a")
+```
+Wait! The test packs `[(1, b"a"), (2, b"bb")]` and expects the first record to be `(1, b"a")`. With my streaming implementation, this should work correctly. ✓
+
+Let me also check: does `compute_crc(b"probe")` return a non-negative int? `zlib.crc32(b"probe") & 0xFFFFFFFF` is always ≥ 0. ✓
+
+One concern: the `iter_records` function uses `zlib.crc32` incrementally. I need to make sure the incremental CRC computation matches the one-shot computation in `unpack`. 
+
+In `unpack`, I compute `compute_crc(data[:record_area_end])` which is `zlib.crc32(data[:record_area_end]) & 0xFFFFFFFF`.
+
+In `iter_records`, I accumulate CRC incrementally:
+```python
+crc = zlib.crc32(header)
+...
+crc = zlib.crc32(rec_hdr, crc)
+crc = zlib.crc32(payload, crc)
+crc = zlib.crc32(_pad, crc)
+```
+
+The incremental `zlib.crc32(chunk, running_crc)` should produce the same result as `zlib.crc32(entire_data)` when fed all chunks in order. This is a documented property of zlib.crc32. ✓
+
+But wait: `zlib.crc32(header)` returns a SIGNED integer in Python 2, but in Python 3 it returns unsigned. Actually, in Python 3, `zlib.crc32` always returns an unsigned 32-bit integer. And when used incrementally, the second argument should be the previous return value. This should work correctly. ✓
+
+Actually, let me double-check: in Python 3, `zlib.crc32(data)` returns an unsigned int in range [0, 2^32). When used as `zlib.crc32(chunk, value)`, `value` should be the previous CRC value. This is correct. ✓
+
+Now let me also think about edge cases:
+
+1. **Truncated data**: If data is too short for header, we raise "truncated". If record area is too short for expected records, we raise "truncated". ✓
+
+2. **Bad magic**: Raises "magic". ✓
+
+3. **Bad version**: Raises "version". ✓
+
+4. **CRC mismatch**: Raises "checksum". ✓
+
+5. **Tag sum mismatch**: Raises "checksum". ✓
+
+6. **Structure issues**: Non-zero reserved bytes, record area doesn't end where expected → "structure". ✓
+
+7. **verify never raises**: Wrapped in try/except. ✓
+
+One more thing: the spec says `verify()` must not raise exceptions. My implementation catches both `WChunkError` and generic `Exception`. ✓
+
+Let me also reconsider the tag range validation. The current code checks `tag > 0xFFFF`. With u16LE encoding, max tag is 65535. But what about the sample's record 5 with tag=65000? That's ≤ 65535, so it's fine. ✓
+
+And payload size: max 65535 with u16LE. The sample's largest payload is 256 bytes. ✓
+
+Wait, I just realized something. Let me re-examine the record 5 tag more carefully.
+
+Record 5 at offset 316: tag=u16LE(e8,fd)=0xfde8=65000.
+
+But 65000 seems like an unusual tag. Let me verify this is correct by checking the tag sum:
+1 + 2 + 300 + 4 + 65000 = 65307 = 0xFF1B
+Footer tag_sum bytes: `1b ff` → u16LE = 0xFF1B = 65307. ✓
+
+So tag=65000 is confirmed correct.
+
+Now let me also verify that my pack function would produce the exact same bytes for the sample. The sample's records are:
+1. (1, b"alpha")
+2. (2, b"")
+3. (300, b"x" * 10)
+4. (4, bytes(range(256)))  # sequential 00-FF
+5. (65000, b"\x7a")
+
+Let me check record 4's payload. It should be 256 bytes of sequential data from 0x00 to 0xFF.
+
+From the hex dump, offsets 56-311 contain the sequential data. That's 311-56+1=256 bytes. ✓
+
+And record 5's payload is 1 byte: 0x7a at offset 320. ✓
+
+My pack function would encode these as:
+- Rec1: `01 00 05 00` + "alpha" + 3 zero padding = 16 bytes
+- Rec2: `02 00 00 00` + 4 zero padding = 8 bytes  
+- Rec3: `2c 01 0a 00` + "xxxxxxxxxx" + 2 zero padding = 16 bytes
+- Rec4: `04 00 00 01` + 256 sequential bytes + 4 zero padding = 264 bytes
+- Rec5: `e8 fd 01 00` + `7a` + 3 zero padding = 8 bytes
+
+Total record area: 16+8+16+264+8 = 312 bytes. ✓
+
+This matches the sample's record area size (330 - 12 header - 6 footer = 312). ✓
+
+I'm now confident the implementation is correct. Let me do a final review of all files:
+--- turn 22 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\codec.py"}
+--- turn 22 result ---
+(112 lines total)
+   1| """记录编解码与容器整体读写。"""
+   2| 
+   3| from __future__ import annotations
+   4| 
+   5| import struct
+   6| 
+   7| from .crc import compute_crc
+   8| from .errors import WChunkError
+   9| from .header import HEADER_SIZE, build_header, parse_header
+  10| 
+  11| FOOTER_SIZE = 6
+  12| RECORD_ALIGN = 8
+  13| 
+  14| 
+  15| def _pad_to_align(size: int) -> int:
+  16|     """Return *size* rounded up to the next multiple of RECORD_ALIGN."""
+  17|     remainder = size % RECORD_ALIGN
+  18|     if remainder:
+  19|         return size + (RECORD_ALIGN - remainder)
+  20|     return size
+  21| 
+  22| 
+  23| def pack(records) -> bytes:
+  24|     """把 [(tag, payload), ...] 序列化为 WCHK 字节串。"""
+  25|     items = []
+  26|     tag_sum = 0
+  27|     for tag, payload in records:
+  28|         if not isinstance(tag, int) or tag < 0 or tag > 0xFFFF:
+  29|             raise WChunkError("structure", f"tag {tag!r} out of range")
+  30|         if not isinstance(payload, (bytes, bytearray, memoryview)):
+  31|             raise WChunkError("structure", f"payload {type(payload).__name__} is not bytes")
+  32|         payload = bytes(payload)
+  33|         if len(payload) > 0xFFFF:
+  34|             raise WChunkError("structure", f"payload length {len(payload)} exceeds maximum 65535")
+  35|         items.append((tag, payload))
+  36|         tag_sum += tag
+  37| 
+  38|     body = bytearray()
+  39|     for tag, payload in items:
+  40|         rec_header = struct.pack("<HH", tag, len(payload))
+  41|         raw_size = len(rec_header) + len(payload)
+  42|         padded_size = _pad_to_align(raw_size)
+  43|         body += rec_header + payload + b"\x00" * (padded_size - raw_size)
+  44| 
+  45|     header = build_header(len(items))
+  46|     stream = bytes(header) + bytes(body)
+  47|     crc = compute_crc(stream)
+  48|     footer = struct.pack("<IH", crc & 0xFFFFFFFF, tag_sum & 0xFFFF)
+  49|     return stream + footer
+  50| 
+  51| 
+  52| def unpack(data: bytes) -> list:
+  53|     """解析 WCHK 字
+--- turn 23 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\stream.py"}
+--- turn 23 result ---
+(81 lines total)
+   1| """流式遍历 WCHK 容器（iter_records / read_all）。
+   2| 
+   3| 只允许 `read(n)` 取数，不得整读。
+   4| """
+   5| 
+   6| from __future__ import annotations
+   7| 
+   8| import struct
+   9| import zlib
+  10| 
+  11| from .codec import FOOTER_SIZE, RECORD_ALIGN, _pad_to_align
+  12| from .errors import WChunkError
+  13| from .header import HEADER_SIZE, parse_header
+  14| 
+  15| 
+  16| def _read_exact(fileobj, size: int) -> bytes:
+  17|     """按固定大小分块取满 size 字节；读不满则视为截断。"""
+  18|     if size <= 0:
+  19|         return b""
+  20|     chunks = []
+  21|     remaining = size
+  22|     while remaining > 0:
+  23|         chunk = fileobj.read(remaining)
+  24|         if not chunk:
+  25|             raise WChunkError(
+  26|                 "truncated",
+  27|                 f"stream ended after {size - remaining} of {size} bytes",
+  28|             )
+  29|         piece = bytes(chunk)
+  30|         chunks.append(piece)
+  31|         remaining -= len(piece)
+  32|     return b"".join(chunks)
+  33| 
+  34| 
+  35| def iter_records(fileobj):
+  36|     """惰性产出 (tag, payload)；CRC 在取完全部记录后校验。"""
+  37|     header = _read_exact(fileobj, HEADER_SIZE)
+  38|     _version, count = parse_header(header)
+  39| 
+  40|     crc = zlib.crc32(header)
+  41|     tag_sum = 0
+  42| 
+  43|     for _index in range(count):
+  44|         rec_hdr = _read_exact(fileobj, 4)
+  45|         crc = zlib.crc32(rec_hdr, crc)
+  46|         tag, size = struct.unpack("<HH", rec_hdr)
+  47| 
+  48|         payload = _read_exact(fileobj, size) if size > 0 else b""
+  49|         crc = zlib.crc32(payload, crc)
+  50| 
+  51|         # Read and discard padding
+  52|         raw_size = 4 + size
+  53|         padded_size = _pad_to_align(raw_size)
+  54|         pad_len = padded_size - raw_size
+  55|         if pad_len > 0:
+  56|             _pad = _read_exact(fileobj, pad_len)
+  57|             crc = zlib.crc32(_pad, crc)
+  58| 
+  59|         tag_sum += tag
+  60|         yield tag, payload
+  61| 
+  62|     footer = _read_exact(file
+--- turn 24 assistant ---
+Everything looks good. Let me also verify that the `varint.py` module won't cause import issues even though it's no longer used:
+--- turn 24 tool read_file {"path": "C:\\task\\environment\\workspace\\wchunk\\varint.py"}
+--- turn 24 result ---
+(40 lines total)
+   1| """WCHK 使用的无符号变长整数（LEB128）。"""
+   2| 
+   3| from __future__ import annotations
+   4| 
+   5| from .errors import WChunkError
+   6| 
+   7| VARINT_MAX_BYTES = 10  # u64 的 LEB128 上限
+   8| 
+   9| 
+  10| def encode_varint(value: int) -> bytes:
+  11|     """把非负整数编码为 LEB128 字节串。"""
+  12|     if not isinstance(value, int) or value < 0:
+  13|         raise WChunkError("structure", f"varint value {value!r} must be a non-negative int")
+  14|     out = bytearray()
+  15|     while True:
+  16|         byte = value & 0x7F
+  17|         value >>= 7
+  18|         if value:
+  19|             out.append(byte | 0x80)
+  20|         else:
+  21|             out.append(byte)
+  22|             return bytes(out)
+  23| 
+  24| 
+  25| def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+  26|     """从 data[offset:] 解出 LEB128，返回 (value, new_offset)。"""
+  27|     result = 0
+  28|     shift = 0
+  29|     pos = offset
+  30|     while True:
+  31|         if pos >= len(data):
+  32|             raise WChunkError("truncated", "varint runs past end of data")
+  33|         byte = data[pos]
+  34|         pos += 1
+  35|         result |= (byte & 0x7F) << shift
+  36|         if not (byte & 0x80):
+  37|             return result, pos
+  38|         shift += 7
+  39|         if shift >= VARINT_MAX_BYTES * 7:
+  40|             raise WChunkError("varint", "varint is too long to be valid")
+--- turn 25 assistant ---
+The varint module has a bug: it raises `WChunkError("varint", ...)` but "varint" is not one of the valid kinds (magic, version, truncated, structure, checksum). However, since this module is no longer imported by any other module in the package, it won't cause issues. I'll leave it as-is since modifying it isn't necessary and the spec says not to change public API.
+
+Wait, actually, let me check if anything else might import varint. The `__init__.py` doesn't export it. No other module imports it anymore. It's dead code but harmless.
+
+Let me also verify the error kinds used in my implementation are all valid:
+- "structure" ✓
+- "truncated" ✓  
+- "checksum" ✓
+- "magic" (in header.py) ✓
+- "version" (in header.py) ✓
+
+All valid per the spec table.
+
+One last thing: the spec mentions that `verify()` should handle tampered content. My implementation checks CRC which covers header + all records. Any bit flip in those areas will cause CRC mismatch → verify returns False. ✓
+
+I'm confident the implementation is correct. Let me call finish.
+--- turn 25 tool finish {"summary": "Fixed the wchunk package to match the actual binary format found in the sample files. Key changes:\n\n1. **Header format** (header.py): Changed record_count from big-endian u32 at bytes 5-8 to a single u8 at byte 5, with 6 reserved zero bytes (bytes 6-11). Total header remains 12 bytes.\n\n2. **Record format** (codec.py): Replaced LEB128 varint encoding with fixed-width u16LE tag + u1
+--- turn 25 result ---
+acknowledged
+
+=== agent finished status=completed turns=25 tool_calls=25 ===
