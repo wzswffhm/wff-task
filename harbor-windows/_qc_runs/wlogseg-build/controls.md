@@ -76,9 +76,23 @@ aggregate: score=0 weighted=0.34 (Unsatisfied rubric items: error-classification
 | `verify_candidate.py` | 把任一候选实现放进隐藏套件逐项跑 |
 | `counterexample-partial/` | 第二节那条反例的实现（`truncated` 已折叠为 `structure`、流式已退化为整体读取） |
 
-## 五、尚未执行
+## 五、执行进度
 
-- 8 轮模型验证（QWEN×3 / OPUS×3 / GLM×1 / KIMI×1）与 `jobs/` 证据落盘；
-- Docker 内构建与真实 Windows Harbor 容器的动态门禁；
-- `harbor-windows/_index` 登记、打 zip、上传飞书；
+**已完成（2026-10-12）**：
+
+- 8 轮模型验证 —— Qwen3.8-Max-0902 ×3、**Opus 5 ×3（`4router.net`）**、GLM-5.3 ×1、Kimi K3 ×1，
+  全部 VALID；补丁经本机真实 Windows Runtime 判分回填，区分度**准入 PASS（条件 2：双 0 分
+  场景下 Opus `testcase_pass_sum=70` > Qwen `33`）**。
+- 六轮控制对照（golden ×3 = 1、no-change ×3 = 0）重跑通过：`_qc_runs/wlogseg-build/controls-218/`。
+- `jobs/` 已按 `harbor-independent-jobs-archive-v1`（archive-only）落盘 14 轮
+  （8 模型 + 6 控制），并如实声明无容器产物。
+- 交付包已打出并自检 PASS：`deliverables/2026-10-12_wlogseg218-交付/package/wfflab__wlogseg-218-v1.0.0-delivery.zip`
+  （sha256 `9a3970d8…5e4c`）。
+- 飞书已回写：新建记录 `reczz28MRVnWkD2v`（标注员 `wff`，三附件读回校验通过，**状态字段未写入、
+  未改动**，保持飞书新建行默认的「待提交」）。
+
+**尚未执行**：
+
+- Docker 内构建与真实 Windows Harbor 容器的动态门禁（218 全部证据来自宿主 Windows Runtime）；
+- `harbor-windows/_index` 登记；
 - git 提交（按约定只在用户明确要求时执行）。

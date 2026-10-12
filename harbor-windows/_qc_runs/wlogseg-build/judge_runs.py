@@ -31,6 +31,10 @@ PY = r"C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies
 PYLIBS = r"C:\Users\Administrator\Desktop\wff-task\harbor-windows\_qc_runs\wlogseg-build\pylibs"
 VERIFIER_ENV = "WLOGSEG_VERIFIER_ROOT"
 GIT = "git"
+# 裸名 `powershell` 在子进程的最小 PATH 下解析不到（WinError 2），必须用绝对路径。
+PS_DIR = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                      "System32", "WindowsPowerShell", "v1.0")
+PS_EXE = os.path.join(PS_DIR, "powershell.exe")
 
 
 def sh(args, cwd=None, timeout=3600, env=None):
@@ -121,14 +125,14 @@ def judge_case(task_dir: Path, run_dir: Path, case: str, judge_root: Path) -> di
     env[VERIFIER_ENV] = str(task_dir / "verifier")
     env["PYTHONPATH"] = PYLIBS + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PATH"] = os.path.dirname(PY) + os.pathsep + env.get("PATH", "")
+    env["PATH"] = os.pathsep.join([os.path.dirname(PY), PS_DIR, env.get("PATH", "")])
     for k in ("PYTHONUTF8", "PYTHONIOENCODING"):
         env.pop(k, None)
 
     vdir.mkdir(parents=True, exist_ok=True)
     out_json = vdir / "result.json"
     t0 = time.time()
-    rc, o, e = sh(["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+    rc, o, e = sh([PS_EXE, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
                    "-NonInteractive", "-File", str(task_dir / "tests" / "test.ps1"),
                    "-TaskRoot", str(task_dir), "-WorkspaceRoot", str(sandbox),
                    "-OutputPath", str(out_json)], task_dir, timeout=3600, env=env)
@@ -151,6 +155,9 @@ def judge_case(task_dir: Path, run_dir: Path, case: str, judge_root: Path) -> di
     summary["_cases"] = cases
     summary["f2p_all_pass"] = all(v for k, v in cases.items() if k.startswith("f2p-"))
     summary["p2p_all_pass"] = all(v for k, v in cases.items() if k.startswith("p2p-"))
+    # 判分沙箱里的 git init 残留（sandbox/.git）没有任何证据价值，却会让上层仓库
+    # 把它当嵌套仓库（gitlink）收走。best-effort 清掉。
+    shutil.rmtree(sandbox / ".git", ignore_errors=True)
     return summary
 
 

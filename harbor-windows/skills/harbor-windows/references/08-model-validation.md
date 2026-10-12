@@ -530,6 +530,47 @@ New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -ExecutionPolicy Bypa
 **新排障顺序（取代 §7.12 第五节）**：① 短请求探活 → ② **直接开 `<ALIAS>_STREAM=1` 重跑** →
 ③ 仍失败再测吞吐/抬超时/禁 thinking → ④ 最后才考虑换端点。**`agent.status=error` 先怀疑传输层，别先怀疑难度。**
 
+### 7.15 中转端点的「HTTP 200 伪响应」（2026-10-12 实证，`4router.net`）
+
+**症状**：三轮 `agent.status=INVALID`、`invalid_reason=agent_produced_no_change`，但轨迹里
+模型那一回合的 `text` 只有一句：
+
+```
+[No upstream account is currently available. Please retry later.]
+```
+
+或 `⚠️ 上游模型未返回任何内容。可能原因：触发了安全策略、上游限流…请重试…`，
+配 `stop_reason=end_turn`、`output_tokens=0`、`patch_bytes=0`。
+三轮墙钟合计仅 **1.5 分钟**（正常一轮 ≥10 分钟）——**「太快 + 零输出」是端点伪响应，
+不是模型不会做**。
+
+**定性**：中转网关在账号池耗尽/限流时**不回 5xx**，而是回 **200 + 说明文本**。
+`agent_harness` 原逻辑把它当「模型主动收尾」，于是立刻结束主循环并记成模型无改动。
+同端点短请求探活是**间歇性**可用（一次 6 连探：4 次 OK、2 次读超时），
+所以「探活绿」不代表整轮能跑完。
+
+**修复（已内置）**：
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| 判定 | `agent_harness._upstream_unavailable(doc)` | 无 `tool_use` 且（text 命中账号池/空响应提示，或 无 text 且 `output_tokens==0`）→ 判为伪响应；有真实 `tool_use` 一律放行 |
+| 请求 | `agent_harness.run_agent` 的请求循环 | 伪响应整轮重试：`HARBOR_WINDOWS_UPSTREAM_RETRIES`（默认 6，退避 `3·n` 秒、上限 30s）；耗尽才记 `upstream_unavailable_after_N` |
+| 轮次 | `_qc_runs/wlogseg-build/run_opus218.py` | 某轮 INVALID 且归因属传输层/上游不可用时，清目录重跑（`--attempts 5`），全 VALID 后同步进题包 |
+
+**排障口诀**：**「HTTP 200 + 秒回 + 无 tool_use + `output_tokens=0`」→ 先读 text 里有没有
+中转方提示，别把它记成模型 0 分**（记 0 分等于把端点故障算进难度维度）。
+
+**同源第二种形态：心跳挂起（read timeout 救不了）**。同一端点在拥塞时还会「连上、
+SSE 心跳持续、但迟迟不给内容」——此时 `read timeout`（两次数据间隔）**永不触发**，
+实测整轮可挂 >9 分钟（215 上正常首步仅 4–8 秒）。
+`agent_harness._post()` 因此加了**整次请求的墙钟上限**：`iter_lines` 循环内比对
+`deadline = t0 + timeout`，越界抛 `TimeoutError` 交上层按传输重试。
+端点侧建议 `request_timeout` 取**单步真实最大生成时间 × 1.5**（本次 Opus@4router 取 240 s）；
+调大它只会让挂起更久地失败，与 §7.12 的结论一致。
+
+**真实负载与短探活不等价**：同端点短请求 6 连探 4 次 OK，而**带完整题面 + 5 个工具**的
+真实请求 3 次里就挂 1 次。探活绿只证明凭据与链路通，**不证明负载可跑**。
+
 ---
 
 ## 八、多模型自检

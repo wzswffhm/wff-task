@@ -42,6 +42,10 @@ AGENT_MAX_STEPS = int(os.environ.get("HARBOR_WINDOWS_AGENT_MAX_STEPS", "40"))
 AGENT_CMD_TIMEOUT = int(os.environ.get("HARBOR_WINDOWS_AGENT_CMD_TIMEOUT", "300"))
 AGENT_REQ_TIMEOUT = float(os.environ.get("HARBOR_WINDOWS_AGENT_REQ_TIMEOUT", "900"))
 AGENT_STEP_RETRIES = int(os.environ.get("HARBOR_WINDOWS_AGENT_STEP_RETRIES", "2"))
+# 上游中转「伪成功」响应（HTTP 200 但没有真实模型输出）的重试次数。
+# 实测 2026-10-12：4router.net 在账号池耗尽时返回 200 + 一句说明文本，
+# 若按正常回复处理会直接结束 agent 主循环，把端点故障记成「模型无改动」。
+AGENT_UPSTREAM_RETRIES = int(os.environ.get("HARBOR_WINDOWS_UPSTREAM_RETRIES", "6"))
 AGENT_MAX_OBS_CHARS = int(os.environ.get("HARBOR_WINDOWS_AGENT_MAX_OBS", "24000"))
 AGENT_MAX_WRITE_CHARS = int(os.environ.get("HARBOR_WINDOWS_AGENT_MAX_WRITE", "400000"))
 
@@ -279,11 +283,19 @@ def _post(url, headers, payload, timeout=AGENT_REQ_TIMEOUT):
     生成期间连接上没有任何数据，会触发 read timeout（实测 300s/900s 都会被判超时），
     表现为"agent 卡住"。改用 SSE 后数据持续到达，read timeout 只在**两次数据之间**
     计时，长生成不会再被误杀，同时还能实时记录步进度。
+
+    ★ 墙钟兜底（2026-10-12 实证）：中转端点在账号池拥塞时会**持续发 SSE 心跳**
+    （注释/空行）却迟迟不给内容，此时 read timeout 永不触发 —— 整轮可以挂到天荒地老。
+    因此除 read timeout 外再加一道**整次请求的墙钟上限** `timeout` 秒，超时抛
+    TimeoutError 交给上层重试。
     """
     # 流式下 read timeout 是"两次数据到达之间的最大间隔"，给足余量即可。
     to = httpx.Timeout(connect=30.0, read=180.0, write=120.0, pool=60.0)
     if isinstance(timeout, (int, float)):
         to = httpx.Timeout(connect=30.0, read=float(timeout), write=120.0, pool=60.0)
+
+    wall = float(timeout) if isinstance(timeout, (int, float)) else float(AGENT_REQ_TIMEOUT)
+    deadline = time.time() + wall
 
     body = dict(payload)
     body["stream"] = True
@@ -299,6 +311,10 @@ def _post(url, headers, payload, timeout=AGENT_REQ_TIMEOUT):
             return r.status_code, None, raw
 
         for line in r.iter_lines():
+            if time.time() > deadline:
+                raise TimeoutError(
+                    "stream wall-clock limit %.0fs exceeded (got %d block(s), stop_reason=%s)"
+                    % (wall, len(blocks), stop_reason))
             if not line:
                 continue
             if not line.startswith("data:"):
@@ -353,6 +369,39 @@ def _post(url, headers, payload, timeout=AGENT_REQ_TIMEOUT):
     doc = {"content": content, "stop_reason": stop_reason, "usage": usage,
            "model": model_returned}
     return 200, doc, ""
+
+
+# 中转端点在「没有可用上游账号」时不会报 5xx，而是回 200 + 这类说明文本。
+_UPSTREAM_EMPTY_MARKERS = (
+    "no upstream account is currently available",
+    "no available upstream",
+    "上游模型未返回任何内容",
+)
+
+
+def _upstream_unavailable(doc) -> str | None:
+    """识别「上游不可用」的伪响应；是则返回说明文本，否则返回 None。
+
+    判据（任一）：
+      * text 命中中转方的账号池/空响应提示；
+      * 既没有 tool_use、也没有任何 text，且 output_tokens == 0。
+    有真实 tool_use 的响应一律不算，避免误伤「模型主动收尾」的正常 stop。
+    """
+    if doc is None:
+        return "no_document"
+    blocks = doc.get("content") or []
+    if any(b.get("type") == "tool_use" for b in blocks):
+        return None
+    texts = "".join(b.get("text") or "" for b in blocks
+                    if b.get("type") == "text").strip()
+    low = texts.lower()
+    for marker in _UPSTREAM_EMPTY_MARKERS:
+        if marker in low:
+            return "upstream_notice: %s" % texts[:160]
+    out_tokens = (doc.get("usage") or {}).get("output_tokens") or 0
+    if not texts and not out_tokens:
+        return "empty_response"
+    return None
 
 
 # ------------------------------------------------------------------ 主循环
@@ -473,28 +522,47 @@ def run_agent(task_dir: str, ep: dict, run_index: int, instruction: str,
             req_to = float(ep.get("request_timeout") or AGENT_REQ_TIMEOUT)
             last_err = None
             status = doc = raw = None
-            for attempt in range(1, AGENT_STEP_RETRIES + 1):
+            transport_tries = 0
+            upstream_tries = 0
+            while True:
                 try:
                     status, doc, raw = _post(url, headers, payload, timeout=req_to)
-                    last_err = None
-                    break
                 except Exception as e:
+                    transport_tries += 1
                     last_err = "%s: %s" % (type(e).__name__, str(e)[:200])
                     log({"step": step, "kind": "transport_retry",
-                         "attempt": attempt, "error": last_err})
-                    if attempt < AGENT_STEP_RETRIES:
-                        time.sleep(min(2 ** attempt, 10))
+                         "attempt": transport_tries, "error": last_err})
+                    if transport_tries >= AGENT_STEP_RETRIES:
+                        return {**meta, "status": "INVALID",
+                                "invalid_reason": "transport_error: %s" % last_err,
+                                "steps": steps}
+                    time.sleep(min(2 ** transport_tries, 10))
+                    continue
 
-            if last_err:
-                return {**meta, "status": "INVALID",
-                        "invalid_reason": "transport_error: %s" % last_err,
-                        "steps": steps}
+                if status != 200 or doc is None:
+                    log({"step": step, "kind": "http_error", "status": status,
+                         "body": (raw or "")[:1500]})
+                    return {**meta, "status": "INVALID",
+                            "invalid_reason": "http_%s: %s" % (status, (raw or "")[:300]),
+                            "steps": steps, "http_status": status}
 
-            if status != 200 or doc is None:
-                log({"step": step, "kind": "http_error", "status": status, "body": (raw or "")[:1500]})
-                return {**meta, "status": "INVALID",
-                        "invalid_reason": "http_%s: %s" % (status, (raw or "")[:300]),
-                        "steps": steps, "http_status": status}
+                # 中转端点常见的「HTTP 200 但没有真实输出」：整轮重试同一条请求，
+                # 而不是把它当成模型主动结束（那会把端点故障记成模型无改动）。
+                bad = _upstream_unavailable(doc)
+                if bad:
+                    upstream_tries += 1
+                    log({"step": step, "kind": "upstream_empty_retry",
+                         "attempt": upstream_tries, "detail": bad})
+                    if upstream_tries >= AGENT_UPSTREAM_RETRIES:
+                        return {**meta, "status": "INVALID",
+                                "invalid_reason": "upstream_unavailable_after_%d: %s"
+                                                  % (upstream_tries, bad),
+                                "steps": steps}
+                    time.sleep(min(3 * upstream_tries, 30))
+                    continue
+
+                last_err = None
+                break
 
             blocks = doc.get("content") or []
             usage = doc.get("usage") or {}
