@@ -61,7 +61,7 @@ python build_delivery_extras.py --assets outside_harbor-assets --out delivery-ex
 按规范第七、八章执行多模型验证并计算区分度准入。
 
 ```bash
-# 完整跑（Qwen 3 次 + Opus 3 次 + GLM 1 次 + Kimi 1 次）
+# 完整跑（Qwen 3 次 + Opus 3 次；GLM/Kimi 自 2026-10-13 起可选）
 python run_model_validation.py --tasks outside_harbor-assets --out delivery-extras/tasks
 
 # 连通性冒烟（每模型 1 次）
@@ -83,7 +83,7 @@ python run_model_validation.py --score-only --out delivery-extras/tasks
 |---|---|---|---|---|
 | `qwen3.8-max` | Qwen3.8-Max-0902 | `qwen3.8-max-0902` | 3 | primary |
 | `opus-5` | Opus 5 | `claude-opus-5` | 3 | primary |
-| `glm-5.3` | GLM-5.3 | `glm-5.3` | 1 | auxiliary |
+| `glm-5.3` | GLM-5.3 | `glm-5.3` | 1 | auxiliary（**2026-10-13 起可选**） |
 | `kimi-k3` | Kimi K3 | `kimi-k3` | 1 | auxiliary |
 
 协议均为 **Anthropic Messages**（`POST {base_url}/v1/messages`，header `x-api-key` + `anthropic-version: 2023-06-01`）。
@@ -106,10 +106,13 @@ python run_model_validation.py --score-only --out delivery-extras/tasks
 
 ```
 条件 1: Opus5.model_score_sum > Qwen.model_score_sum
-条件 2: 两者 model_score_sum == 0 且 Opus5.testcase_pass_sum > Qwen.testcase_pass_sum
+条件 2: 两者 model_score_sum 相等 且 Opus5.testcase_pass_sum > Qwen.testcase_pass_sum
+        （不限于双 0；Qwen 三轮全满分时同样走条件 2，靠 testcase 通过数区分）
 ```
 
 - 只统计 **VALID** 运行；**INVALID 必须查明原因并补跑**，不得计入难度统计
+- Qwen 三轮全满分**不再**单独构成出局理由，但此时 required testcase 的条数与
+  颗粒度必须足以让 Opus 的 `testcase_pass_sum` 严格多出
 - `--score-only` 退出码：`0` 无明确失败／`1` 存在明确不通过（待定不算失败）
 
 ### 输出

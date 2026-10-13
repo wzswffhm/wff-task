@@ -131,9 +131,13 @@ def read_task_toml(assets, tid):
     m = re.search(r'^\s*version\s*=\s*"([^"]+)"', txt, re.M)
     if m:
         out["version"] = m.group(1)
-    m = re.search(r'docker_image\s*=\s*"([^"]+)"', txt)
-    if m:
-        out["docker_image"] = m.group(1)
+    # task.toml 不得写 docker_image；镜像引用取自 environment/Dockerfile 的 FROM
+    df = os.path.join(assets, tid, "environment", "Dockerfile")
+    if os.path.isfile(df):
+        dm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
+                       open(df, encoding="utf-8", errors="replace").read())
+        if dm:
+            out["docker_image"] = dm.group(1)
     m = re.search(r'\[metadata\][^\[]*?tags\s*=\s*\[([^\]]*)\]', txt, re.S)
     if m:
         out["tags"] = [t.strip().strip('"') for t in m.group(1).split(",") if t.strip()]

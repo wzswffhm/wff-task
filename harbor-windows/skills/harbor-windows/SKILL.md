@@ -3,7 +3,7 @@ name: harbor-windows
 description: >
   Windows 专项 Coding Bench（Harbor Windows）题包生产、交付与自动化模型验证全流程。按《Windows 专项 Coding Bench 数据采购》（windwos-第二版，替代 v1.0.2）
   生成符合冻结 Harbor Schema（默认 1.3）的标准题包，覆盖 Windows 价值反事实判定、标准 Harbor 五件套构题、F2P/P2P 二值判分、
-  Golden/no-change 对照、Qwen3.8-Max-0902 / Opus 5 各 3 次 + GLM-5.3 / Kimi K3 各 ≥1 次的自动化模型区分度验证、身份三元组一致性与 delivery-extras 伴随材料交付。
+  Golden/no-change 对照、Qwen3.8-Max-0902 / Opus 5 各 3 次 的自动化模型区分度验证（GLM-5.3 / Kimi K3 自 2026-10-13 起可选，不再必需）、身份三元组一致性与 delivery-extras 伴随材料交付。
   Use when the user asks to 出题/产题/构题/生产题包/交付题包 for Windows coding benchmark, mentions
   Windows 专项 Coding Bench、Harbor Windows、Harbor Task、Harbor 题包、SWE-bench-Live、swelive_spec、F2P/P2P、Golden 验证、
   no-change、模型区分度、多模型验证, or wants to convert/整改旧题包到本规范。Also use when reviewing whether an existing
@@ -58,7 +58,7 @@ description: >
    → 4.5 🚦【硬性前置门】预打包 + 甲方 windows-harbor-qc 自检（不 PASS 禁止开始任何跑分）
    → 5. Windows 环境验证
    → 6. Golden / no-change / 反例验证
-   → 7. 多模型验证（Qwen/Opus 各 3 + GLM/Kimi 各 ≥1）
+   → 7. 多模型验证（Qwen/Opus 各 3；GLM/Kimi 可选）
    → 8. Hack 与泄漏审查
    → 9. 身份与材料一致性校验
    → 10. 版本冻结与交付
@@ -79,7 +79,7 @@ description: >
 | 工具权限 / 网络策略 | 是否 air-gapped、allowlist |
 | Token / 时间预算 | 与 `task.toml` 的 timeout 一致 |
 | 采样参数 | temperature/top_p 等 |
-| 精确模型标识 | `Qwen3.8-Max-0902`、`Opus 5`、`GLM-5.3`、`Kimi K3` |
+| 精确模型标识 | 必需：`Qwen3.8-Max-0902`、`Opus 5`；可选：`GLM-5.3`、`Kimi K3`（2026-10-13 起） |
 
 > **模型或平台版本变更后，不得与旧结果直接比较；需要用于准入时应统一回刷。**
 
@@ -195,6 +195,17 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 | 判分证据 | `verifier/result.json` 的有效性、二值分数与 testcase 集合必须被自检脚本认可；`tests/required_testcases.json` 存在，且与各 job 的 testcase 集合**逐字一致**（以 `report.md` 报错为准，不要凭记忆自拟协议） |
 | 身份 | 全部 job 的 `task_checksum` 与交付包的 **Harbor dirhash 完全一致** |
 
+> ⚠️ **已知差异（2026-10-13 起）：`task.toml` 不得写 `docker_image`**。
+> 基础镜像只由 `environment/Dockerfile` 的 `FROM` 声明并 pin 到不可变 digest。
+> 甲方 QC 的 `run_qc.py` 仍把该字段当作必需项，缺失会写 `task.toml has no docker_image`
+> 并把「静态结构」判为 FAIL、退出码 `1` —— **这正是预期行为**，不要为过检查把字段写回去；
+> 正确做法是在交付说明里记录该差异（详见 `references/06-acceptance-gates.md` 零节）。
+> 两个配套坑：`run_qc.py` 的 `--attempts` 最小为 `3`（传 `1`/`2` 会在 argparse
+> 阶段直接退出，日志里只剩一句 usage，极易误判成容器起不来）；**Harbor 侧不受影响** ——
+> `harbor/environments/definition.py` 的 `should_use_prebuilt_docker_image()` 在
+> `docker_image` 为空时返回 `False`，于是自动回落到 `environment/Dockerfile` 构建，
+> `--force-build` 只是排除缓存的额外保险。
+
 > ⚠️ **`adapter.toml` 的经典坑**：甲方 `inspect_delivery.py` 读的是**扁平 key**
 > （`prepare` / `validate` / `run` / `restore` / `cleanup` / `workspace`）。
 > 若同一文件里又写了同名的 `[prepare]` / `[validate]` / `[test]` / `[restore]` /
@@ -245,14 +256,23 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的全部文件，因此：
 
 | 模型 | 次数 | 用途 |
 |---|---|---|
-| **Qwen3.8-Max-0902** | 各 3 次 | 主要难度模型 |
-| **Opus 5** | 各 3 次 | 主要难度模型 |
-| GLM-5.3 | ≥1 次 | 可运行性 + 基础质量 |
-| Kimi K3 | ≥1 次 | 可运行性 + 基础质量 |
+| **Qwen3.8-Max-0902** | 各 3 次 | 主要难度模型（**必需**） |
+| **Opus 5** | 各 3 次 | 主要难度模型（**必需**） |
+| GLM-5.3 | 可选 | 额外可运行性佐证；**自 2026-10-13 起不再必需** |
+| Kimi K3 | 可选 | 额外可运行性佐证；**自 2026-10-13 起不再必需** |
+
+> **规则变更（2026-10-13）**：甲方确认 GLM-5.3 与 Kimi K3 **不再是交付必需项**。
+> 新生产的题包只跑 控制组（no-change ×3 / Golden ×3）+ Qwen3.8-Max-0902 ×3 + Opus 5 ×3，
+> 合计 12 轮；已有 GLM/Kimi 结果的旧题包**不回退、不改写**，仍按其当时口径归档。
 
 **区分度准入（满足任一）**：
 1. `Opus5.model_score_sum > Qwen.model_score_sum`；或
-2. 两者 `model_score_sum = 0` 且 `Opus5.testcase_pass_sum > Qwen.testcase_pass_sum`
+2. 两者 `model_score_sum` 相等，且 `Opus5.testcase_pass_sum > Qwen.testcase_pass_sum`
+
+条件 2 **不限于「双方均为 0」**：Qwen 三轮全满分（3 = 3）时同样走条件 2。
+此时正式分已顶格、拉不开差距，区分度全部由 `testcase_pass_sum` 承担，
+**Opus 必须严格多出**才算通过。因此「Qwen 全满分」本身不再是出局理由，
+但 required testcase 的条数与颗粒度必须真的能分开两者。
 
 不满足 → 整改或替换。只统计 **VALID** 运行；INVALID 必须查明原因并补跑。
 
@@ -263,7 +283,7 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的全部文件，因此：
 export HARBOR_WINDOWS_ALIYUN_KEY=<aliyun key>   # qwen / glm / kimi 共用
 export HARBOR_WINDOWS_BLVR_KEY=<blvr key>       # opus
 
-# 2) 全量验证（Qwen 3 + Opus 3 + GLM 1 + Kimi 1）
+# 2) 全量验证（Qwen 3 + Opus 3；GLM/Kimi 自 2026-10-13 起可选）
 python scripts/run_model_validation.py \
     --tasks outside_harbor-assets --out delivery-extras/tasks
 
@@ -421,6 +441,7 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `references/08-model-validation.md` | 多模型跑分自检：端点/命令/权限、QWEN thinking（§7.10）、计划任务绝对路径（§7.11）、**传输层超时（§7.12）**、网关非流式硬墙（§7.13）、**流式是正解（§7.14）** |
 | `references/09-gz-package-analysis.md` | 压缩包结构分析 |
 | `references/10-windows-ops-pitfalls.md` | Windows 题运维坑：容器适配 6 坑、计划任务编排 3 坑、飞书写回编码坑、`runner.py` 参数化与并行 |
+| `references/11-latest-qc-requirements.md` | **最新质检要求（20261012 批次）**：魔法阈值禁令、无效槽位单列、Windows 价值映射与归类、权重废止、配置可解析、公开/隐藏分层与负访问证明 |
 | `references/08-model-validation.md` | 多模型门槛、区分度计算、稳定性验收 |
 | `references/09-gz-package-analysis.md` | 对 `Windows_SWE_d70d30df` 27 题现包的实测分析 |
 | `scripts/validate_package.py` | 题包结构与身份一致性校验（实测 27 题包可用） |
@@ -451,7 +472,7 @@ cat "$SKILL/assets/harbor-skeleton/README.md"
 python "$SKILL/scripts/build_delivery_extras.py" \
     --assets outside_harbor-assets --out delivery-extras
 
-# 3) 多模型自动化验证（Qwen 3 + Opus 3 + GLM 1 + Kimi 1）
+# 3) 多模型自动化验证（Qwen 3 + Opus 3；GLM/Kimi 自 2026-10-13 起可选）
 export HARBOR_WINDOWS_ALIYUN_KEY=<key>
 export HARBOR_WINDOWS_BLVR_KEY=<key>
 python "$SKILL/scripts/run_model_validation.py" \

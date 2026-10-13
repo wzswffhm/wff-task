@@ -1,14 +1,15 @@
 {
-  "schema_version": "rubric-conditions-v2",
+  "schema_version": "rubric-conditions-v3",
   "task_id": "wfflab__wchunk-216",
-  "task_version": "1.2.0",
+  "task_version": "1.2.1",
   "scope": "verifier-side only; never injected into the agent environment",
-  "programmatic_weight": 0.5,
-  "llm_judge_weight": 0.5,
+  "revision_note": "Revision 2026-10-12 (task version 1.2.1): the four llm_judge reviewer items were retired. The effective score has always been the binary required F2P/P2P gate and no per-candidate reviewer score was ever collected, so the 0.5 llm_judge weight described a score that did not exist. The programmatic weights below were normalised from a 0.5 budget to 1.0 by doubling each item. Deprecation record: REFIT-2026-10-12.md.",
+  "programmatic_weight": 1.0,
+  "llm_judge_weight": 0.0,
   "programmatic": [
     {
       "rubric_id": "sample-compatibility",
-      "weight": 0.15,
+      "weight": 0.3,
       "test_ids": [
         "f2p-sample-verifies",
         "f2p-sample-roundtrip-byte-identical",
@@ -21,7 +22,7 @@
     },
     {
       "rubric_id": "layout-and-alignment",
-      "weight": 0.06,
+      "weight": 0.12,
       "test_ids": [
         "f2p-record-alignment-is-eight-bytes"
       ],
@@ -31,7 +32,7 @@
     },
     {
       "rubric_id": "checksum-semantics",
-      "weight": 0.1,
+      "weight": 0.2,
       "test_ids": [
         "f2p-crc-matches-standard-check-value",
         "f2p-tampered-content-is-rejected",
@@ -43,7 +44,7 @@
     },
     {
       "rubric_id": "error-classification",
-      "weight": 0.09,
+      "weight": 0.18,
       "test_ids": [
         "f2p-truncated-container-reports-truncated",
         "f2p-truncated-stream-reports-truncated",
@@ -57,17 +58,18 @@
     },
     {
       "rubric_id": "streaming",
-      "weight": 0.05,
+      "weight": 0.1,
       "test_ids": [
-        "p2p-iter-records-is-streaming"
+        "p2p-iter-records-is-streaming",
+        "p2p-stream-tail-checksum-is-rejected"
       ],
-      "description": "iter_records() is lazy: it only issues fixed-size read(n) calls and yields the first record after reading a small prefix of the container.",
-      "pass_condition": "iter_records() never issues an unbounded read (no read(), read(-1) or readlines()); the first record is yielded after consuming only a bounded prefix of the stream.",
-      "failure_reason": "The iterator buffers the whole container before yielding, so a few-hundred-MB container is still pulled into memory as one object."
+      "description": "iter_records() is lazy: it only issues bounded read(n) calls, yields records as they are consumed instead of buffering the whole container, and still validates the trailer once the last record has been produced.",
+      "pass_condition": "iter_records() never issues an unbounded read (no read(), read(-1) or readlines()); when the container has been read in full the number of records still pending does not grow when the input grows 8x, and its single read window does not grow with the input size either; a container whose trailer checksum was altered is fully iterated and then rejected with WChunkError(kind='checksum').",
+      "failure_reason": "The iterator buffers the whole container before yielding, or it skips the trailer check so a container with a bad checksum is accepted as valid."
     },
     {
       "rubric_id": "api-and-regression",
-      "weight": 0.05,
+      "weight": 0.1,
       "test_ids": [
         "p2p-self-roundtrip-small-records",
         "p2p-empty-payload-roundtrip",
@@ -79,56 +81,5 @@
       "failure_reason": "Regression in the public API or in self-produced containers: round-trip only works for the sample shape, or read_all() disagrees with unpack()."
     }
   ],
-  "llm_judge": [
-    {
-      "rubric_id": "contract-preservation",
-      "weight": 0.15,
-      "description": "The delivered fix keeps the public surface the task contract names, including the documented exception taxonomy.",
-      "pass_condition": "pack / unpack / verify / iter_records / read_all / WChunkError keep their names, arity and observable semantics, and WChunkError.kind still distinguishes the documented categories; the visible smoke test still passes unmodified.",
-      "failure_reason": "The fix renames or removes a public entry point, changes an argument contract, or makes the visible smoke test fail.",
-      "criteria": [
-        "Every public name listed by the task contract still exists and is importable.",
-        "No argument was renamed, reordered or given a new required default.",
-        "WChunkError still carries the documented kind values and the original exception type.",
-        "The visible smoke test passes without being edited."
-      ]
-    },
-    {
-      "rubric_id": "implementation-quality",
-      "weight": 0.15,
-      "description": "The fix is a coherent implementation rather than a patch bolted onto the sample path.",
-      "pass_condition": "Parsing, checksum and streaming logic share one consistent format model; the streaming path validates the trailer instead of skipping it; no dead or duplicated code path is left behind.",
-      "failure_reason": "The batch path and the streaming path disagree about the format, the trailer check exists only in one of them, or the fix is duplicated code kept separate on purpose.",
-      "criteria": [
-        "A single format model drives header, record and trailer handling.",
-        "Streaming and batch readers agree on every well-formed container.",
-        "No leftover scaffolding, commented-out experiment or debug print.",
-        "Errors are raised where the structure is violated, not swallowed and re-derived later."
-      ]
-    },
-    {
-      "rubric_id": "anti-shortcut-discipline",
-      "weight": 0.1,
-      "description": "The fix generalises beyond the two shipped samples instead of special-casing them.",
-      "pass_condition": "No branch keys off the sample bytes, the sample length, the number of records, or a literal expected digest; every behaviour the contract states holds for freshly generated containers.",
-      "failure_reason": "The implementation detects the sample (by hash, size or record count) and returns a canned result, weakens a check so malformed input passes, or disables the trailer verification to make the sample verify.",
-      "criteria": [
-        "No literal comparison against the sample bytes or a hard-coded checksum of them.",
-        "Malformed inputs are still rejected after the fix.",
-        "verify() returns False rather than raising for every malformed input the suite constructs."
-      ]
-    },
-    {
-      "rubric_id": "verification-report",
-      "weight": 0.1,
-      "description": "The delivery states how the fix was verified and the statement is reproducible.",
-      "pass_condition": "A short report names the commands the author ran, what they observed before and after the fix, and how a reviewer can repeat it in the same image; claims match the shipped artefacts.",
-      "failure_reason": "No verification statement is shipped, or the statement claims results the artefacts cannot reproduce.",
-      "criteria": [
-        "The report names concrete commands, not intentions.",
-        "Before/after observations are stated for the sample round-trip and the trailer check.",
-        "The stated commands only use what the image ships."
-      ]
-    }
-  ]
+  "llm_judge": []
 }

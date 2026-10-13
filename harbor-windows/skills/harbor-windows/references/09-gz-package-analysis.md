@@ -156,7 +156,7 @@ score = 1.0 if resolved else 0.0
 | 2 | **无 `solution/` 目录** | 五件套含 `solution/` | 包内**只有** `environment/` + `instruction.md` + `task.toml` + `tests/`；**缺 `solution/`** | ❌ 严重缺失 |
 | 3 | **F2P/P2P 声明位置** | 应在 `tests/` 中明确 required 分组 | `FAIL_TO_PASS`/`PASS_TO_PASS` 在 `harbor/*.json` 与 `swelive_spec.json`，需确认与 Harbor Verifier 一致 | ⚠️ 待核对 |
 | 4 | **delivery-extras** | 必须有题外伴随材料目录 | **完全没有** | ❌ 缺失 |
-| 5 | **模型运行记录** | Qwen/Opus 各 3 次 + GLM/Kimi 各 ≥1 | **完全没有** | ❌ 缺失 |
+| 5 | **模型运行记录** | Qwen/Opus 各 3 次（GLM/Kimi 自 2026-10-13 起可选） | **完全没有** | ❌ 缺失 |
 | 6 | **Golden/no-change 证据** | 3×1 / 3×0 + 干净重建 | **完全没有** | ❌ 缺失 |
 | 7 | **来源与授权** | `source_and_license.json` 等 | 仅 `SANITIZATION_MANIFEST.json` 有 Hash | ⚠️ 部分 |
 | 8 | **题目版本号** | 每题显式版本 + 升级记录 | 全部 `1.0`，无变更记录 | ❌ 待补 |

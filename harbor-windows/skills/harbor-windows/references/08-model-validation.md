@@ -42,19 +42,28 @@
 | 指标 | 定义 | 取值范围 |
 |---|---|---|
 | `model_score_sum` | 同一模型 3 次二值正式分数之和 | **0–3** |
-| `testcase_pass_sum` | 同一模型 3 次运行中 required testcase 的 PASS 数量总和 | 仅用于**双方正式分均为 0** 时比较，不形成部分分 |
+| `testcase_pass_sum` | 同一模型 3 次运行中 required testcase 的 PASS 数量总和 | 仅在双方 `model_score_sum` **相等**时用于进一步区分，不形成部分分 |
 
 ### 单题准入（满足任一）
 
 ```
 条件 1：Opus5.model_score_sum > Qwen3.8-Max-0902.model_score_sum
-条件 2：两者 model_score_sum = 0
+条件 2：两者 model_score_sum 相等
         且 Opus5.testcase_pass_sum > Qwen3.8-Max-0902.testcase_pass_sum
 ```
 
+条件 2 的适用范围已**放宽**：不再要求双方正式分必须为 0。两种典型情形都走条件 2：
+
+- 双方都 0：靠 `testcase_pass_sum` 分辨谁更接近完成；
+- **双方都 3（Qwen 三轮满分、Opus 三轮同样满分）**：正式分已顶格、无法再拉开，
+  此时继续比 `testcase_pass_sum`，**Opus 必须严格更多**才算通过。
+
+因此「Qwen 三轮满分」本身**不再是**出局理由，但它把区分度压力全部转移到
+`testcase_pass_sum` 上：required testcase 的条数与颗粒度必须真的能分开两者，
+否则该题仍不满足准入。
+
 **不满足准入的情况**：
-- 两者正式分和**相同且不全为 0**
-- 双方均为 0 但 testcase 表现**没有严格区分**
+- 两者正式分和相同，且 `testcase_pass_sum` **没有严格区分**（相等或 Opus 更少）
 
 → **该题区分度不满足准入要求，应分析后整改或替换。**
 
@@ -70,7 +79,8 @@
 
 ## 三、辅助模型（8.3）
 
-**GLM-5.3 与 Kimi K3 每题至少完成 1 次有效运行**，主要确认：
+**GLM-5.3 与 Kimi K3 自 2026-10-13 起为可选**，不再是交付必需项。
+如运行，每题完成 1 次有效运行即可，主要确认：
 
 1. Agent 能正常进入、读取和修改工作区
 2. 构建、测试和结果采集链路可运行
@@ -196,7 +206,8 @@ opus_pass_sum = 15               # 条件 2：15 > 12 → 通过区分度
 
 ## 七、自动化执行（`scripts/run_model_validation.py`）
 
-规范要求 4 个模型、共 8 次调用（Qwen 3 + Opus 3 + GLM 1 + Kimi 1）并计算区分度。
+规范要求 主要模型 2 个、共 6 次调用（Qwen 3 + Opus 3）并计算区分度；
+GLM-5.3 / Kimi K3 自 2026-10-13 起为可选（旧口径为再加 2 次调用）。
 手工执行易漏、易算错，统一用脚本完成。
 
 ### 7.1 端点与模型
@@ -575,8 +586,19 @@ SSE 心跳持续、但迟迟不给内容」——此时 `read timeout`（两次�
 实测整轮可挂 >9 分钟（215 上正常首步仅 4–8 秒）。
 `agent_harness._post()` 因此加了**整次请求的墙钟上限**：`iter_lines` 循环内比对
 `deadline = t0 + timeout`，越界抛 `TimeoutError` 交上层按传输重试。
-端点侧建议 `request_timeout` 取**单步真实最大生成时间 × 1.5**（本次 Opus@4router 取 240 s）；
-调大它只会让挂起更久地失败，与 §7.12 的结论一致。
+端点侧 `request_timeout` **不能只按「挂起上限」来设**：它同时就是**单次请求的墙钟上限**
+（§7.14 的 `_post_stream` 走到 `deadline` 即抛 `TimeoutError`），设得过紧会把**正常但耗时**
+的长推理步直接掐断，并触发整轮重试。
+
+**2026-10-13 实证（Opus@4router，219 题包）**：单轮 91 分钟、16 步的轨迹里，相邻时间戳的
+最大间隔精确落在 **289 / 252 / 247 / 246 / 244 / 244 s**，而**中位间隔仅 19.2 s** ——
+这些堆在 240 s 档位的间隔是被人为掐断的，不是端点慢。一轮因此白耗约 20 分钟。
+
+**取值与判据**：
+
+- 长推理模型（Opus 级）取 **≥1800 s**（`OPUS_REQUEST_TIMEOUT` 已存在就应当生效）
+- 只有确认是**心跳挂起**（连上、SSE 心跳持续、迟迟无内容）时才用短墙钟快速失败
+- **判据是间隔的分布**：密集堆在同一个整数值 = 被墙钟掐断；分散、大小不一 = 端点真的慢
 
 **真实负载与短探活不等价**：同端点短请求 6 连探 4 次 OK，而**带完整题面 + 5 个工具**的
 真实请求 3 次里就挂 1 次。探活绿只证明凭据与链路通，**不证明负载可跑**。
@@ -591,8 +613,8 @@ SSE 心跳持续、但迟迟不给内容」——此时 `read timeout`（两次�
 [ ] model_score_sum 计算正确
 [ ] 区分度满足（条件 1 或条件 2）
 [ ] 无 INVALID 未补跑
-[ ] GLM-5.3 ≥1 次有效运行
-[ ] Kimi K3 ≥1 次有效运行
+[ ] （可选）GLM-5.3 ≥1 次有效运行
+[ ] （可选）Kimi K3 ≥1 次有效运行
 [ ] 无模型无关 infra/权限/依赖/Verifier 故障
 [ ] Golden 3×1，无 SKIP/MISSING/ERROR/旧产物
 [ ] no-change 3×0，P2P 全过 + 核心 F2P 失败
@@ -605,7 +627,7 @@ SSE 心跳持续、但迟迟不给内容」——此时 `read timeout`（两次�
 
 ## 九、离线复评：改完 `tests/**` 后免重跑（2026-10-06 实证）
 
-**要解决的问题**：按交付规范 `qualification-gates.md` §Repair semantics，任何题面变更（instruction / workspace / environment / test / rubric / judge / Golden）都会 **invalidate 之前的 controls 与模型得分**，必须开新 epoch **重跑整套**（QWEN×3 + OPUS×3 + GLM×1 + KIMI×1 + controls 3+3，实测量级数小时）。于是"只改一处检查、想知道效果"的代价极高，容易退化成凭猜测改题面。
+**要解决的问题**：按交付规范 `qualification-gates.md` §Repair semantics，任何题面变更（instruction / workspace / environment / test / rubric / judge / Golden）都会 **invalidate 之前的 controls 与模型得分**，必须开新 epoch **重跑整套**（QWEN×3 + OPUS×3 + controls 3+3；GLM/KIMI 自 2026-10-13 起可选，实测量级数小时）。于是"只改一处检查、想知道效果"的代价极高，容易退化成凭猜测改题面。
 
 **关键事实**：本地 runner 带 `-KeepWork` 时（`run.ps1` / `run_matrix.ps1` 均传该开关），**模型在容器内改完的 workspace 会落盘**：
 

@@ -28,6 +28,29 @@
 > 判分证据（`verifier/result.json` 的协议字段、有效性、二值分数、testcase 集合）以自检脚本
 > `report.md` 的报错为准，**不要凭记忆自拟协议字段名**。
 
+### 已知差异：`task.toml` 不写 `docker_image`（2026-10-13 起）
+
+**规范**：基础镜像只在 `environment/Dockerfile` 的 `FROM` 里声明，并 pin 到不可变
+digest（禁止 `latest`）；`task.toml` **不得**写 `docker_image`。
+
+**差异**：随包下发的甲方 QC（`scripts/run_qc.py` 里 `docker_image` 的取值与判空段）
+仍把该字段当作 `task.toml` 的必需项 —— 缺失即写 `task.toml has no docker_image`，
+把"静态结构"判为 `FAIL`，`run_qc.py` 退出码 `1`。
+
+**处理**：这条静态 FAIL **属预期**，不要为过检查把字段写回去。做法是：
+
+- 交付说明里显式记录该差异，并引用本节
+- 其余静态项与**全部动态项**（Oracle / NOP 控制跑）必须仍然 PASS
+- 甲方更新工具包后该 FAIL 自然消失
+
+> 两个配套坑：
+> 1. `run_qc.py` 的 `--attempts` 最小为 `3`；传 `1` 会在 argparse 阶段直接退出，
+>    日志里只留下 `--attempts must be at least 3`，极易误判成"容器跑不起来"。
+> 2. **Harbor 侧不受影响**：`harbor/environments/definition.py` 的
+>    `should_use_prebuilt_docker_image()` 在 `docker_image` 为空时返回 `False`，
+>    `has_agent_environment_definition()` 也把 `environment/Dockerfile` 当作合法定义，
+>    于是 Harbor 自动回落到 Dockerfile 构建；`--force-build` 只是排除缓存的额外保险。
+
 ### 冻结铁律
 
 Harbor dirhash 覆盖除顶层 `jobs/` 以外的**全部**文件。因此：
@@ -91,7 +114,7 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的**全部**文件。因此：
 | 7 | **Golden 独立 3 次均为 1**，无 SKIP、MISSING、ERROR 或旧产物复用 |
 | 8 | 正式评分无权重、无部分分、无 LLM/Agent Judge |
 | 9 | Qwen3.8-Max-0902 与 Opus 5 各 3 次有效运行并满足**区分度**要求 |
-| 10 | GLM-5.3 与 Kimi K3 至少各有 1 次有效运行，无模型无关 infra/质量问题 |
+| 10 | （可选）GLM-5.3 与 Kimi K3 若运行则无模型无关 infra/质量问题；**自 2026-10-13 起不再要求运行** |
 | 11 | 干净重建或恢复、清理、回滚和残留检查通过 |
 | 12 | 无 Solution、测试、答案、凭据和评分通道泄漏 |
 | 13 | 来源、授权、污染、版本和变更记录完整 |
@@ -110,7 +133,7 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的**全部**文件。因此：
 | 题面与测试 | 要求真实下发、双向映射完整、无越界要求、功能验证且接受合理多解 |
 | 对照 | no-change 3 次为 0，Golden 3 次为 1，干净重建/恢复成立 |
 | 评分 | 无权重、无部分分、F2P/P2P 全过为 1 否则为 0，异常为 INVALID |
-| 多模型 | Qwen/Opus 各 3 次满足区分度；GLM/Kimi 无模型无关运行故障 |
+| 多模型 | Qwen/Opus 各 3 次满足区分度（GLM/Kimi 自 2026-10-13 起可选；若运行则不得有模型无关故障） |
 | 安全与完整性 | Solution/隐藏 Tests 不可见；无网络取答案、本地搜答案、篡改测试/评分或旧产物复用 |
 | 版本 | 题包、环境、测试、Solution、运行结果和整改记录可对应到同一冻结版本 |
 
@@ -205,7 +228,7 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的**全部**文件。因此：
 [ ] no-change 3×0（P2P 全过 + 核心 F2P 失败）
 [ ] 至少 1 次干净重建复验
 [ ] Qwen 3 次 + Opus 3 次，区分度满足
-[ ] GLM ≥1 次 + Kimi ≥1 次有效
+[ ] （可选）GLM/Kimi 若运行则有效；2026-10-13 起不强制
 [ ] Hack 四层分级审查完成
 [ ] 身份三元组全链一致
 [ ] 镜像 Digest 已另存

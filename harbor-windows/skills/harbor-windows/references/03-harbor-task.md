@@ -51,7 +51,6 @@ timeout_sec = 172800.0        # 单次端到端评测原则上 ≤ 12 小时（4
 timeout_sec = 7200.0
 
 [environment]
-docker_image = "<registry>/<repo>:<tag>"
 build_timeout_sec = 7200.0
 cpus = 8
 memory = "16G"
@@ -71,9 +70,11 @@ tags = ["coding", "windows", "windows-bench"]
 
 ### 镜像身份要求
 
-- `docker_image` 若在构建期生成，可先留空并加注释说明
+- **`task.toml` 不得写 `docker_image`**：基础镜像只在 `environment/Dockerfile` 的
+  `FROM` 里声明，并 pin 到不可变 digest（禁止 `latest`）
 - **镜像标签不是不可变身份**，必须在 `delivery-extras` 中**另存实际 Digest**
-- Harbor JSON、`task.toml`、`swelive_spec.json` 三处的镜像引用必须**统一**
+- Harbor JSON、`environment/Dockerfile` 的 `FROM`、`swelive_spec.json`
+  三处的镜像引用必须**统一**
 
 ---
 

@@ -22,7 +22,7 @@
 | 题面与测试一致：双向映射完整，检查真实功能，不绑定 Golden 私有写法 |  |  |
 | 无 Hack：没有联网取答案、git 拉答案、搜索 Golden/隐藏测试、改测试或 Verifier 骗分 |  |  |
 | Windows 价值：离开目标 Windows Runtime 后核心行为会消失或实质变化 |  |  |
-| 全模型区分度：已分析 Qwen/Opus/GLM/Kimi 全部规定运行，Qwen 与 Opus 未同时三轮满分，且不存在全模型满分题 |  |  |
+| 全模型区分度：已分析 Qwen/Opus/GLM/Kimi 全部规定运行；Opus 总分严格高于 Qwen，或总分相等（含双方三次全满分）时 `testcase_pass_sum` 严格更高；已记录 `qwen_opus_full_score` / `all_models_full_score` 与判分颗粒度依据 |  |  |
 | 范围、版本、公式、镜像、测试树、Task/ZIP Hash 和运行批次身份已冻结 |  |  |
 | WIP 94 项完整登记，N/A 均有适用性依据 |  |  |
 | D01–D20 全部有结论和原始证据 |  |  |

@@ -154,7 +154,7 @@ delivery-<batch>-<version>/
 | 2 | 主知识方向、次级标签、语言、任务类型、目标 Windows 环境和难度说明 | `metadata/labels.json` |
 | 3 | `requirement → testcase → F2P/P2P` 双向映射及每项依据 | `testcase_mapping.csv` |
 | 4 | no-change、Golden、干净重建、等价实现、错误反例、清理和恢复结果 | `evidence/*` |
-| 5 | Qwen/Opus 各 3 次 + GLM/Kimi 可运行性检查的配置、真实模型标识、运行状态、逐 testcase 结果、轨迹、最终补丁、耗时和 Badcase 归因 | `model_runs/<model>/` |
+| 5 | Qwen/Opus 各 3 次的配置、真实模型标识、运行状态、逐 testcase 结果、轨迹、最终补丁、耗时和 Badcase 归因（GLM/Kimi 的同类材料自 2026-10-13 起可选） | `model_runs/<model>/` |
 | 6 | 环境、Task、Solution、Tests、运行日志和结果文件的版本、Digest/Hash | `metadata/manifest.json`、`checksums.sha256` |
 | 7 | Hack/答案泄漏检查、证据完整性缺口、已知问题、整改和复验记录 | `quality_review.md`、`known_issues.md`、`remediation_and_retest.md` |
 | 8 | 批次清单、覆盖统计、验收状态和版本变更记录 | `batch_manifest.csv`、`knowledge_tree_coverage_report.csv`、`validation_report.md`、`CHANGELOG.md` |

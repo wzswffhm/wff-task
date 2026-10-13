@@ -143,16 +143,61 @@ class GuardedReader:
         return chunk
 
 
-def test_iter_records_is_streaming():
-    records = [(index % 7 + 1, bytes([index % 256]) * 256) for index in range(4000)]
+def _stream_profile(records):
+    """完整消费 records，返回（容器、读取器、产出记录、读满容器时尚未产出的条数）。
+
+    "读满容器时尚未产出的条数"是判断流式真伪的关键观测量：有界缓冲下它是常数
+    （约等于窗口大小 / 单条记录大小），而伪流式或"先吐一条再把剩余全部读走"
+    会随输入规模线性增长。该观测量不假设任何具体块大小。
+    """
     blob = pack(records)
-    assert len(blob) > 900_000
     reader = GuardedReader(blob)
-    stream = iter_records(reader)
-    tag, payload = next(stream)
-    assert (tag, payload) == (1, b"\x00" * 256)
-    assert reader.max_request <= 8192
-    assert reader.bytes_read < len(blob) // 4
+    produced = []
+    pending_at_full_read = None
+    for record in iter_records(reader):
+        produced.append(record)
+        if pending_at_full_read is None and reader.bytes_read >= len(blob):
+            pending_at_full_read = len(records) - len(produced)
+    return blob, reader, produced, (pending_at_full_read or 0)
+
+
+def test_iter_records_is_streaming():
+    """流式读取：只允许有界 read(n)，且窗口与预读领先量不得随输入规模增长。"""
+    records = [(index % 7 + 1, bytes([index % 256]) * 256) for index in range(4000)]
+    blob, reader, produced, pending = _stream_profile(records)
+    assert len(blob) > 900_000
+    # 必须完整消费、顺序一致：只吐第一条就结束的实现会在这里被拒。
+    assert produced == records
+    assert reader.calls > 0
+
+    # 1/8 规模的同实现对照：下面两处观测都不得随输入规模增长。
+    small_records = records[: len(records) // 8]
+    small_blob, small_reader, small_produced, small_pending = _stream_profile(small_records)
+    assert len(small_blob) > 100_000
+    assert small_produced == small_records
+
+    # 读满容器时仍未产出的条数：8 倍规模下不得增长（允许 2 倍余量）。
+    # 合理的定长缓冲（含 64 KiB）在两处观测上都是常数，不会被误杀。
+    assert pending <= max(small_pending * 2, 8)
+    # read(n) 的请求窗口：同样不得随输入规模增长。
+    assert reader.max_request <= max(small_reader.max_request, 1)
+
+
+def test_stream_tail_checksum_is_rejected():
+    """尾部校验和被破坏时：先完整产出记录，再抛出 checksum 分类错误。"""
+    records = [(1, b"alpha"), (2, b"beta"), (300, b"x" * 10), (4, bytes(range(64)))]
+    blob = bytearray(pack(records))
+    # 翻转尾部校验和的 4 个字节（记录区末尾可能带对齐填充，故按尾部长度定位）。
+    blob[-4:] = bytes(byte ^ 0xFF for byte in blob[-4:])
+    tampered = bytes(blob)
+    assert verify(tampered) is False
+
+    produced = []
+    with pytest.raises(WFormatError) as excinfo:
+        for record in iter_records(GuardedReader(tampered)):
+            produced.append(record)
+    assert excinfo.value.kind == "checksum"
+    assert produced == records
 
 
 # --------------------------------------------------------------- F. 不回归

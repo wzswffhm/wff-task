@@ -1,5 +1,89 @@
 # CHANGELOG —— harbor-windows 题包目录
 
+## [chunk-216 与 wfmt-215 质检返修：1.2.0 → 1.2.1 / 2.1.0 → 2.1.1] - 2026-10-12
+
+### 变更原因
+
+质检合并报告（专家修复详解版）004 / 005 号条目对 `wfflab__wchunk-216`（zq-id=11）与
+`wfflab__wfmt-215`（zq-id=12）各提出 6 条问题，两题条目逐字同构：
+
+1. ZQ-01 流式测试引入未声明的 8192 字节读块阈值（QD-SP-02 / VV-02 / VV-03）；
+2. ZQ-02 Kimi 0 分混入 API 配额失败（VV-27 / VV-32 / VV-33）；
+3. ZQ-03 Windows 专属价值较低（QD-SP-12 / QD-SP-18）；
+4. ZQ-04 50% 评审 Rubric 没有逐模型评分证据（VV-14 / VV-19 / VV-30）；
+5. ZQ-05 judge.toml 无法按标准 TOML 解析（FC-08 / FC-09）；
+6. ZQ-06 模型可读取公开仓库测试，缺手册隔离条款的适配说明（QD-IN-02 / QD-IN-06）。
+
+### 变更内容
+
+1. **流式判据（两题）**：删除 `max_request <= 8192`（215 另有 `bytes_read < len(blob) // 4`）硬阈值；
+   改为完整消费 + 「容器读满时仍未产出的记录条数」按 1/8 规模对照（`pending(大) <= max(pending(小) × 2, 8)`）
+   + `max_request` 规模对照；新增尾部校验和用例（216 `p2p-stream-tail-checksum-is-rejected`、
+   215 `f2p-stream-tail-checksum-is-rejected`）。任何块大小（含 64 KiB 定长缓冲）不再被误杀。
+2. **无效槽位**：两包新增 `jobs/invalid-slots.json` 与 `jobs/INVALID-SLOTS.md` 注解层，
+   记录 Kimi 的 HTTP 429 `AccountQuotaExceeded` 原文、起止时间、失败前轮次、候选指纹与镜像 digest；
+   历史 `jobs/` 记录未改写；替代规则统一，本轮未重跑。
+3. **Windows 价值与采购分类**：两包新增 `verifier/WINDOWS_VALUE.md`，逐断言族映射 OS 机制，
+   结论为**通用编码能力（Windows 运行时执行）**；`_index/tasks_index.csv` 的 `primary_direction`
+   改为「通用编码能力」、`windows_target` 标注为执行平台；Windows 专属化候选列入"未实施"。
+4. **评分口径**：`tests/rubric.json` → `programmatic-v3`、`verifier/rubric.conditions.json` → `rubric-conditions-v3`，
+   删除 4 个从未产出过分值的 `llm_judge` 项，程序化权重归一化到 1.0（215：0.20/0.20/0.20/0.15/0.25；
+   216：0.30/0.12/0.20/0.18/0.10/0.10），`judge.toml` 同步 `programmatic_weight = 1.0` / `llm_judge_weight = 0.0`，
+   并写入**版本化废止说明**：配置改动使声明口径与既有生效分一致，不是降低标准。
+5. **judge.toml**：修复第 7 行注释续行缺 `#` 导致的 `Invalid statement (at line 7, column 1)`；
+   用 Python 标准库 `tomllib` 验证可解析；`source_sha256` 指向修复后的 `rubric.json`。
+6. **隔离口径**：两包新增 `verifier/ISOLATION.md`（三层清单 + `isolation-adaptation-v1` 版本化适配口径）
+   与只读探针 `verifier/negative_access_probe.ps1`；探针在本机以当前身份运行 `verdict=PASS`，
+   `environment/validate_environment.ps1` 退出 0。
+7. **版本与身份**：包内 `task.toml` / `environment/adapter.toml` / `environment/agent_visible_paths.json` /
+   `tests/rubric.json` / `tests/run_tests.ps1` / `verifier/rubric.conditions.json` /
+   `verifier/SEALED_MANIFEST.json` 同步升版（216 → **1.2.1**、215 → **2.1.1**），
+   `quality_restoration_version` → `20261012.1`；**交付目录名保持飞书镜像名不动**。
+8. **required 计数**：216 18 → **19**（10 F2P / 9 P2P）；215 15 → **16**（9 F2P / 7 P2P）。
+9. **交付门禁自检修复（质检报告之外）**：两包 `environment/adapter.toml` 的扁平入口 key 与同名
+   `[prepare]` / `[validate]` / `[exec_agent]` / `[test]` / `[restore]` / `[cleanup]` 表冲突，
+   标准 TOML 解析报 `Cannot overwrite a value (at line 38, column 9)`
+   （`skills/harbor-windows/SKILL.md` §4 已记录「215 v2.1.0 与 216 v1.2.0 带着该缺陷交付甲方」）。
+   按「扁平 key 保留、冲突表名改掉」改为 `[entry.*]`，字段值未改；`tomllib` 全文件解析通过。
+   该文件不参与判分链路，控制组结论不受影响。
+10. **`task.toml` 删除 `docker_image`**（2026-10-13 起的新规范：SKILL.md L198–207、
+   `references/06-acceptance-gates.md`「已知差异」节）：基础镜像只由 `environment/Dockerfile`
+   的 `FROM` 声明并 pin 到不可变 digest。两包删除该字段，Dockerfile 未改；甲方
+   `inspect_delivery.py` 会因此报 `Task has no pinned Docker image`，属**预期差异**、保留不复原；
+   本地 `validate_package.py` 则要求该字段不得出现（见 `known_issues.md` K29、K27）。
+11. **模型区分度门禁放宽**（2026-10-12）：`_reference/windows-harbor-qc` 原先"Qwen 与 Opus
+   同时全满分即 FAIL"的一票否决改为与 skills 侧一致的口径 —— 总分相等时（含双方三轮全满分）
+   由 `testcase_pass_sum` 严格分出高下，`qwen_opus_full_score` / `all_models_full_score`
+   仅作报告记录。QC 工具包内脚本、测试（12 项单测全过）与 5 份文档已同步（`known_issues.md` K30）。
+
+### 复验证据
+
+- 控制组（本机 Windows，Python 3.13.15 + pytest 9.1.1，判分侧由包内 `verifier/` 提供）：
+  - `wfflab__wchunk-216` 1.2.1：Golden 19/19 `formal_score=1`、no-change 9/19 `formal_score=0`；
+  - `wfflab__wfmt-215` 2.1.1：Golden 16/16 `formal_score=1`、no-change 7/16 `formal_score=0`；
+  - 归档：`_qc_runs/refit-215-216/result-{golden,nochange}-{215,216}.json`、
+    `negative-access-{215,216}.json`、`validate-env-{215,216}.txt`。
+- 无效槽位：`jobs/invalid-slots.json`（两包）；未重跑，槽位开放。
+- 逐条闭环与"未实施事项"：各包根 `REFIT-2026-10-12.md`。
+
+### 待办 / 声明
+
+- Windows 专属化改造**未实施**；如需 Windows 专属评测须立项发新版并**重新作答**，
+  新需求不得追溯扣旧样本。
+- 历史试次与历史分数**未重评**；`jobs/` 未改写；Kimi 槽位待配额恢复后按同一计划槽位重跑。
+- **历史 `jobs/` 的身份已随本次返修失效**：按 `skills/harbor-windows/SKILL.md` 第二条铁律
+  「跑分对象必须与最终交付包同一份内容」，正式提交前必须在 215 2.1.1 / 216 1.2.1 上
+  **整批重跑**（对照组 + 模型轮次）并刷新 `jobs/`；本轮只完成本机控制组复验
+  （Golden 1 / no-change 0）与甲方 `inspect_delivery.py` 静态自检 —— 该脚本因 `task.toml`
+  不写 `docker_image` 而报**预期 FAIL**（`Task has no pinned Docker image`），属规范要求，
+  不得为过检查写回字段（见 `known_issues.md` K27、K29、K28）。
+- **`delivery-extras/` 伴随材料按口径不新增**：`skills/harbor-windows/SKILL.md` L356 要求该目录，
+  但本批 4 个交付包原本均未提供，按甲方口径「原本没有就不用加」处理，**不生成骨架**；
+  `validate_package.py` 的 `[FAIL] [交付材料] 未提供 delivery-extras/ 目录` 据此保留为已知现状
+  （见 `known_issues.md` K31）。
+- `_index/checksums.sha256` 覆盖的是**平台发布形态快照**（`wfflab__wfmt-215/…`，含 `extras/`、`jobs/`），
+  不覆盖本次返修的 `*-delivery/` 目录；交付包内文件哈希以各包 `verifier/SEALED_MANIFEST.json` 为准。
+
 ## [wreparse-217 再次加深：1.2.0 → 1.3.0（D1–D6 激进档）] - 2026-10-09
 
 ### 变更原因
@@ -298,3 +382,33 @@ v1.0 的多模型实测显示 16 条 required 对主流模型过于宽松：Opus
 - 本机验证：base 8F2P 全失败 / 8P2P 全通过；oracle 全过；
   L2 nochg 0.0 / golden 1.0；对照证据 12 项全符合预期（3 反例 0.0、等价 1.0）。
 - 替换链状态：wsync-142（replaced）→ wproc-209（判死）→ winstall-210（判死）→ wstamp-211（验证中）。
+
+## 2026-10-13 甲方规则变更：GLM/KIMI 不再必需（模型 job 14 -> 12）
+
+- **新规则**：GLM-5.3 与 Kimi K3 不再是交付必需项。新生产题包只跑 控制组（no-change x3 / Golden x3）
+  + Qwen3.8-Max-0902 x3 + Opus 5 x3，合计 **12 轮 / 12 个 job**。
+- **旧包不回退**：216 在规则变更前已按 14 轮跑完并上传，其 jobs 归档保持当时口径，不重跑、不改写。
+- **同步范围**：
+  - 生产 skill skills/harbor-windows/：SKILL.md、references/01、05、06、07、08、09、10、scripts/README.md（20 处）
+  - 质检 skill _reference/windows-harbor-qc/：SKILL.md、references/checklist.md、rule-matrix.md（10 处）
+  - 门禁脚本 alidate_model_gate.py（REQUIRED_COUNTS 拆为必需 + OPTIONAL_COUNTS）、
+    alidate_model_jobs.py（job 数 12 或 14 均合规）；12 项门禁单测全部通过
+- **验证**：仅提交 6 次必需模型运行时门禁 pass=True；GLM/Kimi 出现时仍须恰好 1 次。
+- **口径**：本次说明不代表修改或重评了原始产物。
+
+## 2026-10-13 最新质检要求（20261012 批次）写入 skill
+
+- 新增 skills/harbor-windows/references/11-latest-qc-requirements.md（完整版），
+  并在 SKILL.md 参考索引接入。
+- 新增 _reference/windows-harbor-qc/references/latest-qc-requirements.md（质检侧判据摘要），
+  并在质检 SKILL.md 接入。
+- 沉淀的 6 条通用要求：
+  1. 性能/流式断言不得固定魔法阈值（须用随输入规模增长的规模对比，并完整消费迭代器、独立断言尾部错误）
+  2. API 配额/限流/传输失败必须单列无效槽位，不得计入能力分，且不得改写归档树
+  3. Windows 价值必须真实映射；否则归入通用编码能力并调整采购分类（禁止只改题名/强加标签）
+  4. 声明了评审权重就必须有逐候选证据与合成公式，否则按正式口径版本化废止
+  5. judge.toml / adapter.toml 必须能被标准解析器（tomllib）完整读取
+  6. 公开测试与隐藏验收必须分层，并以运行时挂载与负访问探针证明隐藏材料不可达
+- 来源：甲方质检报告《Windows-48题质检-专家修复详解版-20261012》第 004/005 篇（zq-id=11 / zq-id=12）。
+- _reference/windows-harbor-qc/MANIFEST.sha256 重算为 34 条（新增 1 项、内容变更 1 项）。
+- 口径：本次说明不代表修改或重评了原始产物；新要求不得追溯扣旧样本。

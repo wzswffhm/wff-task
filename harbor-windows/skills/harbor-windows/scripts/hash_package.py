@@ -7,9 +7,11 @@
        sha256("task_id=…\\ntask_version=…\\ninstruction_md_sha256=…\\n"
               "test_patch_sha256=…\\noracle_patch_sha256=…\\ndockerfile_sha256=…")
    **末行不带换行**（这是冻结口径，改动会让所有历史哈希失效）。
-2. 把 `task_hash` / `task_version` / `docker_image` 回写到四处身份文件：
-   `task.toml`、`tests/swelive_spec.json`、`platform_import.json`、
-   `extras/metadata/manifest.json`，并把各制品 sha256 写进 manifest.artifacts。
+2. 把 `task_hash` / `task_version` 回写到身份文件：`task.toml`、
+   `tests/swelive_spec.json`、`platform_import.json`、`extras/metadata/manifest.json`，
+   并把各制品 sha256 写进 manifest.artifacts。
+   **`task.toml` 只写 `task_hash` 与 `version`，不写 `docker_image`**：
+   基础镜像只由 `environment/Dockerfile` 的 `FROM` 声明。
 3. 重新生成 `_index/checksums.sha256`（覆盖整个题包类型目录）。
 
 ## 用法
@@ -145,11 +147,10 @@ def sync_task(pkg: str, tid: str, write: bool, log) -> str:
     orig_tt = tt
     tt = re.sub(r'(?m)^version\s*=\s*"[^"]*"', 'version = "%s"' % version, tt, count=1)
     tt = re.sub(r'task_hash(\s*=\s*)[0-9a-f]{64}', r'task_hash\g<1>' + task_hash, tt)
-    if image_ref:
-        tt = re.sub(r'(?m)^docker_image\s*=\s*"[^"]*"',
-                    'docker_image = "%s"' % image_ref, tt, count=1)
+    # task.toml 不得写 docker_image：基础镜像只在 environment/Dockerfile 的 FROM
+    # 里声明并 pin digest。镜像引用只回写到 platform_import.json / manifest.json。
     if tt != orig_tt:
-        log("  task.toml 已更新（version / task_hash / docker_image）")
+        log("  task.toml 已更新（version / task_hash）")
         if write:
             open(tt_p, "w", encoding="utf-8", newline="\n").write(tt)
 

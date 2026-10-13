@@ -3,10 +3,12 @@
 # Maps the raw check results onto the authoritative rubric and writes the
 # machine readable task result consumed by the evaluation runner.
 #
-# The rubric is split: programmatic items (0.5) gate the run, llm_judge items
-# (0.5) are scored by the reviewer against the conditions shipped on the
-# verifier side. Only programmatic items take part in the binary gate, so the
-# candidate score stays 0/1 and never turns into a partial credit.
+# The rubric is programmatic only (weights sum to 1.0). Every required F2P/P2P
+# testcase gates the run, so the candidate score stays 0/1 and never turns into
+# a partial credit. Revision 2026-10-12 removed the four llm_judge reviewer
+# items that declared 0.5 of the weight but never produced a per-candidate
+# score; see REFIT-2026-10-12.md. rubric_split is still reported so a consumer
+# can see the split at a glance (programmatic_weight=1.0, llm_judge_weight=0.0).
 #
 # NOTE: keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less files as
 # ANSI, and multi-byte comments can swallow the following newline.

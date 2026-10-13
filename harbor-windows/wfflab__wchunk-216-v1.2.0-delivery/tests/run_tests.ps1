@@ -136,6 +136,7 @@ if _root not in sys.path:
         'test_bad_version_reports_version'          = 'bad-version-reports-version'
         'test_verify_never_raises'                  = 'verify-never-raises'
         'test_iter_records_is_streaming'            = 'iter-records-is-streaming'
+        'test_stream_tail_checksum_is_rejected'     = 'stream-tail-checksum-is-rejected'
         'test_self_roundtrip_small_records'         = 'self-roundtrip-small-records'
         'test_empty_payload_roundtrip'              = 'empty-payload-roundtrip'
         'test_generated_data_roundtrip_verified'    = 'generated-data-roundtrip-verified'
@@ -173,7 +174,7 @@ if _root not in sys.path:
 
     $payload = [pscustomobject][ordered]@{
         task_id      = 'wfflab__wchunk-216'
-        task_version = '1.2.0'
+        task_version = '1.2.1'
         checks       = @($results.ToArray())
     }
     $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ChecksPath -Encoding UTF8

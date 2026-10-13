@@ -127,13 +127,13 @@ Oracle 的截图应截 Harbor CLI/控制台原始输出，必须能看到任务�
 
 ## 7. 四模型轨迹与区分度
 
-`jobs/` 必须直接交付 14 个 Harbor job 目录，并保留 `jobs/config.json`、`jobs/lock.json`、
-`jobs/result.json`、`jobs/job.log`。14 个子 job 按自身元数据分类，不依赖文件夹名称：
+`jobs/` 必须直接交付规定数量的 Harbor job 目录（**2026-10-13 起：必需 12 个**；含可选 GLM/Kimi 为 14 个），并保留 `jobs/config.json`、`jobs/lock.json`、
+`jobs/result.json`、`jobs/job.log`。子 job 按自身元数据分类，不依赖文件夹名称；**必需**部分为：
 
 - Qwen3.8-Max-0902：3 次；
 - Opus 5：3 次；
-- GLM-5.3：1 次；
-- Kimi K3：1 次。
+- GLM-5.3：1 次（**自 2026-10-13 起可选**）；
+- Kimi K3：1 次（**自 2026-10-13 起可选**）。
 - Oracle：3 次；
 - NOP：3 次。
 
@@ -155,7 +155,7 @@ Harbor 原始 job。
 Opus model_score_sum > Qwen model_score_sum
 ```
 
-先检查过易满分题：Qwen 三次和 Opus 三次同时全部 `VALID/1` 时直接失败；Qwen 3、Opus 3、GLM 1、Kimi 1 共 8 次运行全部满分时必须明确记录为全模型满分失败。未触发满分拒绝时，若 Qwen 与 Opus 的 `model_score_sum` 相等，则使用同一 required testcase 集合上的累计通过数作为二级判据：只有 `Opus testcase_pass_sum > Qwen testcase_pass_sum` 才通过。若两者总分相等且 testcase 累计通过数也未严格拉开，则失败；唯一例外是 8 次模型运行全部有效且全部为 0，此时零分平局不因区分度单独返修。GLM/Kimi 不参与主模型分差，GLM 1 而 Opus 0 本身不触发返修，但要纳入全模型结果分布分析；缺少规定 job、运行无效或原始证据不完整仍然不通过。`INVALID`、基础设施失败或缺结果不能按 0 分计入。
+正式区分度：若 Opus 的 `model_score_sum` 严格高于 Qwen 则通过；若两者总分相等，则使用同一 required testcase 集合上的累计通过数作为二级判据，只有 `Opus testcase_pass_sum > Qwen testcase_pass_sum` 才通过。总分相等**不限于双方均为 0**：Qwen 三次与 Opus 三次同时全部 `VALID/1`（正式分顶格）时同样走本判据，此时「双方同时三轮满分」本身不再出局，但必须由 testcase 颗粒度把两者严格分开，否则仍判不通过。若两者总分相等且 testcase 累计通过数也未严格拉开，则失败；唯一例外是 8 次模型运行全部有效且全部为 0，此时零分平局不因区分度单独返修。`qwen_opus_full_score` 与 `all_models_full_score` 必须记录进报告以说明判分颗粒度，但不再单独否决。GLM/Kimi 不参与主模型分差，GLM 1 而 Opus 0 本身不触发返修，但要纳入全模型结果分布分析；缺少规定 job、运行无效或原始证据不完整仍然不通过。`INVALID`、基础设施失败或缺结果不能按 0 分计入。
 
 每个运行必须绑定当前 `task_id + task_version + task_hash`；所有 Harbor `task_checksum`
 必须一致，并等于从当前交付 Task 目录重新计算的 checksum。仅重新生成 evidence 索引不能

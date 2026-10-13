@@ -27,7 +27,7 @@ Register-ScheduledTask -TaskName oh-<tag> `
 Start-ScheduledTask -TaskName oh-<tag>
 ```
 
-- `matrix-task.ps1` 内 `& $psExe -File run_matrix.ps1 …`；`run_matrix.ps1` 已带 `-KeepWork`；GLM/KIMI 固定 `Runs=1`。
+- `matrix-task.ps1` 内 `& $psExe -File run_matrix.ps1 …`；`run_matrix.ps1` 已带 `-KeepWork`；GLM/KIMI 固定 `Runs=1`（两者自 2026-10-13 起为可选，编排层可直接从 plan 中移除）。
 - 多分片 = 每片 **`-Tag` 唯一 + `-Runs 1`**（并行单例优于串行 `Runs=3`）。
 
 | # | 坑 |

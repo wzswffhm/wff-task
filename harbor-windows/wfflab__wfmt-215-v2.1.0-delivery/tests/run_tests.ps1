@@ -133,6 +133,7 @@ if _root not in sys.path:
         'test_bad_magic_is_reported_as_magic'           = 'bad-magic-is-reported-as-magic'
         'test_verify_never_raises'                      = 'verify-never-raises'
         'test_iter_records_is_streaming'                = 'iter-records-is-streaming'
+        'test_stream_tail_checksum_is_rejected'         = 'stream-tail-checksum-is-rejected'
         'test_self_roundtrip_small_records'             = 'self-roundtrip-small-records'
         'test_empty_payload_roundtrip'                  = 'empty-payload-roundtrip'
         'test_pack_verify_agrees_for_generated_data'    = 'pack-verify-agrees-for-generated-data'
@@ -170,7 +171,7 @@ if _root not in sys.path:
 
     $payload = [pscustomobject][ordered]@{
         task_id      = 'wfflab__wfmt-215'
-        task_version = '2.1.0'
+        task_version = '2.1.1'
         checks       = @($results.ToArray())
     }
     $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ChecksPath -Encoding UTF8

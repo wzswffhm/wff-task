@@ -164,10 +164,12 @@ class GuardedReader:
         self._pos = 0
         self.max_request = 0
         self.bytes_read = 0
+        self.calls = 0
 
     def read(self, size=-1):
         if size is None or size < 0:
             raise AssertionError("iter_records must not slurp the whole file")
+        self.calls += 1
         self.max_request = max(self.max_request, size)
         chunk = self._data[self._pos:self._pos + size]
         self._pos += len(chunk)
@@ -175,16 +177,85 @@ class GuardedReader:
         return chunk
 
 
-def test_iter_records_is_streaming():
-    records = [(index % 7 + 1, bytes([index % 256]) * 256) for index in range(4000)]
+STREAM_PAYLOAD = 256
+STREAM_RECORDS = [
+    (index % 7 + 1, bytes([index % 256]) * STREAM_PAYLOAD) for index in range(4000)
+]
+
+
+def _stream_profile(records):
+    """Consume records fully; report how many were still pending when the whole
+    container had been read.
+
+    That count is the decisive streaming observable: a bounded buffer keeps it
+    constant (roughly window size / record size), while a fake-streaming
+    implementation -- slurp-then-yield, or yield-one-then-slurp-the-rest --
+    makes it grow linearly with the input size. No block size is assumed.
+    """
     blob = pack(records)
-    assert len(blob) > 900_000
     reader = GuardedReader(blob)
-    stream = iter_records(reader)
-    tag, payload = next(stream)
-    assert (tag, payload) == (1, b"\x00" * 256)
-    assert reader.max_request <= 8192
-    assert reader.bytes_read < len(blob) // 4
+    produced = []
+    pending_at_full_read = None
+    for record in iter_records(reader):
+        produced.append(record)
+        if pending_at_full_read is None and reader.bytes_read >= len(blob):
+            pending_at_full_read = len(records) - len(produced)
+    return blob, reader, produced, (pending_at_full_read or 0)
+
+
+def test_iter_records_is_streaming():
+    """Section E: lazy production with bounded read(n) calls only.
+
+    The observable is a scale contrast, never a fixed block size:
+
+    * the iterator must be consumed to the end and yield every record in order;
+    * when the container has been read in full, the number of records still
+      pending must not grow when the input grows 8x -- a fake-streaming
+      implementation that reads everything first (or everything after the first
+      record) fails here;
+    * the single read(n) window must not grow with the input size either.
+
+    A legitimate fixed window (including a 64 KiB buffer) passes both checks,
+    so nothing is rejected merely for not using an 8192-byte block.
+    """
+    records = STREAM_RECORDS
+    blob, reader, produced, pending = _stream_profile(records)
+    assert len(blob) > 900_000
+    assert produced == records
+    assert reader.calls > 0
+
+    smaller = records[: len(records) // 8]
+    small_blob, small_reader, small_produced, small_pending = _stream_profile(smaller)
+    assert len(small_blob) > 100_000
+    assert small_produced == smaller
+
+    assert pending <= max(small_pending * 2, 8), (
+        "records still pending when the container had been read in full grew "
+        "from {0} to {1} when the input grew 8x".format(small_pending, pending)
+    )
+    assert reader.max_request <= max(small_reader.max_request, 1), (
+        "the read window grew from {0} to {1} bytes when the input grew 8x".format(
+            small_reader.max_request, reader.max_request
+        )
+    )
+
+
+def test_stream_tail_checksum_is_rejected():
+    """题面 E 节：取完最后一条记录后仍要校验尾部校验和。
+
+    只翻转尾部校验和区域的 4 个字节，记录本身保持完整：迭代必须先把记录
+    照常产出，再抛 WChunkError(kind="checksum")。
+    """
+    records = [(index % 7 + 1, bytes([index % 251]) * 64) for index in range(64)]
+    blob = bytearray(pack(records))
+    blob[-4:] = bytes(byte ^ 0xFF for byte in blob[-4:])
+
+    produced = []
+    with pytest.raises(WChunkError) as excinfo:
+        for record in iter_records(io.BytesIO(bytes(blob))):
+            produced.append(record)
+    assert excinfo.value.kind == "checksum"
+    assert produced == records
 
 
 # --------------------------------------------------------------- F. 不回归

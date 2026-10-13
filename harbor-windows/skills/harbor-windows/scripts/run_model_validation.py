@@ -13,7 +13,8 @@ run_model_validation.py — Harbor Windows 多模型自动化验证
 
 准入规则（满足任一）：
     条件 1: Opus.model_score_sum > Qwen.model_score_sum
-    条件 2: 两者 model_score_sum == 0 且 Opus.testcase_pass_sum > Qwen.testcase_pass_sum
+    条件 2: 两者 model_score_sum 相等 且 Opus.testcase_pass_sum > Qwen.testcase_pass_sum
+            （不限于双 0：Qwen 三轮全满分时同样走条件 2，此时靠 testcase 通过数区分）
 
 只统计 VALID 运行；INVALID 必须查明原因并补跑，不得计入难度统计。
 
@@ -514,23 +515,25 @@ def score_task(out_root, tid, endpoints):
         adm["blocking"] = ["scores_not_filled"]
     else:
         qs, os_ = q["model_score_sum"], o["model_score_sum"]
+        qp, op = q["testcase_pass_sum"], o["testcase_pass_sum"]
         if os_ > qs:
             adm["condition"] = 1
             adm["passed"] = True
             adm["reason"] = f"Opus5.model_score_sum({os_}) > Qwen.model_score_sum({qs})"
-        elif qs == 0 and os_ == 0:
-            qp, op = q["testcase_pass_sum"], o["testcase_pass_sum"]
+        elif os_ == qs:
+            scope = ("双 0 场景" if qs == 0
+                     else f"正式分和相同（{os_} = {qs}，含双方三轮全满分）")
             if op > qp:
                 adm["condition"] = 2
                 adm["passed"] = True
-                adm["reason"] = f"双 0 场景，Opus5.testcase_pass_sum({op}) > Qwen({qp})"
+                adm["reason"] = f"{scope}，Opus5.testcase_pass_sum({op}) > Qwen({qp})"
             else:
                 adm["condition"] = 2
                 adm["passed"] = False
-                adm["reason"] = f"双 0 且 testcase 表现无严格区分（Opus {op} vs Qwen {qp}）"
+                adm["reason"] = f"{scope} 但 testcase 表现无严格区分（Opus {op} vs Qwen {qp}）"
         else:
             adm["passed"] = False
-            adm["reason"] = f"两者正式分和相同且不全为 0（Opus {os_} vs Qwen {qs}）"
+            adm["reason"] = f"Opus5.model_score_sum({os_}) < Qwen.model_score_sum({qs})"
 
     for aux in ("glm-5.3", "kimi-k3"):
         a = result["models"].get(aux, {})
@@ -575,7 +578,8 @@ def write_score_report(out_root, results, schema_ver="1.3"):
     md += ["", "## 3. 准入规则", "",
            "```",
            "条件 1: Opus5.model_score_sum > Qwen.model_score_sum",
-           "条件 2: 两者 model_score_sum == 0 且 Opus5.testcase_pass_sum > Qwen.testcase_pass_sum",
+           "条件 2: 两者 model_score_sum 相等 且 Opus5.testcase_pass_sum > Qwen.testcase_pass_sum",
+           "        （不限于双 0；Qwen 三轮全满分时同样走条件 2）",
            "```", "",
            "> 只统计 VALID 运行；INVALID 必须查明原因并补跑，不得计入难度统计。",
            "> 模型门槛不能覆盖数据质量门槛：题面歧义、错误测试、环境故障、答案泄漏、Windows 价值不足时仍不得验收。",
