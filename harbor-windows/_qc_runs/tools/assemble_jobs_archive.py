@@ -57,13 +57,16 @@ BASE_SCRIPT = TOOLS_DIR / "assemble_216_jobs_archive.py"
 ALPHABET = string.ascii_letters + string.digits
 
 # 轮次计划：label -> (role, 需要的有效轮数)
+# (label, role, 需要的有效轮数, 是否可选)
+# 甲方 2026-10-13 规则：GLM/Kimi 不再必需 —— 缺席即跳过，不视为证据缺口；
+# 旧题包若已按 14 轮跑完，仍可按原样归档（出现时必须满足次数）。
 ROUND_PLAN = [
-    ("no-change", "nop", 3),
-    ("golden", "oracle", 3),
-    ("glm-5.3", "candidate", 1),
-    ("kimi-k3", "candidate", 1),
-    ("opus-5", "candidate", 3),
-    ("qwen3.8-max-0902", "candidate", 3),
+    ("no-change", "nop", 3, False),
+    ("golden", "oracle", 3, False),
+    ("glm-5.3", "candidate", 1, True),
+    ("kimi-k3", "candidate", 1, True),
+    ("opus-5", "candidate", 3, False),
+    ("qwen3.8-max-0902", "candidate", 3, False),
 ]
 
 # 模型别名（与 runner/.env.local 的 <ALIAS>_LABEL 对应）
@@ -130,9 +133,12 @@ def discover_rounds(runs_dir: Path, verbose: bool = True):
     control_rounds: list[tuple[str, str, str]] = []
     problems: list[str] = []
 
-    for label, role, need in ROUND_PLAN:
+    for label, role, need, optional in ROUND_PLAN:
         have = sorted(found.get(label, []))
         if len(have) < need:
+            if optional:
+                print(f"  （可选）{label}: 有效 {len(have)}/{need} 轮，按新规则跳过")
+                continue
             problems.append(f"label={label}（{role}）有效轮次不足：需要 {need}，实际 {len(have)}")
             continue
         for run_id in have[:need]:
@@ -314,8 +320,11 @@ def self_check(jobs_dir: Path, package_root: Path) -> list[str]:
     trials = sorted(p.name for p in jobs_dir.iterdir() if p.is_dir())
     models = [t for t in trials if t.startswith("task__")]
     controls = [t for t in trials if t.startswith("task0__")]
-    if len(trials) != 14 or len(models) != 8 or len(controls) != 6:
-        problems.append(f"trial 命名/数量不符：total={len(trials)} task__={len(models)} task0__={len(controls)}")
+    # 新口径 12（控制 6 + 模型 6）；含可选 GLM/Kimi 的旧口径为 14（控制 6 + 模型 8）
+    if len(controls) != 6 or len(models) not in (6, 8) or len(trials) != len(controls) + len(models):
+        problems.append(
+            f"trial 命名/数量不符：total={len(trials)} task__={len(models)} task0__={len(controls)}"
+            "（期望 控制 6 + 模型 6[新口径] 或 8[含可选 GLM/Kimi]）")
     stray = [t for t in trials if not (t.startswith("task__") or t.startswith("task0__"))]
     if stray:
         problems.append(f"存在未改名的 trial：{stray}")
