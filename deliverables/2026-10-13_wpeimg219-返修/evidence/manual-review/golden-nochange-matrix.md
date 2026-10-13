@@ -1,0 +1,49 @@
+# Golden / no-change 逐 testcase 终态矩阵（wfflab__wpeimg-219 v1.4.0）
+
+| testcase | 分组 | oracle-1 | oracle-2 | oracle-3 | nop-1 | nop-2 | nop-3 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `f2p-amd64-sample-inspects` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-i386-sample-inspects` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-checksum-matches-authoritative-values` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-checksum-ignores-the-stored-field` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-accumulator-matches-authoritative-values` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-checksum-matches-a-live-windows-query` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-checksum-matches-live-queries-across-variants` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-iter-sections-reads-a-real-windows-file-handle` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-iter-sections-is-bounded-on-a-real-handle` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-rva-inside-headers-maps-to-itself` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-rva-inside-a-section-maps-into-the-file` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-rva-in-an-uninitialised-tail-has-no-backing` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-rva-outside-every-section-has-no-backing` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-truncated-section-table-reports-truncated` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-unknown-optional-magic-reports-optional` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-section-past-end-of-file-reports-structure` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-overlapping-virtual-sections-reports-structure` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-overlapping-file-ranges-reports-structure` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-unaligned-section-reports-structure` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-undersized-size-of-image-reports-structure` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-structure-is-reported-before-checksum` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-verify-rejects-every-structural-variant` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `p2p-non-mz-prefix-reports-dos` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `p2p-missing-pe-signature-reports-signature` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `p2p-mismatched-checksum-reports-checksum` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `f2p-data-directories-follow-the-pe-order` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-data-directories-use-the-layout-specific-offset` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-data-directories-respect-declared-count` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-data-directories-ignore-slots-the-header-cannot-hold` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-authenticode-signature-detection` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-authenticode-signature-requires-backing-bytes` | F2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `f2p-trailing-bytes-are-not-a-structural-error` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-signature-info-describes-the-real-signed-data` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-signature-info-without-a-certificate-table` | F2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `f2p-signature-info-skips-non-pkcs7-records` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-signature-info-rejects-a-length-that-cannot-hold` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-signature-info-is-offline-and-standard-library-only` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `f2p-iter-sections-does-not-slurp-the-stream` | F2P | PASS | PASS | PASS | FAIL | FAIL | FAIL |
+| `p2p-verify-never-raises` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `p2p-negative-rva-has-no-backing` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `p2p-public-surface-is-unchanged` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `p2p-accumulator-matches-one-shot-helper` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+| `p2p-package-has-no-external-dependencies` | P2P | PASS | PASS | PASS | PASS | PASS | PASS |
+
+结论：Oracle 三次全 PASS 且 score=1；no-change 三次 P2P 全 PASS、F2P 全 FAIL 且 score=0。

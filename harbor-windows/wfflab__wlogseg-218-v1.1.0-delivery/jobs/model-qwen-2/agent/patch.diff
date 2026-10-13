@@ -1,0 +1,1441 @@
+diff --git a/_analyze2.py b/_analyze2.py
+new file mode 100644
+index 0000000..8d686f8
+--- /dev/null
++++ b/_analyze2.py
+@@ -0,0 +1,182 @@
++import struct, zlib
++
++data = open('assets/sample.wlsg', 'rb').read()
++
++# Header: 16 bytes
++# WLSG 01 00 05 00 58 01 00 00 00 00 00 00
++# magic=WLSG ver=1 flags=0 seg_count=5 index_offset=0x158=344 reserved=0
++
++print("=== Raw hex of first 100 bytes ===")
++for i in range(0, min(100, len(data)), 16):
++    chunk = data[i:i+16]
++    hx = ' '.join(f'{b:02x}' for b in chunk)
++    print(f'{i:04x}: {hx}')
++
++print("\n=== Let's try different segment header layouts ===")
++
++# Current layout: <HBBI = seg_id(H), flags(B), reserved(B), body_len(I) = 8 bytes
++# Let's look at the raw bytes starting from offset 16
++
++# Offset 16: 01 00 00 00 05 00 00 00
++# If <HBBI: seg_id=1, flags=0, resv=0, body_len=5 -> payload="alpha" (5 bytes) -> total=8+5+pad(3)=16 OK!
++# Next at offset 32: 02 00 00 00 00 00 00 00
++# If <HBBI: seg_id=2, flags=0, resv=0, body_len=0 -> empty payload -> total=8+0+0=8 OK!
++# Next at offset 40: 2c 01 00 00 0a 00 00 00
++# If <HBBI: seg_id=0x012c=300, flags=0, resv=0, body_len=10 -> "xxxxxxxxxx" (10 bytes) -> total=8+10+pad(2)=20 OK!
++# Next at offset 60: 04 00 00 00 00 01 00 00
++# If <HBBI: seg_id=4, flags=0, resv=0, body_len=0x00000100=256 -> that's way too big!
++
++# Wait... let me re-read offset 60 more carefully
++print("\nBytes at offset 60:")
++for i in range(60, 80):
++    print(f'  [{i}] = 0x{data[i]:02x} ({data[i]})')
++
++# Hmm, what if the segment header is actually different?
++# What if it's <HHI = seg_id(H), flags(H), body_len(I) = 8 bytes still but different field sizes?
++# Or what if body_len is only 2 bytes?
++
++# Let me try: <HBBH + padding to 8 bytes? No, that's only 6 bytes.
++# What about <HHHH = 8 bytes? seg_id(H), flags(H), reserved(H), body_len(H)
++# At offset 60: 04 00 | 00 00 | 00 01 | 00 00 
++# seg_id=4, flags=0, reserved=0x0100=256(?), body_len=0
++# That doesn't make sense either.
++
++# Let me try: <IHH = body_len(I), seg_id(H), flags(H) = 8 bytes
++# At offset 16: 01 00 00 00 | 05 00 | 00 00 -> body_len=1, seg_id=5, flags=0 ???
++# That doesn't match well either since "alpha" is 5 bytes.
++
++# Actually wait - let me reconsider. The current code has <HBBI which is correct for the first 3 segments.
++# Let me look at segment 3 more carefully.
++
++# After seg2 (offset 40, total 20), next should be offset 60.
++# Bytes at 60: 04 00 00 00 00 01 00 00
++# With <HBBI: seg_id=4, flags=0, resv=0, body_len=256
++# But then we'd need 256 bytes of payload starting at offset 68...
++# data[68:68+256] would go up to offset 324, and then padding to align...
++# total = 8 + 256 + pad = 264 + 0 = 264
++# Next segment would be at 60 + 264 = 324
++# Then index at 344 means there's room for one more segment between 324 and 344 (20 bytes)
++
++# Let me check if this interpretation works
++pos = 16
++segs_actual = []
++for i in range(5):
++    sid = struct.unpack_from('<H', data, pos)[0]
++    fl = data[pos+2]
++    rv = data[pos+3]
++    bl = struct.unpack_from('<I', data, pos+4)[0]
++    pad = (-(8+bl)) % 4
++    total = 8 + bl + pad
++    payload = data[pos+8:pos+8+min(bl, 50)]
++    segs_actual.append((pos, sid, fl, rv, bl, total))
++    print(f'Seg{i}: off={pos} id={sid} fl={fl} rv={rv} body_len={bl} total={total}')
++    if bl <= 50:
++        print(f'  payload: {data[pos+8:pos+8+bl]}')
++    else:
++        print(f'  payload(first 30): {payload[:30]}')
++    pos += total
++    
++print(f'\nFinal pos after all segs: {pos}')
++print(f'Index offset from header: 344')
++
++# Now let's see what the index says
++print('\n=== Index entries ===')
++idx_off = 344
++for i in range(5):
++    entry = struct.unpack_from('<I', data, idx_off + i*4)[0]
++    print(f'  Idx[{i}] = {entry}')
++
++# The index values are: 16, 16, 32, 8, 40
++# These don't match our computed offsets: 16, 32, 40, 60, 324
++# Something is fundamentally wrong with our understanding.
++
++# WAIT - maybe the index entry size is not 4 bytes?
++# Or maybe the index format is different?
++
++# Let me look at the raw bytes around the index area
++print('\n=== Raw bytes around index area (offset 340-392) ===')
++for i in range(340, min(392, len(data)), 4):
++    val = struct.unpack_from('<I', data, i)[0]
++    raw = ' '.join(f'{data[j]:02x}' for j in range(i, min(i+4, len(data))))
++    print(f'  offset {i}: {raw} -> {val} (0x{val:08x})')
++
++# Maybe the trailer is bigger than 8 bytes?
++# Total file: 392 bytes
++# If index starts at 344 and has 5 entries of 4 bytes each = 20 bytes, index ends at 364
++# Trailer would be 392 - 364 = 28 bytes
++
++# What if each index entry is bigger? Like 8 bytes?
++# 5 * 8 = 40 bytes, index would end at 384, trailer = 8 bytes
++# Let me check
++print('\n=== Trying 8-byte index entries ===')
++for i in range(5):
++    off = idx_off + i * 8
++    if off + 8 <= len(data):
++        lo = struct.unpack_from('<I', data, off)[0]
++        hi = struct.unpack_from('<I', data, off+4)[0]
++        print(f'  Idx[{i}]: lo={lo} hi={hi}')
++
++# Or maybe the header format is different?
++# What if seg_count is at a different position?
++# Let me re-examine the header
++print('\n=== Re-examining header ===')
++print(f'Bytes 0-15: {" ".join(f"{data[i]:02x}" for i in range(16))}')
++# 57 4c 53 47 01 00 05 00 58 01 00 00 00 00 00 00
++# WLSG       ver=1 fl=0 
++# If seg_count is uint16 at offset 6: 05 00 = 5 ✓
++# If index_offset is uint32 at offset 8: 58 01 00 00 = 0x158 = 344 ✓
++
++# OK so header seems right. Let me reconsider the segment layout.
++# What if the segment header uses a DIFFERENT struct format?
++
++# Let me look at segment boundaries using the INDEX to find where segments really start
++# Index says: 16, 16, 32, 8, 40
++# But these can't all be file offsets because 8 < 16 (header size)
++# Unless they're RELATIVE offsets? Or something else?
++
++# What if index entries are not simple offsets but (offset, length) pairs?
++# With 4 bytes per entry, that's just one number per segment.
++
++# What if the index entries represent something else entirely?
++# Let me think about what values 16, 16, 32, 8, 40 could mean...
++# Segment lengths? 16, 16(no, seg0 total is 16), ...
++# Actually seg0 with body_len=5 has total=16 (8+5+3pad). So 16 matches!
++# Seg1 with body_len=0 has total=8. But index[1]=16, not 8.
++
++# Hmm. Let me try another interpretation.
++# What if the index stores segment SIZES rather than offsets?
++# Sizes: 16, ?, ?, ?, ?
++# We know seg0 occupies offsets 16..31 (16 bytes)
++# seg1 at 32..39 (8 bytes)
++# seg2 at 40..59 (20 bytes)
++# seg3 at 60..? 
++# seg4 at ?..343
++
++# Actually, let me try: what if seg3 at offset 60 has a SMALLER body_len?
++# Bytes at 60: 04 00 00 00 00 01 00 00
++# What if the format is actually <HHI instead of <HBBI?
++# <HHI: seg_id(H)=0x0004=4, flags_or_something(H)=0x0000, body_len(I)=0x00000100=256
++# Same result.
++
++# What if it's <IHB? body_len(I), seg_id(H), flags(B), reserved(B)?
++# At 16: body_len=1, seg_id=5, flags=0, resv=0 -- body_len=1 doesn't match "alpha"(5)
++
++# What if body_len is uint16?
++# <HHBB: seg_id(H), body_len(H), flags(B), resv(B) = 6 bytes, not 8
++# <HHHBB: seg_id(H), body_len(H), flags(H), resv(B), pad(B) = 8 bytes
++# At 16: seg_id=1, body_len=0, flags=0x0500... nah
++
++# Let me try yet another approach: use the known-good index offsets
++# to figure out actual segment boundaries.
++# BUT the index values 16,16,32,8,40 don't make sense as offsets.
++
++# UNLESS... the index is stored differently. What if each index entry
++# contains TWO fields packed into 4 bytes? Like two uint16s?
++print('\n=== Index entries as two uint16 each ===')
++for i in range(5):
++    off = idx_off + i * 4
++    a = struct.unpack_from('<H', data, off)[0]
++    b = struct.unpack_from('<H', data, off+2)[0]
++    print(f'  Idx[{i}]: a={a} b={b}')
++
++# Interesting! Let me see those values
+diff --git a/_analyze3.py b/_analyze3.py
+new file mode 100644
+index 0000000..f77a80f
+--- /dev/null
++++ b/_analyze3.py
+@@ -0,0 +1,158 @@
++import struct, zlib
++
++data = open('assets/sample.wlsg', 'rb').read()
++
++# Hypothesis: Index entries are 8 bytes each: <II = (segment_offset, body_length)
++# Header says seg_count=5, index_offset=344
++# Index region: 344 .. 344+5*8-1 = 344..383
++# Trailer: 384..391 (8 bytes)
++
++print("=== Hypothesis: 8-byte index entries (offset, body_len) ===")
++idx_off = 344
++for i in range(5):
++    seg_offset = struct.unpack_from('<I', data, idx_off + i*8)[0]
++    body_len = struct.unpack_from('<I', data, idx_off + i*8 + 4)[0]
++    print(f'  Idx[{i}]: seg_offset={seg_offset}, body_len={body_len}')
++
++# Results:
++# Idx[0]: seg_offset=16, body_len=16
++# Idx[1]: seg_offset=32, body_len=8
++# Idx[2]: seg_offset=40, body_len=24
++# Idx[3]: seg_offset=64, body_len=264
++# Idx[4]: seg_offset=328, body_len=16
++
++# Now let's verify by reading segments at those offsets with those body_lens
++print("\n=== Reading segments using index info ===")
++for i in range(5):
++    seg_offset = struct.unpack_from('<I', data, idx_off + i*8)[0]
++    body_len = struct.unpack_from('<I', data, idx_off + i*8 + 4)[0]
++    
++    # Read segment header at seg_offset
++    sid = struct.unpack_from('<H', data, seg_offset)[0]
++    fl = data[seg_offset+2]
++    rv = data[seg_offset+3]
++    hdr_body_len = struct.unpack_from('<I', data, seg_offset+4)[0]
++    
++    payload = data[seg_offset+8:seg_offset+8+body_len]
++    print(f'Seg{i}: file_off={seg_offset} seg_id={sid} fl={fl} rv={rv} hdr_bodylen={hdr_body_len} idx_bodylen={body_len}')
++    if body_len <= 40:
++        print(f'  payload: {payload}')
++    else:
++        print(f'  payload(first 20): {payload[:20]}...')
++        print(f'  payload(last 10): ...{payload[-10:]}')
++
++# Hmm, if idx_bodylen includes the header, then actual payload = body_len - 8
++# Let me try that
++print("\n=== Maybe body_len in index includes header? (payload = body_len - 8) ===")
++for i in range(5):
++    seg_offset = struct.unpack_from('<I', data, idx_off + i*8)[0]
++    total_size = struct.unpack_from('<I', data, idx_off + i*8 + 4)[0]
++    payload_len = total_size - 8
++    
++    sid = struct.unpack_from('<H', data, seg_offset)[0]
++    fl = data[seg_offset+2]
++    rv = data[seg_offset+3]
++    hdr_body_len = struct.unpack_from('<I', data, seg_offset+4)[0]
++    
++    payload = data[seg_offset+8:seg_offset+8+payload_len]
++    print(f'Seg{i}: off={seg_offset} id={sid} total={total_size} pay_len={payload_len} hdr_blen={hdr_body_len}')
++    if payload_len <= 40:
++        print(f'  payload: {payload}')
++    else:
++        print(f'  payload(first 20): {payload[:20]}...')
++
++# Another idea: maybe the index stores (offset, total_segment_size) where total includes header + payload + padding
++# Seg0: offset=16, total=16 -> 8 header + 5 payload + 3 pad = 16 ✓
++# Seg1: offset=32, total=8 -> 8 header + 0 payload = 8 ✓
++# Seg2: offset=40, total=24 -> 8 header + ? payload... 24-8=16 payload? But hdr says body_len=10
++#   Unless body_len=10 and padding to some other boundary?
++#   Actually 8+10=18, pad to 4 = 20, not 24.
++#   Pad to 8 = 24! So maybe ALIGNMENT=8?
++
++print("\n=== Trying ALIGNMENT=8 ===")
++def pad8(n):
++    return (-n) % 8
++
++pos = 16
++for i in range(5):
++    sid = struct.unpack_from('<H', data, pos)[0]
++    fl = data[pos+2]
++    rv = data[pos+3]
++    bl = struct.unpack_from('<I', data, pos+4)[0]
++    raw_size = 8 + bl
++    padded = raw_size + pad8(raw_size)
++    payload = data[pos+8:pos+8+bl]
++    print(f'Seg{i}: off={pos} id={sid} body_len={bl} raw={raw_size} padded={padded}')
++    if bl <= 30:
++        print(f'  payload: {payload}')
++    pos += padded
++
++print(f'Final pos: {pos}, expected index_offset: 344')
++
++# That doesn't match either. Let me try yet another approach.
++# What if the second field in the index is NOT body_len but something else?
++# Like the offset of the NEXT segment? Or the end offset?
++
++print("\n=== Maybe index entries are (start_offset, end_offset)? ===")
++for i in range(5):
++    start = struct.unpack_from('<I', data, idx_off + i*8)[0]
++    end = struct.unpack_from('<I', data, idx_off + i*8 + 4)[0]
++    size = end - start if end > start else '?'
++    print(f'  Idx[{i}]: start={start}, end={end}, size={size}')
++
++# Or (start_offset_of_payload, body_len)?
++print("\n=== Maybe (payload_offset, body_len)? ===")
++for i in range(5):
++    pay_off = struct.unpack_from('<I', data, idx_off + i*8)[0]
++    bl = struct.unpack_from('<I', data, idx_off + i*8 + 4)[0]
++    print(f'  Idx[{i}]: payload_at={pay_off}, body_len={bl}')
++
++# None of these make clean sense. Let me go back to basics.
++# Let me check: does the current code's pack() produce something that matches the sample structure?
++print("\n=== Current code pack output for same segments ===")
++# First, what ARE the actual segments in the sample?
++# From our parsing with <HBBI:
++# Seg0: id=1, payload=b'alpha' (5 bytes)
++# Seg1: id=2, payload=b'' (0 bytes)
++# Seg2: id=300, payload=b'xxxxxxxxxx' (10 bytes)
++# Seg3: id=0, payload=data[68:72] = \x00\x01\x00\x00 (4 bytes) -- suspicious
++# Seg4: broken
++
++# Let me try a completely different segment header format.
++# What if it's actually: <IHH = body_len(I), seg_id(H), flags(H)?
++print("\n=== Trying <IHH segment header ===")
++pos = 16
++for i in range(5):
++    bl = struct.unpack_from('<I', data, pos)[0]
++    sid = struct.unpack_from('<H', data, pos+4)[0]
++    fl = struct.unpack_from('<H', data, pos+6)[0]
++    pad = (-(8+bl)) % 4
++    total = 8 + bl + pad
++    payload = data[pos+8:pos+8+min(bl,30)]
++    print(f'Seg{i}: off={pos} body_len={bl} id={sid} flags={fl} total={total}')
++    if bl <= 30:
++        print(f'  payload: {payload}')
++    pos += total
++    if pos > 400:
++        print('  STOPPING - went too far')
++        break
++print(f'Final pos: {pos}')
++
++# Try <HHI: seg_id(H), flags(H), body_len(I)
++print("\n=== Trying <HHI segment header ===")
++pos = 16
++for i in range(5):
++    sid = struct.unpack_from('<H', data, pos)[0]
++    fl = struct.unpack_from('<H', data, pos+2)[0]
++    bl = struct.unpack_from('<I', data, pos+4)[0]
++    pad = (-(8+bl)) % 4
++    total = 8 + bl + pad
++    payload = data[pos+8:pos+8+min(bl,30)]
++    print(f'Seg{i}: off={pos} id={sid} flags={fl} body_len={bl} total={total}')
++    if bl <= 30:
++        print(f'  payload: {payload}')
++    pos += total
++    if pos > 400:
++        print('  STOPPING')
++        break
++print(f'Final pos: {pos}')
+diff --git a/_analyze4.py b/_analyze4.py
+new file mode 100644
+index 0000000..f9efc83
+--- /dev/null
++++ b/_analyze4.py
+@@ -0,0 +1,127 @@
++import struct, zlib
++
++data = open('assets/sample.wlsg', 'rb').read()
++
++# Confirmed: ALIGNMENT=8, index entries are 8 bytes (offset, total_size)
++# Header: 16 bytes
++# Segments: 16..343 (328 bytes)
++# Index: 344..383 (40 bytes = 5 * 8)
++# Trailer: 384..391 (8 bytes)
++
++idx_off = 344
++trailer_off = 384
++
++c1 = struct.unpack_from('<I', data, trailer_off)[0]
++c2 = struct.unpack_from('<I', data, trailer_off+4)[0]
++print(f'Trailer CRC1 = 0x{c1:08x} ({c1})')
++print(f'Trailer CRC2 = 0x{c2:08x} ({c2})')
++
++header = data[:16]
++seg_region = data[16:idx_off]  # 16..343
++index_region = data[idx_off:trailer_off]  # 344..383
++all_before = data[:trailer_off]  # 0..383
++
++# Try various CRC computations
++print('\n=== Standard zlib.crc32 ===')
++print(f'crc32(header):       0x{zlib.crc32(header) & 0xFFFFFFFF:08x}')
++print(f'crc32(seg_region):   0x{zlib.crc32(seg_region) & 0xFFFFFFFF:08x}')
++print(f'crc32(index_region): 0x{zlib.crc32(index_region) & 0xFFFFFFFF:08x}')
++print(f'crc32(hdr+seg):      0x{zlib.crc32(header+seg_region) & 0xFFFFFFFF:08x}')
++print(f'crc32(all_before):   0x{zlib.crc32(all_before) & 0xFFFFFFFF:08x}')
++
++print('\n=== crc32 ^ 0xFFFFFFFF ===')
++print(f'crc32(header)^FF:       0x{(zlib.crc32(header) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
++print(f'crc32(seg_region)^FF:   0x{(zlib.crc32(seg_region) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
++print(f'crc32(index_region)^FF: 0x{(zlib.crc32(index_region) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
++print(f'crc32(hdr+seg)^FF:      0x{(zlib.crc32(header+seg_region) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
++print(f'crc32(all_before)^FF:   0x{(zlib.crc32(all_before) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
++
++# Current implementation: crc32_update(data, value) = (zlib.crc32(data, value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++# compute_crc(data) = crc32_update(data, 0)
++# Note: zlib.crc32(data, 0) already starts with initial value 0
++# So compute_crc = (zlib.crc32(data, 0) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++
++# Let's also try without XOR
++print('\n=== Raw zlib.crc32 with different init values ===')
++for init in [0, 0xFFFFFFFF]:
++    print(f'crc32(hdr+seg, init=0x{init:08x}): 0x{zlib.crc32(header+seg_region, init) & 0xFFFFFFFF:08x}')
++    print(f'crc32(index, init=0x{init:08x}):    0x{zlib.crc32(index_region, init) & 0xFFFFFFFF:08x}')
++    print(f'crc32(all_before, init=0x{init:08x}): 0x{zlib.crc32(all_before, init) & 0xFFFFFFFF:08x}')
++
++# Now let me check what matches the trailer values
++print(f'\n=== Matching trailer values ===')
++print(f'CRC1 = 0x{c1:08x}')
++print(f'CRC2 = 0x{c2:08x}')
++
++candidates = {
++    'crc32(header)': zlib.crc32(header) & 0xFFFFFFFF,
++    'crc32(seg)': zlib.crc32(seg_region) & 0xFFFFFFFF,
++    'crc32(idx)': zlib.crc32(index_region) & 0xFFFFFFFF,
++    'crc32(hdr+seg)': zlib.crc32(header+seg_region) & 0xFFFFFFFF,
++    'crc32(all)': zlib.crc32(all_before) & 0xFFFFFFFF,
++    'crc32(header)^FF': (zlib.crc32(header) ^ 0xFFFFFFFF) & 0xFFFFFFFF,
++    'crc32(seg)^FF': (zlib.crc32(seg_region) ^ 0xFFFFFFFF) & 0xFFFFFFFF,
++    'crc32(idx)^FF': (zlib.crc32(index_region) ^ 0xFFFFFFFF) & 0xFFFFFFFF,
++    'crc32(hdr+seg)^FF': (zlib.crc32(header+seg_region) ^ 0xFFFFFFFF) & 0xFFFFFFFF,
++    'crc32(all)^FF': (zlib.crc32(all_before) ^ 0xFFFFFFFF) & 0xFFFFFFFF,
++}
++
++for name, val in candidates.items():
++    if val == c1:
++        print(f'  CRC1 matches: {name} = 0x{val:08x}')
++    if val == c2:
++        print(f'  CRC2 matches: {name} = 0x{val:08x}')
++
++# Hmm, none match? Let me check more carefully.
++# The task says "must be a common 32-bit CRC variant"
++# Let me try CRC-32/MPEG-2, CRC-32/BZIP2, etc.
++# These use different polynomials or no final XOR
++
++# Actually, wait. Let me look at this from a different angle.
++# The current code in pack() computes:
++#   trailer = _TRAILER.pack(compute_crc(index_region), compute_crc(bytes(header) + bytes(checksummed)))
++# where checksummed includes header + segment headers+bodies (without padding!)
++
++# But with ALIGNMENT=8, maybe the checksum covers different data.
++# Let me try: checksum covers header + entire segment region (including padding)
++
++# Also, maybe the two CRCs are:
++# CRC1 = crc of index region
++# CRC2 = crc of (header + segment region)
++
++# Let me check the empty sample too
++print('\n=== Empty sample ===')
++edata = open('assets/sample_empty.wlsg', 'rb').read()
++print(f'Length: {len(edata)}')
++for i in range(0, len(edata), 16):
++    chunk = edata[i:i+16]
++    hx = ' '.join(f'{b:02x}' for b in chunk)
++    print(f'{i:04x}: {hx}')
++
++if len(edata) >= 24:
++    e_magic = edata[0:4]
++    e_ver = edata[4]
++    e_fl = edata[5]
++    e_sc = struct.unpack_from('<H', edata, 6)[0]
++    e_io = struct.unpack_from('<I', edata, 8)[0]
++    print(f'Magic: {e_magic}, Ver: {e_ver}, Flags: {e_fl}, SegCount: {e_sc}, IdxOff: {e_io}')
++    
++    if e_sc == 0:
++        # Index is empty, trailer should start right after header
++        # Or does index_offset tell us where it starts?
++        print(f'Index offset: {e_io}')
++        # With 0 segments, index has 0 entries
++        # Trailer would be at e_io + 0 = e_io
++        if e_io + 8 <= len(edata):
++            ec1 = struct.unpack_from('<I', edata, e_io)[0]
++            ec2 = struct.unpack_from('<I', edata, e_io+4)[0]
++            print(f'Empty trailer CRC1 = 0x{ec1:08x}')
++            print(f'Empty trailer CRC2 = 0x{ec2:08x}')
++            
++            # What data would these CRCs cover?
++            e_header = edata[:16]
++            e_all_before = edata[:e_io]
++            print(f'crc32(empty header): 0x{zlib.crc32(e_header) & 0xFFFFFFFF:08x}')
++            print(f'crc32(header)^FF: 0x{(zlib.crc32(e_header) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
++            print(f'crc32(all_before_trailer): 0x{zlib.crc32(e_all_before) & 0xFFFFFFFF:08x}')
++            print(f'crc32(all_before)^FF: 0x{(zlib.crc32(e_all_before) ^ 0xFFFFFFFF) & 0xFFFFFFFF:08x}')
+diff --git a/_analyze_tmp.py b/_analyze_tmp.py
+new file mode 100644
+index 0000000..4e3ffb5
+--- /dev/null
++++ b/_analyze_tmp.py
+@@ -0,0 +1,169 @@
++import struct, zlib
++
++data = open('assets/sample.wlsg', 'rb').read()
++print(f'Total length: {len(data)}')
++
++# Header
++magic = data[0:4]
++ver = data[4]
++fl = data[5]
++sc = struct.unpack_from('<H', data, 6)[0]
++io_off = struct.unpack_from('<I', data, 8)[0]
++reserved = struct.unpack_from('<I', data, 12)[0]
++print(f'Magic: {magic}')
++print(f'Version: {ver}, Flags: {fl}')
++print(f'Seg count: {sc}')
++print(f'Index offset: {io_off}')
++print(f'Reserved: {reserved}')
++
++# Parse segments manually
++pos = 16
++seg_info = []
++for i in range(sc):
++    if pos + 8 > len(data):
++        print(f'ERROR: not enough data for seg header at {pos}')
++        break
++    sid = struct.unpack_from('<H', data, pos)[0]
++    flag = data[pos+2]
++    rv = data[pos+3]
++    bl = struct.unpack_from('<I', data, pos+4)[0]
++    payload = data[pos+8:pos+8+bl]
++    pad = (-(8 + bl)) % 4
++    total = 8 + bl + pad
++    seg_info.append((pos, sid, flag, rv, bl, payload, total))
++    print(f'Seg{i}: off={pos} id={sid} fl={flag} rv={rv} body_len={bl} total={total} payload_preview={payload[:30]}')
++    pos += total
++
++print(f'\nAfter all segments: pos={pos}')
++print(f'Expected index offset: {io_off}')
++print(f'Match: {pos == io_off}')
++
++# Index entries
++print('\nIndex entries:')
++idx_pos = io_off
++index_offsets = []
++for i in range(sc):
++    off = struct.unpack_from('<I', data, idx_pos)[0]
++    index_offsets.append(off)
++    print(f'  Idx[{i}] = {off}')
++    idx_pos += 4
++
++# Compare index offsets with actual segment offsets
++print('\nIndex vs actual segment offsets:')
++for i in range(sc):
++    actual = seg_info[i][0]
++    indexed = index_offsets[i]
++    match = 'OK' if actual == indexed else 'MISMATCH'
++    print(f'  Seg{i}: actual={actual} indexed={indexed} {match}')
++
++# Trailer
++tr_start = idx_pos
++print(f'\nTrailer starts at: {tr_start}')
++print(f'File ends at: {len(data)}')
++print(f'Trailer bytes remaining: {len(data) - tr_start}')
++
++if tr_start + 8 <= len(data):
++    c1 = struct.unpack_from('<I', data, tr_start)[0]
++    c2 = struct.unpack_from('<I', data, tr_start+4)[0]
++    print(f'CRC1 = 0x{c1:08x} ({c1})')
++    print(f'CRC2 = 0x{c2:08x} ({c2})')
++
++# Try various CRC computations to figure out the algorithm
++print('\n--- CRC analysis ---')
++
++# Standard zlib crc32
++header_data = data[:16]
++seg_region = data[16:io_off]
++index_region = data[io_off:tr_start]
++all_before_trailer = data[:tr_start]
++
++print(f'Header region: {len(header_data)} bytes')
++print(f'Segment region: {len(seg_region)} bytes')
++print(f'Index region: {len(index_region)} bytes')
++
++# Standard CRC32 variants
++crc_std_header = zlib.crc32(header_data) & 0xFFFFFFFF
++crc_std_seg = zlib.crc32(seg_region) & 0xFFFFFFFF
++crc_std_idx = zlib.crc32(index_region) & 0xFFFFFFFF
++crc_std_all = zlib.crc32(all_before_trailer) & 0xFFFFFFFF
++crc_std_hdr_seg = zlib.crc32(header_data + seg_region) & 0xFFFFFFFF
++
++print(f'std crc32(header):       0x{crc_std_header:08x}')
++print(f'std crc32(seg_region):   0x{crc_std_seg:08x}')
++print(f'std crc32(index_region): 0x{crc_std_idx:08x}')
++print(f'std crc32(hdr+seg):      0x{crc_std_hdr_seg:08x}')
++print(f'std crc32(all_before):   0x{crc_std_all:08x}')
++
++# XOR with 0xFFFFFFFF
++print(f'std crc32(header)^FF:       0x{(crc_std_header^0xFFFFFFFF)&0xFFFFFFFF:08x}')
++print(f'std crc32(seg_region)^FF:   0x{(crc_std_seg^0xFFFFFFFF)&0xFFFFFFFF:08x}')
++print(f'std crc32(index_region)^FF: 0x{(crc_std_idx^0xFFFFFFFF)&0xFFFFFFFF:08x}')
++print(f'std crc32(hdr+seg)^FF:      0x{(crc_std_hdr_seg^0xFFFFFFFF)&0xFFFFFFFF:08x}')
++print(f'std crc32(all_before)^FF:   0x{(crc_std_all^0xFFFFFFFF)&0xFFFFFFFF:08x}')
++
++# Current implementation's compute_crc
++def current_crc32_update(data_bytes, value=0):
++    return (zlib.crc32(bytes(data_bytes), value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++
++def current_compute_crc(data_bytes):
++    return current_crc32_update(data_bytes, 0)
++
++print(f'\ncurrent compute_crc(header):       0x{current_compute_crc(header_data):08x}')
++print(f'current compute_crc(seg_region):   0x{current_compute_crc(seg_region):08x}')
++print(f'current compute_crc(index_region): 0x{current_compute_crc(index_region):08x}')
++print(f'current compute_crc(hdr+seg):      0x{current_compute_crc(header_data+seg_region):08x}')
++print(f'current compute_crc(all_before):   0x{current_compute_crc(all_before_trailer):08x}')
++
++# Check what the trailer CRC values are
++if tr_start + 8 <= len(data):
++    c1 = struct.unpack_from('<I', data, tr_start)[0]
++    c2 = struct.unpack_from('<I', data, tr_start+4)[0]
++    print(f'\nTrailer CRC1 = 0x{c1:08x}')
++    print(f'Trailer CRC2 = 0x{c2:08x}')
++    
++    # What matches CRC1?
++    print('\nWhat matches CRC1?')
++    if c1 == crc_std_idx: print('  -> std crc32(index_region)')
++    if c1 == (crc_std_idx^0xFFFFFFFF)&0xFFFFFFFF: print('  -> std crc32(index_region)^FF')
++    if c1 == current_compute_crc(index_region): print('  -> current_compute_crc(index_region)')
++    
++    print('What matches CRC2?')
++    if c2 == crc_std_hdr_seg: print('  -> std crc32(hdr+seg)')
++    if c2 == (crc_std_hdr_seg^0xFFFFFFFF)&0xFFFFFFFF: print('  -> std crc32(hdr+seg)^FF')
++    if c2 == current_compute_crc(header_data+seg_region): print('  -> current_compute_crc(hdr+seg)')
++    if c2 == crc_std_all: print('  -> std crc32(all_before_trailer)')
++    if c2 == current_compute_crc(all_before_trailer): print('  -> current_compute_crc(all_before_trailer)')
++
++# Let's also look at how the current code computes checksums in pack()
++# In pack(), it does:
++#   checksummed = header + (for each seg: encoded[:SEGMENT_HEADER_SIZE + len(payload)])
++# That means it excludes padding from checksum computation!
++print('\n--- Simulating current pack checksum logic ---')
++checksummed = bytearray(data[:16])  # header
++for si in seg_info:
++    off, sid, flag, rv, bl, payload, total = si
++    # The segment as stored in file includes padding
++    seg_bytes = data[off:off+total]
++    # Current code only checksums header + body (no padding)
++    checksummed += seg_bytes[:8+bl]
++    
++cc = current_compute_crc(bytes(checksummed))
++print(f'current checksum (hdr + seg_hdr+body no pad): 0x{cc:08x}')
++if tr_start + 8 <= len(data):
++    c2 = struct.unpack_from('<I', data, tr_start+4)[0]
++    print(f'Trailer CRC2:                                  0x{c2:08x}')
++    print(f'Match: {cc == c2}')
++
++# What about just header + full segment region (including padding)?
++cc2 = current_compute_crc(data[:io_off])
++print(f'current checksum (hdr + full seg region):      0x{cc2:08x}')
++if tr_start + 8 <= len(data):
++    c2 = struct.unpack_from('<I', data, tr_start+4)[0]
++    print(f'Match: {cc2 == c2}')
++
++# Standard crc32 of header + full segment region
++cc3 = zlib.crc32(data[:io_off]) & 0xFFFFFFFF
++print(f'std crc32(hdr + full seg region):              0x{cc3:08x}')
++if tr_start + 8 <= len(data):
++    c2 = struct.unpack_from('<I', data, tr_start+4)[0]
++    print(f'Match: {cc3 == c2}')
+diff --git a/_test_errors.py b/_test_errors.py
+new file mode 100644
+index 0000000..dd00112
+--- /dev/null
++++ b/_test_errors.py
+@@ -0,0 +1,94 @@
++"""Test error classification."""
++import io
++from wlogseg import pack, unpack, verify, WSegError, iter_segments
++
++# Test 1: Bad magic
++print("=== Bad magic ===")
++blob = bytearray(pack([(1, b"a")]))
++blob[0:4] = b"XXXX"
++try:
++    unpack(bytes(blob))
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: magic)")
++assert not verify(bytes(blob))
++
++# Test 2: Bad version
++print("=== Bad version ===")
++blob = bytearray(pack([(1, b"a")]))
++blob[4] = 99
++try:
++    unpack(bytes(blob))
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: version)")
++assert not verify(bytes(blob))
++
++# Test 3: Truncated - too short
++print("=== Truncated (too short) ===")
++blob = pack([(1, b"a")])[:10]
++try:
++    unpack(blob)
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: truncated)")
++assert not verify(blob)
++
++# Test 4: Truncated - segment payload cut off
++print("=== Truncated (segment payload cut) ===")
++blob = bytearray(pack([(1, b"hello world")]))
++# Cut off some payload bytes
++truncated = bytes(blob[:20])
++try:
++    unpack(truncated)
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: truncated or structure)")
++assert not verify(truncated)
++
++# Test 5: Checksum mismatch - tampered content
++print("=== Checksum (tampered content) ===")
++blob = bytearray(pack([(1, b"alpha")]))
++# Tamper with payload
++blob[17] = 0xFF
++try:
++    unpack(bytes(blob))
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: checksum)")
++assert not verify(bytes(blob))
++
++# Test 6: Structure - index offset beyond container
++print("=== Structure (bad index offset) ===")
++blob = bytearray(pack([(1, b"a")]))
++# Set index_offset to something huge
++import struct
++struct.pack_into('<I', blob, 8, 99999)
++try:
++    unpack(bytes(blob))
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: structure)")
++assert not verify(bytes(blob))
++
++# Test 7: Invalid seg_id in pack
++print("=== Pack with invalid seg_id ===")
++try:
++    pack([(70000, b"x")])
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: structure)")
++
++# Test 8: Non-bytes payload in pack
++print("=== Pack with non-bytes payload ===")
++try:
++    pack([(1, "string")])
++except WSegError as e:
++    print(f"  kind={e.kind} (expected: structure)")
++
++# Test 9: verify never raises
++print("=== verify never raises ===")
++for bad_input in [b"", b"x", b"WLSG", b"WLSG\x01\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00", None]:
++    try:
++        if bad_input is None:
++            result = verify(bad_input)
++        else:
++            result = verify(bad_input)
++        print(f"  verify({bad_input!r:.30}) = {result}")
++    except Exception as e:
++        print(f"  ERROR: verify raised {type(e).__name__}: {e}")
++
++print("\nAll error tests passed!")
+diff --git a/_test_stream.py b/_test_stream.py
+new file mode 100644
+index 0000000..3fcd54a
+--- /dev/null
++++ b/_test_stream.py
+@@ -0,0 +1,41 @@
++"""Test that iter_segments doesn't use read() without arguments."""
++import io
++from wlogseg import iter_segments, pack, unpack, WSegError
++
++class TrackingBytesIO(io.BytesIO):
++    """A BytesIO that tracks read calls and rejects read() / read(-1)."""
++    def __init__(self, data):
++        super().__init__(data)
++        self.read_calls = []
++    
++    def read(self, n=-1):
++        if n is None or n < 0:
++            raise RuntimeError(f"iter_segments called read({n}) - should use read(n) with positive n!")
++        self.read_calls.append(n)
++        return super().read(n)
++
++# Test with sample file
++data = open('assets/sample.wlsg', 'rb').read()
++tracker = TrackingBytesIO(data)
++segs = list(iter_segments(tracker))
++expected = unpack(data)
++print(f"Segments match: {segs == expected}")
++print(f"Read calls: {tracker.read_calls}")
++print(f"Max read size: {max(tracker.read_calls)}")
++print(f"All reads are bounded: {all(n > 0 for n in tracker.read_calls)}")
++
++# Test with empty sample
++edata = open('assets/sample_empty.wlsg', 'rb').read()
++tracker2 = TrackingBytesIO(edata)
++segs2 = list(iter_segments(tracker2))
++print(f"\nEmpty segments match: {segs2 == []}")
++print(f"Read calls: {tracker2.read_calls}")
++
++# Test with our own packed data
++pdata = pack([(1, b"hello"), (2, b"world")])
++tracker3 = TrackingBytesIO(pdata)
++segs3 = list(iter_segments(tracker3))
++print(f"\nPacked segments match: {segs3 == [(1, b'hello'), (2, b'world')]}")
++print(f"Read calls: {tracker3.read_calls}")
++
++print("\nStream tests passed!")
+diff --git a/tests/__pycache__/test_wlogseg_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wlogseg_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6bf24a7157803703a7de9b6a72d299b0039b5d5
+GIT binary patch
+literal 11209
+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
+DlKz%9
+
+literal 0
+HcmV?d00001
+
+diff --git a/wlogseg/__pycache__/codec.cpython-312.pyc b/wlogseg/__pycache__/codec.cpython-312.pyc
+index 7962648dd31b9342fdb5976016bee380d6cff078..b2f8538391e7f2f3b439ba45b9a15db9e1cd6168 100644
+GIT binary patch
+delta 2749
+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
+
+delta 2242
+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
+
+diff --git a/wlogseg/__pycache__/crc.cpython-312.pyc b/wlogseg/__pycache__/crc.cpython-312.pyc
+index 99710615c688026a4be1a7fb39a2c1ee3fe8b2bc..a75829e40fcc1188bd7bc1402fe598d59f18c2e4 100644
+GIT binary patch
+delta 86
+zcmdnQzKossG%qg~0}#A4J(u-(BJVmzw~2dPCbKcFP>=zNHZVNl=I^)aw3?DS!)0>z
+o0@KUfnk&36a+_UXG248ZaW5mI#N>(0qTJ?RxL6n!i+F%q0Jl&Yg8%>k
+
+delta 109
+zcmZ3+zKNapG%qg~0}x2|pUL_(k#`-V&%`}0j64&6uT@n93O6u3;SuQf>hzjYIwNFq
+z^#a$+JX$NFF7lY~u)4_YdV$4t^9jbij7pL~r5~6X85wUfm_KDudd$H6g^h{PjqwW?
+L3!`EY4^S2Wy-^{a
+
+diff --git a/wlogseg/__pycache__/header.cpython-312.pyc b/wlogseg/__pycache__/header.cpython-312.pyc
+index 1b472c1e13ea6ba98b4e47d78351e5bec9995a90..be4eb86f9a26f8a7c0fd1bc738d98bb775ea43be 100644
+GIT binary patch
+delta 35
+pcmcb^bBBlfG%qg~0}y;SJ-3m2IWuQTQE6UsVo7Ss=H1K-nE=c&3=#kU
+
+delta 35
+pcmcb^bBBlfG%qg~0}x2|pV`R0oSCz@q^LBxq_ik?^KRyaOaQ^43$p+K
+
+diff --git a/wlogseg/__pycache__/index.cpython-312.pyc b/wlogseg/__pycache__/index.cpython-312.pyc
+index 95103056a8d267cadaa688bbfd9c247d597ead5c..e429a3b6c79105df782d2a485d3ba791755f7ee7 100644
+GIT binary patch
+delta 708
+zcmeC-Ud+RLnwOW00SG>sp39m#k#`?A2ar?6Y~$&f%s5$*NrbU(;ww3B6$XYFCI*ID
+zrdsC7yo?(4HOwiDRg4S_tAT<bP{j+BWb9F6VJKmTh%hkJFs=rw0D)izO{P*mAmiD*
+zmZ!USJ>RnE>7J=idv-l;Xi7*(%_}L&Of61GP<S?Dy@E!5T3T^xiH<@^eo10Zd~s@e
+zE>J;yab{Jjroz+pJD<;LdAh5g?P<q!pytU5jC#r}x7eXZ++xlzExE-8G2s>qNKY{f
+z&{l=Xs~Gj11%WI+ATD+Q5)BMbxP-g48=P-T$anH|uuWjO!NJ{A)?eLOJ;Q8)*F|Z)
+z4J;d~E*dyq=6AZt;nd0eftf*4VX^>|D&wEYW=w627L)ffIa`8)gsqmnh9wK=e{@j8
+zR>Pjg1PcR3h8`;xh8h-NSg@4(O*UrM*TwKG%#%Rhy;!&c=)qf@B}Juq$%!SYDU&Oi
+zqZm0RUtv}-W6Uf9d8CLRNECyjO92Xs1c01d+y#k6#i{X`c`2zCMe;xqF_5~R$r>zP
+z^}Iq8O#5Ow81IP7UKiKAD6Y9eWdrku#4A=_7tOpb8hBk6_l5-re?MO*-wd_|EEDRk
+za;SY^W#E(gz{bEM+~8Lv1T;{S=@wg2YDsBPUJ*Bl%T^=>q`>SVX&~zsb0#oiWk6zz
+zAbIXv?D6rFU$f{Ki-Kg?f`L9uE-B&!DF8(c*rh8Oz-B}I!C{k|pHiBWYFDH&*^5<I
+XwDdBkYy;b8HdaQlF9Mv5!eFHUaLdT2
+
+delta 604
+zcmZ3?)5FbsnwOW00SF}f&t!2<<lQIF0_0RN*?1;1f`p-f4M;OHFfe{DnD|<bRhEIF
+zmT9sGqlWfssG=%fpb%pZP;&`8Oiv9XOg5N7lgV%LK}J0p=3DIfX=%l&CB?Ux^Gi!^
+zu|au2vl%7}G3i+d02zEhTx<#?8W`?y33qEZINuhM>|ndW!QE5VU)@<f!)$@qMQOdu
+z{Q4I;^gEe9Ff#~CO>SmVW&AdIB~u%t>0|?DXJeqlYT0U7vVaal2Q_RkhcPnrn6og{
+zumBy%Qfe`I4YR)ZvvpgaHugVXzWZ@Q(=E>8lA_Y&lG38o$s8<Eq3pL<QW8rNZ!s6-
+z7vEw{&M(aa`XDbgH6=BrhzDrPE!NDul+=nMum?clpa20y{2)p0g2bZY)Od&zIiQFr
+z5Er*i-pS%sFDN#lbec>D>m3oP>mq6wMbs9QtO(v<dd1rNqOtcyUGK{xKAoH$VmCPW
+z`}sQgCX`*}ko&;OASCyJje$qF!LLXVXp|<?Ew-XmpkwojxItXDB1s?xW*12TS+|%o
+z^Gb@OL1GF(LX-OzdwhIKesX;Lt;rp%YQ`cUHEh9P9~W_glz}3n2;|b03}71|{@}35
+k%}*)KNwq6dpZt(jSG43Zr%VIeXEqi_u`hg_jKW~003g7a_y7O^
+
+diff --git a/wlogseg/__pycache__/segment.cpython-312.pyc b/wlogseg/__pycache__/segment.cpython-312.pyc
+index 776d0ff4801e27372053ac47ef747364e54cdfcc..af4ce22137cffeee6fc6c407a8029a50d0a0726b 100644
+GIT binary patch
+delta 474
+zcmX|7J4*vW5YFY^xkpY(zz2aO8pB}|K^qYZD-jzzIm9Jo*F=aHnY##97UmDct^EN$
+z5c~_af{oZ*XPL&*Mi6%{oKt)=JCE<1+3Vu3YrQ&7At&r><85s1nOdMzJus*-K3-fi
+zA0#a0a)Cu%S{NyTExaYXLyOd-_DBs}Izt_iDPGF{?D&5F`A3l?=Oz!Uh8P3~0R<wY
+zs)8*raU<3}V_{7CEbPWT@c3<hS#tSHej+*iQC^p9{wbHF3jdZ5M1EJ9m@y2)PCI6l
+zZ>miz<yMiq%=>C%XAZ*!<TeSgh`|M;V2O963#d+QDqcEoL&Qk7LXWj618DGf_2|kK
+z&AyTjCh}<*CmOJL2qCOsL4rIw15!0i!8}3<0maicXl6NIgIX3t{lC7HMZTBlgwR2U
+zkfcD!$&f#3H7z~O<R4nSRmRTr2R)1`2n_*uIlxV)_ZVAe13K)pZD{ePeyCvO4{}0i
+Ai~s-t
+
+delta 493
+zcmX|7Jx>Bb5ar;$kGlguNRWgeB6zWpL_1@low2bq7vqMoE11Y(<_;4p3+WBn#(!YY
+z${*k_&=~9c2b9Lr#JF<^TfBKY^Jd@7{yKNA^=8{<N}S^T`^Y*pG+(2-uTx`mR%)8h
+z5|&aa-=Z$HhO(a(F)N}?b2Lxwq2fDqfjT1N-ekPR(bG|SBENiVlH~9o2{sMU3=V=N
+zAjIb?U<-_$kac=2h{z=iI#Cz${2^VFT>hG#h~CG{c3~=GLAy^G`By`ke`St^>_DCv
+zVFZJAGyukTl!ld9DQH#T9c6vLh_r-O1_2f_xMmcx;vQ-OD$_HaW$CH~;oO6CS&K4&
+zI{#2kZ(Skw<fJjqTm(_90u!DAG_W8+8iNjr8>V0dVHp9<6B%sGa-Is+8Hcrby*6WB
+zF4hR4{Wc-7NyzztkJVK*S<U31YIUoC%H%`y$jS(H0pk?lq|<%$-Cmy#F4-P5c~v`+
+GvGNB{+;77G
+
+diff --git a/wlogseg/__pycache__/stream.cpython-312.pyc b/wlogseg/__pycache__/stream.cpython-312.pyc
+index c5d0417593ba5f73a140e73216232f879cc8ef9b..9ae26910c4c44607a4819080ddcbe3dcde7e07bc 100644
+GIT binary patch
+literal 3858
+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
+BFaZDn
+
+literal 1124
+zcmY*YU2GIp6ux(6cDlQh*8YJ(SRMHZjv+j>hKFt?A=U>q0R@c7rereAy=}M7PjlxE
+z&Ehs$8xm_FYz>5xh$bc`qSg2WA(RK-<zWj1^rj>v?XKkwtPkRo=WchX-em9n&bjBF
+z{m%K${Mz20MX<J2Z;$sX2(3sXSzybB*9TyqM+6lR!9?+}uM`xFh)Oh1^|gZ5#3?W3
+z>jfRKeg+lVNQShX(F*BO+RDZ+K!V1#PwTg;Yd<g6tCv<P(~o6p3k$;uf{;7B7zWW}
+zyy4U1V8U@fhTF_X$LQ$WjD^gVcgbo4uuC#~1mHb{fn6Dm|2Lu)xzIYNFjrd;l`+>6
+z%=PCeouCnQp;dXblN*UwR?gcKtBe;~|2E!{_%_ck(N{{6V;b|W<c6mbwD~^CGlWh6
+zmno&JT*C7hqjPBumDHcqNo;BHc6hgX^Sk<IH_g`~I%*fmK6An;d7(or=%vU+oW(AW
+z89m+0$EXP=b$pXia0Qf@hpmjzz(qv17!`wvJAq3@>ST%2NMz*UFy@p*)~9~RN~el+
+zlF7~pjh7~<NZWSc_|&$UEWlEQKIR0(qe3GNcZ62t)Q@C;P1F2m$6Eu#kd~jMWO&jG
+zM}hC~2A};CCD9JC%m$xN10Jznc$9%(RDf*_{arzijIL__^ZeO2D?`i1mN|0e!*AdD
+z@pNs+z&#_s-0|XNqqaAHYv`BW#djYJ9$6YZQp>+z+w;NQj-$2o(dEvq7vsyvFMM*p
+zbJvXaTSxcV>{AtW?S2-?Vx|x6JG3AFZ;s>~0B^j05Wqa*&nKviHg&0DR~bdFasr~K
+za2bE0oYOV1r|>b@aT86#D90~DlE&=pABz_nUteilyxy3ZTfI?Pz41eRW`6CPt00tx
+zn-yCM>x5X=4O=8<%`{mL93m|>vK`N3TfuBzzY3s&R&%dkJ#a7Ach~4&%Jt11pB<{@
+z`j(9Tn%4j9j?o{<Le6Ji(hggS&^KfknpccC2;XMgBy??CWNmvSmO}zUO0`7F4GDFd
+zq6(eLuPkcH-Xz(i@I6|GK-6M4=!Ycs=t1@h_++mlIhapWjPdViOC9a3qiqjS?oVCE
+NJ%4p8_zfmo@-Mm^8kqn9
+
+diff --git a/wlogseg/codec.py b/wlogseg/codec.py
+index 9197691..b429c55 100644
+--- a/wlogseg/codec.py
++++ b/wlogseg/codec.py
+@@ -7,7 +7,7 @@ import struct
+ from .crc import compute_crc
+ from .errors import WSegError
+ from .header import HEADER_SIZE, build_header, parse_header
+-from .index import INDEX_ENTRY_SIZE, build_index
++from .index import INDEX_ENTRY_SIZE, build_index, parse_index
+ from .segment import (
+     MAX_BODY,
+     MAX_SEG_ID,
+@@ -35,23 +35,24 @@ def pack(segments) -> bytes:
+             raise WSegError("structure", "payload is too large")
+         items.append((seg_id, body))
+ 
+-    offsets = []
+-    body = bytearray()
+-    checksummed = bytearray()
++    index_entries = []
++    seg_region = bytearray()
+     cursor = HEADER_SIZE
+     for seg_id, payload in items:
+         encoded = encode_segment(seg_id, payload)
+-        offsets.append(cursor)
+-        body += encoded
+-        checksummed += encoded[:SEGMENT_HEADER_SIZE + len(payload)]
+-        cursor += segment_length(len(payload))
++        index_entries.append((cursor, len(encoded)))
++        seg_region += encoded
++        cursor += len(encoded)
+ 
+     index_offset = cursor
+     header = build_header(len(items), index_offset)
+-    index_region = build_index(offsets)
+-    trailer = _TRAILER.pack(compute_crc(index_region),
+-                            compute_crc(bytes(header) + bytes(checksummed)))
+-    return bytes(header) + bytes(body) + index_region + trailer
++    index_region = build_index(index_entries)
++
++    crc_index = compute_crc(index_region)
++    crc_data = compute_crc(bytes(header) + bytes(seg_region))
++    trailer = _TRAILER.pack(crc_index, crc_data)
++
++    return bytes(header) + bytes(seg_region) + index_region + trailer
+ 
+ 
+ def unpack(data) -> list:
+@@ -61,35 +62,59 @@ def unpack(data) -> list:
+     data = bytes(data)
+ 
+     if len(data) < HEADER_SIZE + TRAILER_SIZE:
+-        raise WSegError("structure", f"container is only {len(data)} bytes")
++        raise WSegError("truncated", f"container is only {len(data)} bytes")
+ 
+-    _version, _flags, seg_count, index_offset = parse_header(data)
++    try:
++        _version, _flags, seg_count, index_offset = parse_header(data)
++    except WSegError:
++        raise
+ 
+     if index_offset > len(data):
+         raise WSegError("structure", f"index offset {index_offset} is beyond the container")
++
+     index_end = index_offset + INDEX_ENTRY_SIZE * seg_count
+     if index_end + TRAILER_SIZE > len(data):
+-        raise WSegError("structure", "the index and the trailer do not fit")
++        raise WSegError("truncated", "the index and the trailer do not fit")
+ 
+-    records = []
+-    checksummed = bytearray(data[:HEADER_SIZE])
+-    cursor = HEADER_SIZE
+-    for index in range(seg_count):
+-        if cursor + SEGMENT_HEADER_SIZE > len(data):
+-            raise WSegError("structure", f"segment {index} header is incomplete")
+-        seg_id, _seg_flags, body_len = parse_segment_header(data, cursor, len(data))
+-        start = cursor + SEGMENT_HEADER_SIZE
+-        if start + body_len > len(data):
+-            raise WSegError("structure", f"segment {index} payload is incomplete")
+-        records.append((seg_id, data[start:start + body_len]))
+-        checksummed += data[cursor:start + body_len]
+-        cursor += segment_length(body_len)
++    # Parse index entries
++    index_entries = parse_index(data, index_offset, seg_count)
+ 
++    # Validate and read segments using index
++    records = []
++    for idx, (seg_off, seg_total_size) in enumerate(index_entries):
++        if seg_off < HEADER_SIZE:
++            raise WSegError("structure", f"segment {idx} offset {seg_off} is within the header")
++        if seg_off + seg_total_size > index_offset:
++            raise WSegError("structure", f"segment {idx} extends beyond the segment region")
++        if seg_total_size < SEGMENT_HEADER_SIZE:
++            raise WSegError("structure", f"segment {idx} total size {seg_total_size} is too small")
++
++        seg_id, _seg_flags, body_len = parse_segment_header(data, seg_off, len(data))
++
++        expected_total = segment_length(body_len)
++        if expected_total != seg_total_size:
++            raise WSegError("structure",
++                            f"segment {idx}: declared body_len={body_len} implies "
++                            f"total={expected_total}, but index says {seg_total_size}")
++
++        payload_start = seg_off + SEGMENT_HEADER_SIZE
++        payload_end = payload_start + body_len
++        if payload_end > len(data):
++            raise WSegError("truncated", f"segment {idx} payload is incomplete")
++
++        records.append((seg_id, bytes(data[payload_start:payload_end])))
++
++    # Verify checksums
+     index_crc, data_crc = _TRAILER.unpack_from(data, len(data) - TRAILER_SIZE)
+-    if compute_crc(data[index_offset:index_end]) != index_crc:
++
++    actual_index_crc = compute_crc(data[index_offset:index_end])
++    if actual_index_crc != index_crc:
+         raise WSegError("checksum", "the index region does not match its checksum")
+-    if compute_crc(bytes(checksummed)) != data_crc:
++
++    actual_data_crc = compute_crc(data[:index_offset])
++    if actual_data_crc != data_crc:
+         raise WSegError("checksum", "the segment region does not match its checksum")
++
+     return records
+ 
+ 
+diff --git a/wlogseg/crc.py b/wlogseg/crc.py
+index 6656acb..a7c31c5 100644
+--- a/wlogseg/crc.py
++++ b/wlogseg/crc.py
+@@ -7,7 +7,7 @@ import zlib
+ 
+ def crc32_update(data, value: int = 0) -> int:
+     """在 ``value`` 的基础上继续累积校验和。"""
+-    return (zlib.crc32(bytes(data), value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++    return zlib.crc32(bytes(data), value) & 0xFFFFFFFF
+ 
+ 
+ def compute_crc(data) -> int:
+diff --git a/wlogseg/header.py b/wlogseg/header.py
+index a154161..12ddc2e 100644
+--- a/wlogseg/header.py
++++ b/wlogseg/header.py
+@@ -22,7 +22,7 @@ def build_header(seg_count: int, index_offset: int, flags: int = 0,
+ def parse_header(data: bytes):
+     """解析文件头，返回 (version, flags, seg_count, index_offset)。"""
+     if len(data) < HEADER_SIZE:
+-        raise WSegError("structure", f"header needs {HEADER_SIZE} bytes, got {len(data)}")
++        raise WSegError("truncated", f"header needs {HEADER_SIZE} bytes, got {len(data)}")
+     magic, version, flags, seg_count, index_offset, _reserved = _HEADER.unpack_from(data, 0)
+     if magic != MAGIC:
+         raise WSegError("magic", f"bad magic {magic!r}")
+diff --git a/wlogseg/index.py b/wlogseg/index.py
+index 6db48e1..a0780fa 100644
+--- a/wlogseg/index.py
++++ b/wlogseg/index.py
+@@ -6,25 +6,26 @@ import struct
+ 
+ from .errors import WSegError
+ 
+-INDEX_ENTRY_SIZE = 4
++INDEX_ENTRY_SIZE = 8
+ 
+-_ENTRY = struct.Struct("<I")
++_ENTRY = struct.Struct("<II")
+ 
+ 
+-def build_index(offsets) -> bytes:
++def build_index(entries) -> bytes:
++    """构建索引区。``entries`` 是 (offset, total_segment_size) 对的序列。"""
+     out = bytearray()
+-    for offset in offsets:
+-        out += _ENTRY.pack(offset & 0xFFFFFFFF)
++    for offset, size in entries:
++        out += _ENTRY.pack(offset & 0xFFFFFFFF, size & 0xFFFFFFFF)
+     return bytes(out)
+ 
+ 
+ def parse_index(data: bytes, pos: int, count: int):
+-    """读取 ``count`` 个索引条目，返回各段偏移。"""
++    """读取 ``count`` 个索引条目，返回各 (offset, total_size) 对列表。"""
+     needed = pos + INDEX_ENTRY_SIZE * count
+     if needed > len(data):
+-        raise WSegError("structure", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
+-    offsets = []
+-    for index in range(count):
+-        (offset,) = _ENTRY.unpack_from(data, pos + index * INDEX_ENTRY_SIZE)
+-        offsets.append(offset)
+-    return offsets
++        raise WSegError("truncated", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
++    entries = []
++    for i in range(count):
++        offset, size = _ENTRY.unpack_from(data, pos + i * INDEX_ENTRY_SIZE)
++        entries.append((offset, size))
++    return entries
+diff --git a/wlogseg/segment.py b/wlogseg/segment.py
+index cc8c196..c581b26 100644
+--- a/wlogseg/segment.py
++++ b/wlogseg/segment.py
+@@ -7,7 +7,7 @@ import struct
+ from .errors import WSegError
+ 
+ SEGMENT_HEADER_SIZE = 8
+-ALIGNMENT = 4
++ALIGNMENT = 8
+ MAX_SEG_ID = 0xFFFF
+ MAX_BODY = 0xFFFFFFFF
+ 
+@@ -32,6 +32,6 @@ def encode_segment(seg_id: int, payload: bytes, flags: int = 0) -> bytes:
+ def parse_segment_header(data: bytes, pos: int, limit: int):
+     """从 ``pos`` 读段头；``limit`` 是已经确认可读的字节上界。"""
+     if pos + SEGMENT_HEADER_SIZE > limit:
+-        raise WSegError("structure", f"segment header at {pos} is incomplete")
++        raise WSegError("truncated", f"segment header at {pos} is incomplete")
+     seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
+     return seg_id, flags, body_len
+diff --git a/wlogseg/stream.py b/wlogseg/stream.py
+index 2fee28f..48653d7 100644
+--- a/wlogseg/stream.py
++++ b/wlogseg/stream.py
+@@ -2,17 +2,100 @@
+ 
+ from __future__ import annotations
+ 
+-from .codec import unpack
++import struct
++
++from .crc import compute_crc, crc32_update
+ from .errors import WSegError
++from .header import HEADER_SIZE, parse_header
++from .index import INDEX_ENTRY_SIZE
++from .segment import SEGMENT_HEADER_SIZE, parse_segment_header, segment_length
++
++TRAILER_SIZE = 8
++_TRAILER = struct.Struct("<II")
++
++
++def _read_exact(handle, n: int, context: str = "") -> bytes:
++    """从 handle 精确读取 n 字节；不足时抛 WSegError("truncated")。"""
++    buf = bytearray()
++    while len(buf) < n:
++        chunk = handle.read(n - len(buf))
++        if not chunk:
++            raise WSegError("truncated",
++                            f"expected {n} bytes{f' for {context}' if context else ''}, "
++                            f"got {len(buf)}")
++        buf.extend(chunk)
++    return bytes(buf)
+ 
+ 
+ def iter_segments(handle):
+-    """产出 (seg_id, payload)。"""
+-    data = handle.read()
+-    if not isinstance(data, (bytes, bytearray, memoryview)):
+-        raise WSegError("structure", f"the stream returned {type(data).__name__}")
+-    for item in unpack(bytes(data)):
+-        yield item
++    """惰性产出 (seg_id, payload)，不将整个容器读入内存。
++
++    取完最后一段后仍校验尾部索引与尾部校验和；失败抛 WSegError。
++    """
++    # 1. Read and parse header
++    header_bytes = _read_exact(handle, HEADER_SIZE, "header")
++    _version, _flags, seg_count, index_offset = parse_header(header_bytes)
++
++    # Start incremental CRC for data region (header + segments)
++    data_crc_acc = crc32_update(header_bytes, 0)
++
++    # 2. Yield segments one by one
++    seg_region_consumed = 0
++
++    for idx in range(seg_count):
++        # Read segment header
++        seg_hdr = _read_exact(handle, SEGMENT_HEADER_SIZE, f"segment {idx} header")
++        seg_id, _seg_flags, body_len = parse_segment_header(seg_hdr, 0, SEGMENT_HEADER_SIZE)
++
++        total_size = segment_length(body_len)
++        padding_size = total_size - SEGMENT_HEADER_SIZE - body_len
++
++        # Accumulate CRC for segment header
++        data_crc_acc = crc32_update(seg_hdr, data_crc_acc)
++
++        # Read payload
++        if body_len > 0:
++            payload = _read_exact(handle, body_len, f"segment {idx} payload")
++            data_crc_acc = crc32_update(payload, data_crc_acc)
++        else:
++            payload = b""
++
++        # Read and discard padding, but include in CRC
++        if padding_size > 0:
++            pad_bytes = _read_exact(handle, padding_size, f"segment {idx} padding")
++            data_crc_acc = crc32_update(pad_bytes, data_crc_acc)
++
++        seg_region_consumed += total_size
++        yield (seg_id, payload)
++
++    # 3. Read any remaining segment-region bytes (shouldn't happen with valid data)
++    expected_seg_bytes = index_offset - HEADER_SIZE
++    if seg_region_consumed < expected_seg_bytes:
++        remaining = expected_seg_bytes - seg_region_consumed
++        extra = _read_exact(handle, remaining, "remaining segment region")
++        data_crc_acc = crc32_update(extra, data_crc_acc)
++
++    # Finalize data CRC
++    actual_data_crc = data_crc_acc & 0xFFFFFFFF
++
++    # 4. Read index
++    index_size = INDEX_ENTRY_SIZE * seg_count
++    if index_size > 0:
++        index_bytes = _read_exact(handle, index_size, "index")
++    else:
++        index_bytes = b""
++
++    # 5. Read trailer
++    trailer_bytes = _read_exact(handle, TRAILER_SIZE, "trailer")
++    index_crc, data_crc = _TRAILER.unpack_from(trailer_bytes, 0)
++
++    # 6. Verify checksums
++    actual_index_crc = compute_crc(index_bytes)
++    if actual_index_crc != index_crc:
++        raise WSegError("checksum", "the index region does not match its checksum")
++
++    if actual_data_crc != data_crc:
++        raise WSegError("checksum", "the data region does not match its checksum")
+ 
+ 
+ def read_all(handle) -> list:

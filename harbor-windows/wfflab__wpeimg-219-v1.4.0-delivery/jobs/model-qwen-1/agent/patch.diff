@@ -1,0 +1,2341 @@
+diff --git a/_tmp_acc_test.py b/_tmp_acc_test.py
+new file mode 100644
+index 0000000..7dd0d00
+--- /dev/null
++++ b/_tmp_acc_test.py
+@@ -0,0 +1,48 @@
++import sys, struct
++sys.path.insert(0, '.')
++from wpeimg.checksum import ChecksumAccumulator, compute_checksum
++
++with open('assets/amd64-module.bin', 'rb') as f:
++    data = f.read()
++
++# Test that accumulator gives same result regardless of chunk size
++# when feeding the SAME bytes (without skipping checksum field)
++ref_acc = ChecksumAccumulator()
++ref_acc.update(data)
++ref_val = ref_acc.value(len(data))
++
++print(f"Reference (one-shot full file): {ref_val:#x}")
++
++for chunk_size in [1, 2, 3, 7, 100, 512, 1024, 4096]:
++    acc = ChecksumAccumulator()
++    for i in range(0, len(data), chunk_size):
++        acc.update(data[i:i+chunk_size])
++    val = acc.value(len(data))
++    match = val == ref_val
++    if not match:
++        print(f"MISMATCH at chunk_size={chunk_size}: {val:#x} vs {ref_val:#x}")
++    
++print("All chunk sizes consistent:", all(
++    ChecksumAccumulator().update(data[:i]).update(data[i:]).value(len(data)) == ref_val
++    for i in [0, 1, 2, 100, 500, 1000]
++))
++
++# Also verify compute_checksum is stable
++cs = compute_checksum(data)
++print(f"\ncompute_checksum: {cs:#x}")
++
++# Verify it doesn't change when CheckSum field is modified
++data2 = bytearray(data)
++e_lfanew = struct.unpack_from('<I', data2, 0x3C)[0]
++opt_off = e_lfanew + 4 + 20
++struct.pack_into('<I', data2, opt_off + 64, 0xDEADBEEF)
++cs2 = compute_checksum(bytes(data2))
++print(f"After modifying CheckSum field: {cs2:#x}")
++print(f"Stable: {cs == cs2}")
++
++# Test accumulator agreement with compute_checksum per the smoke test
++blob = bytes(range(256)) * 3
++accumulator = ChecksumAccumulator()
++for start in range(0, len(blob), 100):
++    accumulator.update(blob[start:start + 100])
++print(f"\nSmoke test: accumulator.value == compute_checksum: {accumulator.value(len(blob)) == compute_checksum(blob)}")
+diff --git a/_tmp_analyze.py b/_tmp_analyze.py
+new file mode 100644
+index 0000000..5945901
+--- /dev/null
++++ b/_tmp_analyze.py
+@@ -0,0 +1,54 @@
++import struct
++
++def analyze(name):
++    with open('assets/'+name,'rb') as f:
++        data = f.read()
++    print('=== %s === size=%d' % (name, len(data)))
++    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++    coff = e_lfanew + 4
++    machine, nsec, _s, _st, _ns, size_opt, chars = struct.unpack_from('<HHIIIHH', data, coff)
++    opt_off = coff + 20
++    magic = struct.unpack_from('<H', data, opt_off)[0]
++    
++    if magic == 0x10B:
++        entry = struct.unpack_from('<I', data, opt_off + 16)[0]
++        image_base = struct.unpack_from('<I', data, opt_off + 28)[0]
++        section_align = struct.unpack_from('<I', data, opt_off + 32)[0]
++        file_align = struct.unpack_from('<I', data, opt_off + 36)[0]
++        size_of_image = struct.unpack_from('<I', data, opt_off + 56)[0]
++        size_of_headers = struct.unpack_from('<I', data, opt_off + 60)[0]
++        checksum = struct.unpack_from('<I', data, opt_off + 64)[0]
++        num_rva = struct.unpack_from('<I', data, opt_off + 92)[0]
++        dir_start = opt_off + 96
++    else:
++        entry = struct.unpack_from('<I', data, opt_off + 16)[0]
++        image_base = struct.unpack_from('<Q', data, opt_off + 24)[0]
++        section_align = struct.unpack_from('<I', data, opt_off + 32)[0]
++        file_align = struct.unpack_from('<I', data, opt_off + 36)[0]
++        size_of_image = struct.unpack_from('<I', data, opt_off + 56)[0]
++        size_of_headers = struct.unpack_from('<I', data, opt_off + 60)[0]
++        checksum = struct.unpack_from('<I', data, opt_off + 64)[0]
++        num_rva = struct.unpack_from('<I', data, opt_off + 108)[0]
++        dir_start = opt_off + 112
++    
++    print('ImageBase=%#x Entry=%#x SecAlign=%#x FileAlign=%#x' % (image_base, entry, section_align, file_align))
++    print('SizeOfImage=%#x SizeOfHeaders=%#x CheckSum=%#x NumRvaAndSizes=%d' % (size_of_image, size_of_headers, checksum, num_rva))
++    
++    names = ['export','import','resource','exception','certificate','relocation','debug','architecture','global_ptr','tls','load_config','bound_import','iat','delay_import','clr_runtime','reserved']
++    print('Directories:')
++    for i in range(min(num_rva, 16)):
++        va, sz = struct.unpack_from('<II', data, dir_start + i * 8)
++        print('  [%d] %s: VA=%#x Size=%#x' % (i, names[i], va, sz))
++    
++    sec_table_off = opt_off + size_opt
++    print('Section table at %#x:' % sec_table_off)
++    for i in range(nsec):
++        off = sec_table_off + i * 40
++        name_raw = data[off:off+8]
++        vs, va, rs, rp = struct.unpack_from('<IIII', data, off+8)
++        ch = struct.unpack_from('<I', data, off+36)[0]
++        print('  [%d] %r VA=%#x VSize=%#x RawPtr=%#x RawSize=%#x Chars=%#x' % (i, name_raw, va, vs, rp, rs, ch))
++    print()
++
++analyze('amd64-module.bin')
++analyze('i386-module.bin')
+diff --git a/_tmp_cert.py b/_tmp_cert.py
+new file mode 100644
+index 0000000..66e6869
+--- /dev/null
++++ b/_tmp_cert.py
+@@ -0,0 +1,113 @@
++import struct
++
++with open('assets/amd64-module.bin', 'rb') as f:
++    data = f.read()
++
++# Certificate table at offset 0x3600, size 0x33f8
++cert_off = 0x3600
++cert_size = 0x33f8
++
++print('File size:', len(data))
++print('Cert table: offset=%#x size=%#x' % (cert_off, cert_size))
++print('Cert table end:', cert_off + cert_size)
++
++# WIN_CERTIFICATE structure
++dwLength = struct.unpack_from('<I', data, cert_off)[0]
++wRevision = struct.unpack_from('<H', data, cert_off + 4)[0]
++wCertificateType = struct.unpack_from('<H', data, cert_off + 6)[0]
++
++print('WIN_CERTIFICATE:')
++print('  dwLength=%#x' % dwLength)
++print('  wRevision=%#x' % wRevision)
++print('  wCertificateType=%#x' % wCertificateType)
++
++# The body is PKCS#7 SignedData DER
++der_start = cert_off + 8
++der_data = data[der_start:der_start + dwLength - 8]
++print('DER body length:', len(der_data))
++print('First 100 bytes of DER:', der_data[:100].hex())
++
++# Parse ASN.1 DER to find content type
++# ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ... }
++def parse_tag_length(data, offset):
++    tag = data[offset]
++    offset += 1
++    length = data[offset]
++    offset += 1
++    if length & 0x80:
++        num_bytes = length & 0x7F
++        length = 0
++        for i in range(num_bytes):
++            length = (length << 8) | data[offset]
++            offset += 1
++    return tag, length, offset
++
++def parse_oid(data, offset, length):
++    """Parse an OID and return dot-notation string."""
++    end = offset + length
++    components = []
++    first = data[offset]
++    components.append(first // 40)
++    components.append(first % 40)
++    offset += 1
++    value = 0
++    while offset < end:
++        byte = data[offset]
++        value = (value << 7) | (byte & 0x7F)
++        offset += 1
++        if not (byte & 0x80):
++            components.append(value)
++            value = 0
++    return '.'.join(str(c) for c in components)
++
++tag, length, next_off = parse_tag_length(der_data, 0)
++print('\nOuter SEQUENCE: tag=%#x length=%d' % (tag, length))
++
++# Inside ContentInfo SEQUENCE: first element is OID (contentType)
++tag2, length2, next_off2 = parse_tag_length(der_data, next_off)
++print('ContentType: tag=%#x length=%d' % (tag2, length2))
++if tag2 == 0x06:  # OID
++    oid_str = parse_oid(der_data, next_off2, length2)
++    print('ContentType OID:', oid_str)
++
++# Now let's look at the SignedData content
++# ContentInfo.content is [0] EXPLICIT
++tag3, length3, next_off3 = parse_tag_length(der_data, next_off2 + length2)
++print('Content wrapper: tag=%#x length=%d' % (tag3, length3))
++
++# Inside the explicit tag, there's a SEQUENCE (SignedData)
++tag4, length4, next_off4 = parse_tag_length(der_data, next_off3)
++print('SignedData SEQUENCE: tag=%#x length=%d' % (tag4, length4))
++
++# SignedData ::= SEQUENCE {
++#   version INTEGER,
++#   digestAlgorithms SET OF AlgorithmIdentifier,
++#   contentInfo ContentInfo,
++#   certificates [0] IMPLICIT OPTIONAL,
++#   crls [1] IMPLICIT OPTIONAL,
++#   signerInfos SET OF SignerInfo
++# }
++
++# Version
++tag_v, len_v, off_v = parse_tag_length(der_data, next_off4)
++print('Version: tag=%#x length=%d value=%d' % (tag_v, len_v, der_data[off_v] if len_v == 1 else -1))
++off_after_version = off_v + len_v
++
++# DigestAlgorithms SET
++tag_da, len_da, off_da = parse_tag_length(der_data, off_after_version)
++print('DigestAlgorithms SET: tag=%#x length=%d' % (tag_da, len_da))
++
++# Parse algorithm identifiers inside the SET
++pos = off_da
++alg_end = off_da + len_da
++algorithms = []
++while pos < alg_end:
++    tag_ai, len_ai, off_ai = parse_tag_length(der_data, pos)
++    # AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }
++    tag_oid, len_oid, off_oid = parse_tag_length(der_data, off_ai)
++    if tag_oid == 0x06:
++        alg_oid = parse_oid(der_data, off_oid, len_oid)
++        algorithms.append(alg_oid)
++    pos = off_ai + len_ai
++
++print('Digest algorithms:', algorithms)
+diff --git a/_tmp_cert2.py b/_tmp_cert2.py
+new file mode 100644
+index 0000000..d8dbe3b
+--- /dev/null
++++ b/_tmp_cert2.py
+@@ -0,0 +1,107 @@
++import struct
++
++with open('assets/amd64-module.bin', 'rb') as f:
++    data = f.read()
++
++cert_off = 0x3600
++dwLength = struct.unpack_from('<I', data, cert_off)[0]
++der_start = cert_off + 8
++der_data = data[der_start:der_start + dwLength - 8]
++
++def parse_tag_length(data, offset):
++    tag = data[offset]
++    offset += 1
++    length = data[offset]
++    offset += 1
++    if length & 0x80:
++        num_bytes = length & 0x7F
++        length = 0
++        for i in range(num_bytes):
++            length = (length << 8) | data[offset]
++            offset += 1
++    return tag, length, offset
++
++def parse_oid(data, offset, length):
++    end = offset + length
++    components = []
++    first = data[offset]
++    components.append(first // 40)
++    components.append(first % 40)
++    offset += 1
++    value = 0
++    while offset < end:
++        byte = data[offset]
++        value = (value << 7) | (byte & 0x7F)
++        offset += 1
++        if not (byte & 0x80):
++            components.append(value)
++            value = 0
++    return '.'.join(str(c) for c in components)
++
++def skip_element(data, offset):
++    """Skip one TLV element, return offset after it."""
++    tag, length, content_off = parse_tag_length(data, offset)
++    return content_off + length
++
++# Navigate to SignedData SEQUENCE content
++tag, length, off = parse_tag_length(der_data, 0)  # ContentInfo SEQUENCE
++tag, length, off = parse_tag_length(der_data, off)  # contentType OID
++oid_end = off + length
++tag, length, off = parse_tag_length(der_data, oid_end)  # [0] EXPLICIT wrapper
++tag, length, off = parse_tag_length(der_data, off)  # SignedData SEQUENCE
++
++sd_content_start = off
++sd_content_end = off + length
++
++pos = sd_content_start
++
++# Version INTEGER
++tag, length, pos = parse_tag_length(der_data, pos)
++pos = pos + length
++
++# DigestAlgorithms SET
++tag, length, da_start = parse_tag_length(der_data, pos)
++da_end = da_start + length
++pos = da_end
++
++# ContentInfo SEQUENCE
++tag, length, ci_start = parse_tag_length(der_data, pos)
++ci_end = ci_start + length
++pos = ci_end
++
++# Now we might have:
++# certificates [0] IMPLICIT OPTIONAL
++# crls [1] IMPLICIT OPTIONAL  
++# signerInfos SET OF SignerInfo
++
++cert_count = 0
++signer_count = 0
++
++while pos < sd_content_end:
++    tag, length, content_off = parse_tag_length(der_data, pos)
++    
++    if tag == 0xA0:  # [0] certificates
++        # This is a SET OF Certificate
++        cert_set_start = content_off
++        cert_set_end = content_off + length
++        cpos = cert_set_start
++        while cpos < cert_set_end:
++            cpos = skip_element(der_data, cpos)
++            cert_count += 1
++        print('Found certificates [0], count=%d' % cert_count)
++    elif tag == 0xA1:  # [1] crls
++        print('Found CRLs [1]')
++    elif tag == 0x31:  # SET (signerInfos)
++        si_start = content_off
++        si_end = content_off + length
++        spos = si_start
++        while spos < si_end:
++            spos = skip_element(der_data, spos)
++            signer_count += 1
++        print('Found signerInfos SET, count=%d' % signer_count)
++    else:
++        print('Unknown tag %#x at pos %d' % (tag, pos))
++    
++    pos = content_off + length
++
++print('Total: cert_count=%d signer_count=%d' % (cert_count, signer_count))
+diff --git a/_tmp_checksum.py b/_tmp_checksum.py
+new file mode 100644
+index 0000000..3ad976f
+--- /dev/null
++++ b/_tmp_checksum.py
+@@ -0,0 +1,47 @@
++import struct
++
++def pe_checksum(data, checksum_offset):
++    """Compute Windows PE image checksum."""
++    # Sum all 16-bit words, skipping the 4-byte CheckSum field
++    total = 0
++    length = len(data)
++    
++    # Process as 16-bit words
++    i = 0
++    while i < length:
++        # Skip the CheckSum field (4 bytes at checksum_offset)
++        if i == checksum_offset:
++            i += 4
++            continue
++        
++        if i + 1 < length:
++            word = struct.unpack_from('<H', data, i)[0]
++        else:
++            # Odd byte at end
++            word = data[i]
++        
++        total += word
++        # Fold carries
++        total = (total & 0xFFFF) + (total >> 16)
++        i += 2
++    
++    # Final fold
++    total = (total & 0xFFFF) + (total >> 16)
++    # Add file length
++    total += length
++    return total & 0xFFFFFFFF
++
++for name in ['amd64-module.bin', 'i386-module.bin']:
++    with open('assets/' + name, 'rb') as f:
++        data = f.read()
++    
++    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++    coff = e_lfanew + 4
++    opt_off = coff + 20
++    magic = struct.unpack_from('<H', data, opt_off)[0]
++    
++    stored = struct.unpack_from('<I', data, opt_off + 64)[0]
++    checksum_field_offset = opt_off + 64
++    
++    computed = pe_checksum(data, checksum_field_offset)
++    print('%s: stored=%#x computed=%#x match=%s' % (name, stored, computed, stored == computed))
+diff --git a/_tmp_debug_acc.py b/_tmp_debug_acc.py
+new file mode 100644
+index 0000000..baf2ac7
+--- /dev/null
++++ b/_tmp_debug_acc.py
+@@ -0,0 +1,44 @@
++import sys, struct
++sys.path.insert(0, '.')
++from wpeimg.checksum import ChecksumAccumulator, compute_checksum
++
++# Simple test: bytes [0, 1, 2, 3]
++data = bytes([0, 1, 2, 3])
++
++# One-shot
++acc1 = ChecksumAccumulator()
++acc1.update(data)
++print("One-shot:", hex(acc1.value(len(data))))
++
++# Two chunks of 2
++acc2 = ChecksumAccumulator()
++acc2.update(data[:2])
++acc2.update(data[2:])
++print("Two chunks:", hex(acc2.value(len(data))))
++
++# Four chunks of 1
++acc3 = ChecksumAccumulator()
++for b in data:
++    acc3.update(bytes([b]))
++print("Four chunks:", hex(acc3.value(len(data))))
++
++# Manual calculation: words are (0x0100), (0x0302) -> sum = 0x0402
++# Plus length 4 -> 0x0406
++print("Expected: 0x406")
++
++# Now test with actual PE file but without skipping checksum field
++with open('assets/amd64-module.bin', 'rb') as f:
++    data = f.read()
++
++# Full checksum including the CheckSum field
++acc_full = ChecksumAccumulator()
++acc_full.update(data)
++print("\nFull file one-shot:", hex(acc_full.value(len(data))))
++
++acc_full2 = ChecksumAccumulator()
++for i in range(0, len(data), 100):
++    acc_full2.update(data[i:i+100])
++print("Full file chunked:", hex(acc_full2.value(len(data))))
++
++# They should match
++print("Match:", acc_full.value(len(data)) == acc_full2.value(len(data)))
+diff --git a/_tmp_edge_cases.py b/_tmp_edge_cases.py
+new file mode 100644
+index 0000000..df6832c
+--- /dev/null
++++ b/_tmp_edge_cases.py
+@@ -0,0 +1,173 @@
++import sys, struct, io
++sys.path.insert(0, '.')
++
++from wpeimg import (
++    inspect, verify, rva_to_offset, compute_checksum, 
++    iter_sections, signature_info, WImgError,
++    ChecksumAccumulator, KIND_STRUCTURE, KIND_CHECKSUM,
++)
++
++def load(name):
++    with open('assets/' + name, 'rb') as f:
++        return f.read()
++
++print("=== Structure validation edge cases ===")
++
++# 1. Section raw data extends past file end
++data = bytearray(load('i386-module.bin'))
++e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++opt_off = e_lfanew + 4 + 20
++size_opt = struct.unpack_from('<H', data, e_lfanew + 4 + 16)[0]
++sec_table = opt_off + size_opt
++# Modify first section's raw_size to be huge
++struct.pack_into('<I', data, sec_table + 8 + 8, 999999)  # raw_size
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for oversized section")
++except WImgError as e:
++    print(f"OK: oversized section -> kind={e.kind}")
++
++# 2. Overlapping virtual ranges
++data = bytearray(load('i386-module.bin'))
++sec_table = opt_off + size_opt
++# Make second section start at same VA as first
++struct.pack_into('<I', data, sec_table + 40 + 8 + 4, 0x1000)  # virtual_address of section 2
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for overlapping virtual ranges")
++except WImgError as e:
++    print(f"OK: overlapping VA -> kind={e.kind}")
++
++# 3. Overlapping file ranges
++data = bytearray(load('i386-module.bin'))
++sec_table = opt_off + size_opt
++# Make second section's raw_pointer overlap with first
++struct.pack_into('<I', data, sec_table + 40 + 8 + 8, 0x400)  # raw_pointer of section 2
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for overlapping file ranges")
++except WImgError as e:
++    print(f"OK: overlapping file -> kind={e.kind}")
++
++# 4. Section raw data in headers
++data = bytearray(load('i386-module.bin'))
++sec_table = opt_off + size_opt
++# Set raw_pointer to 0 (within headers)
++struct.pack_into('<I', data, sec_table + 8 + 12, 0x0)  # raw_pointer of section 1
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for section in headers")
++except WImgError as e:
++    print(f"OK: section in headers -> kind={e.kind}")
++
++# 5. VA not aligned
++data = bytearray(load('i386-module.bin'))
++sec_table = opt_off + size_opt
++# Set virtual_address to non-aligned value
++struct.pack_into('<I', data, sec_table + 8 + 4, 0x1001)  # virtual_address
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for unaligned VA")
++except WImgError as e:
++    print(f"OK: unaligned VA -> kind={e.kind}")
++
++# 6. Raw pointer not aligned
++data = bytearray(load('i386-module.bin'))
++sec_table = opt_off + size_opt
++# Set raw_pointer to non-aligned value
++struct.pack_into('<I', data, sec_table + 8 + 12, 0x401)  # raw_pointer
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for unaligned raw_pointer")
++except WImgError as e:
++    print(f"OK: unaligned raw_pointer -> kind={e.kind}")
++
++# 7. Checksum mismatch
++data = bytearray(load('i386-module.bin'))
++struct.pack_into('<I', data, opt_off + 64, 0xDEADBEEF)  # wrong checksum
++try:
++    inspect(bytes(data))
++    print("FAIL: should have raised for bad checksum")
++except WImgError as e:
++    print(f"OK: bad checksum -> kind={e.kind}")
++
++# 8. Zero checksum should skip check
++data = bytearray(load('i386-module.bin'))
++struct.pack_into('<I', data, opt_off + 64, 0)  # zero checksum
++result = verify(bytes(data))
++print(f"Zero checksum: verify={result} (expected True)")
++
++print("\n=== Streaming is lazy ===")
++class CountingBytesIO(io.BytesIO):
++    def __init__(self, data):
++        super().__init__(data)
++        self.total_read = 0
++    def read(self, n=-1):
++        if n == -1 or n is None:
++            raise RuntimeError("should not do full read")
++        chunk = super().read(n)
++        self.total_read += len(chunk)
++        return chunk
++
++data = load('i386-module.bin')
++f = CountingBytesIO(data)
++gen = iter_sections(f)
++first = next(gen)
++bytes_before_second = f.total_read
++second = next(gen)
++print(f"First section: {first['name']}")
++print(f"Bytes read before getting first section: {bytes_before_second}")
++print(f"Total bytes read after both sections: {f.total_read}")
++print(f"File size: {len(data)}")
++print(f"Lazy: {f.total_read < len(data)}")
++
++# Verify that reading bytes before first section is bounded
++# and doesn't change when file is extended
++data2 = data + b'\x00' * (len(data) * 8)  # extend file by 8x
++f2 = CountingBytesIO(data2)
++gen2 = iter_sections(f2)
++first2 = next(gen2)
++bytes_before_second2 = f2.total_read
++print(f"Extended file: bytes before first section = {bytes_before_second2}")
++print(f"Same as original: {bytes_before_second == bytes_before_second2}")
++
++print("\n=== RVA mapping edge cases ===")
++data = load('amd64-module.bin')
++# RVA in header region
++off = rva_to_offset(data, 0)
++print(f"RVA 0 -> {off} (expected 0)")
++off = rva_to_offset(data, 0x3FF)
++print(f"RVA 0x3FF -> {off} (expected 0x3FF)")
++
++# RVA beyond all sections
++off = rva_to_offset(data, 0xFFFF)
++print(f"RVA 0xFFFF -> {off} (expected None)")
++
++# RVA in a section but beyond raw_size
++# .text has VSize=0x1068, RawSize=0x1200
++# Try RVA at .text VA + raw_size (should be None since offset_in_section >= raw_size)
++off = rva_to_offset(data, 0x1000 + 0x1200)
++print(f"RVA 0x2200 (.text+raw_size) -> {off} (expected None)")
++
++# RVA within .text raw data
++off = rva_to_offset(data, 0x1000 + 0x100)
++print(f"RVA 0x1100 (.text+0x100) -> {off:#x} (expected 0x500)")
++
++print("\n=== Accumulator incremental consistency ===")
++import os
++data = load('amd64-module.bin')
++# One-shot
++cs1 = compute_checksum(data)
++# Various chunk sizes
++for chunk_size in [1, 2, 3, 7, 100, 512, 1024, 4096]:
++    acc = ChecksumAccumulator()
++    for i in range(0, len(data), chunk_size):
++        acc.update(data[i:i+chunk_size])
++    cs2 = acc.value(len(data))
++    if cs1 != cs2:
++        print(f"MISMATCH at chunk_size={chunk_size}: {cs1:#x} vs {cs2:#x}")
++    else:
++        pass  # OK
++print(f"All chunk sizes match one-shot: True")
++
++print("\nDone!")
+diff --git a/_tmp_test_checksum.py b/_tmp_test_checksum.py
+new file mode 100644
+index 0000000..908c30b
+--- /dev/null
++++ b/_tmp_test_checksum.py
+@@ -0,0 +1,34 @@
++import struct
++import sys
++sys.path.insert(0, '.')
++
++from wpeimg.checksum import compute_checksum, ChecksumAccumulator
++
++for name in ['amd64-module.bin', 'i386-module.bin']:
++    with open('assets/' + name, 'rb') as f:
++        data = f.read()
++    
++    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++    opt_off = e_lfanew + 4 + 20
++    stored = struct.unpack_from('<I', data, opt_off + 64)[0]
++    
++    computed = compute_checksum(data)
++    print('%s: stored=%#x computed=%#x match=%s' % (name, stored, computed, stored == computed))
++
++# Test incremental vs one-shot
++blob = bytes(range(256)) * 3
++acc = ChecksumAccumulator()
++for start in range(0, len(blob), 100):
++    acc.update(blob[start:start+100])
++print('Incremental matches one-shot:', acc.value(len(blob)) == compute_checksum(blob))
++
++# Test that changing CheckSum field doesn't affect result
++with open('assets/amd64-module.bin', 'rb') as f:
++    data = bytearray(f.read())
++e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++opt_off = e_lfanew + 4 + 20
++orig_checksum = compute_checksum(bytes(data))
++# Modify the CheckSum field
++struct.pack_into('<I', data, opt_off + 64, 0xDEADBEEF)
++new_checksum = compute_checksum(bytes(data))
++print('Checksum stable after modifying field:', orig_checksum == new_checksum)
+diff --git a/_tmp_verify.py b/_tmp_verify.py
+new file mode 100644
+index 0000000..6fe5e81
+--- /dev/null
++++ b/_tmp_verify.py
+@@ -0,0 +1,115 @@
++import sys
++sys.path.insert(0, '.')
++
++from wpeimg import (
++    inspect, verify, rva_to_offset, compute_checksum, 
++    iter_sections, signature_info, WImgError, KINDS,
++    ChecksumAccumulator,
++)
++import io
++import struct
++
++def load(name):
++    with open('assets/' + name, 'rb') as f:
++        return f.read()
++
++print("=== A. Image Description ===")
++for name in ['amd64-module.bin', 'i386-module.bin']:
++    data = load(name)
++    info = inspect(data)
++    print(f"\n{name}:")
++    print(f"  machine={info['machine']:#x}")
++    print(f"  is_pe32_plus={info['is_pe32_plus']}")
++    print(f"  number_of_sections={info['number_of_sections']}")
++    print(f"  entry_point_rva={info['entry_point_rva']:#x}")
++    print(f"  image_base={info['image_base']:#x}")
++    print(f"  section_alignment={info['section_alignment']:#x}")
++    print(f"  file_alignment={info['file_alignment']:#x}")
++    print(f"  size_of_image={info['size_of_image']:#x}")
++    print(f"  size_of_headers={info['size_of_headers']:#x}")
++    print(f"  checksum={info['checksum']:#x}")
++    print(f"  has_authenticode_signature={info['has_authenticode_signature']}")
++    print(f"  sections:")
++    for s in info['sections']:
++        print(f"    {s['name']}: VA={s['virtual_address']:#x} VSize={s['virtual_size']:#x} RawPtr={s['raw_pointer']:#x} RawSize={s['raw_size']:#x}")
++    print(f"  data_directories ({len(info['data_directories'])} entries):")
++    for d in info['data_directories']:
++        if d['virtual_address'] or d['size']:
++            print(f"    {d['name']}: VA={d['virtual_address']:#x} Size={d['size']:#x}")
++
++print("\n=== B. Checksum ===")
++for name in ['amd64-module.bin', 'i386-module.bin']:
++    data = load(name)
++    cs = compute_checksum(data)
++    e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++    stored = struct.unpack_from('<I', data, e_lfanew + 4 + 20 + 64)[0]
++    print(f"{name}: computed={cs:#x} stored={stored:#x} match={cs == stored}")
++
++print("\n=== C. RVA Mapping ===")
++data = load('i386-module.bin')
++# .text starts at VA=0x1000, raw_pointer=0x400
++rva = 0x1000
++off = rva_to_offset(data, rva)
++print(f"i386 RVA={rva:#x} -> offset={off:#x} (expected 0x400)")
++# Header RVA
++off = rva_to_offset(data, 0x100)
++print(f"i386 RVA=0x100 -> offset={off:#x} (expected 0x100)")
++# Negative
++off = rva_to_offset(data, -1)
++print(f"i386 RVA=-1 -> {off} (expected None)")
++
++data = load('amd64-module.bin')
++off = rva_to_offset(data, 0x1000)
++print(f"amd64 RVA=0x1000 -> offset={off:#x} (expected 0x400)")
++
++print("\n=== D. Structure Validation ===")
++# Test that verify returns True for good images
++for name in ['amd64-module.bin', 'i386-module.bin']:
++    data = load(name)
++    print(f"{name}: verify={verify(data)}")
++
++print("\n=== E. Error Classification ===")
++# DOS error
++try:
++    inspect(b"XX" + b"\0" * 120)
++except WImgError as e:
++    print(f"No MZ: kind={e.kind} (expected 'dos')")
++
++# Signature error
++data = bytearray(load('i386-module.bin'))
++struct.pack_into('<I', data, 0x3C, 0x80)  # valid e_lfanew
++data[0x80:0x84] = b"XX\x00\x00"  # bad PE sig
++try:
++    inspect(bytes(data))
++except WImgError as e:
++    print(f"Bad PE sig: kind={e.kind} (expected 'signature')")
++
++# Truncated
++try:
++    inspect(b"MZ" + b"\0" * 10)
++except WImgError as e:
++    print(f"Truncated: kind={e.kind} (expected 'truncated')")
++
++print("\n=== F. Streaming ===")
++data = load('i386-module.bin')
++sections = list(iter_sections(io.BytesIO(data)))
++print(f"Streamed sections: {[s['name'] for s in sections]}")
++
++print("\n=== F2. Signature Info ===")
++for name in ['amd64-module.bin', 'i386-module.bin']:
++    data = load(name)
++    si = signature_info(data)
++    print(f"\n{name}:")
++    for k, v in si.items():
++        print(f"  {k}: {v}")
++
++print("\n=== G. __all__ check ===")
++import wpeimg
++expected = [
++    "ChecksumAccumulator", "KIND_CHECKSUM", "KIND_DOS", "KIND_OPTIONAL",
++    "KIND_SIGNATURE", "KIND_STRUCTURE", "KIND_TRUNCATED", "KINDS", "WImgError",
++    "compute_checksum", "inspect", "iter_sections", "rva_to_offset", "signature_info",
++    "verify",
++]
++print(f"__all__ matches: {sorted(wpeimg.__all__) == sorted(expected)}")
++print(f"KINDS: {wpeimg.KINDS}")
+diff --git a/tests/__pycache__/test_wpeimg_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wpeimg_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3e2a23bc1ad43ca4e0c52fe79f09dc04299b506
+GIT binary patch
+literal 10604
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wpeimg/__pycache__/checksum.cpython-312.pyc b/wpeimg/__pycache__/checksum.cpython-312.pyc
+index bb4fc344c29229b6f3880c281c2060f41514eaed..29c30c8e2531d0e754f1066f7212ec7847d5209a 100644
+GIT binary patch
+literal 4509
+zcmc&&O>7&-6`uX$za&bce<Voq%9fq5v1Rxt38WfsWXn!zv~FqzNiEo**1Jn-rR6TO
+zyNoP?N}M7GDs^D0aU%LqL_vZ=MlSLxJ_hZr1q#th5MtqjfcB!BV);-Q1>E;$NlG&4
+zqCIs0&d%<<dGqG|eD4ka+SC*x&_0{|+vHjcA%Dl0S`(^+&EqgwAPN~J3Zt+(Gs>{!
+zb)s+|5`|aUuQ`uylv9Kc$tbV*pciJ?xL>->5c1}PDr#wITovUBRi3i5Y0*+;(^6DL
+z)C|#qX*1(!rXlI#geobj)gKDItr?0rZHsT5^VZs8)>cJHv@@!#r8Ieqm!yxImgY>P
+z2VwfyD@U$rj%XUHeMC0X8C^}Qh7-a)&6FtVdW~Wl_P1->r!-v^U$m#ROhz-tsYEA_
+zT$^!J@hnO_0;^M+s)M+Wt?H@x;m|Z}Na^TOT{XtxT~hE!l0zp{LxE%9+257)ENH+M
+z)$1A41`21wGPC1Ak8&QdCrk&<t!GqAl#Fe&28btH^Z=3`l4LoX&gzn5T8Bm3gvBx(
+z2i7<fu%o0~pt%`wTGFTNEx}Af2CYj5C>+&?s?JEZ-5**<i(QmGyLmlWinh)D@K_)!
+z8D+rWtipg<S!z}=_o$%o(EDbDxX*2;+5z1TZON8<lGqZucC3_%Vs5iP+CroXwjB^W
+z4Vn_6p|-Z2Q%p;m;lR%ZYAb6PXq*$rsfDW+t=e1H97k7=fX+3^psc8U`#qLbMS%q@
+z)y|lPtz83qqfk3czSGt}1&KAA@{)DXnK+rX9ayA;+o0s&JP!J?s=cd%LQ#CVrb5&s
+z3qKBin<8`&J4~J=VdOQ1z+0VqhQ!&67B0BUx_lCj<_43xnsUr{RV&W8JUX3?<l>X=
+zvx8S)bLX0>T$#?OT6+9SEvou6Gj1T6)C|o@CUad4jMHD6-3`3#D0DYSCAO=;-wakd
+zx(ocr&71Iz$S6v!`CvfLaRI(AkUTRBE-}mH$z+XU+w+472We@`vtL(Fs4!E*gjm06
+zye1F)I$(vu<zQ{jPsl8vC)b%tzRGCZBhTlWP`+ecLg3kePT_N~_jBfiToCpFu3&>Y
+zAH_EdZob_{2E2`sM(4?MIl#<WAulNY9B`QRIUu#y^1j-shso8eFz3&6c|Xtrmg1hX
+z0S9*X+9XBZ+MD-O0(mwcs3EGSng54AZYFt>_jz*92H^}rl)jNRra%K$3rJn1L0fLu
+zBWiJ{X7Nirm>WC~!6c52$rD*)YHSS9&M_%W)I!~MB!FPVL`!wDmI1UF31egZG*~XK
+z2Vkr9r%$0nUtULdTStrL*i%1``z)MxIRIx1&EpD|WQ?n>4<IKiJ8n2@WF&binX=4u
+zJY=C&T!G5s@`~h0uFp)RY}Ijj#1c0MNDNQ}5abFONwaL1(OeDy-3?|eQ&w$2b{h?f
+zNZ>UKUtM1|1MJjXXQP1h<~o7SJ^|w2AZsnL0$*uuEBH17Boe)KdhYZ}_~65qw&Ka(
+z&6JLPG`ry=d%G6in}2U9wj|x%vpjUStGwrxB43Hd7J|PImfkE!dp`|Ux_dvreCP7g
+z?sE6h<>7A<_Y&W>-TPI!Yq-eYhFI?``YOE#i~Og}lwC3W*hhBlE%Bcu7JcQ|p+c|{
+z?I`_vzPTVgY~5YVe%4hOs<iDb9V@+a=jHkS!r6!I9Y3@mEVmzARF;O953IJoviwfD
+zeV{O00g)3QB}%b!r2FFpfXe3`cRCi|DtElJ%zqQS7rcMzUQ2oJYlY#D6B|L&*0a$}
+zc6FA9<`b}GxV4xlhr7Sx7KgtKJ_yI*42y@B2Fm+Smb+gr4Bxy68i~dV;SGWG?8o=D
+zmi9u}ih%NVAQmDJMXW!<01&GoQq4kiPu8O!2&?UbPVnT0Gl)E}3ebvT3#+g-9Qj|r
+z=9xM#4tYT|@VUQS@_hW+JgGtsn1NITsV@b!17!Y`gauN~$;QSU(~)$@7g&Q}7<u{M
+z$fmDBbpV;x%T~zOtHMmk))@_wmMA71Ag{CX>X&K|rZlX_FyG;>Pyu0mf=sqmX0>8W
+z!s^Y-fhd**btJJcBz3gI)Aygg&k+j~Nu2ZIEV5l@m$7Z6!<95*1X?lWIvNEGoq7$Z
+z?JRUR$VP-Twcbk1B?=6<ay?)wk)~p7p=Z9Q9N7oH+uBxqYrb=lS-kXxzZ`wBFa)&C
+zEydk)qotw6wmYwvBYg#?($xIS7oZA;3RlX34w!9;76<3vTM2YikGmN6W3n}*w3<x1
+zp=2^`Dp?)Jk!13ntfW_G{K=$Z%E_b^25~JByFTdd63T_1*TMuwyJi^Jd!YM}{KyJI
+z;88Ox^gIgm39-#zFzrH*w+6{~lp0v3Q-{ZDdw~RrgGfkQBNxX~M5!0;3WtC_%j6kI
+znlMrXnx@dveRRZaCAY6VrjVc&F3-vAb#@A%%WB<9X?aphf4~ilN#}<RmLbMao>Mql
+z2*mRIB&y??22us`TxXpFLtq7!2~%yOJ!tAV^gM2mo&(#t8LiKwtjP>J@{<te&$dQ;
+z*Vc@X1H?g-(AGyRfgy^2mb*-D{$ZM2hvzf{$?jjz3GcBn%r%hGY85bqFJ4@-SYcwg
+z+2CQ-D}-d%gKun%#`1)o>HVdYIS==jAw!|@GLlWdjqETG--PwgxyUrUcTwzsdfdTl
+zj4kF=%M_KY1=vH`d2-QU2T*~l7?#}#Oekkc#YJ$jp;s8VlF%EIC&v@^RAT)UD2V3m
+zb=1~+47=B`dkPK0$=U@k7FMQi@Z5D-rB^~PHrjDU#I6rI$n1OJ;Re*Co{|i8+V#Wz
+zF$vk)-6dCVm`S=je!~pT!KK0#q?DstHo_3<rUo|As<xB0rPixJ@fQ5-Rp<a=qJnT>
+zXTs}SZGZJXQ*IwD1S)NvkSGr?ww2os6#NzOg{A#pL;xfn2S~VQHMH->*)@M)CDQwy
+z|M*uUOR+C6FSmYi^?U#EwXnE&>_ND%5^1@0VeUfFS?M~y(tUho&x!9MC)c6}mzZ)i
+zUJxqb=<O3l=aYd4;jTJq>0If2G5>v}Z!HkM6`BhbPktBJyB2P~H83}Dd!!Wm<nn5G
+z-wMC)pO1S<WY;6Y2nQ<S{s)2X4GxA+>{d9}Z(lewK>jokKI`ZH>|>zckwWW5KN@Y}
+zzrYhf4;Im)Ubs?Jp^5EuBhQz!mIW7ceFm>k|M9N?>m^`o9mNjQb)4Pu6BtuRXsP{u
+zP_?&>gf;uN*l=T3l`ZoQ!X)MnyBE3}<R9VIAHv;Gca)UH;iaSZ&y;_1dNusBZ<%uV
+z%nE;oLN0jRi$F|whO+S5q$)d}XQHoI$kB>phqZ{8!vd$ggmBtI6(SznNC6gLm><~y
+i!*9k2)BM<Xj$wLAhaMArK6-=gV#LkUEOVBjto{vQIAe4G
+
+delta 1021
+zcmYLH&rcIU6rP!#-9optOQ|bhgEa_cO*9d0NQ9sf6Jty`NIcksO}o1hN=wb`_CQ+$
+zAso<XgzNzlHNogX!U6vT??wZ`gu3307jHmGJmQ-zEic*c?fW_3yf^Q9KP$nnZEb!8
+zG93P%U7#z$&f7P@T15s*A_E&Fhm+XTBuNOmiwt2A8PpUu1zv?vk{aS7N{WUAD9sYh
+zSNgW1C!7>M#0lpCNsQ{ap6MY0<dwBB0Gxs=DCGq>%p#49GoG@6T`6VRY1?$(3lFaZ
+z!DY1q%%iG$c8R`{YhWOqr#3`{AFp%9i7CBzY;Jo}!J8)xDkv*8yr+8eqzf=Pxf4Pa
+zG=Vhil%$bCjk>gyo65MN&h%@8u9%s%O^f-Ufks#hD2PlJXQnOQCl+I^&SPKvYC9O#
+z1%P?<N9|tCu4F%+SucKwezLd98|7Vfc!|E0tD%l1naPl)6K7oLc7C_00RxwSFPu+G
+zW#>gJ8}i3aB**z3&mGSRi1CXw&JWlHJDp4A%$X<l<SC71e_xLZX;ufoJlgjoCGxub
+zyu6m&3B|Wt;!JiD^7S#ke#Yst2*3vN_%J?gMjOB>T0Fdne$tzV6pNjQk|0KEeo-8N
+zK3j56PY%MX$Zl?X6KpQea0O=t=OA!?2xpsHsmD0le3YJ4P-9aK&9_jBIa6)1IgQro
+zG?}^rTv#J6HPUw4mD9Rj%olTMyTF<wfUd5h7xGVwwwcl=O?}!b=2;K8`Da}Qfc1p?
+zcEj=c`&Am+qv{S-m+c=kT9ws3Il3c9-%hMY-aOj%$?<K<N7hceob$?pQX(Vw{@#KP
+z-h<VMb0Db#VNvIc5<SPK=Y}lcVj8ChUj%QT^G~@n$LFc}SSK&%kA$@WxKbgLHFdjw
+zPtK6>3f9GeS9nWtTSoE)qnI;CSwHyrxGfD}U%(h25Q=FnfN<~^l8+<>53KbcAy9|?
+P6c5yb1dm~81uykK|9Q~W
+
+diff --git a/wpeimg/__pycache__/headers.cpython-312.pyc b/wpeimg/__pycache__/headers.cpython-312.pyc
+index f5447d2ec87546697f735fefa0ede9741bd5f577..8aff416b89c3da07ca5e5e920b5618cfa3e7528d 100644
+GIT binary patch
+literal 5350
+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
+Z8S|bWx~zsXKlr=`>#Jk5!BEPl{tpZcH<<tc
+
+delta 1663
+zcma)6OH3nW9G_`trqj;!No%poqYG^*VS|FO=n5{6mTi{>!fQ>sYewu>R&aUvwH#n)
+zqz4Z*F=k;*b`KmltOm0exYfiMysa@YOlmAPJ!ssRaO;K`J^KGz%94$Ve#!j4|NNix
+zf6V`n)-NwuelVL&6r3+!{c&MU+_covbDJ$K{WOKxm;rGy9vNar#K%m?7!!~wCL$qb
+z2AKtkF)K31Y{(L`BkRXh%z<oxHOLO=+}ye$Fa>@jIu?>b<5T;8-_vmh2!lCwO+Uv5
+zfoxNs>Q}vwfO<g5luXMsqSxWgL!|&K=Yt;g(BLywMT$<nZ))t*gSzgqzM^s)+$ws7
+zQCNjj3<|FpWxdSEysS%=6C+y0En>ErDXNuK-)8$55g6(>?1$rAK^&WwrlQxz2Bv2w
+z!?^s7EJ(4BfFGb>8;;%xOOfzEC_D+Ov2d#i2Z+G9l#-U`=8}n2fr$fw+tkmvuFE8>
+z_w3-7vJae?Mbg~--GuZ$Pzj9R0CpEV$rXS!^{eVLEWO(bbX*5eJpvFU(GxFlA5bZ}
+zDp)wLb;?9EsbjS;NcS@E72SE8ExvXGF{B(XXz9;uRbxEA5lcKH?q4jK|FATaE%`Ic
+z3GjLwKA!aJf0-K3OskgA<@1(X#(-G%XjDvhC`C{Qbk2>(r<Dp(?+l#=6csb%AQE@7
+znBuG1twXyBPqCbLT9rP(5y`|-ty?*uRk6v!0_o8UNA5MtR@sKk+xqH<(A1}42IjUr
+zovh5s2AEN!Y?1|J**3vsTGx9f6RB0a<W+w&JJn}mUC+9%H-br{aU;O74FFgZ$F+pe
+z_eP_~Uc!I<^fiJ>QpYRmElV?RDzJ;Qcjn{j=a!6%J2%e8#M0_w0?($@xV2-*UKwSs
+zGRGKdMHPg^QVOq0E6ek6hk=8K30xx(ArK{SoxliydeP?U>Ib4ARt!&l4G@JvfTSJZ
+z?1!ilxJ8w1o{gIzBT<uYLdVk7Q_+zZ8#J-uVQOc3_i|3`-0RT9?sT~5sLeZkn!^X|
+zuDzGCP5T#ej=t=y=IBq46z%T3y;-w2?}T=JdtBDBFXZgK*$K^lHGRDpY|jU;Xu&Jl
+z?gQTw?r>u2dm$H`))@aG<J!3YQPJO)_xEW2o-CV99o&5K-gmch{t1m~N{`;ZTJ(7H
+zo=ckN((cS&C>uEF{JJgY8P*tgI+B?$iBydXqPxA18h>_od?IAnOzOy8zoXxjcM?Cf
+z4{Cuy%{`bAi{3!q+o^dw_qwyb12N|v)%g01^`Y~~&)4L6kH&kBoV7=d?SRh=Or7aZ
+ziZKc$16A8ua#9YrdatH#*d>Tui4s^2lQq%mDi|aQEypFP+}r{OOJx}+F#|$eUSS-e
+z${VeTP|XBhQD3uOR7*7;hjl0t9vYdN8I{I|ho{2Rcw7xS>&M23R*(SMP?)smE2<o^
+zvdQ?~#bva5H}MvhKt%qsWE`NRr)l~Zs{eP&{1?O0x)TbZWKmUTfN?m}R`pw_$1Kv^
+KNkbD|N#GyW#b^Nl
+
+diff --git a/wpeimg/__pycache__/layout.cpython-312.pyc b/wpeimg/__pycache__/layout.cpython-312.pyc
+index ec1aa76b05b8872746e4bdc76319d976bf408a19..c16d136ce199e2cb24bcdbf5a3fcd9cf4cbaea6c 100644
+GIT binary patch
+literal 3488
+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
+
+delta 1465
+zcmZ8hO>7%Q6rNe{U%dWH?2yKB5)%l?I#5+^DOFmdwn~Uos-`rN5P@p7c-JAVV@I>=
+zwy`$YLL4Ggi9~y-k3J^qr4<JxB<@Hc<Ruj{OAeJlLL88+<iM3TYo`i*(!8BFZ}#nc
+z-+XTyLqGI~ehdcv2<&3t&v)|TPUsZAwlgvM<{G!mt?|n|MjE#)X#AIGS=0pZJ(>vK
+zul0bJG(Y&j&gZvw{#khE@8?h^hiS2{G4S-kIEsOLge+us69`pcwuoe0$=G>3KA+5&
+zNK!2(OY7!psi+o`pXsWmlhZPG`xkC5%`e=za$U*JUYVJ_rCj}JX?773;p5FpDW5lV
+z)1aTWb>{7%AWXtAj1agQdM?GE4W}I`-DK0>e9L@?NBd!&&_j^{>Rth7aNv^ENWk7^
+zW84VDF?)}_k3;sW++g)9h##R9wCOWnV6>RW-T4f<oknPrwXnsS6t`y;C`yrTa+dE7
+z{lH6R3dai;vN(%7@g^kV=(svO?I0iEe3UYKgrBI&tjiI#xS|slcDlT}zOENFLJuwT
+zE~}}g>hc|4TrO8C7fn|*^c-c^aJki@ray4mPgO%VczDIb4ZvxsAOY%?<Go}O*2Z8M
+z*T4an;oe&Ipw~_dSBEIO|GRIB#=Gxr`)gtD=Ho68z}N|#W)JN0%wjY=2(x395Hns(
+zYk&cpjODY~JcaG6T(+mh%M6k1@5Ok6l1b>%2`%lNlF)0HIWlG+iQ`o=4$;X=h0v7>
+zCBRltH%euboQ9Pty6HB!8u~Lb+F<u1<F)yNzOlx+-NF67v$gjR!ml-EcBh)>=bTh_
+zKRgfM!-<v{I1m%{kDKzeGkkGhywnn-&Df+P%0~hl;cMBpUq*p}y4aX(N~tEBA|6#Q
+zWC7o!=l7_p+kf?(sbb5g`6%`ZG$W{m1w8@to4mzqEM4CeEWzS(%me0b9PkDp;x*2D
+z1G0Caw1FSSiws5&hatn$3@A#V^{4`KkXb}5+F)d%vatlxF$$`wC)Fg;3#$E-Uq9n%
+zpPuoC>t9_{S9FEyqthl{!_YR7vB#S%0?kjQf$CeZ=27hm_g0BnRtv7s)sD*<rb<jh
+zge@I`(cXdpBz8|#%u=^+$$4120K+iA)ll1yL}}}TFYdR((SwQflXLqM7aaEW+V$<p
+zdbSnn-OkoOabhVal&Z~De~%7r39ZOL^OWpFQd?Y0ifqq4lQMO^v9eoq-pDv3nO~($
+zD;lq7oT$9};gj;7;zTpQ1Tt*_#S(211tQ+{$U#?76s?p~6hhf^h0Z_7@H&jVBsicI
+zf#AyEY0q^8NEPLw*+X8*4qEZjT1hJx^moZL<mvyyporT(jPY;iy+2U!UzWqn5dzl^
+gp}|BG^&j#KK6~hwFn^ffaqO_qkEf2}LEJg&e|3FFhX4Qo
+
+diff --git a/wpeimg/__pycache__/probe.cpython-312.pyc b/wpeimg/__pycache__/probe.cpython-312.pyc
+index bee5723c8a7ae16ed6285c8bc85ee04f87c80e1c..0b831bf4050d176d962f19fa086c0aed422309c4 100644
+GIT binary patch
+literal 6193
+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
+TaiOPu1Dxa8yPTT~G28enk1J9K
+
+delta 838
+zcmXw1&rcIU6rO3fyDfCLwJj9+QEEU+!9)V4kVq7RkP^fTC<zBQwX@LGw%g2ZjgTsh
+z;i4zVUN~^jg9pO}FD9P!;>m=x;-O45dhy~3#XrD#3%q2%{bt_Gd~d#aZ-?IbmCv%=
+zgm}Cj+JErev!%4*@vTHp3?qVxkQWQmlEk@Z11))p$kDedCB0iOvNv2zo}IaUQ=Lpt
+zP0r5WnPa}inZn8xr3Ou6)|@voM9pVbjk1-+AaEKA|GW8j{L$_V_1vqt2tLn;PlSp<
+zV->-IoD&tad%Ex8C_*%7dCoGHc*clp*LA|5;R+^hIEe_Hd4N@1_NUP0s8Dfp6~B{{
+ziLxWlqhw%h!@dxHYVU_9x}-uTo70Qh0t*$(h5H&+jb+u;vX*WXP5Wx3%U+X)*IB^S
+z*EC4wv<%Ux$$}(fWmKY5zSN+)W=<z%>f^f1ubXN~8yQwh`LapDUfK-c2ao~41sVVd
+z0(dzv@0lh&2gCMU##A$9E2kALJ!`*@C~<+p%_&$!!3`>KNP3t6l`y|*mzrCmG|VTN
+zmse#_q7f4o#^Z7OH|}1M^rBhf<<fRO38LmJ4psEekNQXUt{f!B>Oybz)@J{9x)F$O
+zH`N0@)%2kh*i3(o5A8(`;;Ao@)Hfx%Bi9ml50u54ckySq`=zfQ9%!_6Hev&{!Rz(d
+zg#DpqytTJ>akSn!*617j)1mmqBcyo5V`PU~mvG81w5BGe7m_Zg5ayeDoYhL;cM{VU
+zC<|UbPT|Rz_(-Gr@+yt-K@a2-9IEI@uv5|0dJ~gWl^9u7bxd@;VWI|IXgc;dMltcE
+z6Hoku%R9%tL9_$7qvIVf7^Ixnu2E2d0!&CAxiQ9vXzmy4`++WfN8NwLHY^^eL>%Os
+HdH4MX?&8sj
+
+diff --git a/wpeimg/__pycache__/signature.cpython-312.pyc b/wpeimg/__pycache__/signature.cpython-312.pyc
+index 09d16b2bb5ad891e5dfa50a508b1de02c27552c5..00e50d3433b8ef7188b545d29852bdb3c7c28161 100644
+GIT binary patch
+literal 8954
+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
+
+literal 2172
+zcmZ`)O=ufO6rNrE|2UE?`LF)TG)Y@4F-~ks+JrRVT1pTJPKX6gjA6afjHHdFT`{|k
+zqObx5dN4gT^pLjnkU|eBxwvhh*Fr9ZLh;XKy|nbulW$JlL&>Rcb}hv%?g%}-dGr3}
+z&G(*u?&%35Sk2rocfSiD^atN`mT<uA_X6`65wwViuqY7mBeW<sJ!$WQ-I-ORLRCX4
+zYJ_54DXX%v$|xoj1d3Y5;|-0iU`54srj;4h_4H&ooUc$^q|8uCN>Mf_HsnH;;<~1&
+zhK^+e%XoQtAvY(@W^d(lS8}s6`RwvCX5f<%+^A?e#RZKtu>#uRo7ZONPre5h^AMeq
+zjBLoDoXOt8g{oGV#5i98y_!Z=AqH^zYP}8~2sSiGQ!g^5K*1@5HGqV<5tfU_s$8u$
+zaZytZSyA=L@U93oD0V8s3lo8_2fq8yK?>D@x^zFDGIDtDm*JLRB3(3vc@#p#NBmV(
+z6Ix<TY<X&)mRI1i0LZ*8pMXSUdQ9}}AWF**d#{O1|1%yORx1D!A4mcuI0Sq64e{S+
+zJP%l{pc%Z|<MM|o33q(n7j#iTWz-6pq7m!pn4!-3$`V4%$<_o7?z<H>!$<mzbZlIo
+zMEoDU=zsNE(N@Hau%sDf2{U3wA3&5txpeQplIi3^dQ5>Fy99cmFOZnSMS+WQ&WHnX
+z7D(dG8C3fuG8|;{gHwn>bxolt-a+%If$n?mpoWl6$X`IIGaV2Bl8=C;R>G$%R3@hZ
+zxENOcM&`yvzzRS~Qvo83)-?vW<<>{RmfKQ>OA4(L9pIQVuuAVy<~XZr+KLYCp)1fn
+z+(QSq6Ij<A!2!JMGBfbFlOaG7Iu0AnI-PJ-h*GAy;rNrQWsNCDrKV5diq^n2Sp^Wk
+zZZ$Ve2jfMVF@-`0spPdP?_kOxBiCI;*3($7Hsq!btxyB)f?Qm|v{pBo6ON_)@3w@#
+zugVOXt4h_fQNct58&z|?l@#7%6iVTCqFXsomLXsXV&Vpc*-=tdI_ccz$}WGrxpdeL
+z)M0kOt!=+nD(Td)y}I&%+ObYN$&F_R8NH|Iil*A}L${WAt?VdoX7J(e5^mL`*A=r9
+zhfRvwDuj!=1(BTHF7L~<#~wH|m!$m6hu5=GZZ4C(ZO0hAwL~;sav$A}I|6>+14&x2
+zQ;tll8<3@3?P$ijf`bbV@C!;>N$MVSd=i*&5>a3r8t~Rsw`2Dd#^;qJ6T(L<gE@}!
+z%m<YDIpKYf4%q?MgU)!rummT3u(Ko(JCwa&q)t+{rwj%5Kt=7b&J>pNcW!1Sjzwuc
+zcXckCkuo#+nRJis<vwk%qL#EH-HK4e$e{w*!Onf`$l*Kq;9*$PO_!&y^C`yLt-D^0
+z&0btG0O$oumKt@c)XGcUKb*;W(>~VSNlrR%fd@XL^>KK&Hrh*})R5JiwBiYCc*IKe
+zStFy?;D|MP+!`IT28UkuMWX(8=H(!Y#;sU#EwU#DeW~Ar3!A}(--1&+JtLpxw|h>k
+zi97voKQW%(+U`HM7THO@V@2bioY@#VyV-kg{mjPYh0W>P`yL^+D69qdf+#usc;eB-
+z#__4`-s!F0_ty*UYgS<F>yuAbwogoN1*V-yR&-!v@a$&vTsvze2OnQ}bYWw3ayxl;
+zEBWsF)H?k^`BwSSzkUAd*7@r{O|50xS9T(a&r?tOpPu?^^m%eU|NYR`n-^VA{cp50
+zYeNrjSbf953_hH*k^{i>KfM0y@ekUWjnMF>cf^Xs+SmU6YZyiQ{zQT=1*RWI_B_D7
+z(m5<Xoth1y7oo`PfagWO0CWyeACLgqMM+{Kpuu=?zd`#z5jzFM4qkHqVlT5aY<Z{X
+e13<v5AiNZPf_Lv2Ix)V1#`gVZgg6_Avwr}7V{W(r
+
+diff --git a/wpeimg/__pycache__/stream.cpython-312.pyc b/wpeimg/__pycache__/stream.cpython-312.pyc
+index ebe7ebb7e833c747bf9331bc39be527642b4a328..631ca59ec5fba62579ebee47275d1ca1193f6520 100644
+GIT binary patch
+literal 2693
+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
+
+literal 965
+zcmZuv&1(}u6rb7M>~0g&hBOM*ii;w+mmX9^+E6TQu%%GJdU1_xHrYwLWk1Tyl#-G_
+z5D#hvZ`NavmEvC_NJ}qu$U*R;H%ksxPtI(2+a7!{Z{B;n&)<8W^Z6{`G*SGr@<syS
+zyHHZ%dQAO${M!O9uz(9)$%lbtNr7z1fnq68*knHwsFoUNmKNxi&TYy|U=6e~rn+%^
+zkz(WoUbtj9jRqpbppikBkwH*{dQoUlr|u&oY8p;xc!9Ho#(qLx(3IKmVrBZt+@l41
+zwlXzSd2BDvSrs<Kv$?h#5qp^n2(v<LXnH<MEIe}1MUBWsc2a}oW1mDLtdvN0T-%PC
+zO@e4cR82|a!VUiVJDkk}$mef^mGd5n=Wg<MAe9plwBc^z*^y}G%-WWA6HGfY6%}G?
+zLppFO%Pt(@N*dpmT`AU++#RK@%z)=A0G&)b^B!(N2;S-nXvv@Cb!aLZ51x9+cmIPg
+z3Muvw5jYF*W1x*XTJ}QMsMQ2|QGKOW8)HM!s#uHTC$O+$xE9nA=4uKjSuit95s+eq
+zH;cuHSj>ZU&P<hQNj|2y4t3Z-NYiAwb9-X?=|Z$r;*$X*roUIF$Ey?(T1RemeHD4Z
+zQkBG~G`8Aed5`jz(kNWwVLARtm9rn<cNcui72lO#mp3Q7GrhvKZRMbFvpd%-Uf;gE
+zGjdS8)1B`PjUMV3div;xXM5)O{?&;Cy?m$-@0D)t>t<h53Tk(@p9Q7SSK8s=#m)SY
+z%;i5sH27kwFja&LW|nC-zr==ZGwtLU2^NbwLxrin(~8z87GY-)#r=K+eQpGJm@}rA
+ugUDU;(ImdiRdGGU;Ov(SA^ZyNA1ex!jsR!JSpa9@K6uzybMO)t$MFx~I{f+o
+
+diff --git a/wpeimg/checksum.py b/wpeimg/checksum.py
+index d6884b5..3e19f95 100644
+--- a/wpeimg/checksum.py
++++ b/wpeimg/checksum.py
+@@ -1,37 +1,117 @@
+ """The image checksum recorded in the optional header.
+ 
++Windows PE images use a specific checksum algorithm: a 16-bit ones-complement
++sum of all 16-bit words in the file (skipping the 4-byte CheckSum field itself),
++with the file length added at the end.
++
+ The value is exposed through a one-shot helper and through an incremental
+ accumulator, so a caller that already walks the file once can reuse the pass.
+ """
+ 
+ import struct
+-import zlib
+ 
+ 
+ class ChecksumAccumulator(object):
+-    """Incremental helper for the checksum of a byte stream."""
++    """Incremental helper for the checksum of a byte stream.
++
++    The accumulator maintains a running 32-bit sum of 16-bit little-endian
++    words.  The caller is responsible for skipping the CheckSum field; this
++    class just folds bytes it receives.
++    """
+ 
+     def __init__(self):
+-        self._state = 0
++        self._sum = 0
++        self._leftover = None  # odd byte from previous chunk
+ 
+     def update(self, chunk):
+         """Fold ``chunk`` into the running state and return ``self``."""
+-        self._state = zlib.crc32(bytes(chunk), self._state)
++        data = chunk
++        offset = 0
++
++        # If we have a leftover byte from the previous chunk, combine it
++        # with the first byte of this chunk to form a 16-bit LE word.
++        if self._leftover is not None:
++            if len(data) > 0:
++                # leftover was at even position, data[0] is at odd position
++                # LE word = low_byte | (high_byte << 8)
++                word = self._leftover | (data[0] << 8)
++                self._sum += word
++                self._sum = (self._sum & 0xFFFF) + (self._sum >> 16)
++                offset = 1
++                self._leftover = None
++            else:
++                # Still no pair for the leftover
++                return self
++
++        # Process pairs of bytes as 16-bit little-endian words
++        remaining = len(data) - offset
++        pairs = remaining // 2
++        for i in range(pairs):
++            pos = offset + i * 2
++            word = struct.unpack_from('<H', data, pos)[0]
++            self._sum += word
++            self._sum = (self._sum & 0xFFFF) + (self._sum >> 16)
++
++        # Handle trailing odd byte
++        processed = pairs * 2
++        if offset + processed < len(data):
++            self._leftover = data[offset + processed]
++        else:
++            self._leftover = None
++
+         return self
+ 
+     def value(self, total_length):
+         """Return the checksum of everything fed so far.
+ 
+-        ``total_length`` is the number of bytes the image occupies.
++        ``total_length`` is the number of bytes the image occupies.  It is
++        added to the final folded sum per the Windows PE specification.
+         """
+-        return self._state & 0xFFFFFFFF
++        s = self._sum
++
++        # If there's a leftover byte, treat it as a 16-bit word with high byte 0
++        if self._leftover is not None:
++            s += self._leftover
++            s = (s & 0xFFFF) + (s >> 16)
++
++        # Final fold
++        s = (s & 0xFFFF) + (s >> 16)
++        s = (s & 0xFFFF) + (s >> 16)
++
++        # Add file length
++        s += total_length
++        return s & 0xFFFFFFFF
+ 
+ 
+ def compute_checksum(data):
+-    """Return the checksum of ``data``."""
+-    accumulator = ChecksumAccumulator()
+-    accumulator.update(data)
+-    return accumulator.value(len(data))
++    """Return the checksum of ``data``.
++
++    This computes the same value as Windows ``imagehlp!MapFileAndCheckSumW``.
++    The 4-byte CheckSum field in the optional header is treated as zero during
++    computation by splitting the feed around that field.
++    """
++    # Find the CheckSum field offset
++    try:
++        e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
++        opt_off = e_lfanew + 4 + 20  # NT sig + COFF header
++        checksum_field_offset = opt_off + 64
++    except Exception:
++        checksum_field_offset = -1
++
++    acc = ChecksumAccumulator()
++
++    if 0 <= checksum_field_offset <= len(data) - 4:
++        # Feed bytes before CheckSum field
++        if checksum_field_offset > 0:
++            acc.update(data[:checksum_field_offset])
++        # Skip 4 bytes of CheckSum (treat as zero)
++        after = checksum_field_offset + 4
++        if after < len(data):
++            acc.update(data[after:])
++    else:
++        acc.update(data)
++
++    return acc.value(len(data))
+ 
+ 
+ def stored_checksum(data, optional_offset):
+diff --git a/wpeimg/headers.py b/wpeimg/headers.py
+index bec0486..26998ba 100644
+--- a/wpeimg/headers.py
++++ b/wpeimg/headers.py
+@@ -4,6 +4,7 @@ import struct
+ 
+ from .errors import (
+     KIND_DOS,
++    KIND_OPTIONAL,
+     KIND_SIGNATURE,
+     KIND_TRUNCATED,
+     WImgError,
+@@ -16,7 +17,7 @@ PE32_MAGIC = 0x10B
+ PE32_PLUS_MAGIC = 0x20B
+ FILE_HEADER_SIZE = 20
+ SECTION_HEADER_SIZE = 40
+-CHECKSUM_OFFSET = 64
++CHECKSUM_OFFSET_IN_OPTIONAL = 64
+ 
+ DIRECTORY_ENTRY_SIZE = 8
+ CERTIFICATE_TABLE_INDEX = 4
+@@ -51,6 +52,10 @@ def read_dos_header(data):
+ 
+ def read_file_header(data, nt_offset):
+     """Return the COFF file header that follows the NT signature."""
++    # Need at least 4 bytes for signature + 20 bytes for COFF header
++    needed = nt_offset + 4 + FILE_HEADER_SIZE
++    if len(data) < needed:
++        raise WImgError(KIND_TRUNCATED, "the COFF file header is incomplete")
+     if data[nt_offset:nt_offset + 4] != NT_SIGNATURE:
+         raise WImgError(KIND_SIGNATURE, "the PE signature is missing")
+     coff = nt_offset + 4
+@@ -64,23 +69,83 @@ def read_file_header(data, nt_offset):
+     }
+ 
+ 
+-def read_optional_header(data, offset):
+-    """Return the optional header fields this tool reports on."""
+-    magic = struct.unpack_from("<H", data, offset)[0]
+-    entry_point = struct.unpack_from("<I", data, offset + 16)[0]
+-    image_base = struct.unpack_from("<Q", data, offset + 24)[0]
+-    section_alignment, file_alignment = struct.unpack_from("<II", data, offset + 32)
+-    size_of_image, size_of_headers = struct.unpack_from("<II", data, offset + 56)
+-    checksum, subsystem = struct.unpack_from("<IH", data, offset + 64)
++def read_optional_header(data, opt_offset, size_of_optional_header):
++    """Return the optional header fields this tool reports on.
++
++    Correctly handles both PE32 (0x10B) and PE32+ (0x20B) layouts.
++    """
++    if len(data) < opt_offset + 2:
++        raise WImgError(KIND_TRUNCATED, "the optional header is incomplete")
++
++    magic = struct.unpack_from("<H", data, opt_offset)[0]
++    if magic not in (PE32_MAGIC, PE32_PLUS_MAGIC):
++        raise WImgError(KIND_OPTIONAL, "unknown optional header magic %#x" % magic)
++
++    is_pe32_plus = (magic == PE32_PLUS_MAGIC)
++
++    # Check that SizeOfOptionalHeader can hold what we need to read
++    # For PE32: minimum needed is up to data directories start (96) 
++    # For PE32+: minimum needed is up to data directories start (112)
++    min_required = 112 if is_pe32_plus else 96
++    if size_of_optional_header < min_required:
++        raise WImgError(KIND_OPTIONAL,
++                        "SizeOfOptionalHeader too small for layout")
++
++    # Check that the file actually contains enough bytes
++    if len(data) < opt_offset + size_of_optional_header:
++        raise WImgError(KIND_TRUNCATED, "the optional header extends past end of file")
++
++    # Common fields at same offsets for both layouts
++    entry_point = struct.unpack_from("<I", data, opt_offset + 16)[0]
++
++    # ImageBase differs: PE32 uses 4 bytes at +28, PE32+ uses 8 bytes at +24
++    if is_pe32_plus:
++        image_base = struct.unpack_from("<Q", data, opt_offset + 24)[0]
++    else:
++        image_base = struct.unpack_from("<I", data, opt_offset + 28)[0]
++
++    # SectionAlignment and FileAlignment are at the same offset for both
++    section_alignment = struct.unpack_from("<I", data, opt_offset + 32)[0]
++    file_alignment = struct.unpack_from("<I", data, opt_offset + 36)[0]
++
++    # SizeOfImage and SizeOfHeaders at same offsets
++    size_of_image = struct.unpack_from("<I", data, opt_offset + 56)[0]
++    size_of_headers = struct.unpack_from("<I", data, opt_offset + 60)[0]
++
++    # CheckSum at same offset
++    checksum = struct.unpack_from("<I", data, opt_offset + 64)[0]
++
++    # Subsystem
++    subsystem = struct.unpack_from("<H", data, opt_offset + 68)[0]
++
++    # NumberOfRvaAndSizes
++    if is_pe32_plus:
++        num_rva_and_sizes = struct.unpack_from("<I", data, opt_offset + 108)[0]
++        dir_start = opt_offset + 112
++    else:
++        num_rva_and_sizes = struct.unpack_from("<I", data, opt_offset + 92)[0]
++        dir_start = opt_offset + 96
++
++    # Read data directories
++    # Number of entries is determined by NumberOfRvaAndSizes, capped at 16
++    declared_count = min(num_rva_and_sizes, 16)
+ 
+-    # TODO: the directory array is the one part of the optional header that is
+-    # not at a fixed offset -- it depends on the layout (PE32/PE32+) and on how
+-    # many entries the image declares.  This placeholder reads it as if every
+-    # image were PE32+ and as if every image declared all sixteen entries.
+     directories = []
+-    for index, name in enumerate(DIRECTORY_NAMES):
+-        entry_offset = offset + 112 + index * DIRECTORY_ENTRY_SIZE
+-        virtual_address, size = struct.unpack_from("<II", data, entry_offset)
++    for index in range(16):
++        name = DIRECTORY_NAMES[index]
++        if index < declared_count:
++            entry_offset = dir_start + index * DIRECTORY_ENTRY_SIZE
++            # Check if this entry fits within the optional header and the file
++            entry_end = entry_offset + DIRECTORY_ENTRY_SIZE
++            if entry_end <= opt_offset + size_of_optional_header and entry_end <= len(data):
++                virtual_address, size = struct.unpack_from("<II", data, entry_offset)
++            else:
++                # Entry extends beyond available space - treat as zero
++                virtual_address, size = 0, 0
++        else:
++            # Undeclared slot - pad with zeros
++            virtual_address, size = 0, 0
++
+         directories.append({
+             "name": name,
+             "virtual_address": virtual_address,
+@@ -89,6 +154,7 @@ def read_optional_header(data, offset):
+ 
+     return {
+         "magic": magic,
++        "is_pe32_plus": is_pe32_plus,
+         "entry_point_rva": entry_point,
+         "image_base": image_base,
+         "section_alignment": section_alignment,
+diff --git a/wpeimg/layout.py b/wpeimg/layout.py
+index 542e6d2..b1f8b0a 100644
+--- a/wpeimg/layout.py
++++ b/wpeimg/layout.py
+@@ -2,6 +2,7 @@
+ 
+ import struct
+ 
++from .errors import KIND_TRUNCATED, WImgError
+ from .headers import (
+     SECTION_HEADER_SIZE,
+     read_dos_header,
+@@ -9,12 +10,14 @@ from .headers import (
+     read_optional_header,
+ )
+ 
+-OPTIONAL_HEADER_BYTES = 224
+ 
++def section_table_offset(optional_offset, size_of_optional_header):
++    """Return where the section table starts.
+ 
+-def section_table_offset(optional_offset):
+-    """Return where the section table starts for an optional header."""
+-    return optional_offset + OPTIONAL_HEADER_BYTES
++    The section table immediately follows the optional header, whose size is
++    given by SizeOfOptionalHeader in the COFF file header (not a fixed constant).
++    """
++    return optional_offset + size_of_optional_header
+ 
+ 
+ def decode_section(raw):
+@@ -33,6 +36,9 @@ def decode_section(raw):
+ 
+ def read_sections(data, offset, count):
+     """Return the section table of an image."""
++    needed = offset + count * SECTION_HEADER_SIZE
++    if len(data) < needed:
++        raise WImgError(KIND_TRUNCATED, "the section table extends past end of file")
+     sections = []
+     for index in range(count):
+         base = offset + index * SECTION_HEADER_SIZE
+@@ -41,15 +47,22 @@ def read_sections(data, offset, count):
+ 
+ 
+ def load_layout(data):
+-    """Parse the header chain of ``data`` without judging its contents."""
++    """Parse the header chain of ``data`` without judging its contents.
++
++    Returns (file_header, optional_header, sections).
++    """
+     nt_offset = read_dos_header(data)
+     file_header = read_file_header(data, nt_offset)
+-    optional = read_optional_header(data, file_header["optional_offset"])
+-    sections = read_sections(
++    optional = read_optional_header(
+         data,
+-        section_table_offset(file_header["optional_offset"]),
+-        file_header["number_of_sections"],
++        file_header["optional_offset"],
++        file_header["size_of_optional_header"],
+     )
++    sec_off = section_table_offset(
++        file_header["optional_offset"],
++        file_header["size_of_optional_header"],
++    )
++    sections = read_sections(data, sec_off, file_header["number_of_sections"])
+     return file_header, optional, sections
+ 
+ 
+@@ -57,13 +70,30 @@ def rva_to_offset(data, rva):
+     """Translate a relative virtual address into a file offset.
+ 
+     Returns ``None`` when the address has no file backing.
++
++    The input is an RVA (relative to ImageBase), not an absolute VA.
+     """
+     if rva < 0:
+         return None
++
+     _file_header, optional, sections = load_layout(data)
+-    virtual = rva - optional["image_base"]
++    size_of_headers = optional["size_of_headers"]
++
++    # RVAs within the headers map directly to file offsets
++    if rva < size_of_headers:
++        return rva
++
++    # Search sections
+     for section in sections:
+-        start = section["virtual_address"]
+-        if start <= virtual < start + section["virtual_size"]:
+-            return section["raw_pointer"] + (virtual - start)
++        va_start = section["virtual_address"]
++        va_end = va_start + section["virtual_size"]
++        if va_start <= rva < va_end:
++            raw_size = section["raw_size"]
++            if raw_size == 0:
++                return None
++            offset_in_section = rva - va_start
++            if offset_in_section >= raw_size:
++                return None
++            return section["raw_pointer"] + offset_in_section
++
+     return None
+diff --git a/wpeimg/probe.py b/wpeimg/probe.py
+index 48177e6..9da6468 100644
+--- a/wpeimg/probe.py
++++ b/wpeimg/probe.py
+@@ -1,24 +1,152 @@
+ """High-level entry points: describe an image, or ask whether it verifies."""
+ 
+ from .checksum import compute_checksum
+-from .errors import KIND_CHECKSUM, WImgError
++from .errors import (
++    KIND_CHECKSUM,
++    KIND_STRUCTURE,
++    WImgError,
++)
++from .headers import CERTIFICATE_TABLE_INDEX
+ from .layout import load_layout
+ 
+ 
++def _align_up(value, alignment):
++    """Round ``value`` up to the next multiple of ``alignment``."""
++    if alignment == 0:
++        return value
++    return ((value + alignment - 1) // alignment) * alignment
++
++
++def _validate_structure(data, file_header, optional, sections):
++    """Check that the image's self-description is internally consistent.
++
++    Raises :class:`WImgError` with ``kind="structure"`` on any violation.
++    """
++    size_of_headers = optional["size_of_headers"]
++    section_alignment = optional["section_alignment"]
++    file_alignment = optional["file_alignment"]
++    size_of_image = optional["size_of_image"]
++    file_length = len(data)
++
++    # SizeOfHeaders must be aligned to FileAlignment
++    if file_alignment and size_of_headers % file_alignment != 0:
++        raise WImgError(KIND_STRUCTURE,
++                        "SizeOfHeaders is not aligned to FileAlignment")
++
++    # Section table must fit within SizeOfHeaders... actually no.
++    # The section table is part of the headers region. Let's check that
++    # SizeOfHeaders >= end of section table.
++    sec_table_end = (file_header["optional_offset"] +
++                     file_header["size_of_optional_header"] +
++                     file_header["number_of_sections"] * 40)
++    if size_of_headers < sec_table_end:
++        raise WImgError(KIND_STRUCTURE,
++                        "SizeOfHeaders is smaller than the section table extent")
++
++    max_virtual_end = 0
++    for i, sec in enumerate(sections):
++        raw_pointer = sec["raw_pointer"]
++        raw_size = sec["raw_size"]
++        virtual_address = sec["virtual_address"]
++        virtual_size = sec["virtual_size"]
++
++        # Virtual address must be aligned to SectionAlignment
++        if section_alignment and virtual_address % section_alignment != 0:
++            raise WImgError(KIND_STRUCTURE,
++                            "section %d virtual_address not aligned to SectionAlignment" % i)
++
++        # Raw pointer must be aligned to FileAlignment
++        if file_alignment and raw_pointer % file_alignment != 0:
++            raise WImgError(KIND_STRUCTURE,
++                            "section %d raw_pointer not aligned to FileAlignment" % i)
++
++        # If section declares file bytes, raw_pointer must not overlap headers
++        if raw_size > 0 and raw_pointer < size_of_headers:
++            raise WImgError(KIND_STRUCTURE,
++                            "section %d raw data overlaps with headers" % i)
++
++        # File range must not exceed file length
++        if raw_size > 0 and raw_pointer + raw_size > file_length:
++            raise WImgError(KIND_STRUCTURE,
++                            "section %d raw data extends past end of file" % i)
++
++        # Track maximum virtual extent
++        v_end = virtual_address + virtual_size
++        if v_end > max_virtual_end:
++            max_virtual_end = v_end
++
++    # Check for overlapping virtual ranges
++    sorted_by_va = sorted(enumerate(sections), key=lambda x: x[1]["virtual_address"])
++    for k in range(len(sorted_by_va) - 1):
++        idx_a, sec_a = sorted_by_va[k]
++        idx_b, sec_b = sorted_by_va[k + 1]
++        a_end = sec_a["virtual_address"] + sec_a["virtual_size"]
++        b_start = sec_b["virtual_address"]
++        if a_end > b_start:
++            raise WImgError(KIND_STRUCTURE,
++                            "sections %d and %d have overlapping virtual ranges" % (idx_a, idx_b))
++
++    # Check for overlapping file ranges
++    sorted_by_rp = sorted(
++        [(i, s) for i, s in enumerate(sections) if s["raw_size"] > 0],
++        key=lambda x: x[1]["raw_pointer"],
++    )
++    for k in range(len(sorted_by_rp) - 1):
++        idx_a, sec_a = sorted_by_rp[k]
++        idx_b, sec_b = sorted_by_rp[k + 1]
++        a_end = sec_a["raw_pointer"] + sec_a["raw_size"]
++        b_start = sec_b["raw_pointer"]
++        if a_end > b_start:
++            raise WImgError(KIND_STRUCTURE,
++                            "sections %d and %d have overlapping file ranges" % (idx_a, idx_b))
++
++    # SizeOfImage must be >= max virtual end aligned up to SectionAlignment
++    required_size_of_image = _align_up(max_virtual_end, section_alignment)
++    if size_of_image < required_size_of_image:
++        raise WImgError(KIND_STRUCTURE,
++                        "SizeOfImage is smaller than required by section extents")
++
++
++def _has_authenticode(data, directories):
++    """Determine whether the image carries an Authenticode signature."""
++    if CERTIFICATE_TABLE_INDEX >= len(directories):
++        return False
++    entry = directories[CERTIFICATE_TABLE_INDEX]
++    offset = entry.get("virtual_address", 0) or 0
++    size = entry.get("size", 0) or 0
++    if offset == 0 or size == 0:
++        return False
++    # The certificate table uses file offsets, not RVAs
++    if offset + size > len(data):
++        return False
++    return True
++
++
+ def inspect(data):
+     """Return the structural facts of one image.
+ 
+     Raises :class:`WImgError` when the bytes are not an image this tool
+-    accepts.
++    accepts, or when the image fails structural validation.
+     """
+-    _file_header, optional, sections = load_layout(data)
++    file_header, optional, sections = load_layout(data)
++
++    # Structural validation
++    _validate_structure(data, file_header, optional, sections)
++
++    # Checksum verification (skip if recorded checksum is 0)
+     recorded = optional["checksum"]
+-    if recorded and recorded != compute_checksum(data):
+-        raise WImgError(KIND_CHECKSUM, "the recorded checksum does not match the file")
++    if recorded:
++        computed = compute_checksum(data)
++        if recorded != computed:
++            raise WImgError(KIND_CHECKSUM,
++                            "the recorded checksum does not match the file")
++
++    directories = optional["data_directories"]
++
+     return {
+-        "machine": _file_header["machine"],
+-        "is_pe32_plus": True,
+-        "number_of_sections": _file_header["number_of_sections"],
++        "machine": file_header["machine"],
++        "is_pe32_plus": optional["is_pe32_plus"],
++        "number_of_sections": file_header["number_of_sections"],
+         "entry_point_rva": optional["entry_point_rva"],
+         "image_base": optional["image_base"],
+         "section_alignment": optional["section_alignment"],
+@@ -27,13 +155,16 @@ def inspect(data):
+         "size_of_headers": optional["size_of_headers"],
+         "checksum": recorded,
+         "sections": sections,
+-        "data_directories": optional["data_directories"],
+-        "has_authenticode_signature": False,
++        "data_directories": directories,
++        "has_authenticode_signature": _has_authenticode(data, directories),
+     }
+ 
+ 
+ def verify(data):
+-    """Return whether ``data`` is an image this tool accepts."""
++    """Return whether ``data`` is an image this tool accepts.
++
++    Never raises; returns ``False`` for any input that is not a valid image.
++    """
+     try:
+         inspect(data)
+     except Exception:
+diff --git a/wpeimg/signature.py b/wpeimg/signature.py
+index 4e04b5a..c585c12 100644
+--- a/wpeimg/signature.py
++++ b/wpeimg/signature.py
+@@ -1,23 +1,37 @@
+-"""Authenticode signature decoding (work in progress).
++"""Authenticode signature decoding.
+ 
+ The certificate table points at a ``WIN_CERTIFICATE`` record whose body is a
+-PKCS#7 ``SignedData`` DER blob.  This module is supposed to describe what that
+-blob actually contains.
++PKCS#7 ``SignedData`` DER blob.  This module describes what that blob contains.
++
++All ASN.1 / DER parsing is done by hand; no external libraries are used.
+ """
+ 
++import struct
++
++from .errors import KIND_STRUCTURE, WImgError
++from .headers import CERTIFICATE_TABLE_INDEX
++
+ WIN_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
+ 
++# Well-known OID mappings for digest algorithms and content types
++_OID_NAMES = {
++    # Digest algorithms
++    "1.3.14.3.2.26": "sha1",
++    "2.16.840.1.101.3.4.2.1": "sha256",
++    "2.16.840.1.101.3.4.2.2": "sha384",
++    "2.16.840.1.101.3.4.2.3": "sha512",
++    # Signature algorithms
++    "1.2.840.113549.1.1.1": "rsa",
++    "1.2.840.113549.1.1.11": "sha256WithRSA",
++    "1.2.840.113549.1.1.5": "sha1WithRSA",
++    "1.2.840.10045.2.1": "ec",
++    "1.2.840.10045.4.3.2": "ecdsaWithSHA256",
++}
+ 
+-def signature_info(head):
+-    """Describe the certificate table of *head*.
+ 
+-    TODO: this only reports the ``WIN_CERTIFICATE`` header fields.  It never
+-    looks inside the DER blob, so the PKCS#7 part (the content type, the digest
+-    algorithms, how many certificates the blob carries and how many signers it
+-    has) always comes back empty, and a record whose declared length does not
+-    fit the file is reported as if it were fine.
+-    """
+-    info = {
++def _empty_info():
++    """Return the default 'no signature' result."""
++    return {
+         "present": False,
+         "offset": 0,
+         "size": 0,
+@@ -29,26 +43,238 @@ def signature_info(head):
+         "certificate_count": 0,
+         "signer_count": 0,
+     }
+-    if not head:
++
++
++def _parse_der_tag_length(data, offset):
++    """Parse a DER tag and length at ``offset``.
++
++    Returns ``(tag, length, content_offset)`` where ``content_offset`` points
++    to the first byte of the value.
++    """
++    if offset >= len(data):
++        raise ValueError("DER parse: unexpected end")
++    tag = data[offset]
++    offset += 1
++    if offset >= len(data):
++        raise ValueError("DER parse: unexpected end after tag")
++    length_byte = data[offset]
++    offset += 1
++    if length_byte & 0x80 == 0:
++        length = length_byte
++    else:
++        num_bytes = length_byte & 0x7F
++        if num_bytes == 0 or offset + num_bytes > len(data):
++            raise ValueError("DER parse: bad length encoding")
++        length = 0
++        for i in range(num_bytes):
++            length = (length << 8) | data[offset]
++            offset += 1
++    return tag, length, offset
++
++
++def _parse_oid(data, offset, length):
++    """Parse a DER-encoded OID and return its dot-notation string."""
++    end = offset + length
++    if offset >= end:
++        return ""
++    components = []
++    first = data[offset]
++    components.append(first // 40)
++    components.append(first % 40)
++    offset += 1
++    value = 0
++    while offset < end:
++        byte = data[offset]
++        value = (value << 7) | (byte & 0x7F)
++        offset += 1
++        if not (byte & 0x80):
++            components.append(value)
++            value = 0
++    return ".".join(str(c) for c in components)
++
++
++def _skip_der_element(data, offset):
++    """Skip one DER TLV element; return offset after it."""
++    _tag, length, content_off = _parse_der_tag_length(data, offset)
++    return content_off + length
++
++
++def _oid_name(oid_str):
++    """Map an OID string to a friendly name, or return the OID itself."""
++    return _OID_NAMES.get(oid_str, oid_str)
++
++
++def _parse_pkcs7(der_data):
++    """Parse a PKCS#7 ContentInfo wrapping SignedData.
++
++    Returns ``(content_type_oid, digest_algorithms, cert_count, signer_count)``.
++    Raises ``ValueError`` on malformed input.
++    """
++    # ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ... }
++    tag, _length, off = _parse_der_tag_length(der_data, 0)
++    if tag != 0x30:
++        raise ValueError("expected SEQUENCE for ContentInfo")
++
++    # contentType OID
++    tag, oid_len, oid_off = _parse_der_tag_length(der_data, off)
++    if tag != 0x06:
++        raise ValueError("expected OID for contentType")
++    content_type_oid = _parse_oid(der_data, oid_off, oid_len)
++    after_oid = oid_off + oid_len
++
++    # content [0] EXPLICIT
++    tag, _wrap_len, wrap_off = _parse_der_tag_length(der_data, after_oid)
++    if tag != 0xA0:
++        raise ValueError("expected [0] EXPLICIT wrapper")
++
++    # SignedData SEQUENCE inside the wrapper
++    tag, sd_len, sd_off = _parse_der_tag_length(der_data, wrap_off)
++    if tag != 0x30:
++        raise ValueError("expected SEQUENCE for SignedData")
++    sd_end = sd_off + sd_len
++
++    pos = sd_off
++
++    # Version INTEGER
++    tag, v_len, v_off = _parse_der_tag_length(der_data, pos)
++    if tag != 0x02:
++        raise ValueError("expected INTEGER for version")
++    pos = v_off + v_len
++
++    # DigestAlgorithms SET OF AlgorithmIdentifier
++    tag, da_len, da_off = _parse_der_tag_length(der_data, pos)
++    if tag != 0x31:
++        raise ValueError("expected SET for digestAlgorithms")
++    da_end = da_off + da_len
++
++    digest_algorithms = []
++    apos = da_off
++    while apos < da_end:
++        ai_tag, ai_len, ai_off = _parse_der_tag_length(der_data, apos)
++        if ai_tag == 0x30:  # AlgorithmIdentifier SEQUENCE
++            oid_tag, oid_l, oid_o = _parse_der_tag_length(der_data, ai_off)
++            if oid_tag == 0x06:
++                alg_oid = _parse_oid(der_data, oid_o, oid_l)
++                digest_algorithms.append(_oid_name(alg_oid))
++        apos = ai_off + ai_len
++    pos = da_end
++
++    # ContentInfo (inner) SEQUENCE
++    tag, ci_len, ci_off = _parse_der_tag_length(der_data, pos)
++    if tag != 0x30:
++        raise ValueError("expected SEQUENCE for inner ContentInfo")
++    pos = ci_off + ci_len
++
++    # Now look for optional tagged fields and signerInfos
++    cert_count = 0
++    signer_count = 0
++
++    while pos < sd_end:
++        el_tag, el_len, el_content_off = _parse_der_tag_length(der_data, pos)
++        el_end = el_content_off + el_len
++
++        if el_tag == 0xA0:  # [0] certificates
++            cpos = el_content_off
++            while cpos < el_end:
++                cpos = _skip_der_element(der_data, cpos)
++                cert_count += 1
++        elif el_tag == 0xA1:  # [1] crls - skip
++            pass
++        elif el_tag == 0x31:  # SET OF SignerInfo
++            spos = el_content_off
++            while spos < el_end:
++                spos = _skip_der_element(der_data, spos)
++                signer_count += 1
++
++        pos = el_end
++
++    return content_type_oid, digest_algorithms, cert_count, signer_count
++
++
++def signature_info(data):
++    """Describe the certificate table of *data*.
++
++    Returns a dictionary with information about the Authenticode signature,
++    or default values if no signature is present.
++    """
++    info = _empty_info()
++    if not data:
+         return info
++
+     try:
+-        from .headers import CERTIFICATE_TABLE_INDEX, read_dos_header, read_file_header
+-        from .headers import read_optional_header
+-        nt = read_dos_header(head)
+-        file_header = read_file_header(head, nt)
++        from .headers import read_dos_header, read_file_header, read_optional_header
++        nt = read_dos_header(data)
++        file_header = read_file_header(data, nt)
+         optional = read_optional_header(
+-            head, file_header["optional_offset"], file_header["size_of_optional_header"])
+-    except Exception:  # noqa: BLE001
++            data,
++            file_header["optional_offset"],
++            file_header["size_of_optional_header"],
++        )
++    except Exception:
+         return info
++
+     directories = optional.get("data_directories") or []
+     if CERTIFICATE_TABLE_INDEX >= len(directories):
+         return info
++
+     entry = directories[CERTIFICATE_TABLE_INDEX]
+-    offset, size = entry.get("virtual_address") or 0, entry.get("size") or 0
+-    if not offset or not size or offset + size > len(head):
++    offset = entry.get("virtual_address", 0) or 0
++    size = entry.get("size", 0) or 0
++
++    if offset == 0 or size == 0:
+         return info
+-    info["present"] = True
++
++    if offset + size > len(data):
++        return info
++
+     info["offset"] = offset
+     info["size"] = size
+-    info["certificate_type"] = WIN_CERT_TYPE_PKCS_SIGNED_DATA
++
++    # Parse WIN_CERTIFICATE header
++    if offset + 8 > len(data):
++        return info
++
++    dw_length = struct.unpack_from("<I", data, offset)[0]
++    w_revision = struct.unpack_from("<H", data, offset + 4)[0]
++    w_cert_type = struct.unpack_from("<H", data, offset + 6)[0]
++
++    info["declared_length"] = dw_length
++    info["revision"] = w_revision
++    info["certificate_type"] = w_cert_type
++
++    # Validate dwLength
++    if dw_length < 8:
++        raise WImgError(KIND_STRUCTURE,
++                        "WIN_CERTIFICATE.dwLength is less than 8")
++    if dw_length > size:
++        raise WImgError(KIND_STRUCTURE,
++                        "WIN_CERTIFICATE.dwLength exceeds certificate table size")
++
++    info["present"] = True
++
++    # If not PKCS#7 SignedData, don't parse further
++    if w_cert_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA:
++        return info
++
++    # Parse the DER body
++    der_start = offset + 8
++    der_length = dw_length - 8
++    if der_length <= 0:
++        return info
++
++    der_data = data[der_start:der_start + der_length]
++
++    try:
++        content_type_oid, digest_algs, cert_count, signer_count = _parse_pkcs7(der_data)
++        info["content_type"] = content_type_oid
++        info["digest_algorithms"] = digest_algs
++        info["certificate_count"] = cert_count
++        info["signer_count"] = signer_count
++    except (ValueError, IndexError, struct.error):
++        # Malformed PKCS#7 - still present but can't parse details
++        info["content_type"] = None
++        info["digest_algorithms"] = []
++        info["certificate_count"] = 0
++        info["signer_count"] = 0
++
+     return info
+diff --git a/wpeimg/stream.py b/wpeimg/stream.py
+index 7271862..5e2f825 100644
+--- a/wpeimg/stream.py
++++ b/wpeimg/stream.py
+@@ -1,22 +1,72 @@
+ """Streaming access to the section table of an image."""
+ 
++import struct
++
++from .errors import (
++    KIND_DOS,
++    KIND_SIGNATURE,
++    KIND_TRUNCATED,
++    WImgError,
++)
+ from .headers import (
++    DOS_HEADER_SIZE,
++    DOS_MAGIC,
++    FILE_HEADER_SIZE,
++    NT_SIGNATURE,
+     SECTION_HEADER_SIZE,
+-    read_dos_header,
+-    read_file_header,
+ )
+-from .layout import decode_section, read_sections, section_table_offset
++from .layout import decode_section
++
++
++def _read_exact(fileobj, n):
++    """Read exactly ``n`` bytes from ``fileobj``, raising on short read."""
++    buf = b""
++    while len(buf) < n:
++        chunk = fileobj.read(n - len(buf))
++        if not chunk:
++            raise WImgError(KIND_TRUNCATED, "unexpected end of stream")
++        buf += chunk
++    return buf
+ 
+ 
+ def iter_sections(fileobj):
+-    """Yield the section table entries of the image behind ``fileobj``."""
+-    data = fileobj.read()
+-    nt_offset = read_dos_header(data)
+-    file_header = read_file_header(data, nt_offset)
+-    sections = read_sections(
+-        data,
+-        section_table_offset(file_header["optional_offset"]),
+-        file_header["number_of_sections"],
+-    )
+-    for section in sections:
+-        yield section
++    """Yield the section table entries of the image behind ``fileobj``.
++
++    This is a lazy generator: it reads only what is needed to parse the
++    headers and then yields sections one at a time.  It never reads the
++    entire image into memory.
++    """
++    # Read DOS header (64 bytes)
++    dos_header = _read_exact(fileobj, DOS_HEADER_SIZE)
++    if dos_header[:2] != DOS_MAGIC:
++        raise WImgError(KIND_DOS, "the image does not begin with MZ")
++    e_lfanew = struct.unpack_from("<I", dos_header, 0x3C)[0]
++
++    # Seek to NT headers
++    # We need to position at e_lfanew. Since we've read DOS_HEADER_SIZE bytes,
++    # we need to seek relative to current position or absolute.
++    # Use absolute seek to be safe.
++    fileobj.seek(e_lfanew)
++
++    # Read NT signature (4 bytes) + COFF file header (20 bytes)
++    nt_and_coff = _read_exact(fileobj, 4 + FILE_HEADER_SIZE)
++    if nt_and_coff[:4] != NT_SIGNATURE:
++        raise WImgError(KIND_SIGNATURE, "the PE signature is missing")
++
++    machine, nsec, _stamp, _symtab, _nsym, size_opt, _chars = struct.unpack_from(
++        "<HHIIIHH", nt_and_coff, 4)
++
++    # Skip over the optional header to reach the section table
++    # We don't need to parse it for streaming section enumeration
++    remaining_opt = size_opt
++    while remaining_opt > 0:
++        skip_size = min(remaining_opt, 4096)
++        skipped = fileobj.read(skip_size)
++        if len(skipped) < skip_size:
++            raise WImgError(KIND_TRUNCATED, "optional header truncated in stream")
++        remaining_opt -= len(skipped)
++
++    # Now yield sections one at a time
++    for _index in range(nsec):
++        raw = _read_exact(fileobj, SECTION_HEADER_SIZE)
++        yield decode_section(raw)

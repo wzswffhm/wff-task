@@ -17,7 +17,19 @@ ALIASES = {
     "glm": "glm", "glm-5.3": "glm",
     "kimi": "kimi", "kimi-k3": "kimi",
 }
-REQUIRED_COUNTS = {"qwen": 3, "opus": 3, "glm": 1, "kimi": 1}
+
+# Required rounds: the primary comparison pair. The discrimination rule is
+# stated exclusively in terms of qwen vs opus.
+REQUIRED_COUNTS = {"qwen": 3, "opus": 3}
+
+# Optional rounds (latest scope, 2026-10-13): GLM and Kimi are no longer
+# mandatory. A delivery may omit them entirely; when they ARE supplied they
+# must still be complete and VALID, so a half-finished round can never dilute
+# the gate.
+OPTIONAL_COUNTS = {"glm": 1, "kimi": 1}
+
+# Every alias the gate knows how to score (required + optional).
+ALL_COUNTS = {**REQUIRED_COUNTS, **OPTIONAL_COUNTS}
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -47,12 +59,16 @@ def inspect_runs(
     required_count: int,
     expected_identity: dict[str, Any],
     seen_run_ids: set[str],
+    optional: bool = False,
 ) -> tuple[list[int], int, list[str]]:
     errors: list[str] = []
     if not isinstance(runs, list):
         return [], 0, [f"{name} evidence must be a list"]
     if len(runs) != required_count:
-        errors.append(f"{name} requires exactly {required_count} runs, got {len(runs)}")
+        # An optional model may be absent altogether under the latest scope;
+        # supplying a partial set is still an error.
+        if not (optional and len(runs) == 0):
+            errors.append(f"{name} requires exactly {required_count} runs, got {len(runs)}")
     scores: list[int] = []
     testcase_pass_sum = 0
     for index, run in enumerate(runs, 1):
@@ -120,16 +136,23 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
 
     seen_run_ids: set[str] = set()
     scores_by_model: dict[str, list[int]] = {}
-    for name, count in REQUIRED_COUNTS.items():
+    supplied_optional = 0
+    for name, count in ALL_COUNTS.items():
+        optional = name in OPTIONAL_COUNTS
+        raw = models.get(name)
+        provided = len(raw) if isinstance(raw, list) else 0
         scores, passes, model_errors = inspect_runs(
-            name, models.get(name), count, identity, seen_run_ids
+            name, raw, count, identity, seen_run_ids, optional=optional
         )
         errors.extend(model_errors)
         scores_by_model[name] = scores
+        if optional:
+            supplied_optional += provided
         stats[name] = {
             "valid_runs": len(scores),
             "model_score_sum": sum(scores),
             "testcase_pass_sum": passes,
+            "required": not optional,
         }
 
     qwen_scores = scores_by_model["qwen"]
@@ -139,9 +162,12 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
     qwen_testcase_pass_sum = stats["qwen"]["testcase_pass_sum"]
     opus_testcase_pass_sum = stats["opus"]["testcase_pass_sum"]
     all_scores = [score for scores in scores_by_model.values() for score in scores]
+    # The "every run is VALID/0" and "every run is full score" exceptions cover
+    # exactly the rounds that were actually delivered.
+    expected_total = sum(REQUIRED_COUNTS.values()) + supplied_optional
     all_zero_exception = (
         not errors
-        and len(all_scores) == sum(REQUIRED_COUNTS.values())
+        and len(all_scores) == expected_total
         and all(score == 0 for score in all_scores)
     )
     qwen_opus_full_score = (
@@ -152,7 +178,7 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
     )
     all_models_full_score = (
         not errors
-        and len(all_scores) == sum(REQUIRED_COUNTS.values())
+        and len(all_scores) == expected_total
         and all(score == 1 for score in all_scores)
     )
     stats["distinction"] = {

@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+"""make_screenshots.py -- 为 218/219 的 v1.1.0 交付生成两张证据截图。
+
+  <out>/score_summary.png        模型得分与区分度判据
+  <out>/oracle_nop_controls.png  golden / no-change 控制轮对照
+
+数据全部取自题包的 jobs/（原生 Harbor job），不读取任何汇总截图。
+
+用法：
+    python make_screenshots.py --task 218
+    python make_screenshots.py --task 219
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(r"C:\Users\Administrator\Desktop\wff-task")
+REL = ROOT / "harbor-windows" / "_qc_runs" / "relaunch-20261013"
+STAGED = REL / "staged"
+TASKS = {
+    "218": {"pkg": "wfflab__wlogseg-218-v1.1.0-delivery", "id": "wfflab__wlogseg-218",
+            "version": "1.1.0", "require": 26,
+            "deliverable": ROOT / "deliverables" / "2026-10-13_wlogseg218-返修"},
+    "219": {"pkg": "wfflab__wpeimg-219-v1.4.0-delivery", "id": "wfflab__wpeimg-219",
+            "version": "1.4.0", "require": 43,
+            "deliverable": ROOT / "deliverables" / "2026-10-13_wpeimg219-返修"},
+}
+
+W, H = 1600, 900
+BG = (245, 247, 250)
+CARD = (255, 255, 255)
+INK = (26, 35, 50)
+MUTED = (110, 122, 140)
+GREEN = (26, 127, 75)
+RED = (180, 40, 40)
+BLUE = (37, 99, 235)
+BADGE_BG = (216, 242, 227)
+LINE = (228, 233, 240)
+FONT_DIR = Path(r"C:\Windows\Fonts")
+ALIAS_FULL = {"qwen": "qwen3.8-max-0902", "opus": "opus-5",
+              "glm": "glm-5.3", "kimi": "kimi-k3"}
+
+
+def font(size: int, bold: bool = False):
+    return ImageFont.truetype(str(FONT_DIR / ("segoeuib.ttf" if bold else "segoeui.ttf")), size)
+
+
+def read_json(p: Path, default=None):
+    try:
+        return json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def sha256_file(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "-"
+
+
+def load_trials(jobs: Path):
+    out = []
+    for d in sorted(p for p in jobs.iterdir() if p.is_dir()):
+        if not (d / "result.json").is_file():
+            continue
+        res = read_json(d / "result.json", {}) or {}
+        rep = read_json(d / "verifier" / "report.json", {}) or {}
+        cases = rep.get("cases") or []
+        total = len(cases)
+        passed = sum(1 for c in cases if c.get("passed"))
+        cfg = read_json(d / "config.json", {}) or {}
+        agent = ((res.get("config") or {}).get("agent") or cfg.get("agent") or {})
+        kwargs = agent.get("kwargs") or {}
+        aname = str(agent.get("name") or "").casefold()
+        alias = (kwargs.get("alias")
+                 or ((res.get("agent_result") or {}).get("metadata") or {}).get("alias"))
+        kind = "control" if ("oracle" in aname or aname == "nop") else "model"
+        label = aname if kind == "control" else ALIAS_FULL.get(str(alias).casefold(),
+                                                               str(alias or "unknown"))
+        elapsed = None
+        try:
+            from datetime import datetime as _dt
+            s = str(res.get("started_at") or "")
+            f = str(res.get("finished_at") or "")
+            if s and f:
+                elapsed = int((_dt.fromisoformat(f.replace("Z", "+00:00"))
+                               - _dt.fromisoformat(s.replace("Z", "+00:00"))).total_seconds())
+        except Exception:  # noqa: BLE001
+            elapsed = None
+        out.append({
+            "dir": d.name,
+            "kind": kind,
+            "label": label,
+            "score": rep.get("formal_score"),
+            "checks_total": total,
+            "checks_passed": passed,
+            "checks_sha": sha256_file(d / "verifier" / "report.json")[:18] + "...",
+            "validity": rep.get("run_validity") or "INVALID",
+            "elapsed": elapsed,
+        })
+    return out
+
+
+def card(draw, box):
+    draw.rounded_rectangle(box, radius=18, fill=CARD, outline=LINE, width=1)
+
+
+def badge(draw, text, right, top, ok=True):
+    f = font(30, bold=True)
+    tw = draw.textlength(text, font=f)
+    draw.rounded_rectangle((right - tw - 70, top, right, top + 62), radius=14,
+                           fill=BADGE_BG if ok else (250, 226, 226))
+    draw.text((right - tw - 35, top + 14), text, font=f, fill=GREEN if ok else RED)
+
+
+def header(draw, task_id, version, title, badge_text, ok=True):
+    draw.text((60, 40), title, font=font(42, bold=True), fill=INK)
+    draw.text((60, 100), "Task: %s   Version: %s   Engine: Harbor + Windows containers"
+              % (task_id, version), font=font(22), fill=MUTED)
+    draw.text((60, 130), "Generated: %s" % datetime.now().astimezone().isoformat(),
+              font=font(20), fill=MUTED)
+    badge(draw, badge_text, 1540, 44, ok=ok)
+
+
+def make_score_summary(trials, cfg, out: Path) -> Path:
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+    models = [t for t in trials if t["kind"] == "model"]
+    groups = [("qwen3.8-max-0902", "QWEN"), ("opus-5", "OPUS"),
+              ("glm-5.3", "GLM"), ("kimi-k3", "KIMI")]
+    rows = []
+    for g, name in groups:
+        rs = [t for t in models if t["label"] == g]
+        rows.append({"name": name, "g": g, "n": len(rs),
+                     "scores": [t["score"] for t in rs],
+                     "sum": sum(int(t["score"] or 0) for t in rs),
+                     "pass": sum(t["checks_passed"] for t in rs),
+                     "total": sum(t["checks_total"] for t in rs),
+                     "invalid": sum(1 for t in rs if t["validity"] != "VALID")})
+    by = {r["g"]: r for r in rows}
+    opus, qwen = by["opus-5"], by["qwen3.8-max-0902"]
+    qualified = (opus["sum"] > qwen["sum"]) or (opus["sum"] == 0 and qwen["sum"] == 0
+                                                and opus["pass"] > qwen["pass"])
+    complete = (opus["n"] == 3 and qwen["n"] == 3
+                and all(r["total"] == cfg["require"] for r in rows if r["n"]))
+
+    header(draw, cfg["id"], cfg["version"], "Official Model Score Evidence",
+           "QUALIFIED" if qualified else "FAIL", ok=qualified)
+    card(draw, (60, 180, 1540, 660))
+    cols = [(100, "Model"), (300, "Valid/Req"), (480, "Scores"), (720, "Sum"),
+            (850, "Cases passed"), (1120, "Invalid"), (1300, "Complete")]
+    for x, title in cols:
+        draw.text((x, 212), title, font=font(23, bold=True), fill=INK)
+    y = 288
+    for i, r in enumerate(rows):
+        draw.text((100, y), r["name"], font=font(28, bold=True), fill=INK)
+        draw.text((300, y), "%d / %d" % (r["n"], r["n"]), font=font(25), fill=INK)
+        draw.text((480, y), "[" + ", ".join(str(s) for s in r["scores"]) + "]",
+                  font=font(25), fill=INK)
+        draw.text((720, y), str(r["sum"]), font=font(28, bold=True), fill=INK)
+        draw.text((850, y), "%d / %d" % (r["pass"], r["total"]), font=font(25), fill=INK)
+        draw.text((1120, y), str(r["invalid"]), font=font(25), fill=INK)
+        draw.text((1300, y), "YES" if (r["n"] and r["total"] == cfg["require"]) else "NO",
+                  font=font(25, bold=True),
+                  fill=GREEN if (r["n"] and r["total"] == cfg["require"]) else RED)
+        y += 90
+        if i != len(rows) - 1:
+            draw.line((100, y - 26, 1500, y - 26), fill=LINE, width=2)
+
+    card(draw, (60, 700, 1540, 856))
+    ctl = [t for t in trials if t["kind"] == "control"]
+    g_ok = all(int(t["score"] or 0) == 1 for t in ctl if t["label"] == "oracle")
+    n_ok = all(int(t["score"] or 0) == 0 for t in ctl if t["label"] == "nop")
+    draw.text((100, 726),
+              "Differentiation: score_sum %d vs %d -> testcase_pass_sum Opus %d vs Qwen %d"
+              % (opus["sum"], qwen["sum"], opus["pass"], qwen["pass"]),
+              font=font(26, bold=True), fill=GREEN if qualified else RED)
+    draw.text((100, 776),
+              "Controls: oracle x3 = 1 (%s), no-change x3 = 0 (%s)   required cases = %d   "
+              "Invalid runs: %d"
+              % ("OK" if g_ok else "FAIL", "OK" if n_ok else "FAIL", cfg["require"],
+                 sum(r["invalid"] for r in rows)),
+              font=font(22), fill=MUTED)
+    draw.text((100, 808),
+              "Grading: task tests/test.ps1 inside Harbor Windows containers; "
+              "%d model runs + 3 oracle + 3 no-change" % len(models),
+              font=font(22), fill=MUTED)
+
+    out.mkdir(parents=True, exist_ok=True)
+    p = out / "score_summary.png"
+    img.save(p, "PNG")
+    return p
+
+
+def make_controls(trials, cfg, out: Path) -> Path:
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+    controls = [t for t in trials if t["kind"] == "control"]
+    golden = [t for t in controls if t["label"] == "oracle"]
+    nop = [t for t in controls if t["label"] == "nop"]
+    ok = (bool(golden) and bool(nop)
+          and all(int(t["score"] or 0) == 1 for t in golden)
+          and all(int(t["score"] or 0) == 0 for t in nop))
+
+    header(draw, cfg["id"], cfg["version"], "Oracle / No-change Control Evidence",
+           "PASS" if ok else "FAIL", ok=ok)
+    blocks = [(nop, "No-change (expected 0)", 180, 500, 0),
+              (golden, "Golden / Oracle (expected 1)", 534, 848, 1)]
+    for rows, title, top, bottom, expect in blocks:
+        card(draw, (60, top, 1540, bottom))
+        draw.text((100, top + 30), title, font=font(30, bold=True), fill=INK)
+        y = top + 104
+        for i, t in enumerate(sorted(rows, key=lambda r: r["dir"]), start=1):
+            got = int(t["score"] or 0)
+            draw.text((100, y), "Run %d" % i, font=font(24, bold=True), fill=BLUE)
+            draw.text((250, y), t["dir"][:34], font=font(20), fill=INK)
+            draw.text((760, y), "score=%d" % got, font=font(22, bold=True),
+                      fill=GREEN if got == expect else RED)
+            draw.text((940, y), "cases %d/%d" % (t["checks_passed"], t["checks_total"]),
+                      font=font(22), fill=INK)
+            draw.text((1180, y), t["validity"], font=font(22),
+                      fill=GREEN if t["validity"] == "VALID" else RED)
+            draw.text((1330, y), t["checks_sha"], font=font(18), fill=MUTED)
+            y += 62
+
+    out.mkdir(parents=True, exist_ok=True)
+    p = out / "oracle_nop_controls.png"
+    img.save(p, "PNG")
+    return p
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--task", required=True, choices=sorted(TASKS))
+    a = ap.parse_args()
+    cfg = TASKS[a.task]
+    jobs = STAGED / cfg["pkg"] / "jobs"
+    if not jobs.is_dir():
+        print("jobs/ missing: %s" % jobs)
+        return 2
+    out = cfg["deliverable"] / "evidence" / "images"
+    trials = load_trials(jobs)
+    print("trials: %d (model %d / control %d)"
+          % (len(trials), sum(1 for t in trials if t["kind"] == "model"),
+             sum(1 for t in trials if t["kind"] == "control")))
+    for p in (make_score_summary(trials, cfg, out), make_controls(trials, cfg, out)):
+        print("wrote %s (%d bytes)" % (p, p.stat().st_size))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

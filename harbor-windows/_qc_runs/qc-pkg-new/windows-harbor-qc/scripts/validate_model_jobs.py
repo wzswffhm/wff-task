@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from validate_model_gate import ALIASES, REQUIRED_COUNTS
+from validate_model_gate import ALIASES, ALL_COUNTS, OPTIONAL_COUNTS, REQUIRED_COUNTS
 
 
 CJK = re.compile(r"[\u3400-\u9fff]")
@@ -102,7 +102,7 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
     errors: list[str] = []
     warnings: list[str] = []
     details: list[dict[str, Any]] = []
-    models: dict[str, list[dict[str, Any]]] = {name: [] for name in REQUIRED_COUNTS}
+    models: dict[str, list[dict[str, Any]]] = {name: [] for name in ALL_COUNTS}
     agent_counts = {"oracle": 0, "nop": 0}
     checksums: set[str] = set()
     required_ids, groups = required_cases(task_root)
@@ -112,8 +112,14 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
             errors.append(f"jobs/ is missing Harbor parent job file: {relative}")
     job_dirs = sorted(path for path in jobs_root.iterdir() if path.is_dir() and (path / "result.json").is_file())
 
-    if len(job_dirs) != 14:
-        errors.append(f"jobs/ must contain exactly 14 Harbor job directories, got {len(job_dirs)}")
+    # 3 Oracle + 3 NOP + the required model rounds; optional models may be absent.
+    expected_jobs = 6 + sum(REQUIRED_COUNTS.values())
+    if len(job_dirs) not in (expected_jobs,
+                             expected_jobs + sum(OPTIONAL_COUNTS.values())):
+        errors.append(
+            "jobs/ must contain %d Harbor job directories (or %d with the optional "
+            "GLM/Kimi rounds), got %d"
+            % (expected_jobs, expected_jobs + sum(OPTIONAL_COUNTS.values()), len(job_dirs)))
     for job in job_dirs:
         label = job.name
         for relative in COMMON_FILES:
@@ -206,9 +212,16 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
         if secret:
             errors.append(f"{label} contains a possible credential in {secret}")
 
-    for model, count in REQUIRED_COUNTS.items():
-        if len(models[model]) != count:
-            errors.append(f"jobs/ contains {len(models[model])} {model} model jobs; exactly {count} required")
+    for model, count in ALL_COUNTS.items():
+        found = len(models[model])
+        if model in OPTIONAL_COUNTS:
+            # optional under the latest scope: absent is fine, partial is not
+            if found not in (0, count):
+                errors.append(
+                    f"jobs/ contains {found} {model} model jobs; either 0 (optional) "
+                    f"or exactly {count} are accepted")
+        elif found != count:
+            errors.append(f"jobs/ contains {found} {model} model jobs; exactly {count} required")
     for agent in ("oracle", "nop"):
         if agent_counts[agent] != 3:
             errors.append(f"jobs/ contains {agent_counts[agent]} {agent} jobs; exactly 3 required")

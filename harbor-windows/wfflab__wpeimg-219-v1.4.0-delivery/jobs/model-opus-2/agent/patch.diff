@@ -1,0 +1,903 @@
+diff --git a/wpeimg/checksum.py b/wpeimg/checksum.py
+index d6884b5..ecb2c39 100644
+--- a/wpeimg/checksum.py
++++ b/wpeimg/checksum.py
+@@ -1,39 +1,129 @@
+ """The image checksum recorded in the optional header.
+ 
++The value is the one Windows computes for an image (the number
++``imagehlp!MapFileAndCheckSumW`` reports): a 16-bit one's complement sum of
++the whole file, taken with the ``CheckSum`` field itself read as zero, to
++which the file length is added at the very end.  It is not a CRC.
++
+ The value is exposed through a one-shot helper and through an incremental
+ accumulator, so a caller that already walks the file once can reuse the pass.
+ """
+ 
++import array
+ import struct
+-import zlib
++import sys
++
++CHECKSUM_FIELD_IN_OPTIONAL = 64
++_NATIVE_LITTLE = sys.byteorder == "little"
++
++
++def _sum_words(buf):
++    """Return ``(sum_of_16bit_words, trailing_odd_byte_or_None)``."""
++    length = len(buf)
++    paired = length - (length & 1)
++    words = array.array("H")
++    if paired:
++        words.frombytes(bytes(buf[:paired]))
++        if not _NATIVE_LITTLE:
++            words.byteswap()
++    tail = buf[paired] if paired != length else None
++    if tail is not None and not isinstance(tail, int):
++        tail = tail[0] if tail else None
++    return sum(words), tail
+ 
+ 
+ class ChecksumAccumulator(object):
+-    """Incremental helper for the checksum of a byte stream."""
++    """Incremental helper for the checksum of a byte stream.
++
++    Chunks may have any size; an odd-sized chunk keeps its last byte pending
++    so that it pairs with the first byte of the following chunk, exactly as a
++    one-shot pass over the concatenation would.
++    """
+ 
+     def __init__(self):
+-        self._state = 0
++        self._total = 0
++        self._pending = None
+ 
+     def update(self, chunk):
+         """Fold ``chunk`` into the running state and return ``self``."""
+-        self._state = zlib.crc32(bytes(chunk), self._state)
++        if chunk is None:
++            return self
++        view = memoryview(chunk).cast("B") if not isinstance(
++            chunk, (bytes, bytearray)) else chunk
++        if not len(view):
++            return self
++        if self._pending is not None:
++            first = view[0]
++            self._total += self._pending | (first << 8)
++            self._pending = None
++            view = view[1:]
++            if not len(view):
++                return self
++        partial, tail = _sum_words(view)
++        self._total += partial
++        self._pending = tail
+         return self
+ 
+     def value(self, total_length):
+         """Return the checksum of everything fed so far.
+ 
+-        ``total_length`` is the number of bytes the image occupies.
++        ``total_length`` is the number of bytes the whole image occupies; it
++        is folded into the result the way Windows does it.
+         """
+-        return self._state & 0xFFFFFFFF
++        total = self._total
++        if self._pending is not None:
++            total += self._pending
++        while total >> 16:
++            total = (total & 0xFFFF) + (total >> 16)
++        return (total + int(total_length)) & 0xFFFFFFFF
++
++
++def checksum_field_offset(data):
++    """Return where the ``CheckSum`` field sits, or ``None``.
++
++    The lookup is deliberately forgiving: ``compute_checksum`` has to behave
++    like the system helper, which simply reads the field when the headers are
++    good enough to locate it and otherwise sums the raw bytes.
++    """
++    if len(data) < 0x40 or data[:2] != b"MZ":
++        return None
++    nt_offset = struct.unpack_from("<I", data, 0x3C)[0]
++    if nt_offset < 0 or nt_offset + 24 + 4 > len(data):
++        return None
++    if data[nt_offset:nt_offset + 4] != b"PE\0\0":
++        return None
++    optional = nt_offset + 4 + 20
++    if optional + 2 > len(data):
++        return None
++    magic = struct.unpack_from("<H", data, optional)[0]
++    if magic not in (0x10B, 0x20B):
++        return None
++    field = optional + CHECKSUM_FIELD_IN_OPTIONAL
++    if field + 4 > len(data):
++        return None
++    return field
+ 
+ 
+ def compute_checksum(data):
+-    """Return the checksum of ``data``."""
++    """Return the checksum ``data`` should record in its optional header.
++
++    The four bytes of the ``CheckSum`` field are treated as zero, so the
++    result does not depend on whatever is recorded there now.
++    """
++    view = memoryview(data).cast("B") if not isinstance(
++        data, (bytes, bytearray)) else data
+     accumulator = ChecksumAccumulator()
+-    accumulator.update(data)
+-    return accumulator.value(len(data))
++    field = checksum_field_offset(view)
++    if field is None:
++        accumulator.update(view)
++    else:
++        accumulator.update(view[:field])
++        accumulator.update(b"\0\0\0\0")
++        accumulator.update(view[field + 4:])
++    return accumulator.value(len(view))
+ 
+ 
+ def stored_checksum(data, optional_offset):
+     """Return the checksum currently recorded in the optional header."""
+-    return struct.unpack_from("<I", data, optional_offset + 64)[0]
++    return struct.unpack_from(
++        "<I", data, optional_offset + CHECKSUM_FIELD_IN_OPTIONAL)[0]
+diff --git a/wpeimg/headers.py b/wpeimg/headers.py
+index bec0486..bc507d1 100644
+--- a/wpeimg/headers.py
++++ b/wpeimg/headers.py
+@@ -4,6 +4,7 @@ import struct
+ 
+ from .errors import (
+     KIND_DOS,
++    KIND_OPTIONAL,
+     KIND_SIGNATURE,
+     KIND_TRUNCATED,
+     WImgError,
+@@ -16,9 +17,9 @@ PE32_MAGIC = 0x10B
+ PE32_PLUS_MAGIC = 0x20B
+ FILE_HEADER_SIZE = 20
+ SECTION_HEADER_SIZE = 40
+-CHECKSUM_OFFSET = 64
+ 
+ DIRECTORY_ENTRY_SIZE = 8
++DIRECTORY_COUNT = 16
+ CERTIFICATE_TABLE_INDEX = 4
+ DIRECTORY_NAMES = (
+     "export",
+@@ -39,6 +40,21 @@ DIRECTORY_NAMES = (
+     "reserved",
+ )
+ 
++# Where the directory array starts inside the optional header, and how wide
++# ``ImageBase`` is, for each of the two layouts.
++_LAYOUTS = {
++    PE32_MAGIC: {
++        "image_base_offset": 28,
++        "image_base_format": "<I",
++        "directory_base": 96,
++    },
++    PE32_PLUS_MAGIC: {
++        "image_base_offset": 24,
++        "image_base_format": "<Q",
++        "directory_base": 112,
++    },
++}
++
+ 
+ def read_dos_header(data):
+     """Return the offset of the NT headers recorded at 0x3C."""
+@@ -51,9 +67,13 @@ def read_dos_header(data):
+ 
+ def read_file_header(data, nt_offset):
+     """Return the COFF file header that follows the NT signature."""
++    if nt_offset < 0 or nt_offset + 4 > len(data):
++        raise WImgError(KIND_TRUNCATED, "the NT signature is out of reach")
+     if data[nt_offset:nt_offset + 4] != NT_SIGNATURE:
+         raise WImgError(KIND_SIGNATURE, "the PE signature is missing")
+     coff = nt_offset + 4
++    if coff + FILE_HEADER_SIZE > len(data):
++        raise WImgError(KIND_TRUNCATED, "the file header is incomplete")
+     machine, nsec, _stamp, _symtab, _nsym, size_opt, _chars = struct.unpack_from(
+         "<HHIIIHH", data, coff)
+     return {
+@@ -64,31 +84,63 @@ def read_file_header(data, nt_offset):
+     }
+ 
+ 
+-def read_optional_header(data, offset):
+-    """Return the optional header fields this tool reports on."""
++def read_optional_header(data, offset, size_of_optional_header):
++    """Return the optional header fields this tool reports on.
++
++    ``offset`` is where the optional header starts and
++    ``size_of_optional_header`` is the length the COFF file header declares
++    for it.  The magic selects between the two layouts: ``ImageBase`` is four
++    bytes in a PE32 image and eight in a PE32+ one, which also moves the data
++    directory array.
++    """
++    if offset + 2 > len(data):
++        raise WImgError(KIND_TRUNCATED, "the optional header magic is missing")
+     magic = struct.unpack_from("<H", data, offset)[0]
++    layout = _LAYOUTS.get(magic)
++    if layout is None:
++        raise WImgError(
++            KIND_OPTIONAL, "the optional header magic is neither 0x10B nor 0x20B")
++
++    directory_base = layout["directory_base"]
++    if size_of_optional_header < directory_base:
++        raise WImgError(
++            KIND_OPTIONAL,
++            "SizeOfOptionalHeader does not cover the declared layout")
++    if offset + directory_base > len(data):
++        raise WImgError(KIND_TRUNCATED, "the optional header is incomplete")
++
+     entry_point = struct.unpack_from("<I", data, offset + 16)[0]
+-    image_base = struct.unpack_from("<Q", data, offset + 24)[0]
++    image_base = struct.unpack_from(
++        layout["image_base_format"], data, offset + layout["image_base_offset"])[0]
+     section_alignment, file_alignment = struct.unpack_from("<II", data, offset + 32)
+     size_of_image, size_of_headers = struct.unpack_from("<II", data, offset + 56)
+     checksum, subsystem = struct.unpack_from("<IH", data, offset + 64)
+ 
+-    # TODO: the directory array is the one part of the optional header that is
+-    # not at a fixed offset -- it depends on the layout (PE32/PE32+) and on how
+-    # many entries the image declares.  This placeholder reads it as if every
+-    # image were PE32+ and as if every image declared all sixteen entries.
++    # ``NumberOfRvaAndSizes`` is the last word before the array itself.
++    declared = struct.unpack_from("<I", data, offset + directory_base - 4)[0]
++    available = min(declared, DIRECTORY_COUNT)
++    header_end = offset + size_of_optional_header
++
+     directories = []
+-    for index, name in enumerate(DIRECTORY_NAMES):
+-        entry_offset = offset + 112 + index * DIRECTORY_ENTRY_SIZE
+-        virtual_address, size = struct.unpack_from("<II", data, entry_offset)
++    for index in range(DIRECTORY_COUNT):
++        virtual_address = 0
++        size = 0
++        if index < available:
++            entry = offset + directory_base + index * DIRECTORY_ENTRY_SIZE
++            limit = min(header_end, len(data))
++            # A slot the optional header or the file cannot hold reads as zero
++            # rather than as an error: the image only wrote down a count.
++            if entry + DIRECTORY_ENTRY_SIZE <= limit:
++                virtual_address, size = struct.unpack_from("<II", data, entry)
+         directories.append({
+-            "name": name,
++            "name": DIRECTORY_NAMES[index],
+             "virtual_address": virtual_address,
+             "size": size,
+         })
+ 
+     return {
+         "magic": magic,
++        "is_pe32_plus": magic == PE32_PLUS_MAGIC,
+         "entry_point_rva": entry_point,
+         "image_base": image_base,
+         "section_alignment": section_alignment,
+@@ -97,5 +149,6 @@ def read_optional_header(data, offset):
+         "size_of_headers": size_of_headers,
+         "checksum": checksum,
+         "subsystem": subsystem,
++        "number_of_rva_and_sizes": declared,
+         "data_directories": directories,
+     }
+diff --git a/wpeimg/layout.py b/wpeimg/layout.py
+index 542e6d2..9711d86 100644
+--- a/wpeimg/layout.py
++++ b/wpeimg/layout.py
+@@ -2,6 +2,7 @@
+ 
+ import struct
+ 
++from .errors import KIND_STRUCTURE, KIND_TRUNCATED, WImgError
+ from .headers import (
+     SECTION_HEADER_SIZE,
+     read_dos_header,
+@@ -9,20 +10,24 @@ from .headers import (
+     read_optional_header,
+ )
+ 
+-OPTIONAL_HEADER_BYTES = 224
+ 
++def section_table_offset(optional_offset, size_of_optional_header):
++    """Return where the section table starts for an optional header.
+ 
+-def section_table_offset(optional_offset):
+-    """Return where the section table starts for an optional header."""
+-    return optional_offset + OPTIONAL_HEADER_BYTES
++    The table follows the optional header, whose length the COFF file header
++    declares; it is not at a fixed distance from the optional header.
++    """
++    return optional_offset + size_of_optional_header
+ 
+ 
+ def decode_section(raw):
+     """Turn one 40-byte section header into a dictionary."""
++    if len(raw) < SECTION_HEADER_SIZE:
++        raise WImgError(KIND_TRUNCATED, "a section header is incomplete")
+     virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from(
+         "<IIII", raw, 8)
+     return {
+-        "name": raw[0:8].rstrip(b"\0").decode("latin-1"),
++        "name": bytes(raw[0:8]).rstrip(b"\0").decode("latin-1"),
+         "virtual_address": virtual_address,
+         "virtual_size": virtual_size,
+         "raw_pointer": raw_pointer,
+@@ -33,6 +38,9 @@ def decode_section(raw):
+ 
+ def read_sections(data, offset, count):
+     """Return the section table of an image."""
++    end = offset + count * SECTION_HEADER_SIZE
++    if end > len(data):
++        raise WImgError(KIND_TRUNCATED, "the section table is incomplete")
+     sections = []
+     for index in range(count):
+         base = offset + index * SECTION_HEADER_SIZE
+@@ -44,26 +52,128 @@ def load_layout(data):
+     """Parse the header chain of ``data`` without judging its contents."""
+     nt_offset = read_dos_header(data)
+     file_header = read_file_header(data, nt_offset)
+-    optional = read_optional_header(data, file_header["optional_offset"])
++    optional = read_optional_header(
++        data,
++        file_header["optional_offset"],
++        file_header["size_of_optional_header"],
++    )
+     sections = read_sections(
+         data,
+-        section_table_offset(file_header["optional_offset"]),
++        section_table_offset(
++            file_header["optional_offset"],
++            file_header["size_of_optional_header"],
++        ),
+         file_header["number_of_sections"],
+     )
+     return file_header, optional, sections
+ 
+ 
++def _round_up(value, alignment):
++    if alignment <= 0:
++        return value
++    remainder = value % alignment
++    if remainder:
++        return value + (alignment - remainder)
++    return value
++
++
++def _overlaps(first_start, first_end, second_start, second_end):
++    return first_start < second_end and second_start < first_end
++
++
++def validate_structure(data, file_header, optional, sections):
++    """Check that the image's own description is self-consistent.
++
++    Trailing bytes past the last section are fine: real images carry an
++    Authenticode signature or an overlay there.
++    """
++    length = len(data)
++    size_of_headers = optional["size_of_headers"]
++    section_alignment = optional["section_alignment"]
++    file_alignment = optional["file_alignment"]
++
++    table_end = section_table_offset(
++        file_header["optional_offset"],
++        file_header["size_of_optional_header"],
++    ) + file_header["number_of_sections"] * SECTION_HEADER_SIZE
++
++    if file_alignment and size_of_headers % file_alignment:
++        raise WImgError(
++            KIND_STRUCTURE, "SizeOfHeaders is not aligned to FileAlignment")
++    if size_of_headers < table_end:
++        raise WImgError(
++            KIND_STRUCTURE, "SizeOfHeaders does not cover the section table")
++
++    highest = 0
++    for section in sections:
++        name = section["name"] or "<unnamed>"
++        raw_size = section["raw_size"]
++        raw_pointer = section["raw_pointer"]
++        virtual_address = section["virtual_address"]
++
++        if raw_size:
++            if raw_pointer + raw_size > length:
++                raise WImgError(
++                    KIND_STRUCTURE,
++                    "section %s claims file bytes past the end of the file" % (name,))
++            if raw_pointer < size_of_headers:
++                raise WImgError(
++                    KIND_STRUCTURE,
++                    "section %s overlaps the image headers" % (name,))
++            if file_alignment and raw_pointer % file_alignment:
++                raise WImgError(
++                    KIND_STRUCTURE,
++                    "section %s is not aligned to FileAlignment" % (name,))
++        if section_alignment and virtual_address % section_alignment:
++            raise WImgError(
++                KIND_STRUCTURE,
++                "section %s is not aligned to SectionAlignment" % (name,))
++        highest = max(highest, virtual_address + section["virtual_size"])
++
++    for index, first in enumerate(sections):
++        for second in sections[index + 1:]:
++            if first["virtual_size"] and second["virtual_size"]:
++                if _overlaps(
++                        first["virtual_address"],
++                        first["virtual_address"] + first["virtual_size"],
++                        second["virtual_address"],
++                        second["virtual_address"] + second["virtual_size"]):
++                    raise WImgError(
++                        KIND_STRUCTURE,
++                        "sections %s and %s overlap in memory"
++                        % (first["name"], second["name"]))
++            if first["raw_size"] and second["raw_size"]:
++                if _overlaps(
++                        first["raw_pointer"],
++                        first["raw_pointer"] + first["raw_size"],
++                        second["raw_pointer"],
++                        second["raw_pointer"] + second["raw_size"]):
++                    raise WImgError(
++                        KIND_STRUCTURE,
++                        "sections %s and %s overlap in the file"
++                        % (first["name"], second["name"]))
++
++    if optional["size_of_image"] < _round_up(highest, section_alignment):
++        raise WImgError(
++            KIND_STRUCTURE, "SizeOfImage does not cover every section")
++
++
+ def rva_to_offset(data, rva):
+     """Translate a relative virtual address into a file offset.
+ 
+-    Returns ``None`` when the address has no file backing.
++    Returns ``None`` when the address has no file backing.  The argument is a
++    relative virtual address: ``ImageBase`` has not been added to it.
+     """
+-    if rva < 0:
++    if rva is None or rva < 0:
+         return None
+     _file_header, optional, sections = load_layout(data)
+-    virtual = rva - optional["image_base"]
++    if rva < optional["size_of_headers"]:
++        return rva
+     for section in sections:
+         start = section["virtual_address"]
+-        if start <= virtual < start + section["virtual_size"]:
+-            return section["raw_pointer"] + (virtual - start)
++        if start <= rva < start + section["virtual_size"]:
++            delta = rva - start
++            if not section["raw_size"] or delta >= section["raw_size"]:
++                return None
++            return section["raw_pointer"] + delta
+     return None
+diff --git a/wpeimg/probe.py b/wpeimg/probe.py
+index 48177e6..80b475d 100644
+--- a/wpeimg/probe.py
++++ b/wpeimg/probe.py
+@@ -2,7 +2,33 @@
+ 
+ from .checksum import compute_checksum
+ from .errors import KIND_CHECKSUM, WImgError
+-from .layout import load_layout
++from .headers import CERTIFICATE_TABLE_INDEX
++from .layout import load_layout, validate_structure
++
++
++def certificate_table_span(data, optional):
++    """Return ``(offset, size)`` of the certificate table, or ``(0, 0)``.
++
++    The first field of the certificate directory entry is a file offset, not
++    a relative virtual address.
++    """
++    directories = optional.get("data_directories") or []
++    if CERTIFICATE_TABLE_INDEX >= len(directories):
++        return 0, 0
++    entry = directories[CERTIFICATE_TABLE_INDEX]
++    offset = entry.get("virtual_address") or 0
++    size = entry.get("size") or 0
++    if not offset or not size:
++        return 0, 0
++    if offset < 0 or size < 0 or offset + size > len(data):
++        return 0, 0
++    return offset, size
++
++
++def has_authenticode_signature(data, optional):
++    """Return whether the image really carries signature bytes."""
++    offset, size = certificate_table_span(data, optional)
++    return bool(offset and size)
+ 
+ 
+ def inspect(data):
+@@ -11,14 +37,15 @@ def inspect(data):
+     Raises :class:`WImgError` when the bytes are not an image this tool
+     accepts.
+     """
+-    _file_header, optional, sections = load_layout(data)
++    file_header, optional, sections = load_layout(data)
++    validate_structure(data, file_header, optional, sections)
+     recorded = optional["checksum"]
+     if recorded and recorded != compute_checksum(data):
+         raise WImgError(KIND_CHECKSUM, "the recorded checksum does not match the file")
+     return {
+-        "machine": _file_header["machine"],
+-        "is_pe32_plus": True,
+-        "number_of_sections": _file_header["number_of_sections"],
++        "machine": file_header["machine"],
++        "is_pe32_plus": optional["is_pe32_plus"],
++        "number_of_sections": file_header["number_of_sections"],
+         "entry_point_rva": optional["entry_point_rva"],
+         "image_base": optional["image_base"],
+         "section_alignment": optional["section_alignment"],
+@@ -28,7 +55,7 @@ def inspect(data):
+         "checksum": recorded,
+         "sections": sections,
+         "data_directories": optional["data_directories"],
+-        "has_authenticode_signature": False,
++        "has_authenticode_signature": has_authenticode_signature(data, optional),
+     }
+ 
+ 
+diff --git a/wpeimg/signature.py b/wpeimg/signature.py
+index 4e04b5a..dde837f 100644
+--- a/wpeimg/signature.py
++++ b/wpeimg/signature.py
+@@ -1,23 +1,136 @@
+-"""Authenticode signature decoding (work in progress).
++"""Authenticode signature decoding.
+ 
+ The certificate table points at a ``WIN_CERTIFICATE`` record whose body is a
+-PKCS#7 ``SignedData`` DER blob.  This module is supposed to describe what that
+-blob actually contains.
++PKCS#7 ``SignedData`` DER blob.  This module reports the record's own header
++fields and what the blob inside it carries, using a small self-contained DER
++reader: nothing outside the standard library is involved.
+ """
+ 
++import struct
++
++from .errors import KIND_STRUCTURE, WImgError
++from .headers import (
++    CERTIFICATE_TABLE_INDEX,
++    read_dos_header,
++    read_file_header,
++    read_optional_header,
++)
++
+ WIN_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
++WIN_CERTIFICATE_HEADER_SIZE = 8
++
++TAG_SEQUENCE = 0x30
++TAG_SET = 0x31
++TAG_OID = 0x06
++TAG_CONTEXT_0 = 0xA0
++TAG_CONTEXT_1 = 0xA1
++
++ALGORITHM_NAMES = {
++    "1.3.14.3.2.26": "sha1",
++    "2.16.840.1.101.3.4.2.1": "sha256",
++    "2.16.840.1.101.3.4.2.2": "sha384",
++    "2.16.840.1.101.3.4.2.3": "sha512",
++    "1.2.840.113549.1.1.1": "rsa",
++    "1.2.840.113549.1.1.11": "sha256WithRSA",
++    "1.2.840.113549.1.1.5": "sha1WithRSA",
++    "1.2.840.10045.2.1": "ec",
++    "1.2.840.10045.4.3.2": "ecdsaWithSHA256",
++}
++
++
++class _DerError(Exception):
++    """Raised internally when a DER blob cannot be walked."""
++
++
++def _parse_tlv(buf, pos, end):
++    """Return ``(tag, content_start, content_end, next_pos)`` at ``pos``."""
++    if pos >= end:
++        raise _DerError("ran off the end of the blob")
++    tag = buf[pos]
++    cursor = pos + 1
++    if tag & 0x1F == 0x1F:  # multi-byte tag number
++        while cursor < end and buf[cursor] & 0x80:
++            cursor += 1
++        cursor += 1
++    if cursor >= end:
++        raise _DerError("truncated length")
++    first = buf[cursor]
++    cursor += 1
++    if first < 0x80:
++        content_end = cursor + first
++        if content_end > end:
++            raise _DerError("element overruns the blob")
++        return tag, cursor, content_end, content_end
++    if first == 0x80:  # indefinite length: scan to the end-of-contents marker
++        content_start = cursor
++        probe = cursor
++        while True:
++            if probe + 1 >= end:
++                raise _DerError("unterminated indefinite length")
++            if buf[probe] == 0 and buf[probe + 1] == 0:
++                return tag, content_start, probe, probe + 2
++            _tag, _start, _stop, probe = _parse_tlv(buf, probe, end)
++    count = first & 0x7F
++    if count == 0 or count > 8 or cursor + count > end:
++        raise _DerError("unsupported length encoding")
++    length = int.from_bytes(bytes(buf[cursor:cursor + count]), "big")
++    cursor += count
++    content_end = cursor + length
++    if content_end > end:
++        raise _DerError("element overruns the blob")
++    return tag, cursor, content_end, content_end
++
++
++def _children(buf, start, end):
++    """Yield ``(tag, content_start, content_end)`` for each child element."""
++    cursor = start
++    while cursor < end:
++        tag, content_start, content_end, cursor = _parse_tlv(buf, cursor, end)
++        yield tag, content_start, content_end
++
++
++def _decode_oid(buf, start, end):
++    """Return the dotted-decimal form of an OID's value bytes."""
++    if start >= end:
++        raise _DerError("empty object identifier")
++    first = buf[start]
++    if first // 40 > 2:
++        parts = [2, first - 80]
++    else:
++        parts = [first // 40, first % 40]
++    value = 0
++    seen = False
++    for index in range(start + 1, end):
++        byte = buf[index]
++        value = (value << 7) | (byte & 0x7F)
++        seen = True
++        if not byte & 0x80:
++            parts.append(value)
++            value = 0
++            seen = False
++    if seen:
++        raise _DerError("unterminated object identifier")
++    return ".".join(str(part) for part in parts)
++
++
++def _read_oid_child(buf, start, end):
++    """Return the dotted OID of the first child of an AlgorithmIdentifier."""
++    for tag, content_start, content_end in _children(buf, start, end):
++        if tag == TAG_OID:
++            return _decode_oid(buf, content_start, content_end)
++        break
++    raise _DerError("no algorithm identifier found")
++
+ 
++def _count_children(buf, start, end):
++    total = 0
++    for _tag, _start, _end in _children(buf, start, end):
++        total += 1
++    return total
+ 
+-def signature_info(head):
+-    """Describe the certificate table of *head*.
+ 
+-    TODO: this only reports the ``WIN_CERTIFICATE`` header fields.  It never
+-    looks inside the DER blob, so the PKCS#7 part (the content type, the digest
+-    algorithms, how many certificates the blob carries and how many signers it
+-    has) always comes back empty, and a record whose declared length does not
+-    fit the file is reported as if it were fine.
+-    """
+-    info = {
++def _blank_info():
++    return {
+         "present": False,
+         "offset": 0,
+         "size": 0,
+@@ -29,26 +142,103 @@ def signature_info(head):
+         "certificate_count": 0,
+         "signer_count": 0,
+     }
+-    if not head:
++
++
++def _describe_pkcs7(body, info):
++    """Fill the PKCS#7 half of ``info`` from a ``SignedData`` DER blob."""
++    end = len(body)
++    tag, start, stop, _next = _parse_tlv(body, 0, end)
++    if tag != TAG_SEQUENCE:
++        raise _DerError("the record body is not a ContentInfo sequence")
++
++    content_type = None
++    signed_data = None
++    for child_tag, child_start, child_end in _children(body, start, stop):
++        if child_tag == TAG_OID and content_type is None:
++            content_type = _decode_oid(body, child_start, child_end)
++        elif child_tag == TAG_CONTEXT_0:
++            inner_tag, inner_start, inner_end, _n = _parse_tlv(
++                body, child_start, child_end)
++            if inner_tag == TAG_SEQUENCE:
++                signed_data = (inner_start, inner_end)
++    info["content_type"] = content_type
++    if signed_data is None:
++        return
++
++    elements = list(_children(body, signed_data[0], signed_data[1]))
++    algorithms = []
++    certificates = 0
++    signers = 0
++    for index, (child_tag, child_start, child_end) in enumerate(elements):
++        if index == 1 and child_tag == TAG_SET:
++            for alg_tag, alg_start, alg_end in _children(
++                    body, child_start, child_end):
++                if alg_tag != TAG_SEQUENCE:
++                    continue
++                oid = _read_oid_child(body, alg_start, alg_end)
++                algorithms.append(ALGORITHM_NAMES.get(oid, oid))
++        elif child_tag == TAG_CONTEXT_0 and index > 1:
++            certificates = _count_children(body, child_start, child_end)
++        elif child_tag == TAG_SET and index > 1:
++            signers = _count_children(body, child_start, child_end)
++    info["digest_algorithms"] = algorithms
++    info["certificate_count"] = certificates
++    info["signer_count"] = signers
++
++
++def signature_info(data):
++    """Describe the certificate table of ``data``."""
++    info = _blank_info()
++    if not data:
+         return info
+     try:
+-        from .headers import CERTIFICATE_TABLE_INDEX, read_dos_header, read_file_header
+-        from .headers import read_optional_header
+-        nt = read_dos_header(head)
+-        file_header = read_file_header(head, nt)
++        nt_offset = read_dos_header(data)
++        file_header = read_file_header(data, nt_offset)
+         optional = read_optional_header(
+-            head, file_header["optional_offset"], file_header["size_of_optional_header"])
+-    except Exception:  # noqa: BLE001
++            data,
++            file_header["optional_offset"],
++            file_header["size_of_optional_header"],
++        )
++    except WImgError:
+         return info
++
+     directories = optional.get("data_directories") or []
+     if CERTIFICATE_TABLE_INDEX >= len(directories):
+         return info
+     entry = directories[CERTIFICATE_TABLE_INDEX]
+-    offset, size = entry.get("virtual_address") or 0, entry.get("size") or 0
+-    if not offset or not size or offset + size > len(head):
++    offset = entry.get("virtual_address") or 0
++    size = entry.get("size") or 0
++    if not offset or not size:
++        return info
++    if offset < 0 or size < 0 or offset + size > len(data):
+         return info
++    if offset + WIN_CERTIFICATE_HEADER_SIZE > len(data):
++        return info
++
++    declared_length, revision, cert_type = struct.unpack_from(
++        "<IHH", data, offset)
++    if declared_length < WIN_CERTIFICATE_HEADER_SIZE or declared_length > size:
++        raise WImgError(
++            KIND_STRUCTURE,
++            "the WIN_CERTIFICATE length does not fit the certificate table")
++
+     info["present"] = True
+     info["offset"] = offset
+     info["size"] = size
+-    info["certificate_type"] = WIN_CERT_TYPE_PKCS_SIGNED_DATA
++    info["declared_length"] = declared_length
++    info["revision"] = revision
++    info["certificate_type"] = cert_type
++
++    if cert_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA:
++        return info
++
++    body = bytes(data[
++        offset + WIN_CERTIFICATE_HEADER_SIZE:offset + declared_length])
++    try:
++        _describe_pkcs7(body, info)
++    except _DerError:
++        info["content_type"] = None
++        info["digest_algorithms"] = []
++        info["certificate_count"] = 0
++        info["signer_count"] = 0
+     return info
+diff --git a/wpeimg/stream.py b/wpeimg/stream.py
+index 7271862..ce873d8 100644
+--- a/wpeimg/stream.py
++++ b/wpeimg/stream.py
+@@ -1,22 +1,77 @@
+-"""Streaming access to the section table of an image."""
++"""Streaming access to the section table of an image.
+ 
++The image can be far larger than its header, so this module only ever asks
++the file object for a bounded, explicitly sized slice: enough to walk the DOS
++header, the NT headers and then one section header at a time.  The number of
++bytes read before the first section is produced does not depend on the size
++of the file.
++"""
++
++from .errors import KIND_TRUNCATED, WImgError
+ from .headers import (
++    DOS_HEADER_SIZE,
++    FILE_HEADER_SIZE,
+     SECTION_HEADER_SIZE,
+     read_dos_header,
+     read_file_header,
++    read_optional_header,
+ )
+-from .layout import decode_section, read_sections, section_table_offset
++from .layout import decode_section, section_table_offset
++
++MAX_OPTIONAL_PREFETCH = 4096
++
++
++def _read_exactly(fileobj, count):
++    """Return up to ``count`` bytes, using sized reads only."""
++    if count <= 0:
++        return b""
++    pieces = []
++    remaining = count
++    while remaining > 0:
++        chunk = fileobj.read(remaining)
++        if not chunk:
++            break
++        pieces.append(bytes(chunk))
++        remaining -= len(chunk)
++    return b"".join(pieces)
++
++
++def _grow(fileobj, buffer, target):
++    """Extend ``buffer`` until it holds ``target`` bytes of the file."""
++    if len(buffer) >= target:
++        return buffer
++    return buffer + _read_exactly(fileobj, target - len(buffer))
+ 
+ 
+ def iter_sections(fileobj):
+-    """Yield the section table entries of the image behind ``fileobj``."""
+-    data = fileobj.read()
+-    nt_offset = read_dos_header(data)
+-    file_header = read_file_header(data, nt_offset)
+-    sections = read_sections(
+-        data,
+-        section_table_offset(file_header["optional_offset"]),
+-        file_header["number_of_sections"],
+-    )
+-    for section in sections:
+-        yield section
++    """Yield the section table entries of the image behind ``fileobj``.
++
++    The generator is lazy: nothing is read until the first entry is asked
++    for, and only the headers are ever pulled into memory.
++    """
++    buffer = _grow(fileobj, b"", DOS_HEADER_SIZE)
++    nt_offset = read_dos_header(buffer)
++
++    buffer = _grow(fileobj, buffer, nt_offset + 4 + FILE_HEADER_SIZE)
++    file_header = read_file_header(buffer, nt_offset)
++
++    optional_offset = file_header["optional_offset"]
++    size_of_optional_header = file_header["size_of_optional_header"]
++
++    buffer = _grow(fileobj, buffer, optional_offset + min(
++        size_of_optional_header, MAX_OPTIONAL_PREFETCH))
++    read_optional_header(buffer, optional_offset, size_of_optional_header)
++
++    table = section_table_offset(optional_offset, size_of_optional_header)
++    buffer = _grow(fileobj, buffer, table)
++    if len(buffer) < table:
++        raise WImgError(KIND_TRUNCATED, "the section table is incomplete")
++
++    position = table
++    for _index in range(file_header["number_of_sections"]):
++        buffer = _grow(fileobj, buffer, position + SECTION_HEADER_SIZE)
++        raw = buffer[position:position + SECTION_HEADER_SIZE]
++        if len(raw) < SECTION_HEADER_SIZE:
++            raise WImgError(KIND_TRUNCATED, "the section table is incomplete")
++        yield decode_section(raw)
++        position += SECTION_HEADER_SIZE

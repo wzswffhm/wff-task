@@ -1,0 +1,498 @@
+diff --git a/wlogseg/codec.py b/wlogseg/codec.py
+index 9197691..b66c0fe 100644
+--- a/wlogseg/codec.py
++++ b/wlogseg/codec.py
+@@ -1,4 +1,12 @@
+-"""容器整体读写：文件头、段区、尾部索引与尾部校验和。"""
++"""容器整体读写：文件头、段区、尾部索引与尾部校验和。
++
++布局（以 ``assets/`` 下的样本为权威依据）::
++
++    [16 字节文件头][段区 ...][尾部索引：每段 8 字节][尾部 8 字节校验和]
++
++尾部 8 字节是两个小端 u32：索引区的 CRC-32、以及「文件头 + 整个段区（含每段
++的零填充）」的 CRC-32。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,7 +15,7 @@ import struct
+ from .crc import compute_crc
+ from .errors import WSegError
+ from .header import HEADER_SIZE, build_header, parse_header
+-from .index import INDEX_ENTRY_SIZE, build_index
++from .index import INDEX_ENTRY_SIZE, build_index, parse_index
+ from .segment import (
+     MAX_BODY,
+     MAX_SEG_ID,
+@@ -22,11 +30,21 @@ TRAILER_SIZE = 8
+ _TRAILER = struct.Struct("<II")
+ 
+ 
+-def pack(segments) -> bytes:
+-    """把 [(seg_id, payload), ...] 序列化为 WLSG 字节串。"""
++def _normalise(segments):
++    """校验并规整输入的 (seg_id, payload) 序列。"""
+     items = []
+-    for seg_id, payload in segments:
+-        if not isinstance(seg_id, int) or isinstance(seg_id, bool) or not 0 <= seg_id <= MAX_SEG_ID:
++    try:
++        iterator = iter(segments)
++    except TypeError as exc:
++        raise WSegError("structure", f"segments is not iterable: {exc}") from exc
++    for entry in iterator:
++        try:
++            seg_id, payload = entry
++        except (TypeError, ValueError) as exc:
++            raise WSegError("structure", f"segment entry {entry!r} is not a pair") from exc
++        if isinstance(seg_id, bool) or not isinstance(seg_id, int):
++            raise WSegError("structure", f"segment id {seg_id!r} is not an int")
++        if not 0 <= seg_id <= MAX_SEG_ID:
+             raise WSegError("structure", f"segment id {seg_id!r} out of range")
+         if not isinstance(payload, (bytes, bytearray, memoryview)):
+             raise WSegError("structure", f"payload {type(payload).__name__} is not bytes")
+@@ -34,62 +52,95 @@ def pack(segments) -> bytes:
+         if len(body) > MAX_BODY:
+             raise WSegError("structure", "payload is too large")
+         items.append((seg_id, body))
++    return items
++
++
++def pack(segments) -> bytes:
++    """把 [(seg_id, payload), ...] 序列化为 WLSG 字节串。"""
++    items = _normalise(segments)
+ 
+-    offsets = []
+     body = bytearray()
+-    checksummed = bytearray()
++    entries = []
+     cursor = HEADER_SIZE
+     for seg_id, payload in items:
+         encoded = encode_segment(seg_id, payload)
+-        offsets.append(cursor)
++        entries.append((cursor, len(encoded)))
+         body += encoded
+-        checksummed += encoded[:SEGMENT_HEADER_SIZE + len(payload)]
+-        cursor += segment_length(len(payload))
++        cursor += len(encoded)
+ 
+     index_offset = cursor
+     header = build_header(len(items), index_offset)
+-    index_region = build_index(offsets)
++    index_region = build_index(entries)
+     trailer = _TRAILER.pack(compute_crc(index_region),
+-                            compute_crc(bytes(header) + bytes(checksummed)))
+-    return bytes(header) + bytes(body) + index_region + trailer
++                            compute_crc(header + bytes(body)))
++    return header + bytes(body) + index_region + trailer
++
++
++def _walk(data: bytes, seg_count: int, index_offset: int):
++    """顺序推进段区，返回 ([(seg_id, payload)], [(offset, length)])。
++
++    段区完全位于 ``index_offset`` 之前，所以这一步只依赖已经确认可读的字节：
++    走完 ``seg_count`` 个段后必须正好落在 ``index_offset`` 上，否则就是「段区
++    长度与段数不符」这类结构矛盾。
++    """
++    records = []
++    entries = []
++    cursor = HEADER_SIZE
++    for number in range(seg_count):
++        if cursor + SEGMENT_HEADER_SIZE > index_offset:
++            raise WSegError("structure",
++                            f"segment {number} header does not fit before the index")
++        seg_id, _flags, body_len = parse_segment_header(data, cursor, index_offset)
++        start = cursor + SEGMENT_HEADER_SIZE
++        total = segment_length(body_len)
++        if start + body_len > index_offset or cursor + total > index_offset:
++            raise WSegError("structure",
++                            f"segment {number} payload does not fit before the index")
++        records.append((seg_id, data[start:start + body_len]))
++        entries.append((cursor, total))
++        cursor += total
++    if cursor != index_offset:
++        raise WSegError("structure",
++                        f"segment region ends at {cursor} but the index starts at {index_offset}")
++    return records, entries
+ 
+ 
+ def unpack(data) -> list:
+     """解析 WLSG 字节串；任何结构 / 完整性问题都抛 WSegError。"""
++    if isinstance(data, str):
++        raise WSegError("structure", "unpack expects bytes, got str")
+     if not isinstance(data, (bytes, bytearray, memoryview)):
+         raise WSegError("structure", f"unpack expects bytes, got {type(data).__name__}")
+-    data = bytes(data)
++    blob = bytes(data)
++
++    # 先解析文件头：魔数 / 版本比「整体长度」更能说明问题。
++    _version, _flags, seg_count, index_offset = parse_header(blob)
+ 
+-    if len(data) < HEADER_SIZE + TRAILER_SIZE:
+-        raise WSegError("structure", f"container is only {len(data)} bytes")
++    if index_offset < HEADER_SIZE:
++        raise WSegError("structure", f"index offset {index_offset} overlaps the header")
++    # 段区本身被截断。
++    if index_offset > len(blob):
++        raise WSegError("truncated",
++                        f"segment region needs {index_offset} bytes, got {len(blob)}")
+ 
+-    _version, _flags, seg_count, index_offset = parse_header(data)
++    # 段区与段数的自洽性只依赖已读到的字节，先判它，才能把「段区长度与段数
++    # 不符」正确归为 structure 而不是 truncated。
++    records, computed = _walk(blob, seg_count, index_offset)
+ 
+-    if index_offset > len(data):
+-        raise WSegError("structure", f"index offset {index_offset} is beyond the container")
+     index_end = index_offset + INDEX_ENTRY_SIZE * seg_count
+-    if index_end + TRAILER_SIZE > len(data):
+-        raise WSegError("structure", "the index and the trailer do not fit")
++    if index_end + TRAILER_SIZE > len(blob):
++        raise WSegError("truncated", "the index and the trailer do not fit")
+ 
+-    records = []
+-    checksummed = bytearray(data[:HEADER_SIZE])
+-    cursor = HEADER_SIZE
+-    for index in range(seg_count):
+-        if cursor + SEGMENT_HEADER_SIZE > len(data):
+-            raise WSegError("structure", f"segment {index} header is incomplete")
+-        seg_id, _seg_flags, body_len = parse_segment_header(data, cursor, len(data))
+-        start = cursor + SEGMENT_HEADER_SIZE
+-        if start + body_len > len(data):
+-            raise WSegError("structure", f"segment {index} payload is incomplete")
+-        records.append((seg_id, data[start:start + body_len]))
+-        checksummed += data[cursor:start + body_len]
+-        cursor += segment_length(body_len)
++    stored = parse_index(blob, index_offset, seg_count)
+ 
+-    index_crc, data_crc = _TRAILER.unpack_from(data, len(data) - TRAILER_SIZE)
+-    if compute_crc(data[index_offset:index_end]) != index_crc:
++    index_crc, data_crc = _TRAILER.unpack_from(blob, index_end)
++    if compute_crc(blob[index_offset:index_end]) != index_crc:
+         raise WSegError("checksum", "the index region does not match its checksum")
+-    if compute_crc(bytes(checksummed)) != data_crc:
++    if compute_crc(blob[:index_offset]) != data_crc:
+         raise WSegError("checksum", "the segment region does not match its checksum")
++
++    if stored != computed:
++        raise WSegError("structure", "the index entries disagree with the segment region")
+     return records
+ 
+ 
+@@ -98,7 +149,5 @@ def verify(data) -> bool:
+     try:
+         unpack(data)
+         return True
+-    except WSegError:
+-        return False
+-    except Exception:  # noqa: BLE001
++    except Exception:  # noqa: BLE001 - 契约要求永不抛出
+         return False
+diff --git a/wlogseg/crc.py b/wlogseg/crc.py
+index 6656acb..a1bf809 100644
+--- a/wlogseg/crc.py
++++ b/wlogseg/crc.py
+@@ -1,4 +1,9 @@
+-"""容器尾部校验和使用的 32 位校验和。"""
++"""容器尾部校验和使用的 32 位校验和。
++
++容器使用的是通用的 CRC-32（CRC-32/ISO-HDLC，即 zlib / gzip / PNG 所用的那一
++种）：多项式 0x04C11DB7 的反射形式，初值全 1，结果取反，输出反射。它是数据的
++一个确定函数，常见测试向量 ``b"123456789"`` 对应 ``0xCBF43926``。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,12 +11,19 @@ import zlib
+ 
+ 
+ def crc32_update(data, value: int = 0) -> int:
+-    """在 ``value`` 的基础上继续累积校验和。"""
+-    return (zlib.crc32(bytes(data), value) ^ 0xFFFFFFFF) & 0xFFFFFFFF
++    """在 ``value`` 的基础上继续累积校验和。
++
++    满足增量性质::
++
++        compute_crc(a + b) == crc32_update(b, crc32_update(a, 0))
++    """
++    if isinstance(data, str):
++        raise TypeError("crc32_update expects a bytes-like object")
++    return zlib.crc32(bytes(data), value & 0xFFFFFFFF) & 0xFFFFFFFF
+ 
+ 
+ def compute_crc(data) -> int:
+-    """返回容器使用的 32 位校验和。"""
++    """返回容器使用的 32 位校验和（标准 CRC-32）。"""
+     if isinstance(data, str):
+         raise TypeError("compute_crc expects a bytes-like object")
+     return crc32_update(data, 0)
+diff --git a/wlogseg/header.py b/wlogseg/header.py
+index a154161..84725c1 100644
+--- a/wlogseg/header.py
++++ b/wlogseg/header.py
+@@ -1,4 +1,15 @@
+-"""文件头布局。"""
++"""文件头布局。
++
++与样本一致的 16 字节文件头::
++
++    偏移  长度  含义
++    0     4     魔数 b"WLSG"
++    4     1     版本号
++    5     1     标志位
++    6     2     段数量（小端）
++    8     4     索引区偏移（小端）
++    12    4     保留，恒为 0
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -19,12 +30,19 @@ def build_header(seg_count: int, index_offset: int, flags: int = 0,
+                         index_offset & 0xFFFFFFFF, 0)
+ 
+ 
+-def parse_header(data: bytes):
+-    """解析文件头，返回 (version, flags, seg_count, index_offset)。"""
+-    if len(data) < HEADER_SIZE:
+-        raise WSegError("structure", f"header needs {HEADER_SIZE} bytes, got {len(data)}")
+-    magic, version, flags, seg_count, index_offset, _reserved = _HEADER.unpack_from(data, 0)
+-    if magic != MAGIC:
++def parse_header(data):
++    """解析文件头，返回 (version, flags, seg_count, index_offset)。
++
++    魔数在长度检查之前判定：只要已经能看到前 4 个字节且与魔数不符，就报
++    ``kind="magic"``，而不是把它当成截断。
++    """
++    blob = bytes(data)
++    if len(blob) >= len(MAGIC) and blob[:len(MAGIC)] != MAGIC:
++        raise WSegError("magic", f"bad magic {blob[:len(MAGIC)]!r}")
++    if len(blob) < HEADER_SIZE:
++        raise WSegError("truncated", f"header needs {HEADER_SIZE} bytes, got {len(blob)}")
++    magic, version, flags, seg_count, index_offset, _reserved = _HEADER.unpack_from(blob, 0)
++    if magic != MAGIC:  # pragma: no cover - 上面已经判定过
+         raise WSegError("magic", f"bad magic {magic!r}")
+     if version != SUPPORTED_VERSION:
+         raise WSegError("version", f"unsupported version {version}")
+diff --git a/wlogseg/index.py b/wlogseg/index.py
+index 6db48e1..28ae900 100644
+--- a/wlogseg/index.py
++++ b/wlogseg/index.py
+@@ -1,4 +1,8 @@
+-"""尾部段索引。"""
++"""尾部段索引。
++
++每个条目 **8 字节**：段起始偏移（小端 u32）+ 段总长度（小端 u32，含段头与
++填充）。早期草稿写的 4 字节条目与实际样本不一致。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -6,25 +10,27 @@ import struct
+ 
+ from .errors import WSegError
+ 
+-INDEX_ENTRY_SIZE = 4
++INDEX_ENTRY_SIZE = 8
+ 
+-_ENTRY = struct.Struct("<I")
++_ENTRY = struct.Struct("<II")
+ 
+ 
+-def build_index(offsets) -> bytes:
++def build_index(entries) -> bytes:
++    """``entries`` 是 (offset, length) 序列。"""
+     out = bytearray()
+-    for offset in offsets:
+-        out += _ENTRY.pack(offset & 0xFFFFFFFF)
++    for offset, length in entries:
++        out += _ENTRY.pack(offset & 0xFFFFFFFF, length & 0xFFFFFFFF)
+     return bytes(out)
+ 
+ 
+-def parse_index(data: bytes, pos: int, count: int):
+-    """读取 ``count`` 个索引条目，返回各段偏移。"""
++def parse_index(data, pos: int, count: int):
++    """读取 ``count`` 个索引条目，返回 [(offset, length), ...]。"""
++    blob = bytes(data)
+     needed = pos + INDEX_ENTRY_SIZE * count
+-    if needed > len(data):
+-        raise WSegError("structure", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
+-    offsets = []
+-    for index in range(count):
+-        (offset,) = _ENTRY.unpack_from(data, pos + index * INDEX_ENTRY_SIZE)
+-        offsets.append(offset)
+-    return offsets
++    if pos < 0 or needed > len(blob):
++        raise WSegError("truncated", f"index needs {INDEX_ENTRY_SIZE * count} bytes at {pos}")
++    entries = []
++    for number in range(count):
++        offset, length = _ENTRY.unpack_from(blob, pos + number * INDEX_ENTRY_SIZE)
++        entries.append((offset, length))
++    return entries
+diff --git a/wlogseg/segment.py b/wlogseg/segment.py
+index cc8c196..54f8317 100644
+--- a/wlogseg/segment.py
++++ b/wlogseg/segment.py
+@@ -1,4 +1,17 @@
+-"""段的头布局与编码。"""
++"""段的头布局与编码。
++
++真实布局（以 ``assets/`` 下的样本为准）::
++
++    偏移  长度  含义
++    0     2     段号（小端）
++    2     1     标志位
++    3     1     保留，恒为 0
++    4     4     数据长度（小端）
++    8     n     数据
++    8+n   p     零填充，使「段头 + 数据 + 填充」对齐到 8 字节
++
++注意：早期草稿里写的是 4 字节对齐，实际样本是 **8 字节** 对齐。
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,7 +20,7 @@ import struct
+ from .errors import WSegError
+ 
+ SEGMENT_HEADER_SIZE = 8
+-ALIGNMENT = 4
++ALIGNMENT = 8
+ MAX_SEG_ID = 0xFFFF
+ MAX_BODY = 0xFFFFFFFF
+ 
+@@ -20,18 +33,22 @@ def padding_for(body_len: int) -> int:
+ 
+ 
+ def segment_length(body_len: int) -> int:
++    """段在文件中占用的总字节数（含段头与填充）。"""
+     return SEGMENT_HEADER_SIZE + body_len + padding_for(body_len)
+ 
+ 
+ def encode_segment(seg_id: int, payload: bytes, flags: int = 0) -> bytes:
+     body = bytes(payload)
+-    head = _SEGMENT.pack(seg_id, flags & 0xFF, 0, len(body))
++    head = _SEGMENT.pack(seg_id & 0xFFFF, flags & 0xFF, 0, len(body))
+     return head + body + b"\x00" * padding_for(len(body))
+ 
+ 
+-def parse_segment_header(data: bytes, pos: int, limit: int):
++def parse_segment_header(data, pos: int, limit: int):
+     """从 ``pos`` 读段头；``limit`` 是已经确认可读的字节上界。"""
+-    if pos + SEGMENT_HEADER_SIZE > limit:
+-        raise WSegError("structure", f"segment header at {pos} is incomplete")
+-    seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
++    if pos < 0 or pos + SEGMENT_HEADER_SIZE > limit:
++        raise WSegError("truncated", f"segment header at {pos} is incomplete")
++    try:
++        seg_id, flags, _reserved, body_len = _SEGMENT.unpack_from(data, pos)
++    except struct.error as exc:  # pragma: no cover - 上面的长度检查已覆盖
++        raise WSegError("truncated", f"segment header at {pos} is incomplete: {exc}") from exc
+     return seg_id, flags, body_len
+diff --git a/wlogseg/stream.py b/wlogseg/stream.py
+index 2fee28f..f865335 100644
+--- a/wlogseg/stream.py
++++ b/wlogseg/stream.py
+@@ -1,20 +1,93 @@
+-"""流式读取。"""
++"""流式读取。
++
++``iter_segments`` 惰性产出段，只使用固定大小的 ``read(n)``（``n`` 为正整数）
++从文件对象要数据，不会把整个容器读进内存。
++"""
+ 
+ from __future__ import annotations
+ 
+-from .codec import unpack
++from .crc import compute_crc, crc32_update
+ from .errors import WSegError
++from .header import HEADER_SIZE, parse_header
++from .index import INDEX_ENTRY_SIZE, parse_index
++from .segment import SEGMENT_HEADER_SIZE, parse_segment_header, segment_length
++
++TRAILER_SIZE = 8
++READ_CHUNK = 8192  # 单次 read() 的最大字节数
++
++
++def _read_exact(handle, length: int) -> bytes:
++    """从流中读取恰好 ``length`` 字节；不足时抛 WSegError("truncated")。"""
++    if length <= 0:
++        return b""
++    chunks = []
++    remaining = length
++    while remaining > 0:
++        chunk = handle.read(min(remaining, READ_CHUNK))
++        if not isinstance(chunk, (bytes, bytearray, memoryview)):
++            raise WSegError("structure",
++                            f"the stream returned {type(chunk).__name__} instead of bytes")
++        chunk = bytes(chunk)
++        if not chunk:
++            raise WSegError("truncated",
++                            f"stream ended after {length - remaining} of {length} bytes")
++        chunks.append(chunk)
++        remaining -= len(chunk)
++    return b"".join(chunks)
+ 
+ 
+ def iter_segments(handle):
+-    """产出 (seg_id, payload)。"""
+-    data = handle.read()
+-    if not isinstance(data, (bytes, bytearray, memoryview)):
+-        raise WSegError("structure", f"the stream returned {type(data).__name__}")
+-    for item in unpack(bytes(data)):
+-        yield item
++    """惰性产出 (seg_id, payload)；取完最后一段后校验尾部索引与尾部校验和。"""
++    header_blob = _read_exact(handle, HEADER_SIZE)
++    _version, _flags, seg_count, index_offset = parse_header(header_blob)
++
++    if index_offset < HEADER_SIZE:
++        raise WSegError("structure", f"index offset {index_offset} overlaps the header")
++
++    data_crc = crc32_update(header_blob, 0)
++    cursor = HEADER_SIZE
++    computed = []
++
++    for number in range(seg_count):
++        if cursor + SEGMENT_HEADER_SIZE > index_offset:
++            raise WSegError("structure",
++                            f"segment {number} header does not fit before the index")
++        seg_header = _read_exact(handle, SEGMENT_HEADER_SIZE)
++        seg_id, _seg_flags, body_len = parse_segment_header(seg_header, 0, SEGMENT_HEADER_SIZE)
++        total = segment_length(body_len)
++        if cursor + total > index_offset:
++            raise WSegError("structure", f"segment {number} does not fit before the index")
++
++        body = _read_exact(handle, body_len)
++        padding = _read_exact(handle, total - SEGMENT_HEADER_SIZE - body_len)
++
++        data_crc = crc32_update(seg_header, data_crc)
++        data_crc = crc32_update(body, data_crc)
++        data_crc = crc32_update(padding, data_crc)
++
++        computed.append((cursor, total))
++        cursor += total
++        yield (seg_id, body)
++
++    if cursor != index_offset:
++        raise WSegError("structure",
++                        f"segment region ends at {cursor} but the index starts at {index_offset}")
++
++    index_blob = _read_exact(handle, INDEX_ENTRY_SIZE * seg_count)
++    stored = parse_index(index_blob, 0, seg_count)
++
++    trailer_blob = _read_exact(handle, TRAILER_SIZE)
++    index_crc = int.from_bytes(trailer_blob[0:4], "little")
++    expected_data_crc = int.from_bytes(trailer_blob[4:8], "little")
++
++    if compute_crc(index_blob) != index_crc:
++        raise WSegError("checksum", "the index region does not match its checksum")
++    if data_crc != expected_data_crc:
++        raise WSegError("checksum", "the segment region does not match its checksum")
++    if stored != computed:
++        raise WSegError("structure", "the index entries disagree with the segment region")
+ 
+ 
+ def read_all(handle) -> list:
+     """把结果收成一个列表。"""
+-    return [item for item in iter_segments(handle)]
++    return list(iter_segments(handle))
