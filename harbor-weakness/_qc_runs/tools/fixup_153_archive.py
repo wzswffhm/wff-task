@@ -60,14 +60,17 @@ def main():
                 shutil.copy2(src, dst)
 
         # 2) verifier-only 判分 trial 日志改名，避免与 agent trial 混淆
+        # 2026-10-13 修正：qwen / opus 的「完整试次 trial.log」与「verifier-only 重判
+        # regrade-trial.log」已分别归档，两者并存；此时不得再改名覆盖。
         old = traj_dir / "trial.log"
         new = traj_dir / "regrade-trial.log"
         if old.is_file():
-            if check:
+            if new.exists():
+                if not check:
+                    print(f"[{run}] regrade-trial.log 已存在，保留 trial.log（完整试次）不清除")
+            elif check:
                 problems.append(f"{run}: trial.log 待改名为 regrade-trial.log")
             else:
-                if new.exists():
-                    new.unlink()
                 old.rename(new)
 
         # 3) 说明.md
