@@ -1,0 +1,976 @@
+diff --git a/_tmp_test3.py b/_tmp_test3.py
+new file mode 100644
+index 0000000..7354690
+--- /dev/null
++++ b/_tmp_test3.py
+@@ -0,0 +1,56 @@
++import ctypes, ctypes.wintypes as wt
++
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++QDD = k32.QueryDosDeviceW
++QDD.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
++QDD.restype = wt.DWORD
++
++# Check all drive letters
++dbuf = ctypes.create_unicode_buffer(260)
++for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
++    drive = c + ":"
++    n = QDD(drive, dbuf, 260)
++    if n:
++        print(f"{drive} -> {dbuf.value}")
++
++# Also check GetLogicalDrives
++GD = k32.GetLogicalDrives
++GD.restype = wt.DWORD
++bits = GD()
++print(f"\nLogical drives bitmask: {bits:#010x}")
++for i in range(26):
++    if bits & (1 << i):
++        print(f"  {chr(65+i)}: is available")
++
++# Try FindFirstVolume / FindNextVolume
++FFV = k32.FindFirstVolumeW
++FFV.argtypes = [wt.LPWSTR, wt.DWORD]
++FFV.restype = wt.HANDLE
++FNV = k32.FindNextVolumeW
++FNV.argtypes = [wt.HANDLE, wt.LPWSTR, wt.DWORD]
++FNV.restype = wt.BOOL
++FVC = k32.FindVolumeClose
++FVC.argtypes = [wt.HANDLE]
++FVC.restype = wt.BOOL
++
++vol_buf = ctypes.create_unicode_buffer(260)
++h = FFV(vol_buf, 260)
++if h and h != -1:
++    print("\nVolumes:")
++    while True:
++        print(f"  {vol_buf.value}")
++        # Get volume path names
++        GVPN = k32.GetVolumePathNamesForVolumeNameW
++        GVPN.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD, ctypes.POINTER(wt.DWORD)]
++        GVPN.restype = wt.BOOL
++        path_buf = ctypes.create_unicode_buffer(1024)
++        ret_len = wt.DWORD()
++        ok = GVPN(vol_buf.value, path_buf, 1024, ctypes.byref(ret_len))
++        if ok:
++            paths = path_buf.value.split('\x00')
++            for p in paths:
++                if p:
++                    print(f"    mounted at: {p}")
++        if not FNV(h, vol_buf, 260):
++            break
++    FVC(h)
+diff --git a/_tmp_test4.py b/_tmp_test4.py
+new file mode 100644
+index 0000000..9df73e6
+--- /dev/null
++++ b/_tmp_test4.py
+@@ -0,0 +1,49 @@
++import ctypes, ctypes.wintypes as wt, os
++
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++nt_path = r"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\EF1C7BAF-9DC4-5D2D-AD94-D515E6FA7579\Files\Python312\python.exe"
++unc_path = "\\\\?\\GLOBALROOT" + nt_path
++
++CF = k32.CreateFileW
++CF.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
++CF.restype = wt.HANDLE
++
++GENERIC_READ = 0x80000000
++FILE_SHARE_READ = 0x00000001
++OPEN_EXISTING = 3
++FILE_ATTRIBUTE_NORMAL = 0x80
++
++h = CF(unc_path, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
++if h and h != -1:
++    print("Opened successfully!")
++    GFP = k32.GetFinalPathNameByHandleW
++    GFP.argtypes = [wt.HANDLE, wt.LPWSTR, wt.DWORD, wt.DWORD]
++    GFP.restype = wt.DWORD
++    
++    for flag in [0, 1, 2, 3]:
++        buf = ctypes.create_unicode_buffer(1024)
++        n = GFP(h, buf, 1024, flag)
++        err = ctypes.get_last_error()
++        print(f"flag={flag}: n={n}, err={err}, value={repr(buf.value)}")
++    
++    CH = k32.CloseHandle
++    CH.argtypes = [wt.HANDLE]
++    CH.restype = wt.BOOL
++    CH(h)
++else:
++    err = ctypes.get_last_error()
++    print(f"Failed to open, error={err}")
++
++# Also try with \\?\ prefix directly on the NT path (without GLOBALROOT)
++print("\n--- Try without GLOBALROOT ---")
++unc_path2 = "\\\\?" + nt_path
++h2 = CF(unc_path2, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
++if h2 and h2 != -1:
++    print("Opened!")
++    buf = ctypes.create_unicode_buffer(1024)
++    n = GFP(h2, buf, 1024, 0)
++    print(f"DOS: n={n}, value={repr(buf.value)}")
++    CH(h2)
++else:
++    print(f"Failed, err={ctypes.get_last_error()}")
+diff --git a/_tmp_test5.py b/_tmp_test5.py
+new file mode 100644
+index 0000000..15c7ae8
+--- /dev/null
++++ b/_tmp_test5.py
+@@ -0,0 +1,28 @@
++import ctypes, os
++import wvas._winapi as w
++
++handle = w.OpenProcess(w.PROCESS_QUERY_INFORMATION | w.PROCESS_VM_READ, False, os.getpid())
++mbi = w.MEMORY_BASIC_INFORMATION()
++address = 0
++image_paths = set()
++count = 0
++
++while address < 0x7FFFFFFFFFFF:
++    written = w.VirtualQueryEx(handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi))
++    if not written:
++        break
++    if mbi.Type == w.MEM_IMAGE and mbi.State == w.MEM_COMMIT:
++        buf = ctypes.create_unicode_buffer(1024)
++        n = w.GetMappedFileNameW(handle, ctypes.c_void_p(mbi.BaseAddress), buf, 1024)
++        if n:
++            image_paths.add(buf.value)
++    next_addr = (mbi.BaseAddress or 0) + mbi.RegionSize
++    if next_addr <= address:
++        break
++    address = next_addr
++
++w.CloseHandle(handle)
++
++print(f"Unique image paths ({len(image_paths)}):")
++for p in sorted(image_paths):
++    print(f"  {p}")
+diff --git a/_tmp_test6.py b/_tmp_test6.py
+new file mode 100644
+index 0000000..e3157cc
+--- /dev/null
++++ b/_tmp_test6.py
+@@ -0,0 +1,51 @@
++import ctypes, ctypes.wintypes as wt
++
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++nt_path = r"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\EF1C7BAF-9DC4-5D2D-AD94-D515E6FA7579\Files\Python312\python.exe"
++
++# Try opening with \\?\GLOBALROOT prefix
++unc_path = "\\\\?\\GLOBALROOT" + nt_path
++
++CF = k32.CreateFileW
++CF.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
++CF.restype = wt.HANDLE
++
++GENERIC_READ = 0x80000000
++FILE_SHARE_READ = 0x00000001
++OPEN_EXISTING = 3
++FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
++
++h = CF(unc_path, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None)
++err = ctypes.get_last_error()
++print(f"handle={h}, err={err}")
++
++if h and h != -1:
++    GFP = k32.GetFinalPathNameByHandleW
++    GFP.argtypes = [wt.HANDLE, wt.LPWSTR, wt.DWORD, wt.DWORD]
++    GFP.restype = wt.DWORD
++    
++    for flag_name, flag in [("DOS", 0), ("NT", 1), ("GUID", 2), ("VOLUME_GUID", 3)]:
++        buf = ctypes.create_unicode_buffer(1024)
++        n = GFP(h, buf, 1024, flag)
++        err2 = ctypes.get_last_error()
++        print(f"  {flag_name}: n={n}, err={err2}, value={repr(buf.value)}")
++    
++    # Try GetFileInformationByHandleEx with FileNameInfo
++    GFIBHE = k32.GetFileInformationByHandleEx
++    GFIBHE.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
++    GFIBHE.restype = wt.BOOL
++    
++    # FileNameInfo = 2
++    class FILE_NAME_INFO(ctypes.Structure):
++        _fields_ = [("FileNameLength", wt.DWORD), ("FileName", ctypes.c_wchar * 1024)]
++    
++    fni = FILE_NAME_INFO()
++    ok = GFIBHE(h, 2, ctypes.byref(fni), ctypes.sizeof(fni))
++    err3 = ctypes.get_last_error()
++    print(f"  FileNameInfo: ok={ok}, err={err3}, name={repr(fni.FileName[:fni.FileNameLength])}")
++    
++    CH = k32.CloseHandle
++    CH.argtypes = [wt.HANDLE]
++    CH.restype = wt.BOOL
++    CH(h)
+diff --git a/_tmp_test7.py b/_tmp_test7.py
+new file mode 100644
+index 0000000..3d74797
+--- /dev/null
++++ b/_tmp_test7.py
+@@ -0,0 +1,71 @@
++import ctypes, ctypes.wintypes as wt
++
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
++
++nt_path = r"\Device\vmsmb\VSMB-{dcc079ae-60ba-4d07-847c-3493609c0870}\EF1C7BAF-9DC4-5D2D-AD94-D515E6FA7579\Files\Python312\python.exe"
++
++# Try NtOpenFile + NtQueryInformationFile
++# Or try using RtlNtPathNameToDosPathName
++
++# First, let's try the simplest approach: just check if the file exists
++# at the expected DOS location by extracting the relative path
++
++# Actually, let's try a completely different approach:
++# Use GetLongPathNameW or GetFullPathNameW on a constructed path
++
++# Or: use the fact that in this container, C: maps to the vmsmb share
++# and try to find the mapping by comparing file IDs
++
++# Let's try opening via \\.\GLOBALROOT
++unc_path = "\\\\.\\GLOBALROOT" + nt_path
++print(f"Trying: {unc_path}")
++
++CF = k32.CreateFileW
++CF.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
++CF.restype = wt.HANDLE
++
++GENERIC_READ = 0x80000000
++FILE_SHARE_READ = 0x00000001
++OPEN_EXISTING = 3
++
++h = CF(unc_path, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None)
++err = ctypes.get_last_error()
++print(f"handle={h}, err={err}")
++
++if h and h != -1:
++    GFP = k32.GetFinalPathNameByHandleW
++    GFP.argtypes = [wt.HANDLE, wt.LPWSTR, wt.DWORD, wt.DWORD]
++    GFP.restype = wt.DWORD
++    
++    buf = ctypes.create_unicode_buffer(1024)
++    n = GFP(h, buf, 1024, 0)
++    print(f"DOS: n={n}, value={repr(buf.value)}")
++    
++    CH = k32.CloseHandle
++    CH.argtypes = [wt.HANDLE]
++    CH.restype = wt.BOOL
++    CH(h)
++
++# Try another approach: use DosPathToSessionPathW
++print("\n--- DosPathToSessionPathW ---")
++DPSP = k32.DosPathToSessionPathW
++# This function doesn't exist in kernel32, it's in kernelbase
++
++# Let's try yet another approach: enumerate all symbolic links in \??\
++# using NtQueryDirectoryObject or RegQueryValueEx on HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\DOS Devices
++
++import winreg
++try:
++    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\DOS Devices")
++    i = 0
++    while True:
++        try:
++            name, value, vtype = winreg.EnumValue(key, i)
++            print(f"  {name} = {value}")
++            i += 1
++        except OSError:
++            break
++    winreg.CloseKey(key)
++except Exception as e:
++    print(f"Registry error: {e}")
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..1504056619a0793ecfe9c3300748df5ca3c8cb86
+GIT binary patch
+literal 125
+zcmX@j%ge<81j^sfWr66&AOanHW&w&!XQ*V*Wb|9fP{ah}eFmxdCF5)rQ<7R-l9ZYP
+vri)|Z<1_OzOXB183My}L*yQG?l;)(`6|n*pGXilji1Cq`k&&^88OQ<vFS8o{
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/test_wvas_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wvas_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8c500aa7dca0611432bc5be8189e8f4b0bc29f0
+GIT binary patch
+literal 22737
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wvas/__pycache__/_winapi.cpython-312.pyc b/wvas/__pycache__/_winapi.cpython-312.pyc
+index 65ed0e5e9976815825c9da0bd6a51fdb2ba8e44c..5a0d4babc95e8e375c431a6c895a7fbd2f0b051e 100644
+GIT binary patch
+delta 212
+zcmdlW+9u9-nwOW00SHPZ&u0a5OyrYboVQV(pIIiAEh_*djtZhQQdzQsCZAxkXJt;+
+zh?kpe$0#QRWGKLtrAW3gL}_idVLrml=slT{U7k^Uvm*OVMzLG`fu*TMl`i?kE~#ai
+z$*JMD*nI+=Cx7Em=JEt;W(4Bm?VFW3n;C5$2uWQR(z+<5)xdv4MsB{>Os^G8>p53)
+nZZO(zvC-m!v`qv56$XhLQZn;3W@>=g;-A?V8I_Bafo1>z%)m9u
+
+delta 84
+zcmZn@-yq6&nwOW00SLqe&SxEGpU5Y{D6&zVpP4O1vV|c^WAicQBg~BMle^jF88tVr
+kX1~cec^;=cmpf1cBM=w2Za&W0%*gebjge8gNEs*s0DZy~YybcN
+
+diff --git a/wvas/__pycache__/vas.cpython-312.pyc b/wvas/__pycache__/vas.cpython-312.pyc
+index b4e76251520ded36a2a439751d22a7d6f364590b..5acbbe0ab0c632749d80db3cbe42bf86f76e5ef4 100644
+GIT binary patch
+literal 10880
+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
+
+delta 2131
+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
+
+diff --git a/wvas/_winapi.py b/wvas/_winapi.py
+index 82faf2f..482c641 100644
+--- a/wvas/_winapi.py
++++ b/wvas/_winapi.py
+@@ -67,6 +67,10 @@ GetMappedFileNameW = psapi.GetMappedFileNameW
+ GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
+ GetMappedFileNameW.restype = wt.DWORD
+ 
++QueryDosDeviceW = kernel32.QueryDosDeviceW
++QueryDosDeviceW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
++QueryDosDeviceW.restype = wt.DWORD
++
+ 
+ def last_error():
+     return ctypes.get_last_error()
+diff --git a/wvas/vas.py b/wvas/vas.py
+index 868a1c4..86d1d29 100644
+--- a/wvas/vas.py
++++ b/wvas/vas.py
+@@ -22,7 +22,7 @@ import ctypes
+ from . import _winapi as w
+ from .errors import WVasError
+ 
+-PATH_BUFFER_CHARS = 260
++PATH_BUFFER_CHARS = 1024
+ 
+ _PROTECTION_NAMES = {
+     w.PAGE_NOACCESS: "none",
+@@ -41,6 +41,10 @@ _TYPE_NAMES = {
+     w.MEM_PRIVATE: "private",
+ }
+ 
++# Win32 error codes used for error classification
++_ERROR_ACCESS_DENIED = 5
++_ERROR_INVALID_PARAMETER = 87
++
+ 
+ def protection_name(protect):
+     """Map a PAGE_* protection value onto its short textual name."""
+@@ -52,38 +56,157 @@ def type_name(region_type):
+     return _TYPE_NAMES.get(region_type, "private")
+ 
+ 
++# ---------------------------------------------------------------------------
++# NT device path → DOS drive letter mapping
++# ---------------------------------------------------------------------------
++
++_device_map_cache = None
++
++
++def _build_device_map():
++    """Build a mapping from NT device names to DOS drive letters.
++
++    Returns a list of (nt_device_lower, drive_letter) tuples sorted by
++    descending length of nt_device so that longest-prefix matching is
++    achieved by iterating in order.
++    """
++    global _device_map_cache
++    if _device_map_cache is not None:
++        return _device_map_cache
++
++    mapping = {}
++    dbuf = ctypes.create_unicode_buffer(260)
++    for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
++        drive = c + ":"
++        n = w.QueryDosDeviceW(drive, dbuf, 260)
++        if n:
++            nt_path = dbuf.value.rstrip("\\")
++            mapping[nt_path.lower()] = drive
++
++    # Sort by descending key length for longest-prefix match
++    result = sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
++    _device_map_cache = result
++    return result
++
++
++def _nt_to_dos(nt_path):
++    """Convert an NT device path to a DOS path.
++
++    Returns a DOS path string (e.g. ``C:\\Windows\\...``) if conversion
++    succeeds, or ``None`` if the path cannot be expressed as a DOS or UNC
++    path that the caller can open directly.
++    """
++    if not nt_path:
++        return None
++
++    # Already a DOS-style path (shouldn't happen, but be safe)
++    if len(nt_path) >= 2 and nt_path[1] == ':' and nt_path[0].isalpha():
++        return nt_path
++
++    nt_lower = nt_path.lower()
++
++    # Handle \??\ prefix (sometimes returned by GetMappedFileNameW)
++    if nt_lower.startswith("\\??\\"):
++        remainder = nt_path[3:]  # skip leading backslash -> X:\...
++        if len(remainder) >= 2 and remainder[1] == ':':
++            return remainder
++        return None
++
++    # Try device map lookup (longest prefix first)
++    device_map = _build_device_map()
++    for dev_name, drive_letter in device_map:
++        prefix = dev_name + "\\"
++        if nt_lower.startswith(prefix):
++            return drive_letter + nt_path[len(dev_name):]
++        if nt_lower == dev_name:
++            return drive_letter + "\\"
++
++    # Cannot convert – not a recognised device prefix
++    return None
++
++
++# ---------------------------------------------------------------------------
++# Process handle management
++# ---------------------------------------------------------------------------
++
+ def _open_process(pid):
++    """Open a process handle, raising :class:`WVasError` on failure."""
+     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+         raise WVasError("pid must be a positive integer", kind="badarg", pid=pid)
++
+     handle = w.OpenProcess(
+         w.PROCESS_QUERY_INFORMATION | w.PROCESS_VM_READ, False, pid
+     )
+     if not handle:
+-        raise OSError(w.last_error(), "OpenProcess failed")
++        err = w.last_error()
++        if err == _ERROR_ACCESS_DENIED:
++            raise WVasError(
++                "access denied opening process", kind="access-denied", pid=pid
++            )
++        # ERROR_INVALID_HANDLE or other errors when pid doesn't exist
++        # On Windows, OpenProcess on a non-existent pid typically returns
++        # ERROR_INVALID_PARAMETER (87) or similar.
++        raise WVasError(
++            "cannot open process %d (error %d)" % (pid, err),
++            kind="no-such-process",
++            pid=pid,
++        )
+     return handle
+ 
+ 
++# ---------------------------------------------------------------------------
++# Mapped file path resolution
++# ---------------------------------------------------------------------------
++
+ def _mapped_path(handle, mbi):
+-    """Return the file name backing this region, if any."""
++    """Return the DOS file path backing this region, or ``None``.
++
++    * If the region is not file-backed (not MEM_IMAGE / MEM_MAPPED),
++      returns ``None``.
++    * If ``GetMappedFileNameW`` fails (anonymous mapping, etc.),
++      returns ``None``.
++    * Otherwise converts the NT device path to a DOS path; if conversion
++      fails, returns ``None``.
++    """
+     if mbi.Type not in (w.MEM_IMAGE, w.MEM_MAPPED):
+         return None
++
+     buffer = ctypes.create_unicode_buffer(PATH_BUFFER_CHARS)
+     written = w.GetMappedFileNameW(
+         handle, ctypes.c_void_p(mbi.BaseAddress), buffer, PATH_BUFFER_CHARS
+     )
+     if not written:
+-        return ""
+-    return buffer.value
++        # No file name available (anonymous mapping, etc.)
++        return None
+ 
++    nt_path = buffer.value
++    dos_path = _nt_to_dos(nt_path)
++    return dos_path
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
+ 
+ def regions(pid, include_reserved=True):
+-    """Return the regions of ``pid``'s virtual address space."""
++    """Return the regions of ``pid``'s virtual address space.
++
++    Each element is a dict with keys: base, size, state, type, protect,
++    path, image.  The list is sorted by ascending ``base``.
++
++    When *include_reserved* is ``True`` (the default) both committed and
++    reserved regions are reported.  When ``False``, only committed regions
++    appear.
++    """
+     handle = _open_process(pid)
+     try:
+         result = []
+         mbi = w.MEMORY_BASIC_INFORMATION()
+         address = 0
+-        while address < 0x7FFFFFFFFFFF:
++        # Use a 64-bit safe upper bound.  On 64-bit Windows user-mode VA
++        # space extends up to 0x7FFFFFFFFFFF; on 32-bit it's 0x7FFFFFFF.
++        # We just keep querying until VirtualQueryEx returns 0.
++        while True:
+             written = w.VirtualQueryEx(
+                 handle,
+                 ctypes.c_void_p(address),
+@@ -92,21 +215,69 @@ def regions(pid, include_reserved=True):
+             )
+             if not written:
+                 break
+-            if mbi.State == w.MEM_COMMIT:
+-                base_address = mbi.BaseAddress or 0
+-                result.append({
+-                    "base": base_address & 0xFFFFFFFF,
+-                    "size": mbi.RegionSize & 0xFFFFFFFF,
+-                    "state": "commit",
+-                    "type": type_name(mbi.Type),
+-                    "protect": protection_name(mbi.Protect),
+-                    "path": _mapped_path(handle, mbi),
+-                    "image": mbi.Type == w.MEM_IMAGE,
+-                })
++
++            state = mbi.State
++            if state == w.MEM_FREE:
++                # Skip free regions regardless of include_reserved
++                next_address = (mbi.BaseAddress or 0) + mbi.RegionSize
++                if next_address <= address:
++                    break
++                address = next_address
++                continue
++
++            if state == w.MEM_RESERVE and not include_reserved:
++                next_address = (mbi.BaseAddress or 0) + mbi.RegionSize
++                if next_address <= address:
++                    break
++                address = next_address
++                continue
++
++            # Determine state label
++            if state == w.MEM_COMMIT:
++                state_str = "commit"
++            elif state == w.MEM_RESERVE:
++                state_str = "reserve"
++            else:
++                # Unknown state – skip
++                next_address = (mbi.BaseAddress or 0) + mbi.RegionSize
++                if next_address <= address:
++                    break
++                address = next_address
++                continue
++
++            base_address = mbi.BaseAddress or 0
++            region_size = mbi.RegionSize
++
++            # For reserved regions, protection is typically 0 (NOACCESS).
++            # Report whatever the kernel gives us.
++            prot = protection_name(mbi.Protect)
++            rtype = type_name(mbi.Type)
++
++            # File path: only meaningful for committed regions with a type
++            # that indicates file backing.  For reserved regions there is
++            # never a file behind them.
++            if state == w.MEM_COMMIT:
++                path = _mapped_path(handle, mbi)
++            else:
++                path = None
++
++            is_image = (mbi.Type == w.MEM_IMAGE)
++
++            result.append({
++                "base": base_address,
++                "size": region_size,
++                "state": state_str,
++                "type": rtype,
++                "protect": prot,
++                "path": path,
++                "image": is_image,
++            })
++
+             next_address = (mbi.BaseAddress or 0) + mbi.RegionSize
+             if next_address <= address:
+                 break
+             address = next_address
++
+         result.sort(key=lambda item: item["base"])
+         return result
+     finally:
+@@ -114,14 +285,90 @@ def regions(pid, include_reserved=True):
+ 
+ 
+ def file_backed_regions(pid):
+-    """Return only the regions that have a file behind them."""
+-    return [item for item in regions(pid) if item["path"]]
++    """Return only the regions that have a file behind them.
++
++    This is equivalent to filtering :func:`regions` for items whose
++    ``path`` is not ``None``, preserving the original order.
++    """
++    return [item for item in regions(pid) if item["path"] is not None]
+ 
+ 
+ def modules(pid):
+-    """Return the loaded executable images, lowest base address first."""
+-    return [
+-        {"path": item["path"], "base": item["base"], "size": item["size"]}
+-        for item in regions(pid)
+-        if item["image"]
+-    ]
++    """Return the loaded executable images, lowest base address first.
++
++    Each image appears exactly once.  The returned dicts have keys
++    ``path``, ``base``, and ``size``.  If an image's file path cannot be
++    converted to a DOS path, ``path`` is ``None`` but the entry is still
++    present.
++    """
++    all_regions = regions(pid)
++
++    # Collect image regions grouped by their AllocationBase (which groups
++    # all sections belonging to the same loaded module together).
++    seen_bases = set()
++    result = []
++
++    for item in all_regions:
++        if not item["image"]:
++            continue
++
++        # Use the base address of the region as a unique key for
++        # deduplication.  But multiple regions belong to the same module
++        # (e.g. .text, .rdata, .data sections).  We want one entry per
++        # distinct module.  The most reliable dedup key is the file path
++        # combined with the allocation base.  However, since we may not
++        # have a path (None), we use the first region's base of each
++        # contiguous image group.
++        #
++        # A simpler approach: deduplicate by (path, allocation_base).
++        # Since we don't expose allocation_base, we deduplicate by path
++        # alone when path is not None, and by base when path is None.
++        # Actually, the cleanest approach is to track which allocation
++        # bases we've already emitted.
++
++        # We need the allocation base.  Let's re-query or store it.
++        # Since we didn't store AllocationBase in the region dict, let's
++        # deduplicate differently: group consecutive image regions that
++        # share the same path into a single module entry using the lowest
++        # base and summed size.
++        pass
++
++    # Better approach: iterate through regions, collect image regions,
++    # then deduplicate by path.  For regions with the same path, keep the
++    # one with the lowest base and sum the sizes.
++    # For regions with path=None, each distinct base is a separate module.
++
++    # Actually, the simplest correct approach: walk through all regions,
++    # and for each image region, check if we've already seen this module.
++    # Two regions belong to the same module if they have the same non-None
++    # path, OR if they are adjacent image regions with the same path.
++    # 
++    # The most robust way: re-query with VirtualQueryEx to get
++    # AllocationBase, then group by AllocationBase.  But that's expensive.
++    #
++    # Simplest correct approach: deduplicate by path.  For each unique
++    # path among image regions, report one entry with the minimum base
++    # and total size.  For path=None image regions, treat each as unique
++    # (they shouldn't normally occur for real modules).
++
++    path_groups = {}  # path -> {"base": min_base, "size": total_size}
++    none_entries = []  # image regions with path=None
++
++    for item in all_regions:
++        if not item["image"]:
++            continue
++        p = item["path"]
++        if p is not None:
++            if p in path_groups:
++                grp = path_groups[p]
++                grp["size"] += item["size"]
++                if item["base"] < grp["base"]:
++                    grp["base"] = item["base"]
++            else:
++                path_groups[p] = {"path": p, "base": item["base"], "size": item["size"]}
++        else:
++            none_entries.append({"path": None, "base": item["base"], "size": item["size"]})
++
++    result = list(path_groups.values()) + none_entries
++    result.sort(key=lambda m: m["base"])
++    return result

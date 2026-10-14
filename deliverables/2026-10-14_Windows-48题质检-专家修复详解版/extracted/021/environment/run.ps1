@@ -1,0 +1,3 @@
+param([Parameter(Mandatory)][string]$WorkspaceRoot)
+& (Join-Path $PSScriptRoot 'prepare.ps1') -WorkspaceRoot $WorkspaceRoot
+exit $LASTEXITCODE

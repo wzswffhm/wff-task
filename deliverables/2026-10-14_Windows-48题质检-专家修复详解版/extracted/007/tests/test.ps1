@@ -1,0 +1,22 @@
+param([switch]$TrustedLocal)
+$ErrorActionPreference = 'Stop'
+$logs = 'C:\logs\verifier'; $root = 'C:\bench-fixtures\reparse'; $exe = 'C:\testbed\bin\WinTask.exe'
+New-Item -ItemType Directory -Force $logs | Out-Null
+Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+& 'C:\testbed\build.ps1' *> (Join-Path $logs 'candidate-build.log')
+if ($LASTEXITCODE -ne 0) { throw 'candidate build failed' }
+$required = @('copy_tree','empty_tree','timestamp_preserved','source_junction_rejected','destination_junction_rejected','preflight_no_partial_copy'); $cases = @()
+function Assert([bool]$ok,[string]$message) { if (-not $ok) { throw $message } }
+function Reset([string]$path) { Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $path | Out-Null }
+function Invoke-App([string[]]$arguments) { $global:LASTEXITCODE=0; $text = (& $exe @arguments 2>&1 | Out-String).Trim(); [pscustomobject]@{ Code=[int]$LASTEXITCODE; Text=$text } }
+function Junction([string]$link,[string]$target) { New-Item -ItemType Directory -Force $target | Out-Null; & cmd.exe /c mklink /J $link $target | Out-Null; Assert ($LASTEXITCODE -eq 0) 'junction creation failed' }
+function Remove-Junction([string]$link) { if (Test-Path $link) { & cmd.exe /c rmdir $link | Out-Null } }
+function Case([string]$id,[string]$group,[scriptblock]$body) { $sw=[Diagnostics.Stopwatch]::StartNew(); try { & $body; $status='PASS'; $message=$null } catch { $status='FAIL'; $message=$_.Exception.Message }; $sw.Stop(); $script:cases += [pscustomobject]@{id=$id;group=$group;status=$status;message=$message;duration_ms=$sw.Elapsed.TotalMilliseconds} }
+Case 'copy_tree' 'P2P' { Reset $root; $src=Join-Path $root 'src'; $dst=Join-Path $root 'dst'; New-Item -ItemType Directory -Force (Join-Path $src 'a\b') | Out-Null; Set-Content (Join-Path $src 'a\b\data.txt') 'hello' -Encoding UTF8; $r=Invoke-App @($src,$dst); Assert ($r.Code -eq 0) $r.Text; Assert ((Get-Content (Join-Path $dst 'a\b\data.txt') -Raw).Trim() -eq 'hello') 'content mismatch' }
+Case 'empty_tree' 'P2P' { Reset $root; $src=Join-Path $root 'src'; $dst=Join-Path $root 'dst'; New-Item -ItemType Directory -Force $src | Out-Null; $r=Invoke-App @($src,$dst); Assert ($r.Code -eq 0) $r.Text; Assert (Test-Path $dst) 'destination missing' }
+Case 'timestamp_preserved' 'P2P' { Reset $root; $src=Join-Path $root 'src'; $dst=Join-Path $root 'dst'; New-Item -ItemType Directory -Force $src | Out-Null; $f=Join-Path $src 't.txt'; Set-Content $f 't'; $stamp=[DateTime]::UtcNow.AddMinutes(-7); [IO.File]::SetLastWriteTimeUtc($f,$stamp); $r=Invoke-App @($src,$dst); Assert ($r.Code -eq 0) $r.Text; Assert ([Math]::Abs(([IO.File]::GetLastWriteTimeUtc((Join-Path $dst 't.txt'))-$stamp).TotalSeconds) -lt 3) 'timestamp not preserved' }
+Case 'source_junction_rejected' 'F2P' { Reset $root; $src=Join-Path $root 'src'; $dst=Join-Path $root 'dst'; New-Item -ItemType Directory -Force $src | Out-Null; Junction (Join-Path $src 'linked') (Join-Path $root 'outside'); $r=Invoke-App @($src,$dst); Assert ($r.Code -eq 2) 'source junction accepted'; Assert (-not (Test-Path $dst)) 'destination was created' }
+Case 'destination_junction_rejected' 'F2P' { Reset $root; $src=Join-Path $root 'src'; $dst=Join-Path $root 'dst'; New-Item -ItemType Directory -Force $src | Out-Null; Set-Content (Join-Path $src 'new.txt') 'new'; Junction $dst (Join-Path $root 'outside'); $r=Invoke-App @($src,$dst); Assert ($r.Code -eq 2) 'destination junction accepted'; Assert (-not (Test-Path (Join-Path $root 'outside\new.txt'))) 'wrote through junction'; Remove-Junction $dst }
+Case 'preflight_no_partial_copy' 'F2P' { Reset $root; $src=Join-Path $root 'src'; $dst=Join-Path $root 'dst'; New-Item -ItemType Directory -Force $src | Out-Null; New-Item -ItemType Directory -Force $dst | Out-Null; Set-Content (Join-Path $dst 'sentinel.txt') 'keep'; Junction (Join-Path $src 'bad') (Join-Path $root 'outside'); $r=Invoke-App @($src,$dst); Assert ($r.Code -eq 2) 'bad source accepted'; Assert ((Get-Content (Join-Path $dst 'sentinel.txt') -Raw).Trim() -eq 'keep') 'destination changed' }
+$score = if (@($cases | Where-Object status -ne 'PASS').Count -eq 0) { 1 } else { 0 }; $result=[ordered]@{validity='VALID';score=$score;required=$required;testcases=$cases}; $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $logs 'results.json') -Encoding UTF8; [IO.File]::WriteAllText((Join-Path $logs 'reward.txt'),[string]$score,[Text.Encoding]::ASCII); exit 0
+
