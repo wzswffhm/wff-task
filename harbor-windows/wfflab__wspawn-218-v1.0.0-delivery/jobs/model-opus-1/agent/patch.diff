@@ -1,0 +1,654 @@
+diff --git a/wspawn/_winapi.py b/wspawn/_winapi.py
+index 273b792..e80ef70 100644
+--- a/wspawn/_winapi.py
++++ b/wspawn/_winapi.py
+@@ -1,9 +1,14 @@
+ """Thin ctypes bindings for the Win32 calls that :mod:`wspawn` needs.
+ 
+-Only what the current implementation actually calls is bound here; the DLL is
+-loaded lazily so that importing the package stays cheap.
++Only what the implementation actually calls is bound here; the DLL is loaded
++lazily so that importing the package stays cheap.
++
++Every binding reports failure as an :class:`OSError` carrying ``winerror`` (via
++:func:`ctypes.WinError`), so the layers above can turn the Win32 error code into
++a :class:`wspawn.WSpawnError` with the right ``kind``.
+ """
+ 
++import ctypes
+ import os
+ 
+ FILE_TYPE_UNKNOWN = 0x0000
+@@ -12,7 +17,35 @@ FILE_TYPE_CHAR = 0x0002
+ FILE_TYPE_PIPE = 0x0003
+ FILE_TYPE_REMOTE = 0x8000
+ 
++HANDLE_FLAG_INHERIT = 0x00000001
++HANDLE_FLAG_PROTECT_FROM_CLOSE = 0x00000002
++
++ERROR_INVALID_FUNCTION = 1
++ERROR_ACCESS_DENIED = 5
++ERROR_INVALID_HANDLE = 6
++ERROR_NOT_SUPPORTED = 50
++ERROR_INVALID_PARAMETER = 87
++ERROR_CALL_NOT_IMPLEMENTED = 120
++
++#: Win32 error codes that mean "this object or environment cannot do that at
++#: all"; retrying the same call will never help.
++UNSUPPORTED_ERRORS = frozenset(
++    (
++        ERROR_INVALID_FUNCTION,
++        ERROR_ACCESS_DENIED,
++        ERROR_NOT_SUPPORTED,
++        ERROR_CALL_NOT_IMPLEMENTED,
++    )
++)
++
++#: Handles are pointer-sized.  ctypes quietly turns an out-of-range int into
++#: NULL, so the range has to be checked before the value reaches it.
++_POINTER_BITS = ctypes.sizeof(ctypes.c_void_p) * 8
++HANDLE_MIN = -(1 << (_POINTER_BITS - 1))
++HANDLE_MAX = (1 << _POINTER_BITS) - 1
++
+ _IS_WINDOWS = os.name == "nt"
++_API = {}
+ 
+ 
+ def is_windows():
+@@ -20,20 +53,113 @@ def is_windows():
+     return _IS_WINDOWS
+ 
+ 
+-def _kernel32():
+-    import ctypes
++def _load():
++    """Bind (once) the kernel32 entry points the module uses."""
++    if _API:
++        return _API
++    if not _IS_WINDOWS:
++        raise OSError("the Win32 handle API is only available on Windows")
++
++    from ctypes import wintypes
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++    get_handle_information = kernel32.GetHandleInformation
++    get_handle_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
++    get_handle_information.restype = wintypes.BOOL
++
++    set_handle_information = kernel32.SetHandleInformation
++    set_handle_information.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
++    set_handle_information.restype = wintypes.BOOL
++
++    get_file_type = kernel32.GetFileType
++    get_file_type.argtypes = [wintypes.HANDLE]
++    get_file_type.restype = wintypes.DWORD
++
++    get_console_mode = kernel32.GetConsoleMode
++    get_console_mode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
++    get_console_mode.restype = wintypes.BOOL
++
++    _API.update(
++        wintypes=wintypes,
++        GetHandleInformation=get_handle_information,
++        SetHandleInformation=set_handle_information,
++        GetFileType=get_file_type,
++        GetConsoleMode=get_console_mode,
++    )
++    return _API
+ 
+-    return ctypes.WinDLL("kernel32", use_last_error=True)
++
++def in_handle_range(value):
++    """Return ``True`` when ``value`` fits in a pointer-sized handle."""
++    return HANDLE_MIN <= int(value) <= HANDLE_MAX
++
++
++def _as_handle(value):
++    """Convert ``value`` to a ``HANDLE``; raise ``ValueError`` when impossible."""
++    api = _load()
++    try:
++        number = int(value)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("%r is not a handle value" % (value,)) from exc
++    if not in_handle_range(number):
++        raise ValueError("%r is out of range for a Win32 handle" % (value,))
++    return api["wintypes"].HANDLE(number)
++
++
++def _fail(code_hint=ERROR_INVALID_HANDLE):
++    code = ctypes.get_last_error() or code_hint
++    return ctypes.WinError(code)
++
++
++def handle_flags(handle):
++    """Return the ``HANDLE_FLAG_*`` bits of ``handle`` (``GetHandleInformation``).
++
++    This is the authoritative, externally observable inheritance state of a
++    kernel object: it comes straight out of the handle table rather than from
++    any bookkeeping of our own.
++    """
++    api = _load()
++    flags = api["wintypes"].DWORD(0)
++    target = _as_handle(handle)
++    ctypes.set_last_error(0)
++    if not api["GetHandleInformation"](target, ctypes.byref(flags)):
++        raise _fail()
++    return int(flags.value)
++
++
++def set_handle_flags(handle, mask, flags):
++    """Apply ``flags`` (restricted to ``mask``) to ``handle``."""
++    api = _load()
++    target = _as_handle(handle)
++    ctypes.set_last_error(0)
++    if not api["SetHandleInformation"](target, int(mask), int(flags)):
++        raise _fail()
+ 
+ 
+ def file_type(handle):
+     """Return the ``GetFileType`` value for an object handle."""
+     if not _IS_WINDOWS:
+         raise OSError("GetFileType is only available on Windows")
+-    import ctypes
+-    from ctypes import wintypes
++    api = _load()
++    target = _as_handle(handle)
++    ctypes.set_last_error(0)
++    return int(api["GetFileType"](target))
++
++
++def is_console(handle):
++    """Return ``True`` when ``handle`` refers to a console screen/input buffer."""
++    api = _load()
++    mode = api["wintypes"].DWORD(0)
++    target = _as_handle(handle)
++    ctypes.set_last_error(0)
++    return bool(api["GetConsoleMode"](target, ctypes.byref(mode)))
++
+ 
+-    func = _kernel32().GetFileType
+-    func.argtypes = [wintypes.HANDLE]
+-    func.restype = wintypes.DWORD
+-    return int(func(wintypes.HANDLE(int(handle))))
++def is_valid_handle(handle):
++    """Return ``True`` when ``handle`` is a live handle in this process."""
++    try:
++        handle_flags(handle)
++    except (OSError, ValueError):
++        return False
++    return True
+diff --git a/wspawn/inherit.py b/wspawn/inherit.py
+index eb1617b..62c7637 100644
+--- a/wspawn/inherit.py
++++ b/wspawn/inherit.py
+@@ -1,41 +1,153 @@
+-"""Inheritance flags for the objects the host hands to its helpers."""
++"""Inheritance flags for the objects the host hands to its helpers.
+ 
+-import os
++On Windows the bit that decides whether a kernel object crosses a process
++boundary is ``HANDLE_FLAG_INHERIT`` on the handle itself, not a
++descriptor-level flag.  Everything here therefore goes through
++``Get/SetHandleInformation``, so the state we report is the state the kernel
++will act on -- and the same state an independent observer reads back with the
++same Win32 calls.
++"""
+ 
++from . import _winapi
+ from .errors import WSpawnError
+ 
++#: Handle values are kernel-table indices scaled by four; a process that keeps
++#: thousands of objects open still stays far below this ceiling, so scanning it
++#: is enough to enumerate everything this process could hand over.
++_SCAN_LIMIT = 0x10000
++
++
++def _require_windows(what):
++    if not _winapi.is_windows():
++        raise WSpawnError(
++            "%s needs the Win32 handle API, which this platform does not provide" % what,
++            kind="unsupported",
++        )
++
++
++def _oserror_kind(exc):
++    """Classify a Win32 failure into one of :class:`WSpawnError`'s kinds."""
++    if getattr(exc, "winerror", None) in _winapi.UNSUPPORTED_ERRORS:
++        return "unsupported"
++    return "os"
++
+ 
+ def _as_number(handle):
++    if isinstance(handle, bool):
++        raise WSpawnError("handle must be an integer, got %r" % (handle,), kind="badarg")
+     try:
+         return int(handle)
+-    except (TypeError, ValueError):
++    except (TypeError, ValueError, OverflowError):
+         raise WSpawnError("handle must be an integer, got %r" % (handle,), kind="badarg")
+ 
+ 
+-def set_inheritable(handle, enabled=True):
+-    """Mark ``handle`` as transferable to child processes, or stop it being so."""
++def resolve_handle(handle, what="handle"):
++    """Return ``handle`` as a live Win32 handle value in this process.
++
++    Accepts an OS handle or -- as a convenience for callers that only hold a C
++    runtime file descriptor -- a descriptor, which is translated to the handle
++    underneath it.  The result is always a handle the kernel recognises, so the
++    operation that follows cannot silently act on nothing.
++
++    Values that can never name a transferable object are rejected rather than
++    answered with a plausible-looking default:
++
++    * a negative value is ``INVALID_HANDLE_VALUE`` or a pseudo handle
++      (``GetCurrentProcess()``, ``GetCurrentThread()``).  Pseudo handles are
++      not entries in the handle table, so their inheritance cannot be read or
++      changed at all -> ``unsupported``.
++    * a value outside the pointer-sized handle range -> ``badarg``.
++    * ``0`` (``NULL``) or a dead handle -> ``os``.
++    """
++    _require_windows(what)
+     number = _as_number(handle)
++
++    if not _winapi.in_handle_range(number):
++        raise WSpawnError(
++            "%r is out of range for a Win32 handle" % (handle,), kind="badarg", handle=handle
++        )
++
++    if number < 0:
++        raise WSpawnError(
++            "%r is a pseudo handle or INVALID_HANDLE_VALUE; %s cannot act on it"
++            % (handle, what),
++            kind="unsupported",
++            handle=handle,
++        )
++
++    if number > 0 and _winapi.is_valid_handle(number):
++        return number
++
++    if 0 < number < _SCAN_LIMIT:
++        # Not a live handle; it may still be a C runtime file descriptor.
++        import msvcrt
++
++        try:
++            translated = int(msvcrt.get_osfhandle(number))
++        except (OSError, ValueError):
++            translated = None
++        if translated is not None and _winapi.is_valid_handle(translated):
++            return translated
++
++    raise WSpawnError(
++        "not a live object handle in this process: %r" % (handle,),
++        kind="os",
++        handle=handle,
++    )
++
++
++def set_inheritable(handle, enabled=True):
++    """Mark ``handle`` as transferable to child processes, or stop it being so.
++
++    The change is written to the handle table with ``SetHandleInformation``, so
++    it is observable from outside this module and honoured by process creation.
++    """
++    target = resolve_handle(handle, "set_inheritable()")
++    flags = _winapi.HANDLE_FLAG_INHERIT if enabled else 0
+     try:
+-        os.set_inheritable(number, bool(enabled))
+-    except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os", handle=handle) from exc
+-    except (TypeError, ValueError) as exc:
++        _winapi.set_handle_flags(target, _winapi.HANDLE_FLAG_INHERIT, flags)
++    except ValueError as exc:
+         raise WSpawnError(str(exc), kind="badarg", handle=handle) from exc
++    except OSError as exc:
++        raise WSpawnError(
++            "cannot change the inheritance of %r: %s" % (handle, exc),
++            kind=_oserror_kind(exc),
++            handle=handle,
++        ) from exc
+ 
+ 
+ def is_inheritable(handle):
+     """Return ``True`` when ``handle`` is currently transferable."""
+-    number = _as_number(handle)
++    target = resolve_handle(handle, "is_inheritable()")
+     try:
+-        return bool(os.get_inheritable(number))
++        flags = _winapi.handle_flags(target)
++    except ValueError as exc:
++        raise WSpawnError(str(exc), kind="badarg", handle=handle) from exc
+     except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++        raise WSpawnError(
++            "cannot read the inheritance of %r: %s" % (handle, exc),
++            kind=_oserror_kind(exc),
++            handle=handle,
++        ) from exc
++    return bool(flags & _winapi.HANDLE_FLAG_INHERIT)
+ 
+ 
+ def inheritable_handles():
+     """Return every object in this process that is currently transferable.
+ 
+-    The host tracks the objects it opens itself, so the module reports what the
+-    current implementation knows about.
++    The handle table is probed directly rather than trusting bookkeeping of our
++    own, so objects opened by the standard library or by extension modules show
++    up too.  That is the set :func:`wspawn.spawn` has to narrow down.
+     """
+-    return []
++    _require_windows("inheritable_handles()")
++    found = []
++    inherit_bit = _winapi.HANDLE_FLAG_INHERIT
++    read_flags = _winapi.handle_flags
++    for number in range(4, _SCAN_LIMIT, 4):
++        try:
++            flags = read_flags(number)
++        except (OSError, ValueError):
++            continue
++        if flags & inherit_bit:
++            found.append(number)
++    return found
+diff --git a/wspawn/kinds.py b/wspawn/kinds.py
+index 8ac6fb3..5cc0d4a 100644
+--- a/wspawn/kinds.py
++++ b/wspawn/kinds.py
+@@ -1,16 +1,43 @@
+ """Classification of the objects the host may hand to its helpers."""
+ 
++from . import _winapi
+ from .errors import WSpawnError
++from .inherit import _oserror_kind, resolve_handle
+ 
+ 
+ def handle_kind(handle):
+-    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``."""
++    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``.
++
++    ``"unknown"`` means "a live object this module cannot name" (an event, a
++    mutex, a process); an invalid handle is an error, not an unknown kind.
++    """
++    target = resolve_handle(handle, "handle_kind()")
++
+     try:
+-        number = int(handle)
+-    except (TypeError, ValueError):
+-        raise WSpawnError("handle must be an integer, got %r" % (handle,), kind="badarg")
+-    if number <= 0:
+-        raise WSpawnError("not a usable object handle: %r" % (handle,), kind="os", handle=handle)
+-    # The classification was only ever wanted for a log line that never made it
+-    # into production, so the module reports the neutral value for everything.
++        kind = _winapi.file_type(target)
++    except ValueError as exc:
++        raise WSpawnError(str(exc), kind="badarg", handle=handle) from exc
++    except OSError as exc:
++        raise WSpawnError(
++            "cannot classify %r: %s" % (handle, exc),
++            kind=_oserror_kind(exc),
++            handle=handle,
++        ) from exc
++
++    # A file on a network share reports FILE_TYPE_DISK with the remote bit set.
++    kind &= ~_winapi.FILE_TYPE_REMOTE
++
++    if kind == _winapi.FILE_TYPE_DISK:
++        return "file"
++    if kind == _winapi.FILE_TYPE_PIPE:
++        return "pipe"
++    if kind == _winapi.FILE_TYPE_CHAR:
++        # Character devices cover both consoles and things like NUL; only a
++        # console answers GetConsoleMode.
++        try:
++            if _winapi.is_console(target):
++                return "console"
++        except (OSError, ValueError):
++            pass
++        return "unknown"
+     return "unknown"
+diff --git a/wspawn/proc.py b/wspawn/proc.py
+index b300be0..c4ebe17 100644
+--- a/wspawn/proc.py
++++ b/wspawn/proc.py
+@@ -1,9 +1,31 @@
+-"""Starting helper processes with a handover of the caller's objects."""
++"""Starting helper processes with a handover of the caller's objects.
++
++The handover is done with an explicit inherited-handle list
++(``PROC_THREAD_ATTRIBUTE_HANDLE_LIST``) attached to the process creation call.
++That is the only mechanism on Windows that narrows inheritance to a chosen set:
++``bInheritHandles`` on its own hands over *every* handle that happens to carry
++``HANDLE_FLAG_INHERIT``, which is exactly the leak this module has to prevent.
++
++Two properties follow from using the handle list, and callers rely on both:
++
++* the child's handle table holds the listed objects and nothing else of ours,
++  so other inheritable objects in this process stay private;
++* an inherited handle keeps the *same numeric value* in the child, so the
++  caller can pass the number along (argv, environment, a config blob) and the
++  child can use it directly.
++"""
+ 
+ import os
+ import subprocess
+ 
++from . import _winapi
+ from .errors import WSpawnError
++from .inherit import _require_windows, resolve_handle, set_inheritable
++
++#: subprocess sentinels (PIPE/STDOUT/DEVNULL) and the standard descriptors are
++#: never handle values, so only integers above this are considered for the
++#: "caller passed a raw OS handle as a standard stream" fallback.
++_STD_FD_MAX = 2
+ 
+ 
+ class SpawnedProcess(object):
+@@ -14,6 +36,9 @@ class SpawnedProcess(object):
+         self.inherit = tuple(inherit)
+         self.pid = popen.pid
+         self.returncode = None
++        self.stdin = popen.stdin
++        self.stdout = popen.stdout
++        self.stderr = popen.stderr
+ 
+     def wait(self, timeout=None):
+         self.returncode = self._popen.wait(timeout=timeout)
+@@ -23,9 +48,17 @@ class SpawnedProcess(object):
+         self.returncode = self._popen.poll()
+         return self.returncode
+ 
++    def communicate(self, input=None, timeout=None):
++        out = self._popen.communicate(input=input, timeout=timeout)
++        self.returncode = self._popen.returncode
++        return out
++
+     def terminate(self):
+         self._popen.terminate()
+ 
++    def kill(self):
++        self._popen.kill()
++
+ 
+ def _normalise_argv(argv):
+     if isinstance(argv, (str, bytes)):
+@@ -45,29 +78,166 @@ def _normalise_handles(inherit):
+     if isinstance(inherit, int):
+         raise WSpawnError("inherit must be a sequence of handles, not a single handle", kind="badarg")
+     try:
+-        return tuple(int(item) for item in inherit)
+-    except (TypeError, ValueError) as exc:
+-        raise WSpawnError("inherit must contain integer handles: %s" % exc, kind="badarg") from exc
++        items = list(inherit)
++    except TypeError as exc:
++        raise WSpawnError("inherit must be a sequence of handles: %s" % exc, kind="badarg") from exc
++    out = []
++    for item in items:
++        if isinstance(item, bool):
++            raise WSpawnError(
++                "inherit must contain integer handles, got %r" % (item,), kind="badarg"
++            )
++        try:
++            out.append(int(item))
++        except (TypeError, ValueError, OverflowError) as exc:
++            raise WSpawnError(
++                "inherit must contain integer handles: %s" % exc, kind="badarg"
++            ) from exc
++    return tuple(out)
++
++
++def _prepare_handover(handles):
++    """Resolve, validate and arm the handles that will cross the boundary.
++
++    Returns the de-duplicated handle values for the inherited handle list, in
++    the order the caller gave them.
++    """
++    prepared = []
++    for handle in handles:
++        target = resolve_handle(handle, "spawn()")
++        if target & 3 == 3:
++            # Legacy console pseudo handles (0x3, 0x7, 0xb, ...) cannot appear
++            # in an inherited handle list; process creation rejects them.
++            raise WSpawnError(
++                "a console pseudo handle (%r) cannot be handed over explicitly; "
++                "pass it as stdin/stdout/stderr instead" % (handle,),
++                kind="unsupported",
++                handle=handle,
++            )
++        # The handle list is only honoured for handles that are themselves
++        # marked inheritable, so arm each one before process creation.
++        set_inheritable(target, True)
++        if target not in prepared:
++            prepared.append(target)
++    return prepared
++
++
++def _is_open_fd(number):
++    try:
++        os.fstat(number)
++    except (OSError, ValueError, OverflowError):
++        return False
++    return True
++
++
++def _as_std_stream(value, name, opened):
++    """Normalise one ``stdin``/``stdout``/``stderr`` argument for ``Popen``.
++
++    ``None`` becomes ``NUL``: an unspecified standard stream must not quietly
++    hand this process's own stream to the child.  A raw OS handle is accepted
++    too -- it is wrapped in a throwaway descriptor over a *duplicate*, so the
++    caller's handle is neither closed nor consumed.  Descriptors, file objects
++    and the ``subprocess`` sentinels keep their usual meaning.
++    """
++    if value is None:
++        return subprocess.DEVNULL
++    if isinstance(value, bool) or not isinstance(value, int):
++        return value
++    if value <= _STD_FD_MAX or _is_open_fd(value):
++        return value
++    if not _winapi.is_windows() or not _winapi.is_valid_handle(value):
++        return value
++
++    import msvcrt
++    import _winapi as _stdlib_winapi
++
++    try:
++        duplicate = _stdlib_winapi.DuplicateHandle(
++            _stdlib_winapi.GetCurrentProcess(),
++            value,
++            _stdlib_winapi.GetCurrentProcess(),
++            0,
++            True,
++            _stdlib_winapi.DUPLICATE_SAME_ACCESS,
++        )
++    except OSError as exc:
++        raise WSpawnError(
++            "cannot use %r as %s: %s" % (value, name, exc), kind="os", handle=value
++        ) from exc
++    try:
++        fd = msvcrt.open_osfhandle(duplicate, 0)
++    except (OSError, ValueError) as exc:
++        _stdlib_winapi.CloseHandle(duplicate)
++        raise WSpawnError(
++            "cannot use %r as %s: %s" % (value, name, exc), kind="unsupported", handle=value
++        ) from exc
++    # open_osfhandle takes ownership of the duplicate; closing the descriptor
++    # closes it, which is what `opened` is collected for.
++    opened.append(fd)
++    return fd
++
++
++def _startupinfo(handle_list):
++    """Build a STARTUPINFO carrying the inherited-handle list."""
++    try:
++        info = subprocess.STARTUPINFO()
++    except AttributeError as exc:  # pragma: no cover - non-Windows stdlib
++        raise WSpawnError(
++            "this runtime cannot restrict handle inheritance: %s" % exc, kind="unsupported"
++        ) from exc
++    if not hasattr(info, "lpAttributeList"):  # pragma: no cover - very old runtime
++        raise WSpawnError(
++            "this runtime has no process attribute list, so handle inheritance "
++            "cannot be restricted",
++            kind="unsupported",
++        )
++    if handle_list:
++        info.lpAttributeList = {"handle_list": list(handle_list)}
++    return info
+ 
+ 
+ def spawn(argv, inherit=(), stdin=None, stdout=None, stderr=None):
+     """Start a helper process, handing it the objects named in ``inherit``.
+ 
++    The child can reach the objects in ``inherit`` -- under the same handle
++    values -- plus the standard streams given here, and nothing else of this
++    process.  A standard stream left as ``None`` is wired to ``NUL`` rather
++    than to this process's own stream, so a handover nobody asked for cannot
++    happen by omission.
++
+     Returns a :class:`SpawnedProcess`.
+     """
+     command = _normalise_argv(argv)
+     handles = _normalise_handles(inherit)
++    _require_windows("spawn()")
+ 
++    handle_list = _prepare_handover(handles)
++    info = _startupinfo(handle_list)
++
++    opened = []
+     kwargs = {
+-        # The helper is expected to need the objects it is handed, so close_fds
+-        # stays off; otherwise the log pipe is gone before the helper starts.
+-        "close_fds": False,
+-        "stdin": stdin,
+-        "stdout": stdout,
+-        "stderr": stderr,
++        # close_fds=True is what makes the standard library attach the attribute
++        # list and create the process with a *restricted* inherited set; with it
++        # off, every inheritable object here would cross the boundary.
++        "close_fds": True,
++        "startupinfo": info,
+     }
+     try:
+-        popen = subprocess.Popen(command, **kwargs)
+-    except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os") from exc
+-    return SpawnedProcess(popen, handles)
++        kwargs["stdin"] = _as_std_stream(stdin, "stdin", opened)
++        kwargs["stdout"] = _as_std_stream(stdout, "stdout", opened)
++        kwargs["stderr"] = _as_std_stream(stderr, "stderr", opened)
++        try:
++            popen = subprocess.Popen(command, **kwargs)
++        except WSpawnError:
++            raise
++        except OSError as exc:
++            raise WSpawnError(str(exc), kind="os") from exc
++        except ValueError as exc:
++            raise WSpawnError(str(exc), kind="badarg") from exc
++    finally:
++        for fd in opened:
++            try:
++                os.close(fd)
++            except OSError:
++                pass
++    return SpawnedProcess(popen, handle_list)
