@@ -75,17 +75,13 @@ class ModelGateTests(unittest.TestCase):
         result = evaluate(evidence)
         self.assertFalse(result["pass"])
 
-    def test_qwen_opus_full_score_tie_fails_without_better_opus_testcases(self):
-        # 放宽后（2026-10-12）：双方三轮全满分不再直接出局，
-        # 但 testcase 累计通过数没有严格区分时仍然失败。
+    def test_qwen_opus_full_score_is_rejected(self):
         result = evaluate(self.evidence((1, 1, 1), (1, 1, 1)))
         self.assertFalse(result["pass"])
         self.assertTrue(result["stats"]["distinction"]["qwen_opus_full_score"])
-        self.assertFalse(result["stats"]["distinction"]["full_score_tiebreak_pass"])
         self.assertTrue(any("both full-score" in error for error in result["errors"]))
 
-    def test_qwen_opus_full_score_passes_when_opus_testcases_are_better(self):
-        # 放宽后的准入路径：正式分已顶格，由 testcase_pass_sum 打破平局。
+    def test_qwen_opus_full_score_is_rejected_even_with_better_opus_testcases(self):
         evidence = self.evidence((1, 1, 1), (1, 1, 1))
         for item in evidence["models"]["qwen"]:
             item["cases"] = [
@@ -98,24 +94,16 @@ class ModelGateTests(unittest.TestCase):
                 {"id": "case-1", "status": "PASS"},
             ]
         result = evaluate(evidence)
-        self.assertTrue(result["pass"], result["errors"])
+        self.assertFalse(result["pass"])
         self.assertTrue(result["stats"]["distinction"]["qwen_opus_full_score"])
-        self.assertTrue(result["stats"]["distinction"]["full_score_tiebreak_pass"])
 
-    def test_all_models_full_score_is_recorded_not_rejected(self):
-        # 8 次全满分必须记录进报告；是否放行同样由 Opus/Qwen 的 testcase 区分度决定。
+    def test_all_models_full_score_is_rejected_and_reported(self):
         evidence = self.evidence((1, 1, 1), (1, 1, 1))
         evidence["models"]["glm"][0]["score"] = 1
         evidence["models"]["kimi"][0]["score"] = 1
-        for item in evidence["models"]["opus"]:
-            item["cases"] = [
-                {"id": "case-0", "status": "PASS"},
-                {"id": "case-1", "status": "PASS"},
-            ]
         result = evaluate(evidence)
-        self.assertTrue(result["pass"], result["errors"])
+        self.assertFalse(result["pass"])
         self.assertTrue(result["stats"]["distinction"]["all_models_full_score"])
-        self.assertTrue(result["stats"]["distinction"]["full_score_tiebreak_pass"])
 
     def test_glm_and_kimi_require_exactly_one_run(self):
         evidence = self.evidence()

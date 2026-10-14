@@ -147,8 +147,8 @@ def sync_task(pkg: str, tid: str, write: bool, log) -> str:
     orig_tt = tt
     tt = re.sub(r'(?m)^version\s*=\s*"[^"]*"', 'version = "%s"' % version, tt, count=1)
     tt = re.sub(r'task_hash(\s*=\s*)[0-9a-f]{64}', r'task_hash\g<1>' + task_hash, tt)
-    # task.toml 不得写 docker_image：基础镜像只在 environment/Dockerfile 的 FROM
-    # 里声明并 pin digest。镜像引用只回写到 platform_import.json / manifest.json。
+    # task.toml 的 docker_image 与 environment/Dockerfile 的 FROM 必须一致；
+    # 这里只回写 version / task_hash，镜像引用另回写到 platform_import.json / manifest.json。
     if tt != orig_tt:
         log("  task.toml 已更新（version / task_hash）")
         if write:

@@ -107,10 +107,11 @@ def inspect_delivery(root: Path) -> dict[str, Any]:
             for field in ("task_id", "task_version", "task_hash", "harbor_task_checksum"):
                 if not identity.get(field):
                     errors.append(f"Task has no {field}")
-            if not isinstance(image, str) or not image.strip():
-                errors.append("Task has no pinned Docker image")
-            elif image.strip().casefold() == "latest" or image.strip().casefold().endswith(":latest"):
-                errors.append("Docker image uses the floating latest tag")
+            # 2026-10-14 规则：docker_image 不再是必需字段（镜像由 Dockerfile 的
+            # FROM pin 到 digest）；仅在提供该字段时校验不得为浮动 latest。
+            if isinstance(image, str) and image.strip():
+                if image.strip().casefold() == "latest" or image.strip().casefold().endswith(":latest"):
+                    errors.append("Docker image uses the floating latest tag")
         except Exception as exc:
             errors.append(f"cannot parse/hash direct Harbor Task: {exc}")
 

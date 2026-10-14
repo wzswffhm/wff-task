@@ -66,14 +66,30 @@
 | K30 | 门禁口径（2026-10-12 放宽） | **Qwen 与 Opus 同时全满分不再直接出局**：`_reference/windows-harbor-qc/scripts/validate_model_gate.py` 原先对 `qwen_opus_full_score` 一票否决（判词 "an all-full primary-model task is too easy"），现改为落入统一判据——`Opus model_score_sum > Qwen` 直接通过；两者相等（**含双方三轮全满分**）时必须 `Opus testcase_pass_sum > Qwen testcase_pass_sum`；`qwen_opus_full_score` / `all_models_full_score` 保留为报告记录项（`full_score_tiebreak_pass`）但不再单独否决；8 轮全 `VALID/0` 的零分平局例外不变。QC 工具包内已同步：`SKILL.md` L44、`references/checklist.md`、`references/manual-review.md`、`references/quality-gates.md`、`references/rule-matrix.md`（FAIL 表该行移入「仅提示或人工复核」）、`tests/test_model_gate.py`（12 项单测全过）。此放宽与 `skills/harbor-windows/SKILL.md` L264–270、`references/08-model-validation.md` L47–68、`scripts/run_model_validation.py` L517–536 既有的放宽口径现已一致。**验证方式**：以 `tests/test_model_gate.py` 12 项单测（含「全满分且 Opus testcase 更多 → PASS」「全满分但 testcase 未严格更多 → FAIL」「全模型满分仅记录不否决」）与合成证据为准；`_qc_runs/qc-{215,216}-auto/model-gate.json` 是**历史输出快照**（`pass=false`，其 testcase 状态为 `NONE`），且历史 `jobs/` 身份已随返修失效（K28），真实模型证据须整批重跑后重新采集。 |
 | K31 | 交付材料口径（已定，不整改） | **`delivery-extras/` 伴随材料按口径不新增**：`skills/harbor-windows/SKILL.md` L356 要求该目录，`scripts/validate_package.py` 也判 `[FAIL] [交付材料] 未提供 delivery-extras/ 目录`（规范 5.1）；但本批 4 个交付包（215 / 216 / 218 / 219）**原本均未提供**，甲方口径为「原本没有就不用加」，故维持现状、**不生成骨架**。规范形态见 `scripts/build_delivery_extras.py`（`EXTERNAL_IMAGES.json` + `tasks/<task-id>/{metadata/{labels,manifest}.json, testcase_mapping.csv, evidence/{golden,no_change,clean_room,negative_and_equivalent_controls,cleanup_and_restore}/, model_runs/<model>/, quality_review.md}`），若日后要求补齐须立项统一处置。 |
 | K32 | 自检脚本瑕疵（不影响题包） | `skills/harbor-windows/scripts/validate_package.py` 的 `[tests]` 提示行把示例文件名 `test_wpeimg_semantics.py` 与 `verifier` 拼进「tests/ 文件」列表，**与包内实际内容无关**（两包 `tests/` 实为 `aggregate_results.ps1` / `judge.toml` / `required_testcases.json` / `rubric.json` / `run_tests.ps1` / `test.bat` / `test.ps1` 共 7 个文件，隐藏套件在 `verifier/tests/` 下）。复核时不要据该行判断 tests/ 被污染。 |
+| K33 | **门禁新增（2026-10-14）** | **Windows 专属机制门禁落地，四题现状全部 FAIL**：甲方 2026-10-14 飞书三条返修原因（216 / 215 / 218）的核心判定是「题目和验收是平台无关的容器格式 / CRC / 流式 IO，没有 Windows 专属行为，不满足 Windows 题要求」，并直接引用包内 `verifier/WINDOWS_VALUE.md` 的自认句（「本题不主张 Windows 反事实价值，按通用编码能力归类」）作为证据。为此新增可复算门禁 F1–F6：`scripts/check_windows_mechanism.py`（读 `metadata/windows_mechanism.json`，校验机制 ↔ 题面 ↔ F2P 用例三方锚点 + 环境层「非 Windows 必失败」证据 + 扫描自我否认表述），并已接入 `scripts/validate_package.py`（新增 `[Windows机制]` 类别）。**实测**：对 `wfflab__`{`wchunk-216`, `wfmt-215`, `wlogseg-218`, `wpeimg-219`} 四包运行，均 FAIL（缺门禁产物 + 自认句命中 4–12 处）；对同行合规题 `win-fs-001` 运行 PASS（12 项自测全过，见 `_qc_runs/windows-mechanism-rework/gate_selftest.py`）。 | 四题按现行门禁**不具备 Windows 专项交付资格**；这是**性质判定**，与测试做得多细无关 | 按甲方专家修复步骤第 3 条处置：**给题注入真实 Windows 机制后发新版并重新作答**，或按实际采购分类移出 Windows 池。**不得只删掉自认句** —— 删掉只让门禁变绿，判定依据仍在题面与测试里。历史包可用 `--allow-legacy-exempt` + 包内 `WINDOWS_MECHANISM_EXEMPT.md` 不追溯改判（F6 除外，且该标记文件交付前必须删除）。规则与可照抄手法见 `skills/harbor-windows/references/12-windows-mechanism-gate.md` |
 
 ## 题号对照（本目录实物包）
 
-- `wfflab__wfmt-215` —— **通用编码能力（Windows 运行时执行）**（二进制容器格式）｜L4｜required **9 F2P + 7 P2P = 16**（返修后 2.1.1）
-- `wfflab__wchunk-216` —— **通用编码能力（Windows 运行时执行）**（长度前缀记录容器）｜L4｜required **10 F2P + 9 P2P = 19**（返修后 1.2.1）
+- `wfflab__wfmt-215` —— ~~通用编码能力（Windows 运行时执行）~~ → **甲方已否决该归类（2026-10-14）**，须注入 Windows 机制后发新版｜L4｜required **9 F2P + 7 P2P = 16**（返修后 2.1.1）
+- `wfflab__wchunk-216` —— ~~通用编码能力（Windows 运行时执行）~~ → **甲方已否决该归类（2026-10-14）**，须注入 Windows 机制后发新版｜L4｜required **10 F2P + 9 P2P = 19**（返修后 1.2.1）
 - `wfflab__wreparse-217` —— 文件系统与路径（NTFS 重解析点）｜**L4**｜required **45 F2P + 15 P2P = 60**
 
 > 历史材料中出现的 `wsync-142`、`wreserved-201`、`wads-202`、`wacl-203`、`wpathext-204`、
 > `wreg-205`、`wencoding-206`、`wps-207`、`wrotate-208`、`wproc-209`、`winstall-210`、
 > `wstamp-211`、`wtask-216` 属于完整仓库的其他题包，不在本目录交付范围内。
 > 题目实体与 F2P/P2P 计数以 `_index/tasks_index.csv` 与各题 `tests/required_testcases.json` 为准。
+
+## wfflab__wvas-216（2026-10-14，替换 wchunk-216 槽位）
+
+- **区分度已达标**：Opus score_sum 3 > Qwen score_sum 2（Opus 逐 case 48 > Qwen 46）。
+- **opus-2 曾出现一次真实模型失败**：该轮模型只读文件、未产出补丁即结束（8/16，与 no-change 一致），
+  属 MODEL_FAILURE 而非契约缺陷——它引用的「可见冒烟用例要求 module.path 为真」只针对当前进程断言，
+  与验收 C 允许 `None` 不冲突。已重跑并取得 1 分，最终三份 Opus 轮次均为 1。
+- **交付 ZIP 条目分隔符**：必须为正斜杠；.NET Framework 的 `ZipFile::CreateFromDirectory` 会写反斜杠，
+  已改用 Python `zipfile` 生成（与 219/218/216 历史交付包一致）。
+- **`tests/judge.toml` 与 `tests/rubric.json` 保留**：`validate_package.py` 的「旧评分残留」检查会在
+  全部 12 个题包上报警（含已通过甲方验收的 219）。本包判分本身已是 required F2P/P2P 二值，
+  judge.toml 仅作 rubric 元数据并由 `source_sha256` 绑定 `rubric.json`；清除会改变 task checksum
+  而使 12 轮真实轮次全部失效，故保留并在此登记。
+- **`delivery-extras/` 未随题包提供**：该目录属交付伴随材料，不影响题包自包含性；
+  `_index/` 已提供目录级伴随材料。

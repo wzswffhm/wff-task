@@ -46,6 +46,7 @@ delivery-<batch>-<version>/
         ├── metadata/
         │   ├── source_and_license.json
         │   ├── labels.json
+        │   ├── windows_mechanism.json          # ★ Windows 专属机制门禁产物（F1–F6，缺则不得验收）
         │   ├── lineage_and_contamination.json
         │   └── manifest.json
         ├── evidence/
@@ -63,6 +64,39 @@ delivery-<batch>-<version>/
         ├── quality_review.md
         └── remediation_and_retest.md
 ```
+
+---
+
+## 一之二、三种交付范围必须分清（2026-10-14 起）
+
+甲方返修第 1 条：「请把**参考解和隐藏测试作为验收侧资产**一并交付，并保持对模型隔离。」
+为此必须把三个范围分开，不要用一句话同时表达：
+
+| 范围 | 内容 | `solution/**` | 用途 |
+|---|---|---|---|
+| **完整本地题** | 标准 Harbor 树 + `source.json` | **必须有** | 生产与 Golden 验证的真相源 |
+| **普通模型资产** | 参与方可改的部分（`environment/workspace/**` 等） | **不得携带** | 交给被测模型 |
+| **验收侧交付包（默认提交形态）** | 完整本地题 + 隐藏测试副本 + `delivery-extras/` | **必须有** | 提交甲方质检 |
+
+验收侧交付包额外必须包含：
+
+1. `solution/reference/**` —— `solve.ps1` 依赖的参考源码。
+   215/216 被判「不能单独复现验收」，正是因为 `solution/solve.ps1` 依赖 `reference/wfmt|wchunk`
+   而该目录没有交付，入口依赖包外注入；
+2. **隐藏语义测试在 `tests/` 下的副本**——215/216 缺 `tests/test_*_semantics.py`
+   （只有 `verifier/tests/` 有），而 218/219 的 `tests/` 与 `verifier/tests/` 各一份且 sha256 相同；
+3. **隔离的负访问证明**——探针脚本 + 结果，证明候选身份读不到 / 写不到隐藏测试与参考解
+   （形态参考同行 019 的 `GuardProbe.cs` 与 `test.ps1` 中的 `read_denied/write_denied/tests_denied` 断言、
+   或本仓库的 `verifier/negative_access_probe.ps1`）。
+
+> 「普通模型资产不含 `solution/**`」**不等于**「验收包可以不给参考解」。
+> 仅在收件方**明确要求**纯参与方包（Harbor 四件套）时才导出精简形态，
+> 且必须在 `delivery-extras/` 留一份完整题与哈希，供甲方比对。
+> 交付 ZIP 由 `scripts/package_task_zip.py` 生成：**含** `solution/`、`source.json`、
+> 隐藏测试副本与 `jobs/`，仅排除 `extras/`、缓存与凭据。
+
+> 交付包内**不得**出现自我否认 Windows 价值的表述（「按通用编码能力归类」等）——
+> 该判据由 `references/12-windows-mechanism-gate.md` 的 F6 强制，且**不可豁免**。
 
 ---
 

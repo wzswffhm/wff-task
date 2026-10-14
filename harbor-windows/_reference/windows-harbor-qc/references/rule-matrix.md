@@ -13,11 +13,12 @@
 | `task.toml` 的 instruction/workspace/setup/test/golden 入口缺失、越界或指向未交付文件 | `FAIL` |
 | `solution/` 缺少可由标准 OracleAgent 调用的 `solve.ps1` 或 `solve.bat` | `FAIL` |
 | 测试入口引用未交付文件，或 required testcase 少于 5 条 | `FAIL` |
-| `jobs/` 不是规定数量的原生 Harbor job：**必需** Qwen×3、Opus×3、Oracle×3、NOP×3（12 个）；GLM×1、Kimi×1 自 2026-10-13 起可选（含则为 14 个） | `FAIL` |
+| `jobs/` 不是 14 个原生 Harbor job：Qwen×3、Opus×3、GLM×1、Kimi×1、Oracle×3、NOP×3 | `FAIL` |
 | 任一 job 缺少规定的原始 config/lock/result/log/verifier/reward/trajectory 文件 | `FAIL` |
 | 任一模型运行不是 `VALID`、不是二值 0/1、testcase 集合不完整或 Task Hash 不一致 | `FAIL` |
+| Qwen 三次与 Opus 三次同时全部 `VALID/1` | 不单独失败；仍按总分与 `testcase_pass_sum` 判定，并标记 `qwen_opus_full_score` / `all_models_full_score` 供人工复核 |
 | Opus 总分低于 Qwen | `FAIL` |
-| Opus 与 Qwen 总分相等，但 Opus 的 `testcase_pass_sum` 没有严格高于 Qwen，且全部规定模型运行（必需 6 次；含可选 GLM/Kimi 为 8 次）并非全部 `VALID/0` | `FAIL` |
+| Opus 与 Qwen 总分相等，但 Opus 的 `testcase_pass_sum` 没有严格高于 Qwen，且 8 次规定模型运行并非全部 `VALID/0` | `FAIL` |
 | Oracle 任一轮不是 `VALID/1` 或 required testcase 未全 PASS | `FAIL` |
 | NOP 任一轮不是 `VALID/0`、P2P 未全 PASS，或没有核心 F2P FAIL | `FAIL` |
 | 缺测试、构建、环境、权限或解析故障被写成正式 reward 0 | `FAIL`，应为 `INVALID/BLOCKED` |
@@ -57,23 +58,21 @@
 | 缺少顶层 `metadata/` | 不单独失败 |
 | `task.toml` 缺 network policy 字段 | 不单独失败 |
 | GLM 得分高于 Opus | 不因该现象单独失败；仍执行 Opus/Qwen 主分差门禁 |
-| Qwen 三次与 Opus 三次同时全部 `VALID/1`（或 8 次规定模型运行全部满分） | 不单独 `FAIL`（2026-10-12 放宽）；按 `testcase_pass_sum` 判据裁决，并必须记录 `qwen_opus_full_score` / `all_models_full_score` |
 | 泛化描述“每模型运行次数不足” | 不单独使用该措辞；若少于固定 14 个 job，按目录和原始证据缺件失败 |
 | 历史问题库记录某题曾经存在缺陷 | 只作风险提示；必须用当前版本证据确认 |
 | 执行时间较长，但未超过冻结预算且无超时或死锁证据 | 不单独失败 |
 
 ## 模型平分判定
 
-先分析 Qwen、Opus、GLM、Kimi 的全部规定运行。当 Qwen 与 Opus 的三次 `model_score_sum`
-相等时，比较相同 required testcase 集合上的 `testcase_pass_sum`：Opus 严格高于 Qwen 则区分度
-门禁通过；小于或等于则失败，但下述全模型有效零分例外仍然保留。**总分相等不限于双方均为 0**：
-Qwen 三次与 Opus 三次同时全部 `VALID/1`（正式分顶格）时同样走本判据——「双方同时三轮满分」
-本身不再出局，但必须由 testcase 颗粒度严格分开两者，否则仍判失败。`qwen_opus_full_score`
-与 `all_models_full_score` 必须记录进报告，用于说明判分颗粒度是否足以区分主模型，不再单独否决。
+先分析 Qwen、Opus、GLM、Kimi 的全部规定运行。Qwen 与 Opus 同时三轮满分不再直接失败，仍按
+下述总分与 `testcase_pass_sum` 判定，并同时记录 `qwen_opus_full_score` 与
+`all_models_full_score` 供人工复核。当 Qwen 与 Opus 的三次 `model_score_sum` 相等时，
+继续比较相同 required testcase 集合上的 `testcase_pass_sum`。若 Opus 严格高于 Qwen，
+则区分度门禁通过；若 Opus 小于或等于 Qwen，则门禁失败，但下述全模型有效零分例外仍然保留。
 
 ## 合法的零分平局例外
 
-只有全部规定模型运行（必需 Qwen×3 + Opus×3 共 6 次；含可选 GLM×1 + Kimi×1 则 8 次）全部是 `VALID/0` 时，即使 Opus 的
+只有 Qwen×3、Opus×3、GLM×1、Kimi×1 共 8 次运行全部是 `VALID/0` 时，即使 Opus 的
 `testcase_pass_sum` 没有严格高于 Qwen，也允许 `Opus = Qwen = 0`。如果不满足该例外且
 Opus/Qwen 总分相等，则必须由 Opus 更高的 testcase 累计通过数打破平局。
 

@@ -22,14 +22,10 @@ ALIASES = {
 # stated exclusively in terms of qwen vs opus.
 REQUIRED_COUNTS = {"qwen": 3, "opus": 3}
 
-# Optional rounds (latest scope, 2026-10-13): GLM and Kimi are no longer
-# mandatory. A delivery may omit them entirely; when they ARE supplied they
-# must still be complete and VALID, so a half-finished round can never dilute
-# the gate.
-OPTIONAL_COUNTS = {"glm": 1, "kimi": 1}
-
-# Every alias the gate knows how to score (required + optional).
-ALL_COUNTS = {**REQUIRED_COUNTS, **OPTIONAL_COUNTS}
+# 2026-10-14 rule: GLM and Kimi are no longer run. If evidence for them is
+# present it is ignored entirely -- it neither affects the gate nor counts as
+# an error.
+IGNORED_MODELS = ("glm", "kimi")
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -136,23 +132,17 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
 
     seen_run_ids: set[str] = set()
     scores_by_model: dict[str, list[int]] = {}
-    supplied_optional = 0
-    for name, count in ALL_COUNTS.items():
-        optional = name in OPTIONAL_COUNTS
-        raw = models.get(name)
-        provided = len(raw) if isinstance(raw, list) else 0
+    for name, count in REQUIRED_COUNTS.items():
         scores, passes, model_errors = inspect_runs(
-            name, raw, count, identity, seen_run_ids, optional=optional
+            name, models.get(name), count, identity, seen_run_ids, optional=False
         )
         errors.extend(model_errors)
         scores_by_model[name] = scores
-        if optional:
-            supplied_optional += provided
         stats[name] = {
             "valid_runs": len(scores),
             "model_score_sum": sum(scores),
             "testcase_pass_sum": passes,
-            "required": not optional,
+            "required": True,
         }
 
     qwen_scores = scores_by_model["qwen"]
@@ -163,8 +153,8 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
     opus_testcase_pass_sum = stats["opus"]["testcase_pass_sum"]
     all_scores = [score for scores in scores_by_model.values() for score in scores]
     # The "every run is VALID/0" and "every run is full score" exceptions cover
-    # exactly the rounds that were actually delivered.
-    expected_total = sum(REQUIRED_COUNTS.values()) + supplied_optional
+    # exactly the required primary-model rounds (Qwen 3 + Opus 3 = 6).
+    expected_total = sum(REQUIRED_COUNTS.values())
     all_zero_exception = (
         not errors
         and len(all_scores) == expected_total
@@ -190,18 +180,19 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
             opus_score_sum == qwen_score_sum
             and opus_testcase_pass_sum > qwen_testcase_pass_sum
         ),
+        "full_score_tiebreak_pass": (
+            qwen_opus_full_score
+            and opus_testcase_pass_sum > qwen_testcase_pass_sum
+        ),
         "rule": (
-            "Qwen and Opus cannot both be full-score across all required runs; "
-            "Opus score sum must exceed Qwen; when score sums tie, Opus testcase pass sum "
-            "must exceed Qwen, unless every required model run is VALID/0"
+            "Opus score sum must exceed Qwen; when the score sums tie, Opus testcase pass sum "
+            "must strictly exceed Qwen, unless every required model run is VALID/0. A Qwen/Opus "
+            "full-score tie is decided by testcase_pass_sum: Qwen passing fewer testcases than "
+            "Opus is sufficient distinction, so the required testcase set must still separate "
+            "the two models. all_models_full_score is recorded for the report only."
         ),
     }
-    if qwen_opus_full_score:
-        errors.append(
-            "model distinction gate failed: Qwen and Opus are both full-score across "
-            "all required runs; an all-full primary-model task is too easy"
-        )
-    elif not errors and not all_zero_exception:
+    if not errors and not all_zero_exception:
         if opus_score_sum < qwen_score_sum:
             errors.append(
                 "model distinction gate failed: Opus model_score_sum is lower than "
@@ -211,10 +202,19 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
             opus_score_sum == qwen_score_sum
             and opus_testcase_pass_sum <= qwen_testcase_pass_sum
         ):
-            errors.append(
-                "model distinction gate failed: Opus and Qwen model_score_sum are tied, "
-                "but Opus testcase_pass_sum is not strictly greater than Qwen"
-            )
+            if qwen_opus_full_score:
+                errors.append(
+                    "model distinction gate failed: Qwen and Opus are both full-score across "
+                    f"all required runs (model_score_sum tied at {opus_score_sum}), and Opus "
+                    f"testcase_pass_sum ({opus_testcase_pass_sum}) is not strictly greater than "
+                    f"Qwen ({qwen_testcase_pass_sum}); the required testcases do not separate "
+                    "the two models"
+                )
+            else:
+                errors.append(
+                    "model distinction gate failed: Opus and Qwen model_score_sum are tied, "
+                    "but Opus testcase_pass_sum is not strictly greater than Qwen"
+                )
     return {"pass": not errors, "errors": errors, "stats": stats, "task": identity}
 
 

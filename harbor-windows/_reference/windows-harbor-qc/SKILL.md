@@ -40,15 +40,15 @@ python scripts\run_delivery_qc.py --input D:\path\delivery.zip --out D:\path\qc-
 
 1. 安全解压；ZIP 内必须只有一个最外层作业文件夹，且其名称与 ZIP 文件名去掉 `.zip` 后完全一致。该文件夹本身就是 Harbor Task 根目录，必须直接包含 `task.toml`、`instruction.md`、`environment/`、`solution/`、`tests/`、`jobs/`。不接受 `outside_harbor/`、`outside_harbor-assets/` 等 Demo 包装层。
 2. 检查 Task 的 `instruction.md + task.toml + environment/ + solution/ + tests/`、所有入口实际引用文件、固定镜像和测试协议。`source.json` 可有可无；存在时必须有效且身份一致。required testcase 少于 5 条失败，5–27 条正常，超过 27 条只提示人工复核。
-3. 直接读取 `jobs/` 中的模型与控制轮 job：**必需** Qwen 3 次、Opus 3 次、Oracle 3 次、NOP 3 次（**合计 12 个**）；GLM 1 次、Kimi 1 次**自 2026-10-13 起为可选**，存在时合计 14 个。模型 job 必须含 `agent/model-result.json` 与 `agent/trajectory.jsonl`；所有 job 必须含原始 `result.json`、verifier 结果、reward 和日志。
-4. 模型准入比较三次正式分数总和：`Opus model_score_sum > Qwen model_score_sum` 时通过。两者总分相等时（**不限于双方均为 0**：Qwen 三次与 Opus 三次同时全部 `VALID/1` 也走这一支路），继续比较逐 testcase 的累计通过数，只有 `Opus testcase_pass_sum > Qwen testcase_pass_sum` 才通过——正式分已经顶格时，区分度全部由 `testcase_pass_sum` 承担，「Qwen 与 Opus 同时三轮满分」本身**不再**是出局理由（2026-10-12 放宽），但 required testcase 的条数与颗粒度必须真的能把两者分开。全部规定模型运行（必需口径 6 次；含可选 GLM/Kimi 则 8 次）均为 `VALID/0` 时，即使 testcase 累计通过数也未拉开差距，零分平局仍允许通过。Opus 总分低于 Qwen，或总分相等且 Opus testcase 累计通过数没有严格高于 Qwen（且不满足全模型有效零分例外）时失败。`qwen_opus_full_score` 与 `all_models_full_score` 不再单独否决，但**仍必须记录进报告**，用于说明判分颗粒度是否足以区分主模型。GLM/Kimi 不参与主分差，GLM 高于 Opus本身不触发返修，但必须纳入全模型结果分布分析，且所有原始轨迹必须完整有效。
+3. 直接读取 `jobs/` 中 14 个 Harbor job：Qwen 3 次、Opus 3 次、GLM 1 次、Kimi 1 次、Oracle 3 次、NOP 3 次。模型 job 必须含 `agent/model-result.json` 与 `agent/trajectory.jsonl`；所有 job 必须含原始 `result.json`、verifier 结果、reward 和日志。
+4. 模型准入先拒绝过易满分题：Qwen 三次和 Opus 三次同时全部 `VALID/1` 时直接失败；8 次规定模型运行全部满分时也必须明确记录为全模型满分失败。其余情况比较三次正式分数总和：`Opus model_score_sum > Qwen model_score_sum` 时通过；两者总分相等时，继续比较逐 testcase 的累计通过数，只有 `Opus testcase_pass_sum > Qwen testcase_pass_sum` 才通过。规定的 8 次模型运行全部 `VALID/0` 时，即使 testcase 累计通过数也未拉开差距，零分平局仍允许通过。Opus 总分低于 Qwen，或总分相等且 Opus testcase 累计通过数没有严格高于 Qwen（且不满足全模型有效零分例外）时失败。GLM/Kimi 不参与主分差，GLM 高于 Opus本身不触发返修，但必须纳入全模型结果分布分析，且所有原始轨迹必须完整有效。
 5. 在 Windows Containers 模式下真实调用 Harbor。Oracle 默认独立 3 次且全部 `VALID/1`；NOP 默认独立 3 次且全部 `VALID/0`，每轮 P2P 全 PASS、至少一个核心 F2P FAIL。
 
 每轮 Harbor 参数固定为 `--n-attempts 1 --n-concurrent 1 --max-retries 0`。缺测试、零测试、构建失败、`SKIP/ERROR/NOT_RUN`、解析错误、权限或环境故障必须判为 `INVALID/BLOCKED`，不能生成正式 0 分。不得减少 required 清单、替换原始 jobs、复用旧 Task 轨迹或通过修改输入消除失败。
 
 模型 jobs 必须保留模型/提供商、中文口语化原始提示词、原始响应、候选代码或补丁、`trajectory.jsonl`、`verifier/result.json`、`reward.txt`、逐 testcase 终态、时间和 Task checksum。提示词不得添加“中文口语化提示：”前缀。发现凭据、Solution/测试泄漏、Hash 不一致或缺少原始文件时失败。
 
-以下项目不得单独作为返修理由：Dockerfile 的 `FROM` 未 pin SHA-256 digest；缺少顶层 `evidence/` 或 `metadata/`；`task.toml` 缺 network policy 字段；全部规定模型运行均有效且全 0；泛化的“每模型运行次数不足”；GLM 为 1 而 Opus 为 0。这里的“运行次数不足”豁免不取消标准目录门禁：`jobs/` 少于规定数量的原生 Harbor job（**2026-10-13 起为 12 个**；含可选 GLM/Kimi 的旧口径为 14 个），仍按目录/证据缺件判定失败。
+以下项目不得单独作为返修理由：Dockerfile 的 `FROM` 未 pin SHA-256 digest；缺少顶层 `evidence/` 或 `metadata/`；`task.toml` 缺 network policy 字段；全部规定模型运行均有效且全 0；泛化的“每模型运行次数不足”；GLM 为 1 而 Opus 为 0。这里的“运行次数不足”豁免不取消标准目录门禁：`jobs/` 少于规定的 14 个原生 Harbor job，仍按目录/证据缺件判定失败。
 
 写不通过原因时只写真实触发的硬门禁，附文件、job 和 testcase 证据。不要把建议项包装成必改项，也不要因为另一个门禁已经失败就追加未经验证的模板化原因。
 
@@ -56,7 +56,6 @@ python scripts\run_delivery_qc.py --input D:\path\delivery.zip --out D:\path\qc-
 
 自动入口完成后，必须按 [references/quality-gates.md](references/quality-gates.md)、
 [references/manual-review.md](references/manual-review.md) 和采购手册完成十项人工硬门禁，并提交
-- `references/latest-qc-requirements.md`：最新质检要求（20261012 批次）——魔法阈值禁令、无效槽位单列、Windows 价值映射、权重废止、配置可解析、公开/隐藏分层。
 结构化 `quality-review.json`。原有五项分别是：Golden/NOP 是否按预期得分；每项评分标准和每个 testcase
 是否判分正确；testcase 是否严格对应题面并检查功能；是否存在联网取答案、搜索 Golden、修改
 测试/Verifier 等 Hack；是否具备真实 Windows 价值。每项都必须逐项给出 job、轨迹、testcase 或

@@ -31,7 +31,11 @@ description: >
 
 生产前先记住，任何情况下不得违反：
 
-1. **Windows 价值**：换 Linux/macOS 后主要实现、错误根因、Evaluator 若基本不变 → 不是 Windows 专项题
+1. **Windows 价值（可复算门禁）**：换 Linux/macOS 后主要实现、错误根因、Evaluator 若基本不变 → 不是 Windows 专项题。
+   每题必须提供 `metadata/windows_mechanism.json`，由 `scripts/check_windows_mechanism.py` 按 **F1–F6** 逐条复算
+   （≥3 条机制，每条都要能定位到题面条款与一条 **F2P** 用例；环境层要有"非 Windows 必然失败"的锚点）。
+   **包内严禁出现自我否认 Windows 价值的表述**（「不主张 Windows…」「按通用编码能力归类」「platform-agnostic」等）
+   —— 这类句子会被甲方直接引为不合格证据，且**不可豁免**。详见 `references/12-windows-mechanism-gate.md`
 2. **二值判分**：required F2P + P2P 全过 = 1，否则 = 0；异常 = INVALID（**不得伪装成 0 分**）。无权重、无部分分、无 LLM Judge
 3. **身份唯一**：全包统一 `task_id + task_version + task_hash`；镜像 tag 不是身份，必须另存 Digest
 4. **跑分前必须先过甲方自检**（2026-10-12 起，硬性前置门）：在真实 Windows Runtime 中开跑
@@ -83,16 +87,43 @@ description: >
 
 > **模型或平台版本变更后，不得与旧结果直接比较；需要用于准入时应统一回刷。**
 
-### 1. 候选与 Windows 价值预筛
+### 1. 候选与 Windows 价值预筛（硬门禁 F1–F6）
 
 对每个候选逐题回答**反事实问题**：
 
 > 将目标 OS 替换为 Linux 或 macOS，主要实现、错误根因和 Evaluator 是否基本不变？
 
-- 答案为「是」→ 淘汰或重新立意
+- 答案为「是」→ **淘汰或重新立意**（不得靠"归入通用题池"的说明绕过；
+  若确要保留通用题，就按甲方口径调整采购分类并**不占 Windows 名额**）
 - 判据、12 个主流方向、6 个常见误判 → `references/02-windows-value.md`
 
-**产出**：`delivery-extras/tasks/<task-id>/metadata/labels.json`（主方向 + 次级标签 + 语言 + 任务类型 + 目标 Windows 环境 + 难度）
+**产出（两项都要）**：
+
+```text
+delivery-extras/tasks/<task-id>/metadata/labels.json              # 主方向 + 次级标签 + 语言 + 任务类型 + 目标 Windows 环境 + 难度
+delivery-extras/tasks/<task-id>/metadata/windows_mechanism.json   # ★ 机制门禁产物（缺则 4.5 与 9 均不通过）
+```
+
+复制 `assets/metadata-templates/windows_mechanism.json` 并逐项填实。要点：
+
+| 字段 | 要求 |
+|---|---|
+| `counterfactual` | `answer` 必须为「否」，`reason` 写明"为什么换 OS 后不成立"，点名机制 |
+| `exclusive_declaration.quote` | **排他声明**，必须与 `instruction.md` **逐字一致**（≥8 字符） |
+| `mechanisms[]` | ≥3 条；每条给 `name` + `instruction_quote`（题面逐字）+ `test_ref`（`文件#L起-L止`）+ `f2p_case`（必须是 `required_testcases.json` 里 group=F2P 的用例） |
+| `non_windows_must_fail` | `file` + `evidence` 逐字，且含平台判定关键字（`$IsWindows` / `Win32NT` / `DriveFormat` / `GetFileInformationByHandle` 等） |
+
+> **排他声明 ≠ 免责声明**（本批次最容易踩的坑）：
+> ✅ `目标是真实的 Windows NTFS 语义，不需要实现其他操作系统版本。`
+> ❌ `本题不主张 Windows 反事实价值，按通用编码能力归类。`
+> 前者把其他 OS 排除出验收范围（加强），后者自我否认被测能力（**F6 命中即 FAIL**）。
+
+自检：
+
+```bash
+python scripts/check_windows_mechanism.py --task-dir <题包目录>          # 退出码 0 才算过
+python scripts/check_windows_mechanism.py --package <题包根目录> --json gate.json
+```
 
 ### 2. 来源/授权/污染/重复检查
 
@@ -157,6 +188,20 @@ testcase → 题面要求/公开契约 → 预期行为
 阶段 6 的 Golden/no-change 对照、阶段 7 的模型验证），必须先对**待交付形态**的题包
 执行甲方 `windows-harbor-qc` 自检，并达到退出码 `0`。
 退出码 `1`（FAIL）或 `2`（BLOCKED）时**一律不得开始跑分** —— 先修包、再自检，直到 PASS。
+
+**本地前置（更早、零成本，先跑这两条再谈甲方自检）**：
+
+```bash
+SKILL=<skill目录>
+# ① Windows 专属机制门禁 —— 不过就别往下走：这道题的性质错了，跑多少轮都白跑
+python "$SKILL/scripts/check_windows_mechanism.py" --task-dir <题包目录>          # 必须 exit 0
+# ② 题包结构与身份校验（已内置 ①）
+python "$SKILL/scripts/validate_package.py" --package <题包根目录> --schema-version 1.3
+```
+
+> **为什么机制门禁排在最前**：题面与判据若落在平台无关的字节层，甲方会以
+> 「Windows 专属价值低」直接退回（216/215/218 的实际结局），与测试做得多细无关。
+> 这是**性质错误**，不是质量问题 —— 早发现只损失改题时间，晚发现要赔上整批跑分。
 
 **自检包位置**：`harbor-windows/_reference/windows-harbor-qc/`
 （甲方最新版；2026-10-12 版共 34 个文件，可用包内 `MANIFEST.sha256` 自校。
@@ -319,7 +364,11 @@ python scripts/validate_package.py --package <题包根目录> --schema-version 
 ```
 
 检查项：身份三元组一致、目录结构合规、无自定义必需字段、无 Solution/隐藏 Tests 泄漏、
+**Windows 专属机制门禁（F1–F6，见 `references/12-windows-mechanism-gate.md`）**、
 伴随材料齐全、Hash 匹配。详见 `references/06-acceptance-gates.md`。
+
+> 校验器输出的 `[Windows机制]` 类别即该门禁；它同时可单独运行（`scripts/check_windows_mechanism.py`），
+> 便于只改题面时快速复验而不用整包重跑。
 
 ### 10. 版本冻结与交付
 
@@ -329,10 +378,18 @@ python scripts/validate_package.py --package <题包根目录> --schema-version 
 - 由资格汇总生成 `jobs/`：`scripts/build_jobs.py`（每次跑分一个 `<job-id>/{agent,verifier}`）
 - 生成甲方 QC 必备的 `tests/required_testcases.json`：`scripts/build_required_testcases.py`
 - 对齐甲方 QC 报告协议 aggregate-v1（rubric `test_ids` 需 `f2p-`/`p2p-` 前缀）：`scripts/align_report_protocol.py`
-- 打交付 ZIP：`scripts/package_task_zip.py`（**必须含 `solution/`、`source.json`、`jobs/`**；仅排除 `extras/` 与缓存，缺必备件即拒发）；
+- 打交付 ZIP：`scripts/package_task_zip.py`（**必须含 `solution/`、`source.json`、`jobs/`、
+  隐藏测试副本**；仅排除 `extras/`、缓存与凭据，缺必备件即拒发）；
   输出 ZIP 名与内层根目录名均为 `<task_id>-v<题目版本>-delivery`（`task_id` 取自 `task.toml` 的
   `[metadata].task_id`，**不得**用本地目录名派生），解压到 `harbor-windows/` 后与飞书附件名逐字一致
 - 交付结构见 `references/05-delivery-structure.md`
+
+> **验收侧交付口径（R1，2026-10-14 起）**：提交给甲方的**默认形态**是「验收侧交付包」，
+> 必须含 `solution/reference/**`（`solve.ps1` 依赖的参考源码，215/216 正是缺这一项被判"不能单独复现验收"）、
+> 隐藏语义测试在 `tests/` 下的副本（215/216 缺 `tests/test_*_semantics.py`，与 218/219 形态不一致），
+> 以及隔离的**负访问证明**（探针脚本 + 结果）。
+> 「普通模型资产不含 `solution/**`」与「验收侧必须含 `solution/**`」是两条不同口径，不要混用。
+> 仅在收件方明确要求纯参与方包（Harbor 四件套）时才导出精简形态，并在 `delivery-extras/` 留完整题与哈希。
 
 ---
 
@@ -411,15 +468,19 @@ wfflab__wfmt-215-v2.1.0-delivery/      # ← wfflab__wfmt-215-v2.1.0-delivery.zi
 | 11 | 交付 ZIP 缺 `jobs/`，或把上游故障轮记成 0 分 | `jobs/<job-id>/{agent,verifier}` 必须齐全；故障轮标 `excluded` 并写明原因；原始轨迹未留存时**显式声明缺口，不得伪造** |
 | 12 | **先跑分、后自检**（或拖到交付前才自检） | 阶段 4.5 是硬性前置门：预打包 → 甲方 `windows-harbor-qc` 自检 PASS → 内容冻结 → 才允许跑任何一轮。跑完再改包 = 全部 `task_checksum` 失效，整批重跑 |
 | 13 | `adapter.toml` 同时写扁平 key 与同名 `[table]` | 甲方读扁平 key；同名表会让 TOML 直接解析失败。**保留扁平 key，改掉冲突的表名** |
+| 14 | 题面或说明文档写「不主张 Windows 价值」「按通用编码能力归类」 | 这是**自我否认**，甲方直接引为不合格证据（F6 **永不豁免**）。要么给题注入真实 Windows 机制发新版，要么按甲方口径移出 Windows 池 —— **删掉那段话不算整改** |
+| 15 | 验收侧交付包缺 `solution/reference/**` 或隐藏测试副本 | 「普通模型资产不含 `solution/`」≠「验收包可以不给参考解」。缺则被判"不能单独复现验收"，并附加 job 层身份问题 |
+| 16 | 缺测/执行故障被写成 FAIL 并输出正式 0 分 | 两类必须分开：缺测、SKIP、基础设施异常 → **INVALID**（写 `invalid.txt`、**删除 `reward.txt`**、非零退出），只有功能失败才是 0 分 |
 
 ---
 
-## 15 条一票否决（速查）
+## 17 条一票否决（速查）
 
 反事实不通过 / 题面不可解 / Golden≠1 或 no-change≠0 / P2P 在 base 失败或 F2P 无关 /
 testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分或 LLM Judge /
 环境缺陷记 0 分 / Solution 或答案泄漏 / 环境不可恢复 / 来源授权不清 /
 重复或表面变体题 / 区分度不足 / 无法在预算内判分 /
+**Windows 专属机制门禁不过（F1–F6，含包内自我否认 Windows 价值的表述）** /
 **未过甲方自检即开跑，或跑分后改包致 `task_checksum` 失效**
 
 > 完整定义 → `references/06-acceptance-gates.md`
@@ -442,9 +503,11 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `references/09-gz-package-analysis.md` | 压缩包结构分析 |
 | `references/10-windows-ops-pitfalls.md` | Windows 题运维坑：容器适配 6 坑、计划任务编排 3 坑、飞书写回编码坑、`runner.py` 参数化与并行 |
 | `references/11-latest-qc-requirements.md` | **最新质检要求（20261012 批次）**：魔法阈值禁令、无效槽位单列、Windows 价值映射与归类、权重废止、配置可解析、公开/隐藏分层与负访问证明 |
+| `references/12-windows-mechanism-gate.md` | **★ Windows 专属机制门禁（F1–F6）与验收侧交付口径**：门禁产物字段、排他声明 vs 免责声明、题面/环境/验证三层手法清单、INVALID 与 FAIL 分离、`solution/**` 验收侧交付要求、历史包豁免口径 |
 | `references/08-model-validation.md` | 多模型门槛、区分度计算、稳定性验收 |
 | `references/09-gz-package-analysis.md` | 对 `Windows_SWE_d70d30df` 27 题现包的实测分析 |
-| `scripts/validate_package.py` | 题包结构与身份一致性校验（实测 27 题包可用） |
+| `scripts/validate_package.py` | 题包结构与身份一致性校验（**已内置 Windows 机制门禁，输出 `[Windows机制]` 类别**） |
+| `scripts/check_windows_mechanism.py` | **★ Windows 专属机制门禁（F1–F6）可复算校验器**：读 `metadata/windows_mechanism.json`，校验机制↔题面↔F2P 用例三方锚点、环境层"非 Windows 必失败"证据，并扫描包内自我否认表述。退出码 `0` 才算过 |
 | `scripts/build_delivery_extras.py` | 批量生成 delivery-extras 骨架 |
 | `scripts/build_jobs.py` | **由资格汇总生成 `jobs/<job-id>/{agent,verifier}`**（故障轮保留并标 `excluded`；含凭据扫描） |
 | `scripts/build_required_testcases.py` | **生成甲方 QC 必备的 `tests/required_testcases.json`**（F2P/P2P 依据取自 candidate/golden 对照或 `swelive_spec.json`） |
@@ -455,15 +518,20 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | 仓库根 `models.local.json` | 模型端点与凭据的**唯一来源**（脚本自动上溯定位；含明文凭据，按甲方要求纳入版本控制） |
 | `scripts/README.md` | 六个脚本的完整用法说明 |
 | `assets/harbor-skeleton/` | 标准 Harbor 五件套骨架（含可直接复用的 grade.py / test.ps1 / Dockerfile） |
-| `assets/metadata-templates/` | 伴随材料 JSON 模板（source_and_license / labels / lineage / manifest） |
+| `assets/metadata-templates/` | 伴随材料 JSON 模板（source_and_license / labels / lineage / manifest / **windows_mechanism**） |
 
-## 快速上手（六条命令）
+## 快速上手（七条命令）
 
 ```bash
 SKILL=<skill目录>
 
 # 0) 依赖（多模型验证需要 httpx）
 pip install httpx
+
+# 0.5) ★ Windows 专属机制门禁 —— 不过就别往下走（性质错误，跑分救不回来）
+#      先按 assets/metadata-templates/windows_mechanism.json 填好
+#      delivery-extras/tasks/<task-id>/metadata/windows_mechanism.json
+python "$SKILL/scripts/check_windows_mechanism.py" --task-dir <题包目录>
 
 # 1) 从骨架起一题（按该 README 的 cp 清单操作）
 cat "$SKILL/assets/harbor-skeleton/README.md"
@@ -486,7 +554,7 @@ python "$SKILL/scripts/validate_package.py" \
 python "$SKILL/scripts/build_jobs.py" \
     --task-dir <题包目录> --summary <model_runs_summary_*.json>
 
-# 6) 打交付 ZIP（含 jobs/，自动排除 solution/ 与凭据），并逐文件核对
+# 6) 打交付 ZIP（验收侧：含 solution/、隐藏测试副本、source.json、jobs/；仅排除 extras/ 与凭据），并逐文件核对
 python "$SKILL/scripts/package_task_zip.py" \
     --task-dir <题包目录> --out-dir <出包目录> --verify
 ```

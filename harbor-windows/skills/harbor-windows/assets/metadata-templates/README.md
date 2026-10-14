@@ -6,8 +6,12 @@
 |---|---|---|
 | `source_and_license.json` | 3.5-① | 来源、License、授权、隐私、Windows 相关性 |
 | `labels.json` | 3.5-② | 主知识方向、次级标签、语言、任务类型、Windows 环境、难度 |
+| `windows_mechanism.json` | **12-§1（F1–F6）** | **★ Windows 专属机制门禁产物**：反事实判定 + 排他声明 + ≥3 条机制（题面逐字锚点 / 测试行号 / F2P 用例）+ 非 Windows 必失败证据。缺则 **阶段 4.5 与阶段 9 均不通过** |
 | `lineage_and_contamination.json` | 3.5-① | Lineage、污染风险、重复风险、Hack 四层分级 |
 | `manifest.json` | 3.5-⑥ | 身份三元组、制品哈希、冻结基线 |
+
+> `windows_mechanism.json` 填完后必须过门禁：
+> `python scripts/check_windows_mechanism.py --task-dir <题包目录>`（退出码 `0`）。
 
 ## 其余伴随材料（CSV / MD，无 JSON 模板）
 

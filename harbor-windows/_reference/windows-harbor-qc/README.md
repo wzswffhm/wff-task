@@ -74,8 +74,9 @@ Windows 价值），以及采购手册新增的范围与身份冻结、WIP 94 �
 为 `BLOCKED`。人工复核只能降级自动结论，不能把 `FAIL/BLOCKED` 升级为通过。
 
 模型区分度是与十项人工复核并行的自动硬门禁。脚本分析 Qwen×3、Opus×3、GLM×1、Kimi×1
-全部结果；Qwen 与 Opus 同时三轮满分时直接失败，8 次运行全部满分时明确标记为全模型满分题并
-拒收。未触发满分拒绝时，继续应用 Opus/Qwen 总分与 testcase 累计通过数规则。
+全部结果；Qwen 与 Opus 同时三轮满分时不再直接失败，而是标记 `qwen_opus_full_score`
+（全模型满分时另记 `all_models_full_score`）并继续应用 Opus/Qwen 总分与 testcase
+累计通过数规则：总分相等时必须由 Opus 更高的 testcase 累计通过数打破平局。
 
 不通过原因必须基于本次真实检查证据，不得复制其他题目的返修模板。每条原因应定位到 ZIP 成员、Task 文件、Harbor job、verifier 报告或 testcase；建议项与硬门禁分开写。
 

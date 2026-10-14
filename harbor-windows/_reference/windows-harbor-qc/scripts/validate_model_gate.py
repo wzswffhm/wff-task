@@ -17,10 +17,7 @@ ALIASES = {
     "glm": "glm", "glm-5.3": "glm",
     "kimi": "kimi", "kimi-k3": "kimi",
 }
-# 必需模型：Qwen/Opus 各 3 次。
 REQUIRED_COUNTS = {"qwen": 3, "opus": 3}
-# 可选模型：旧口径为必需，2026-10-13 起降级为可选；出现时仍须恰好 1 次。
-OPTIONAL_COUNTS = {"glm": 1, "kimi": 1}
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -134,20 +131,6 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
             "model_score_sum": sum(scores),
             "testcase_pass_sum": passes,
         }
-    # 可选模型：缺席即跳过；出现时按同一规则校验（出现次数须恰好）
-    for name, count in OPTIONAL_COUNTS.items():
-        if name not in models:
-            continue
-        scores, passes, model_errors = inspect_runs(
-            name, models.get(name), count, identity, seen_run_ids
-        )
-        errors.extend(model_errors)
-        scores_by_model[name] = scores
-        stats[name] = {
-            "valid_runs": len(scores),
-            "model_score_sum": sum(scores),
-            "testcase_pass_sum": passes,
-        }
 
     qwen_scores = scores_by_model["qwen"]
     opus_scores = scores_by_model["opus"]
@@ -156,12 +139,9 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
     qwen_testcase_pass_sum = stats["qwen"]["testcase_pass_sum"]
     opus_testcase_pass_sum = stats["opus"]["testcase_pass_sum"]
     all_scores = [score for scores in scores_by_model.values() for score in scores]
-    # 期望总运行数：必需模型 + 实际提供的可选模型（新口径 6，旧口径 8）
-    expected_total = sum(REQUIRED_COUNTS.values()) + sum(
-        count for name, count in OPTIONAL_COUNTS.items() if name in scores_by_model)
     all_zero_exception = (
         not errors
-        and len(all_scores) == expected_total
+        and len(all_scores) == sum(REQUIRED_COUNTS.values())
         and all(score == 0 for score in all_scores)
     )
     qwen_opus_full_score = (
@@ -172,7 +152,7 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
     )
     all_models_full_score = (
         not errors
-        and len(all_scores) == expected_total
+        and len(all_scores) == sum(REQUIRED_COUNTS.values())
         and all(score == 1 for score in all_scores)
     )
     stats["distinction"] = {
@@ -184,18 +164,15 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
             opus_score_sum == qwen_score_sum
             and opus_testcase_pass_sum > qwen_testcase_pass_sum
         ),
-        "full_score_tiebreak_pass": (
-            qwen_opus_full_score
-            and opus_testcase_pass_sum > qwen_testcase_pass_sum
-        ),
         "rule": (
-            "Opus score sum must exceed Qwen; when the score sums tie, Opus testcase pass sum "
-            "must strictly exceed Qwen, unless every required model run is VALID/0. A Qwen/Opus "
-            "full-score tie is NOT rejected outright (relaxed 2026-10-12): it is decided by "
-            "testcase_pass_sum, so the required testcase set must still separate the two models. "
-            "all_models_full_score stays recorded for the report but no longer fails by itself"
+            "Opus score sum must exceed Qwen; when score sums tie, Opus testcase pass sum "
+            "must exceed Qwen, unless every required model run is VALID/0. Full scores on "
+            "both primary models are flagged in stats but are no longer rejected on their own"
         ),
     }
+    # A full score on both primary models is no longer an automatic rejection.
+    # The primary distinction rule below still has to hold, and the two
+    # full-score flags stay in stats so a reviewer can see the borderline case.
     if not errors and not all_zero_exception:
         if opus_score_sum < qwen_score_sum:
             errors.append(
@@ -206,19 +183,10 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
             opus_score_sum == qwen_score_sum
             and opus_testcase_pass_sum <= qwen_testcase_pass_sum
         ):
-            if qwen_opus_full_score:
-                errors.append(
-                    "model distinction gate failed: Qwen and Opus are both full-score across "
-                    f"all required runs (model_score_sum tied at {opus_score_sum}), and Opus "
-                    f"testcase_pass_sum ({opus_testcase_pass_sum}) is not strictly greater than "
-                    f"Qwen ({qwen_testcase_pass_sum}); the required testcases do not separate "
-                    "the two models"
-                )
-            else:
-                errors.append(
-                    "model distinction gate failed: Opus and Qwen model_score_sum are tied, "
-                    "but Opus testcase_pass_sum is not strictly greater than Qwen"
-                )
+            errors.append(
+                "model distinction gate failed: Opus and Qwen model_score_sum are tied, "
+                "but Opus testcase_pass_sum is not strictly greater than Qwen"
+            )
     return {"pass": not errors, "errors": errors, "stats": stats, "task": identity}
 
 

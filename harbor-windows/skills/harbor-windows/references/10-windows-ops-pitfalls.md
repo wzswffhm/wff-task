@@ -69,10 +69,18 @@ Start-ScheduledTask -TaskName oh-<tag>
 
 ## 6 交付落盘与飞书写回（表锁）坑
 
-**单题交付产物（5 件，与 217 同构）**：`README.md` + `evidence/oracle_nop_controls.png`
+**单题交付产物（5 件）**：`README.md` + `evidence/oracle_nop_controls.png`
 （oracle/nop截图）+ `evidence/score_summary.png`（分数截图）+ `evidence/model_runs_summary_*.json`
-（权威读数）+ 四件套 ZIP（作业压缩包，ZIP 根 = task-id，含 `task.toml`/`instruction.md`/`environment/`/
-`tests/`，**不含 `solution/`**）。手工交付入口建议再附 `instruction.md`（供粘贴「提示词」字段）与字段对照表。
+（权威读数）+ 交付 ZIP（作业压缩包，ZIP 根 = `<task-id>-v<版本>-delivery`）。
+手工交付入口建议再附 `instruction.md`（供粘贴「提示词」字段）与字段对照表。
+
+> **口径更新（2026-10-14）：默认上传「验收侧交付包」，不是四件套。**
+> 早期做法上传的是"四件套 ZIP（含 `task.toml`/`instruction.md`/`environment/`/`tests/`，**不含 `solution/`**）"。
+> 甲方返修第 1 条已明确要求「把**参考解和隐藏测试作为验收侧资产**一并交付，并保持对模型隔离」——
+> 215/216 正是因缺 `solution/reference/**` 与 `tests/test_*_semantics.py` 被判"不能单独复现验收"。
+> 现行默认形态 = 完整题（含 `solution/reference/**`）+ 隐藏测试副本 + 隔离负访问证据 + `jobs/`；
+> 仅在收件方**明确要求**纯参与方包时才上传不含 `solution/` 的精简四件套。
+> 详见 `references/12-windows-mechanism-gate.md` §6 与 `references/05-delivery-structure.md`。
 
 - **★ 飞书写回 `permission_denied`（code `800020812`）= 表被锁**：不是 token 失效。
   `base +base-get` 看 `is_advanced: true`；**读得到、建行/传附件被拒**。对应群公告「18:00 后可能锁表

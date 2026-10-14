@@ -250,13 +250,15 @@ def static_check(task: Path) -> dict[str, Any]:
     version = task_config.get("version") or config.get("task_version")
     if not version:
         errors.append("task.toml has no [task].version")
+    # 2026-10-14 规则：task.toml 不再需要 docker_image。基础镜像由
+    # environment/Dockerfile 的 FROM 声明并 pin 到不可变 digest；该字段若出现，
+    # 只校验它不得使用浮动的 latest 标签。
     docker_image = config.get("docker_image")
     if not docker_image and isinstance(config.get("environment"), dict):
         docker_image = config["environment"].get("docker_image")
-    if not isinstance(docker_image, str) or not docker_image.strip():
-        errors.append("task.toml has no docker_image")
-    elif docker_image.strip().endswith(":latest") or docker_image.strip() == "latest":
-        errors.append("docker_image must not use floating latest tag")
+    if isinstance(docker_image, str) and docker_image.strip():
+        if docker_image.strip().endswith(":latest") or docker_image.strip() == "latest":
+            errors.append("docker_image must not use floating latest tag")
     if source_present and isinstance(source, dict):
         if not source.get("task_id"):
             errors.append("source.json has no task_id")

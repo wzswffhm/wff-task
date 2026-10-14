@@ -26,6 +26,7 @@ python validate_package.py --package <题包根目录> --json validate-report.js
 | task.toml | `version` / `[metadata]` / `[agent]` / `[verifier]` / `[environment]` / 资源 / 12h 上限 |
 | 题面泄漏 | Golden Patch / Oracle / 隐藏测试 / F2P-P2P / Reward 关键词 |
 | 环境泄漏 | `environment/` 内是否混入 Solution 或答案 |
+| **Windows机制** | **★ Windows 专属机制门禁 F1–F6（委托 `check_windows_mechanism.py`）** |
 | tests | 验证入口、INVALID 区分能力、二值判分、旧 `judge.toml`/`rubric.json` 残留 |
 | spec | `swelive_spec.json` 的 F2P/P2P 与 `verification_evidence` |
 | 身份 | `harbor/` 与 `harbor-assets/` 的 task_id 一一对应、镜像引用一致 |
@@ -33,6 +34,35 @@ python validate_package.py --package <题包根目录> --json validate-report.js
 | 镜像 | 是否另存不可变 Digest |
 
 退出码：`0` 全过（可能含 FLAG）／`1` 存在 FAIL／`2` 参数错误。
+
+---
+
+## 1.5 `check_windows_mechanism.py` — Windows 专属机制门禁 ★
+
+2026-10-14 起新增的**硬门禁**。把「这道题是否真的依赖 Windows 平台语义」从人工判断题
+变成可复算的门禁题：读 `metadata/windows_mechanism.json`，逐条校验
+**机制 ↔ 题面条款 ↔ F2P 用例**三方锚点，并扫描包内自我否认 Windows 价值的表述。
+
+```bash
+python check_windows_mechanism.py --task-dir <题包目录>
+python check_windows_mechanism.py --package <题包根目录> --json gate.json
+python check_windows_mechanism.py --task-dir <题包目录> --extras <delivery-extras 目录>
+# 历史包（不追溯改判）需显式开关，且包内要有 WINDOWS_MECHANISM_EXEMPT.md
+python check_windows_mechanism.py --task-dir <题包目录> --allow-legacy-exempt
+```
+
+| 判据 | 内容 |
+|---|---|
+| F1 | 门禁产物存在，`task_id` 与包内身份一致 |
+| F2 | `counterfactual.answer` = 「否」且有 `reason` |
+| F3 | `exclusive_declaration.quote` 在 `instruction.md` 中**逐字出现** |
+| F4 | `mechanisms` ≥3 条；`instruction_quote` 题面逐字、`test_ref` 文件与行号有效、`f2p_case` 是 `required_testcases.json` 里的 F2P 用例 |
+| F5 | `non_windows_must_fail` 指向真实文件、证据逐字且含平台判定关键字 |
+| F6 | 包内**无**自我否认／通用化表述（「不主张 Windows…」「通用编码能力」「platform-agnostic」等）——**永不豁免** |
+
+退出码：`0` 通过／`1` 存在 FAIL／`2` 参数错误。
+规则与可照抄的三层手法清单见 `references/12-windows-mechanism-gate.md`。
+
 
 ---
 

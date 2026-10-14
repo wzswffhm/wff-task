@@ -20,6 +20,44 @@
 
 ---
 
+## 判定必须留痕：门禁产物 + 禁止自认句
+
+> **2026-10-14 起为硬门禁**。本节判定的结论不能只停留在"人认为通过"，
+> 必须落成可复算的产物并接受脚本校验 —— 见 `references/12-windows-mechanism-gate.md`。
+
+**产物**：`delivery-extras/tasks/<task-id>/metadata/windows_mechanism.json`
+（模板：`assets/metadata-templates/windows_mechanism.json`），逐条给出：
+
+- `counterfactual.answer = "否"` + `reason`；
+- `exclusive_declaration.quote` —— **排他声明**，与 `instruction.md` 逐字一致；
+- `mechanisms[]` —— ≥3 条，每条 `instruction_quote`（题面逐字）+ `test_ref`（`文件#L起-L止`）
+  + `f2p_case`（必须是 `required_testcases.json` 中 group=F2P 的用例）；
+- `non_windows_must_fail` —— 环境层"非 Windows / 非 NTFS 必然失败"的文件与逐字证据。
+
+**校验**：`python scripts/check_windows_mechanism.py --task-dir <题包目录>`，退出码 `0` 才算过。
+
+### 排他声明 ≠ 免责声明（本批次最大坑）
+
+| | 例句 | 性质 | 判定 |
+|---|---|---|---|
+| ✅ 排他声明 | `目标是真实的 Windows NTFS 语义，不需要实现其他操作系统版本。` | 把其他 OS 排除出验收范围 | 加强项，F3 要求登记 |
+| ❌ 免责声明 | `本题不主张 Windows 反事实价值，按通用编码能力归类。` | 自我否认被测能力 | **F6 命中即 FAIL，永不豁免** |
+
+`wfflab__wchunk-216 / wfmt-215 / wlogseg-218` 被判「Windows 专属价值低」时，
+甲方**直接引用了包内 `verifier/WINDOWS_VALUE.md` 的自认句作为证据**。
+因此：包内出现自认句时，正确处置是**给题注入真实 Windows 机制发新版**（或按甲方口径移出 Windows 池），
+**不是删掉那段话** —— 删掉只让门禁变绿，判定依据仍在题面与测试里。
+
+### 判定前先看的三件事（避免走回头路）
+
+1. **题面是否把机制名写进了"可验收行为"**，而不是只写在背景或"可以使用 Windows API"这类许可式表述里。
+   只写许可 = 跨平台写法也能过 = 本批次翻车的形态。
+2. **验证层是否由评测器自己持有内核对象**（真句柄 / 真命名对象 / 真注册表通知 / 真 Job Object），
+   而不是比对候选输出的字符串。可直接照搬的手法清单见 `references/12-windows-mechanism-gate.md` §5。
+3. **环境层是否有"非 Windows 必然失败"的探针且记为 INVALID**，而不是靠 `$IsWindows` 一句版本号检查。
+
+---
+
 ## 不能单独证明 Windows 价值的 6 种情况
 
 | # | 误判做法 | 为什么不算 |
@@ -100,3 +138,8 @@
 - [ ] 非 S1–S2 表面题
 - [ ] Evaluator 真的能覆盖所申报能力
 - [ ] 难度来源为工程语义，非歧义/冷僻知识
+- [ ] 题面含**排他声明**（并已登记 `exclusive_declaration.quote`）
+- [ ] 至少 3 条机制写进**可验收行为**，每条绑定一条 **F2P** 用例
+- [ ] 环境层有"非 Windows 必然失败"的探针，且该情形记为 **INVALID**
+- [ ] 包内**无**自我否认 Windows 价值的表述（`platform-agnostic` / 「通用编码能力」等）
+- [ ] `check_windows_mechanism.py` 退出码 `0`

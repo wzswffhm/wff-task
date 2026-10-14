@@ -1,4 +1,7 @@
-"""Validate direct Harbor jobs: 8 model trajectories plus 3 Oracle and 3 NOP."""
+"""Validate direct Harbor jobs: 6 primary-model trajectories plus 3 Oracle and 3 NOP.
+
+2026-10-14 rule: GLM/Kimi are no longer run; any such rounds in the package are ignored.
+"""
 from __future__ import annotations
 
 import json
@@ -6,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from validate_model_gate import ALIASES, ALL_COUNTS, OPTIONAL_COUNTS, REQUIRED_COUNTS
+from validate_model_gate import ALIASES, IGNORED_MODELS, REQUIRED_COUNTS
 
 
 CJK = re.compile(r"[\u3400-\u9fff]")
@@ -102,7 +105,7 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
     errors: list[str] = []
     warnings: list[str] = []
     details: list[dict[str, Any]] = []
-    models: dict[str, list[dict[str, Any]]] = {name: [] for name in ALL_COUNTS}
+    models: dict[str, list[dict[str, Any]]] = {name: [] for name in REQUIRED_COUNTS}
     agent_counts = {"oracle": 0, "nop": 0}
     checksums: set[str] = set()
     required_ids, groups = required_cases(task_root)
@@ -112,14 +115,14 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
             errors.append(f"jobs/ is missing Harbor parent job file: {relative}")
     job_dirs = sorted(path for path in jobs_root.iterdir() if path.is_dir() and (path / "result.json").is_file())
 
-    # 3 Oracle + 3 NOP + the required model rounds; optional models may be absent.
+    # 2026-10-14 rule: GLM/Kimi are no longer run. Required jobs are
+    # 3 Oracle + 3 NOP + Qwen 3 + Opus 3 = 12; any extra GLM/Kimi rounds are ignored.
     expected_jobs = 6 + sum(REQUIRED_COUNTS.values())
-    if len(job_dirs) not in (expected_jobs,
-                             expected_jobs + sum(OPTIONAL_COUNTS.values())):
+    if len(job_dirs) < expected_jobs:
         errors.append(
-            "jobs/ must contain %d Harbor job directories (or %d with the optional "
-            "GLM/Kimi rounds), got %d"
-            % (expected_jobs, expected_jobs + sum(OPTIONAL_COUNTS.values()), len(job_dirs)))
+            "jobs/ must contain at least %d Harbor job directories "
+            "(Qwen 3 + Opus 3 + Oracle 3 + NOP 3), got %d"
+            % (expected_jobs, len(job_dirs)))
     for job in job_dirs:
         label = job.name
         for relative in COMMON_FILES:
@@ -133,6 +136,9 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
             errors.append(f"{label} contains unreadable core JSON: {exc}")
             continue
         kind, model, actual_model_name = job_identity(result, config)
+        if model in IGNORED_MODELS:
+            # GLM/Kimi are no longer run: ignore any such rounds entirely.
+            continue
         required_files = MODEL_FILES if kind == "model" else ORACLE_FILES if kind == "oracle" else ()
         for relative in required_files:
             if not (job / relative).is_file():
@@ -212,15 +218,9 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
         if secret:
             errors.append(f"{label} contains a possible credential in {secret}")
 
-    for model, count in ALL_COUNTS.items():
+    for model, count in REQUIRED_COUNTS.items():
         found = len(models[model])
-        if model in OPTIONAL_COUNTS:
-            # optional under the latest scope: absent is fine, partial is not
-            if found not in (0, count):
-                errors.append(
-                    f"jobs/ contains {found} {model} model jobs; either 0 (optional) "
-                    f"or exactly {count} are accepted")
-        elif found != count:
+        if found != count:
             errors.append(f"jobs/ contains {found} {model} model jobs; exactly {count} required")
     for agent in ("oracle", "nop"):
         if agent_counts[agent] != 3:

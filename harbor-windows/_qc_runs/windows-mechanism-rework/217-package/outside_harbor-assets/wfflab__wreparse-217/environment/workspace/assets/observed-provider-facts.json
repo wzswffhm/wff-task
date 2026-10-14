@@ -1,0 +1,59 @@
+{
+  "collected_on": "Windows 11 (10.0.26100) / NTFS / Windows PowerShell 5.1",
+  "purpose": "在真机上对一棵含 junction、符号链接与硬链接的目录树实测采集 provider 行为。docs/REPARSE-CONTRACT.md 描述语义；本文件记录 provider 层返回值的真实形状。两者在实现细节上冲突时，以本文件为准。",
+  "observations": [
+    {
+      "id": "reparse-attribute-is-the-only-reliable-marker",
+      "statement": "硬链接的 LinkType 是 'HardLink'，但其 Attributes 不含 ReparsePoint。只有 Attributes 位包含 FILE_ATTRIBUTE_REPARSE_POINT 的条目才是重解析点；仅凭 LinkType 非空来判定会把硬链接误判为重解析点。",
+      "measured": {
+        "hardlink.txt": {
+          "LinkType": "HardLink",
+          "Attributes": [
+            "Archive"
+          ]
+        },
+        "junction": {
+          "LinkType": "Junction",
+          "Attributes": [
+            "Directory",
+            "ReparsePoint"
+          ]
+        },
+        "symlink-directory": {
+          "LinkType": "SymbolicLink",
+          "Attributes": [
+            "Directory",
+            "ReparsePoint"
+          ]
+        },
+        "symlink-file": {
+          "LinkType": "SymbolicLink",
+          "Attributes": [
+            "Archive",
+            "ReparsePoint"
+          ]
+        }
+      }
+    },
+    {
+      "id": "link-type-vocabulary",
+      "statement": "provider 给出的 LinkType 取值是 'Junction'、'SymbolicLink'、'MountPoint'、'HardLink'。junction 与符号链接的 LinkType 不同，可直接区分；卷挂载点与 junction 同属目录重解析点，但 LinkType 不同。"
+    },
+    {
+      "id": "provider-target-is-a-collection",
+      "statement": "Get-ChildItem 返回的 .Target 是 System.String[]（可能有多个替换项），而不是单个字符串。相对目标按原样给出（例如 'docs'），绝对目标给出完整路径（例如 'C:\\\\tree\\\\docs'）。"
+    },
+    {
+      "id": "powershell-unrolls-single-element-arrays",
+      "statement": "PowerShell 函数 return 一个单元素数组时，调用方拿到的是元素本身而不是数组。因此把 provider 的 .Target 直接转发出去，得到的类型是不稳定的（单目标时是 String，多目标时是 Object[]）。契约把 Target 定义为一个目标串，所以必须显式取首元素并转成字符串。"
+    },
+    {
+      "id": "enumeration-order-is-not-contract-order",
+      "statement": "Get-ChildItem -Force 按目录索引返回条目，其顺序接近 Unicode 序，但契约要求的是序数、忽略大小写的键，且明确禁止使用受宿主区域设置影响的排序。在含非 ASCII 名字的目录上，区域设置敏感的默认排序（PowerShell 的 Sort-Object）会按基字母重排：例如把 'Ä' 与 'ö' 排在 ASCII 的 'Z' 之前，而序数比较把 'Z'(U+005A) 排在 'Ä'(U+00C4) 与 'ö'(U+00F6) 之前。两类顺序在真机上都可复现，必须按契约的序数规则实现。"
+    },
+    {
+      "id": "hard-links-and-symbolic-links-are-not-bind-mountable",
+      "statement": "把一棵目录树经 bind mount 投进 Windows 容器时，bind filter 会拒绝硬链接与符号链接（报 'Access is denied'），目录、普通文件与 junction 仍可创建。因此夹具建在容器的可写层上，而不是任务树里。"
+    }
+  ]
+}

@@ -1,5 +1,94 @@
 # CHANGELOG —— harbor-windows 题包目录
 
+## [wfflab__wvas-216 · 替换 wchunk-216 槽位：改用 Windows 虚拟地址空间审计] - 2026-10-14
+
+### 变更原因
+
+甲方 2026-10-14 判定原 216 槽位的 `wfflab__wchunk-216` 为「通用编码能力」——题目与验收全部是平台无关的
+长度前缀记录容器 / CRC / 流式 IO 语义，**没有 Windows 专属行为**，不满足 Windows 题要求；
+同批另有 `wfflab__wfmt-215`（NTFS 稀疏）、`wfflab__wlogseg-218`（日志轮转共享删除）同期返修。
+
+### 处置
+
+- 新增题包 `wfflab__wvas-216` v1.0.0（新 task_id，替换 216 槽位；`wfflab__wchunk-216` 实物保留为历史）。
+- 方向：**进程虚拟地址空间审计**。被测缺陷来自公开上游 `psutil` 提交
+  `01bb959957d99e582b0f391534bb7462f29ff17e`（issue #216）：`Process.memory_maps()` 在 Windows 上
+  地址被截断为 32 位、保留（`MEM_RESERVE`）区间不可见、`\Device\HarddiskVolume...` 形态路径
+  调用方无法直接打开、匿名映射与无文件背衬区分的缺失。
+- Windows 机制：判分期真实调用 `VirtualQueryEx` / `GetMappedFileNameW` / `QueryDosDeviceW`，
+  并另起目标进程独立测量；Linux 上无对等机制。
+- 题面：无答案、无引导性注释、不含任何运行命令；acceptance 侧资产（`solution/`、隐藏套件）与模型隔离。
+- 评分：纯程序化二值（`formal_score = 1 当且仅当 run_validity == VALID 且全部 required 用例 PASS`），
+  required 16（F2P 8 / P2P 8）。
+- 轮次：控制组 golden 3×1 / no-change 3×0 全 VALID；模型轮 Opus×3 = [1,1,1]、Qwen×3 = [1,1,0]，
+  区分度准入通过（Opus 3 > Qwen 2）；按甲方口径不跑 GLM/Kimi。
+- task checksum：`b925e1c7f68e6954805fa39e6ea584577ced25f87a74d58fb7325b288469461b`（12 个 Harbor job 全部一致）。
+
+## [skill 改造：Windows 专属机制门禁 F1–F6 + 验收侧交付口径] - 2026-10-14
+
+### 变更原因
+
+甲方 2026-10-14 在飞书 wff 表给出三条返修原因（`wfflab__wchunk-216` / `wfflab__wfmt-215` /
+`wfflab__wlogseg-218`，记录 90 / 109 / 148），核心判定是：
+
+> 题目和验收是平台无关的容器格式 / CRC / 流式 IO，**没有 Windows 专属行为，不满足 Windows 题要求**。
+> 需要按实际采购分类处理，**不能只加 Windows 标签**。
+
+并**直接引用包内自认句作为证据**：
+
+> `verifier/WINDOWS_VALUE.md` 也明确写了「本题不主张 Windows 反事实价值，按通用编码能力归类」。
+
+复查发现根因不在判据缺失（`references/02-windows-value.md` 的反事实判定本来就完整），而在三处失效：
+
+1. **判定不留痕** —— 阶段 1 只要求产出 `labels.json`，没有任何字段要求"机制 → 题面条款 → 测试用例"的锚点；
+2. **判定不校验** —— `scripts/validate_package.py` 里**一条 Windows 价值检查都没有**，平台无关的题照样过本地校验；
+3. **自认句反成证据** —— 包内 `WINDOWS_VALUE.md` 的自我降格表述被甲方引为不合格证据。
+
+### 变更内容
+
+1. **新增硬门禁 `scripts/check_windows_mechanism.py`（F1–F6，可复算、可单独运行）**：
+   读 `delivery-extras/tasks/<task-id>/metadata/windows_mechanism.json`，校验
+   ① 门禁产物存在；② `counterfactual.answer = 否` 且有理由；③ 排他声明在 `instruction.md` 逐字出现；
+   ④ `mechanisms` ≥3 条，每条 `instruction_quote`（题面逐字）+ `test_ref`（`文件#L起-L止`，行号在范围内）
+   + `f2p_case`（必须是 `required_testcases.json` 中的 F2P 用例）；
+   ⑤ `non_windows_must_fail` 指向真实文件、证据逐字且含平台判定关键字；
+   ⑥ **包内不得出现自我否认 / 通用化 Windows 价值的表述（永不豁免）**。
+2. **接入 `scripts/validate_package.py`**：新增 `check_windows_value()`，输出 `[Windows机制]` 类别，
+   在平铺、单题、多题目录三种模式均已挂载。实测四包全部 FAIL、同行合规题 `win-fs-001` PASS。
+3. **新增 `references/12-windows-mechanism-gate.md`**：门禁规则、**排他声明 vs 免责声明**的关键区分、
+   题面/环境/验证三层可照抄手法清单（共建内核对象持有、`CreateFileW` 共享模式、
+   `RegNotifyChangeKeyValue` 反短路、`GetFileInformationByHandle` 文件身份、`IsMessageComplete` 分帧、
+   `GetValueKind` + `DoNotExpandEnvironmentNames` 原生类型、INVALID 与 FAIL 分离、对抗性夹具设计）、
+   验收侧交付口径、历史包豁免口径、复验标准。
+4. **交付口径（R1）**：明确三种范围 —— 完整本地题（含 `solution/**`）、普通模型资产（不含）、
+   **验收侧交付包（默认提交形态，含 `solution/reference/**` + 隐藏测试副本 + 隔离负访问证明）**；
+   修正 `SKILL.md` 与 `scripts/README.md` 中"自动排除 `solution/`"的旧表述；
+   `references/05-delivery-structure.md` 新增「三种交付范围必须分清」一节。
+5. **新增模板 `assets/metadata-templates/windows_mechanism.json`** 并登记到该目录 README。
+6. **`SKILL.md`**：四条底线第 1 条改为可复算门禁；阶段 1 产出改为双产物（`labels.json` +
+   `windows_mechanism.json`）；阶段 4.5 前置门新增"先跑机制门禁"（A 级、零成本，不过就别往下走）；
+   阶段 9 校验项与一票否决清单同步；常见陷阱新增 3 条（自认句、验收包缺参考解、缺测记 0 分）。
+7. **`references/02-windows-value.md`**：新增「判定必须留痕」「排他声明 ≠ 免责声明」
+   「判定前先看的三件事」，预筛清单扩到 11 项。
+
+### 复验证据
+
+- 门禁自测 `_qc_runs/windows-mechanism-rework/gate_selftest.py`：**12 项全过**
+  （正例 019 原样 PASS；反例 10 项全部按预期 FAIL；豁免开关 1 项 PASS 且 F6 仍生效）。
+- 四包实测：`_qc_runs/windows-mechanism-rework/gate-result-current4.json`（4/4 FAIL，
+  自认句定位到具体文件与行号）。
+- `py_compile` 两个脚本通过；`validate_package.py --package harbor-windows` 正常输出
+  `[Windows机制]` 类别。
+
+### 待办 / 声明
+
+- **四题未做任何内容改动**（本轮只加门禁与口径）：按甲方专家修复步骤第 3 条，
+  须"注入真实 Windows 语义、发布新版后重新作答"，或按实际采购分类移出 Windows 池。
+- **不得只删除自认句** —— 删掉只让门禁变绿，判定依据仍在题面与测试里，
+  且会被额外记一条"整改不实"。
+- 历史包不追溯改判：可用 `--allow-legacy-exempt` + 包内 `WINDOWS_MECHANISM_EXEMPT.md`
+  把 F1–F5 降级为 FLAG（F6 除外），该标记文件**交付前必须删除**。
+
 ## [chunk-216 与 wfmt-215 质检返修：1.2.0 → 1.2.1 / 2.1.0 → 2.1.1] - 2026-10-12
 
 ### 变更原因

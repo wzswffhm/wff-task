@@ -153,12 +153,16 @@ def check_task_toml(task_dir, r, expect_schema=None):
         else:
             r.flag("task.toml", f"缺少 {field}")
 
-    # 基础镜像只由 environment/Dockerfile 的 FROM 声明；task.toml 不得写 docker_image
-    if re.search(r"(?m)^\s*docker_image\s*=", txt):
-        r.fail("task.toml",
-               "task.toml 不得写 docker_image（基础镜像只由 environment/Dockerfile 的 FROM 声明）")
+    # 甲方 2026-10-14 确认：task.toml 需要携带 docker_image（交付自检与随包 QC 都读它），
+    # 基础镜像同时仍须与 environment/Dockerfile 的 FROM 一致并钉住 digest。
+    m = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', txt)
+    if not m:
+        r.fail("task.toml", "task.toml 缺 docker_image",
+               "甲方口径：task.toml 需声明基础镜像，且与 environment/Dockerfile 的 FROM 一致")
+    elif m.group(1).strip() == "latest" or m.group(1).strip().endswith(":latest"):
+        r.fail("task.toml", "docker_image 不得使用浮动 latest tag", m.group(1))
     else:
-        r.ok("task.toml", "未写 docker_image（符合规范）")
+        r.ok("task.toml", "docker_image 已声明并钉住 digest")
 
     # 12 小时上限（规范：单次端到端原则上 ≤12h）
     am = re.search(r"\[agent\][^\[]*?timeout_sec\s*=\s*([\d.]+)", txt, re.S)
@@ -213,6 +217,36 @@ def check_env_no_solution(task_dir, r):
                "environment/ 禁止泄露 Solution 和隐藏 Tests")
     else:
         r.ok("环境泄漏", "environment/ 未见 Solution/答案/隐藏测试")
+
+
+def check_windows_value(task_dir, r, extras_dir=None, allow_legacy_exempt=False):
+    """检查 Windows 专属机制门禁（references/12-windows-mechanism-gate.md）。
+
+    判据来自甲方质检：题目主要实现 / 错误根因 / Evaluator 必须实质依赖 Windows 平台语义，
+    且包内不得出现自我否认 Windows 价值的表述。实现委托给同目录
+    check_windows_mechanism.py，保证"可复算、可单独运行"。
+    """
+    try:
+        import importlib.util
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "check_windows_mechanism", os.path.join(here, "check_windows_mechanism.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001
+        r.flag("Windows机制", f"无法加载 check_windows_mechanism.py，跳过机制门禁: {exc!r}")
+        return
+
+    res, summary = mod.check_task(task_dir, extras_dir, allow_legacy_exempt)
+    tid = summary.get("task_id") or os.path.basename(os.path.normpath(task_dir))
+    if res.valid:
+        n = len(summary.get("mechanisms", []))
+        r.ok("Windows机制", f"{tid}: Windows 专属机制门禁通过（登记 {n} 条机制，均有题面与 F2P 用例锚点）")
+    else:
+        r.fail("Windows机制", f"{tid}: Windows 专属机制门禁 FAIL（{len(res.errors)} 条）",
+               "\n".join(res.errors[:8]))
+    for w in res.warnings:
+        r.flag("Windows机制", f"{tid}: {w}")
 
 
 def check_tests(task_dir, r):
@@ -398,15 +432,15 @@ def check_identity(harbor_dir, assets_dir, r):
         if iid != expect:
             r.fail("身份", f"{f}: instance_id='{iid}' 与文件名 '{expect}' 不一致",
                    "规范 5.5: task_id 在文件名、task.toml、来源材料、平台配置中必须一致")
-        # task.toml 不得写 docker_image；镜像身份改由 environment/Dockerfile 的 FROM 核对
+        # task.toml 需携带 docker_image；镜像身份再与 environment/Dockerfile 的 FROM 核对
         tt = os.path.join(assets_dir, expect, "task.toml")
         if os.path.isfile(tt):
             ttt = open(tt, encoding="utf-8", errors="replace").read()
             if re.search(r"(?m)^\s*docker_image\s*=", ttt):
-                r.fail("身份", f"{expect}: task.toml 不得写 docker_image",
-                       "规范: 基础镜像只由 environment/Dockerfile 的 FROM 声明")
+                r.ok("镜像声明", f"{expect} task.toml 已写 docker_image")
             else:
-                r.ok("镜像声明", f"{expect} task.toml 未写 docker_image")
+                r.fail("身份", f"{expect}: task.toml 缺 docker_image",
+                       "甲方口径：task.toml 需声明基础镜像")
             df = os.path.join(assets_dir, expect, "environment", "Dockerfile")
             if os.path.isfile(df) and d.get("docker_image"):
                 dft = open(df, encoding="utf-8", errors="replace").read()
@@ -502,23 +536,25 @@ def check_flat_identity(tid, base, r):
     else:
         r.ok("身份", f"{tid}: task_version = {next(iter(vers))}")
 
-    # 镜像身份：environment/Dockerfile 的 FROM ↔ spec ↔ platform_import。
-    # task.toml 不参与，因为它不得写 docker_image。
-    if re.search(r"(?m)^\s*docker_image\s*=", tt):
-        r.fail("身份", f"{tid}: task.toml 不得写 docker_image")
+    # 镜像身份：task.toml ↔ environment/Dockerfile 的 FROM ↔ spec ↔ platform_import。
+    # 甲方 2026-10-14 确认 task.toml 需要携带 docker_image，因此它同时参与核对。
+    tm = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', tt)
+    if not tm:
+        r.fail("身份", f"{tid}: task.toml 缺 docker_image")
     dft_p = os.path.join(os.path.dirname(tt_p), "environment", "Dockerfile")
     fm = None
     if os.path.isfile(dft_p):
         fm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
                        open(dft_p, encoding="utf-8", errors="replace").read())
-    trio = {"environment/Dockerfile": fm.group(1) if fm else None,
+    trio = {"task.toml": tm.group(1) if tm else None,
+            "environment/Dockerfile": fm.group(1) if fm else None,
             "swelive_spec.json": sp.get("image_ref"),
             "platform_import.json": pi.get("docker_image")}
     vals = {v for v in trio.values() if v}
     if None in trio.values() or len(vals) != 1:
-        r.flag("镜像一致", f"{tid}: 镜像引用三处不一致", str(trio))
+        r.flag("镜像一致", f"{tid}: 镜像引用多处不一致", str(trio))
     else:
-        r.ok("镜像一致", f"{tid}: Dockerfile FROM 与 spec / platform_import 一致")
+        r.ok("镜像一致", f"{tid}: task.toml / Dockerfile FROM / spec / platform_import 一致")
 
 
 def check_flat_extras(tid, base, r):
@@ -584,7 +620,7 @@ def check_index_dir(idx, n, r):
             r.ok("伴随材料", f"tasks_index.csv 覆盖全部 {n} 题")
 
 
-def check_flat_package(pkg, r, schema_version):
+def check_flat_package(pkg, r, schema_version, extras=None):
     """平铺布局：pkg 下每个含 task.toml 的子目录 = 一个自包含题包。"""
     tasks = []
     for d in sorted(os.listdir(pkg)):
@@ -602,6 +638,7 @@ def check_flat_package(pkg, r, schema_version):
         check_task_toml(full, r, schema_version)
         check_instruction_no_leak(full, r)
         check_env_no_solution(full, r)
+        check_windows_value(full, r, extras)
         check_tests(full, r)
         check_no_change_and_golden_shape(full, r)
         check_flat_identity(tid, full, r)
@@ -657,7 +694,7 @@ def main():
                     if os.path.isdir(os.path.join(pkg, d))
                     and os.path.isfile(os.path.join(pkg, d, "task.toml"))]
             if flat:
-                check_flat_package(pkg, r, args.schema_version)
+                check_flat_package(pkg, r, args.schema_version, extras)
                 print(r.render())
                 if args.json:
                     c = r.counts()
@@ -678,6 +715,7 @@ def main():
         check_task_toml(assets, r, args.schema_version)
         check_instruction_no_leak(assets, r)
         check_env_no_solution(assets, r)
+        check_windows_value(assets, r, extras)
         check_tests(assets, r)
         check_no_change_and_golden_shape(assets, r)
     else:
@@ -697,6 +735,7 @@ def main():
                 check_task_toml(full, r, args.schema_version)
                 check_instruction_no_leak(full, r)
                 check_env_no_solution(full, r)
+                check_windows_value(full, r, extras)
                 check_tests(full, r)
                 check_no_change_and_golden_shape(full, r)
 
