@@ -115,6 +115,54 @@ def test_bad_magic_is_reported_as_magic(sample):
     assert excinfo.value.kind == "magic"
 
 
+def test_bad_version_is_reported_as_version(sample):
+    """版本号不受支持时必须归类为 version。"""
+    blob = sample[:4] + bytes([0x77]) + sample[5:]
+    assert verify(blob) is False
+    with pytest.raises(WFormatError) as excinfo:
+        unpack(blob)
+    assert excinfo.value.kind == "version"
+
+
+def test_inconsistent_record_count_is_reported_as_structure(sample):
+    """记录数与容器实际长度不符时必须归类为 structure。"""
+    import struct
+
+    blob = bytearray(sample)
+    count = struct.unpack_from("<I", blob, 5)[0]
+    struct.pack_into("<I", blob, 5, count - 1)
+    tampered = bytes(blob)
+    assert verify(tampered) is False
+    with pytest.raises(WFormatError) as excinfo:
+        unpack(tampered)
+    assert excinfo.value.kind == "structure"
+
+
+def test_nonzero_alignment_padding_is_reported_as_structure(sample):
+    """记录对齐填充必须为零字节,非零填充属于结构自相矛盾。"""
+    blob = bytearray(sample)
+    # 第一条记录 tag=1 / len=5 / b"alpha" 共 7 字节,按 4 字节对齐补 1 个零字节。
+    pad_index = 9 + 7
+    assert blob[pad_index] == 0x00
+    blob[pad_index] = 0x2A
+    tampered = bytes(blob)
+    assert verify(tampered) is False
+    with pytest.raises(WFormatError) as excinfo:
+        unpack(tampered)
+    assert excinfo.value.kind == "structure"
+
+
+def test_out_of_range_varint_is_reported_as_varint(sample):
+    """变长整数超出 63 位编码上限时必须归类为 varint。"""
+    blob = bytearray(sample)
+    blob[9:19] = b"\x80" * 10
+    tampered = bytes(blob)
+    assert verify(tampered) is False
+    with pytest.raises(WFormatError) as excinfo:
+        unpack(tampered)
+    assert excinfo.value.kind == "varint"
+
+
 def test_verify_never_raises():
     for blob in (b"", b"W", b"WFMT", b"WFMT\x01\x00\x00", b"WFMT\x01" + b"\x00" * 20):
         assert verify(blob) is False
