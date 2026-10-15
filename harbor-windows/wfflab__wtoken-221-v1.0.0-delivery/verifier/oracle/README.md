@@ -18,7 +18,7 @@ candidate package exposes. It is injected over `environment/workspace/wtoken` by
 
 ## Verified difference
 
-Measured inside `mcr.microsoft.com/windows/server:ltsc2025` (the full,
+Measured inside `mcr.microsoft.com/windows/server:ltsc2022` (the full,
 untrimmed Windows Server runtime; os.version 10.0.26100, the same build as the
 buyer's Windows 11 hosts; pinned by digest in `task.toml`) under Hyper-V
 isolation. The token in that image holds 24 privileges, of which 4 are

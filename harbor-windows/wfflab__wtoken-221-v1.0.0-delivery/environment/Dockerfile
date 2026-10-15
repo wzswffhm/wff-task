@@ -15,10 +15,14 @@
 # policy requires a complete, untrimmed Windows system (>= Server 2019, 2025
 # preferred) and explicitly forbids both trimmed families.
 #
-# ltsc2025 carries os.version 10.0.26100, the same build as the buyer's Windows 11
-# hosts, so this image matches the target environment rather than merely staying
-# compatible with it.
-FROM mcr.microsoft.com/windows/server:ltsc2025@sha256:e74880a9bd512123aca63c28d42b3e5ac95be5afaccbc9d19829fdc5538728b2
+# ltsc2022 carries os.version 10.0.20348, which is exactly the buyer host build.
+# It is also the only complete image that satisfies both constraints at once: a
+# build-equal image runs under process isolation on the buyer's 20348 hosts, and
+# because 20348 <= every Windows 11 build it also runs under Hyper-V isolation on
+# Windows 11 hosts. ltsc2025 (build 26100) would exceed the buyer host build and
+# could not start there at all, so the "prefer 2025" guidance yields to the hard
+# requirement that the buyer can actually run the image.
+FROM mcr.microsoft.com/windows/server:ltsc2022@sha256:7b9f4ac228cf21b6a4f8795e23329442183bd708e3ee55f7b67798481c94f591
 
 SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 

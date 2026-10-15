@@ -86,7 +86,8 @@ def main():
     parser.add_argument("--reference", default="mcr.microsoft.com/windows/server:ltsc2022")
     args = parser.parse_args()
 
-    with open(args.manifest, "r", encoding="utf-8") as handle:
+    # PowerShell's Set-Content -Encoding UTF8 writes a BOM; tolerate it.
+    with open(args.manifest, "r", encoding="utf-8-sig") as handle:
         manifest = json.load(handle)
 
     blobs_dir = os.path.join(args.out, "blobs", "sha256")
