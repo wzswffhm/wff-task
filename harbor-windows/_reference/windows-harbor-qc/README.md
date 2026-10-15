@@ -2,7 +2,7 @@
 
 可直接分发的 Harbor Windows 作业质检 Skill。它检查直接 Harbor Task 根目录和 14 个原始 job，并在本地 Windows Docker 中真实执行 Oracle/NOP。它不会调用模型、修复题包或修改飞书。
 
-规则基线：2026-10-12。
+规则基线：2026-10-15；新增完整 Windows 系统/最低版本、Dockerfile 工具配置、严格 Qwen < Opus，以及实际嵌套虚拟化硬门禁。
 
 判定口径以 `references/rule-matrix.md` 为快速索引，以 `references/checklist.md` 为完整规则。不得使用旧 Demo 目录规则覆盖本包内的直接 Harbor 标准。
 
@@ -25,7 +25,7 @@
   -QualityReview D:\qc\task-quality-review.json
 ```
 
-输出目录必须为空或不存在。默认 Oracle/NOP 各独立运行 3 次；严格稳定性复验可加 `-Attempts 6`。需要强制重建镜像时加 `-ForceBuild`。首次运行可以不传 `-QualityReview`，入口会生成 `quality-review-template.json`，但最终结论会保持 `BLOCKED`；逐项补全证据后，在新的空结果目录重新运行并传入该文件，十项全部 `PASS` 才能得到最终 `PASS`。
+输出目录必须为空或不存在。默认 Oracle/NOP 各独立运行 3 次；严格稳定性复验可加 `-Attempts 6`。需要强制重建镜像时加 `-ForceBuild`。首次运行可以不传 `-QualityReview`，入口会生成 `quality-review-template.json`，但最终结论会保持 `BLOCKED`；逐项补全证据后，在新的空结果目录重新运行并传入该文件，十四项全部 `PASS` 才能得到最终 `PASS`。
 
 正式交付内应包含：
 
@@ -58,7 +58,7 @@
 - `report.md`：最终人读结论；
 - `report.json`：完整结构化结论；
 - `delivery-layout.json`：直接 Harbor Task 目录和身份；
-- `model-gate.json`：3/3/1/1 模型运行和准入结果；先比较 Opus/Qwen 三次正式分数总和，总分相等时允许由更高的 Opus testcase 累计通过数打破平局；规定的 8 次模型运行全部 `VALID/0` 时仍允许零分平局；
+- `model-gate.json`：规定模型运行和严格区分度；Qwen 三次正式分总和必须低于 Opus，平分不能由 testcase 更多或全零例外通过；
 - `model-jobs.json`：14 个 Harbor job 的分类、文件和结果完整性；
 - `harbor/`：真实 Oracle/NOP 报告、命令、原始 CLI 日志和 job 证据。
 
@@ -66,20 +66,29 @@
 
 required testcase 少于 5 条失败，5–27 条正常，超过 27 条只产生人工范围复核警告。Dockerfile `FROM` 未 pin digest、缺少 `evidence/` 或 `metadata/`、`task.toml` 缺 network policy、GLM 1 而 Opus 0，都不能单独触发返修。泛化的“模型运行次数不足”也不单独使用；若 `jobs/` 缺少固定 14 个原生 Harbor job，则按标准目录和原始证据缺件失败。
 
-脚本会额外要求 `quality-review.json`，用于记录十项人工质量硬门禁：原有甲方五项
+脚本会额外要求 `quality-review.json`，用于记录十四项人工质量硬门禁：原有甲方五项
 （Golden/NOP 预期、逐评分项和逐 testcase 判分、题面与功能测试一致性、Hack/答案泄漏、
 Windows 价值），以及采购手册新增的范围与身份冻结、WIP 94 项、D01–D20、独立复算、证据与
-整改复验闭环。模板见 `quality-review-template.json`、`references/quality-gates.md` 和
-`references/procurement-manual-integration.md`。自动门禁全部通过但未提供十项证据时，最终结论
+整改复验闭环，另加镜像远端交付、完整系统/最低版本、Dockerfile 工具配置与容器内功能、实际嵌套虚拟化门禁。模板见 `quality-review-template.json`、`references/quality-gates.md` 和
+`references/procurement-manual-integration.md`。自动门禁全部通过但未提供十四项证据时，最终结论
 为 `BLOCKED`。人工复核只能降级自动结论，不能把 `FAIL/BLOCKED` 升级为通过。
 
-模型区分度是与十项人工复核并行的自动硬门禁。脚本分析 Qwen×3、Opus×3、GLM×1、Kimi×1
-全部结果；Qwen 与 Opus 同时三轮满分时不再直接失败，而是标记 `qwen_opus_full_score`
-（全模型满分时另记 `all_models_full_score`）并继续应用 Opus/Qwen 总分与 testcase
-累计通过数规则：总分相等时必须由 Opus 更高的 testcase 累计通过数打破平局。
+模型区分度是与十四项人工复核并行的自动硬门禁。脚本分析 Qwen×3、Opus×3、GLM×1、Kimi×1
+全部结果；Qwen 与 Opus 同时三轮满分时直接失败，8 次运行全部满分时明确标记为全模型满分题并
+拒收。未触发满分拒绝时，继续应用 Opus/Qwen 总分与 testcase 累计通过数规则。
 
 不通过原因必须基于本次真实检查证据，不得复制其他题目的返修模板。每条原因应定位到 ZIP 成员、Task 文件、Harbor job、verifier 报告或 testcase；建议项与硬门禁分开写。
 
+新增完整口径及六项简化必查表见 [references/current-project-policy.md](references/current-project-policy.md)。
+简化表全部必过，但不取消原有目录、轨迹、WIP 94 项、D01–D20 和镜像交付检查。
+
+实际嵌套虚拟化证据要求见 [references/nested-virtualization-gate.md](references/nested-virtualization-gate.md)。
+旧十三项复核文件缺少新项时，入口将保持 BLOCKED，不能直接复用为最新完整 PASS。
+
 ## 分发边界
+
+镜像交付的执行和判定细节见 [references/image-delivery-gate.md](references/image-delivery-gate.md)。
+做题/返修先确认甲方环境、镜像发布和获取权限，再完成目标同等环境控制验证后运行授权模型。
+本地缓存或 `-ForceBuild` 只能证明本地可运行，不能替代远端获取和甲方可运行的交付证据。
 
 ZIP 内不包含 API key、飞书 token、`.env`、本机缓存或真实作业证据。Skill 只用 Python 标准库和本机 Docker/Harbor，可复制到其他 Windows 主机使用。

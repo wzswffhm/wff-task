@@ -1,7 +1,7 @@
 # Windows Harbor 最新质检规则矩阵
 
 本表用于快速判定，完整执行细节见 `checklist.md`。发生规则冲突时，以本表和直接 Harbor
-标准目录为准，不再使用旧 Demo 包装格式。
+标准目录为准，不再使用旧 Demo 包装格式。新增口径见 [current-project-policy.md](current-project-policy.md)。
 
 ## 必须失败
 
@@ -16,9 +16,8 @@
 | `jobs/` 不是 14 个原生 Harbor job：Qwen×3、Opus×3、GLM×1、Kimi×1、Oracle×3、NOP×3 | `FAIL` |
 | 任一 job 缺少规定的原始 config/lock/result/log/verifier/reward/trajectory 文件 | `FAIL` |
 | 任一模型运行不是 `VALID`、不是二值 0/1、testcase 集合不完整或 Task Hash 不一致 | `FAIL` |
-| Qwen 三次与 Opus 三次同时全部 `VALID/1` | 不单独失败；仍按总分与 `testcase_pass_sum` 判定，并标记 `qwen_opus_full_score` / `all_models_full_score` 供人工复核 |
-| Opus 总分低于 Qwen | `FAIL` |
-| Opus 与 Qwen 总分相等，但 Opus 的 `testcase_pass_sum` 没有严格高于 Qwen，且 8 次规定模型运行并非全部 `VALID/0` | `FAIL` |
+| Qwen 三次与 Opus 三次同时全部 `VALID/1`；8 次规定模型运行全部满分时须同时标记全模型满分 | `FAIL`，题目过易 |
+| Qwen 正式分数总和不严格低于 Opus（包含全零、非零平分和 Opus testcase 更多的平分） | `FAIL` |
 | Oracle 任一轮不是 `VALID/1` 或 required testcase 未全 PASS | `FAIL` |
 | NOP 任一轮不是 `VALID/0`、P2P 未全 PASS，或没有核心 F2P FAIL | `FAIL` |
 | 缺测试、构建、环境、权限或解析故障被写成正式 reward 0 | `FAIL`，应为 `INVALID/BLOCKED` |
@@ -34,6 +33,13 @@
 | D01–D20 中确认存在 Golden/no-change、测试公平性、环境可信度、Hack、计分或批次缺陷 | `FAIL` |
 | 独立复算与 verifier/reward/平台正式分不一致 | `FAIL` |
 | 核心测试只接受 Golden 私有函数、固定代码文本/布局/调用方式，等价实现被误杀 | `FAIL` |
+| 镜像配置冲突；确认远端镜像不存在或甲方无拉取权限，且无目标认可的替代交付方式 | `FAIL`，镜像交付问题 |
+| 目标不允许现场构建，交付仅能依赖作者本机镜像或 Dockerfile | `FAIL`，镜像交付问题 |
+| 在目标同等 Windows/架构/隔离方式下确认无法启动或执行题目 | `FAIL`，环境交付问题 |
+| 实际运行镜像早于 Windows 2019/build 17763，或使用 Nano Server、Server Core、自定义裁剪系统 | `FAIL` |
+| 当前题目实际执行使用非嵌套虚拟化环境 | `FAIL`；物理机 Hyper-V 或单层 VM 不算嵌套 |
+| 实际用到的工具依赖作者宿主/手工安装，Dockerfile 不能复现其安装或基础内置验证；成品容器功能失败 | `FAIL` |
+| 题目只是调用 PowerShell/Windows 工具或生成 BAT，核心行为没有真实 Windows 专项语义 | `FAIL` |
 
 ## 必须 BLOCKED
 
@@ -45,6 +51,10 @@
 | 轨迹、原始日志、候选 SHA、required testcase 终态或评分条件缺失，无法闭合逐项证据链 | `BLOCKED` |
 | 运行因环境、权限、依赖、解析、零测试、401/429 或中断而无效 | `INVALID/BLOCKED`，可信分数为 `null` |
 | 无法从 required testcase 和冻结公式独立复算正式分数 | `BLOCKED` |
+| 缺少 `image_delivery`，或远端拉取、甲方权限、目标兼容、新容器启动和任务执行证据不完整 | `BLOCKED` |
+| 质检机网络/账号权限故障、仓库临时不可用，或未知甲方宿主/架构/隔离方式 | `BLOCKED`；不能直接认定镜像未发布或记模型 0 |
+| 缺少镜像实际版本、家族/基础来源或工具安装与真实功能证据；新增两个结构化复核项未完成 | `BLOCKED` |
+| 缺少外层 VM、扩展暴露、内层启动、当前 jobs 绑定证据或 nested_virtualization 项 | `BLOCKED` |
 
 ## 仅提示或人工复核
 
@@ -61,29 +71,27 @@
 | 泛化描述“每模型运行次数不足” | 不单独使用该措辞；若少于固定 14 个 job，按目录和原始证据缺件失败 |
 | 历史问题库记录某题曾经存在缺陷 | 只作风险提示；必须用当前版本证据确认 |
 | 执行时间较长，但未超过冻结预算且无超时或死锁证据 | 不单独失败 |
+| 镜像使用短名，或 Windows build 与宿主数字不同 | 不单独失败；实测仓库解析、实际隔离方式和目标兼容性；仍须满足镜像最低版本和完整系统规则 |
+| 合格且兼容的完整 Windows 2019/2022 镜像未使用 2025 | 不因非 2025 单独失败；2025 为优先项 |
 
-## 模型平分判定
+## 当前模型区分度口径（2026-10-15）
 
-先分析 Qwen、Opus、GLM、Kimi 的全部规定运行。Qwen 与 Opus 同时三轮满分不再直接失败，仍按
-下述总分与 `testcase_pass_sum` 判定，并同时记录 `qwen_opus_full_score` 与
-`all_models_full_score` 供人工复核。当 Qwen 与 Opus 的三次 `model_score_sum` 相等时，
-继续比较相同 required testcase 集合上的 `testcase_pass_sum`。若 Opus 严格高于 Qwen，
-则区分度门禁通过；若 Opus 小于或等于 Qwen，则门禁失败，但下述全模型有效零分例外仍然保留。
-
-## 合法的零分平局例外
-
-只有 Qwen×3、Opus×3、GLM×1、Kimi×1 共 8 次运行全部是 `VALID/0` 时，即使 Opus 的
-`testcase_pass_sum` 没有严格高于 Qwen，也允许 `Opus = Qwen = 0`。如果不满足该例外且
-Opus/Qwen 总分相等，则必须由 Opus 更高的 testcase 累计通过数打破平局。
+同一冻结题目的 Qwen、Opus 各三轮全部 VALID 后，必须严格满足
+`Qwen model_score_sum < Opus model_score_sum`。正式分数平分一律失败，Opus testcase 表现更强
+也不能挽救平局；全零平局和双方全满分失败。旧平分二级判据与全零例外取消，历史题目的旧结论
+保留为历史记录，不据此改写当前原始分数。
 
 ## 真实执行要求
 
+- 必须按 [nested-virtualization-gate.md](nested-virtualization-gate.md) 证明实际嵌套执行，不能以 Hyper-V 参数或 CPU 支持代替。
+
+- 镜像交付按 [image-delivery-gate.md](image-delivery-gate.md) 单独核验；本地 Oracle/NOP PASS 不替代甲方可获取和可运行的证据。
 - Docker 必须处于 Windows Containers 模式；Linux、WSL 或模拟执行不能代替。
 - Oracle 和 NOP 默认各独立运行 3 次，每轮使用新 job 和干净环境。
 - 每轮固定 `--n-attempts 1 --n-concurrent 1 --max-retries 0`。
 - 运行失败不得盲目重复并覆盖原证据；先判定为题包失败或环境阻塞。
 - Oracle 截图应来自 Harbor CLI/控制台原始输出，并显示任务、Agent、轮次和 `VALID/1`。
-- 自动门禁全部通过但没有完成十项人工质量复核，最终结论为 `BLOCKED`，不得写成 `PASS`。
+- 自动门禁全部通过但没有完成十四项人工质量复核，最终结论为 `BLOCKED`，不得写成 `PASS`。
 
 ## 返修原因写法
 

@@ -12,6 +12,8 @@ from inspect_delivery import harbor_dirhash, inspect_delivery, task_hash
 from validate_model_gate import evaluate
 from validate_model_jobs import validate_jobs
 from run_delivery_qc import QUALITY_GATES, execute
+from image_delivery_review import IMAGE_CHECKS, image_review_template
+from review_fixtures import passing_windows_image, passing_tools, passing_nested_virtualization
 
 
 MODELS = (("qwen3.8-max-0902", "QWEN", "qwen", (0, 0, 0)),
@@ -28,6 +30,21 @@ REQUIRED_CASES = (
 
 
 class DeliveryAndJobsTests(unittest.TestCase):
+    def test_prohibited_dockerfile_is_rejected_by_both_entrypoints(self):
+        from run_qc import static_check
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "delivery"
+            root.mkdir()
+            self.make_delivery(root)
+            (root / "environment" / "Dockerfile").write_text(
+                "FROM mcr.microsoft.com/windows/servercore:ltsc2025\n", encoding="utf-8")
+            layout = inspect_delivery(root)
+            self.assertFalse(layout["pass"])
+            self.assertTrue(any("Server Core" in error for error in layout["errors"]))
+            static = static_check(root)
+            self.assertFalse(static["static_pass"])
+            self.assertTrue(any("Server Core" in error for error in static["errors"]))
+
     def write_job(self, jobs: Path, name: str, checksum: str, *, kind: str,
                   score: int, alias: str | None = None, model_name: str | None = None):
         job = jobs / name
@@ -196,10 +213,26 @@ class DeliveryAndJobsTests(unittest.TestCase):
                 return 0
 
             review = workspace / "quality-review.json"
-            review.write_text(json.dumps({
+            review_data = {
                 key: {"status": "PASS", "evidence": [f"evidence/{key}.md"], "notes": "checked"}
                 for key in QUALITY_GATES
-            }), encoding="utf-8")
+            }
+            image_review = image_review_template()
+            image_review.update(status="PASS", evidence=["image-delivery/review.md"],
+                                configured_image="demo/windows:1.0.0",
+                                resolved_image_digest="sha256:" + "a" * 64,
+                                target_profile={"windows_build": "20348", "architecture": "amd64",
+                                                "isolation": "process", "can_build_images": False})
+            image_review["checks"] = {
+                key: {"status": "PASS", "evidence": [f"image-delivery/{key}.log"], "notes": "fixture"}
+                for key in IMAGE_CHECKS
+            }
+            review_data["image_delivery"] = image_review
+            review_data["windows_image_policy"] = passing_windows_image("demo/windows:1.0.0")
+            review_data["toolchain_in_image"] = passing_tools()
+            review_data["nested_virtualization"] = passing_nested_virtualization(
+                "demo/windows:1.0.0", inspect_delivery(delivery)["task"])
+            review.write_text(json.dumps(review_data), encoding="utf-8")
             args = SimpleNamespace(input=delivery, out=out, attempts=3,
                                    environment=None, force_build=False,
                                    quality_review=review)

@@ -112,11 +112,8 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
             errors.append(f"jobs/ is missing Harbor parent job file: {relative}")
     job_dirs = sorted(path for path in jobs_root.iterdir() if path.is_dir() and (path / "result.json").is_file())
 
-    expected_jobs = sum(REQUIRED_COUNTS.values()) + 6  # + 3 Oracle + 3 NOP
-    if len(job_dirs) != expected_jobs:
-        errors.append(
-            f"jobs/ must contain exactly {expected_jobs} Harbor job directories "
-            f"({sum(REQUIRED_COUNTS.values())} model + 3 Oracle + 3 NOP), got {len(job_dirs)}")
+    if len(job_dirs) != 14:
+        errors.append(f"jobs/ must contain exactly 14 Harbor job directories, got {len(job_dirs)}")
     for job in job_dirs:
         label = job.name
         for relative in COMMON_FILES:

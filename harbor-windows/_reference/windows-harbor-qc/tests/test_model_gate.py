@@ -41,7 +41,7 @@ class ModelGateTests(unittest.TestCase):
         result = evaluate(self.evidence((1, 0, 0), (0, 1, 0)))
         self.assertFalse(result["pass"])
 
-    def test_equal_nonzero_scores_pass_when_opus_testcases_are_better(self):
+    def test_equal_nonzero_scores_fail_even_when_opus_testcases_are_better(self):
         evidence = self.evidence((1, 0, 0), (0, 1, 0))
         for item in evidence["models"]["qwen"]:
             item["cases"] = [
@@ -58,16 +58,22 @@ class ModelGateTests(unittest.TestCase):
                 {"id": "case-1", "status": "FAIL"},
             ]
         result = evaluate(evidence)
-        self.assertTrue(result["pass"], result["errors"])
-        self.assertTrue(result["stats"]["distinction"]["testcase_tiebreak_pass"])
+        self.assertFalse(result["pass"])
+        self.assertTrue(result["stats"]["distinction"]["opus_testcase_advantage"])
+        self.assertFalse(result["stats"]["distinction"]["testcase_tiebreak_pass"])
 
-    def test_all_models_valid_zero_allows_qwen_opus_tie(self):
+    def test_all_models_valid_zero_rejects_qwen_opus_tie(self):
         evidence = self.evidence((0, 0, 0), (0, 0, 0))
         for item in evidence["models"]["qwen"] + evidence["models"]["opus"]:
             item["cases"][0]["status"] = "FAIL"
         result = evaluate(evidence)
-        self.assertTrue(result["pass"], result["errors"])
-        self.assertTrue(result["stats"]["distinction"]["all_models_zero_exception"])
+        self.assertFalse(result["pass"])
+        self.assertTrue(result["stats"]["distinction"]["all_models_zero"])
+        self.assertFalse(result["stats"]["distinction"]["all_models_zero_exception"])
+
+    def test_qwen_score_above_opus_fails_even_with_testcase_advantage(self):
+        result = evaluate(self.evidence((1, 1, 0), (1, 0, 0)))
+        self.assertFalse(result["pass"])
 
     def test_qwen_opus_zero_tie_fails_when_another_model_is_nonzero(self):
         evidence = self.evidence((0, 0, 0), (0, 0, 0))

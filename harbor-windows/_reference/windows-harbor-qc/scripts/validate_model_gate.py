@@ -17,7 +17,7 @@ ALIASES = {
     "glm": "glm", "glm-5.3": "glm",
     "kimi": "kimi", "kimi-k3": "kimi",
 }
-REQUIRED_COUNTS = {"qwen": 3, "opus": 3}
+REQUIRED_COUNTS = {"qwen": 3, "opus": 3, "glm": 1, "kimi": 1}
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -139,7 +139,7 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
     qwen_testcase_pass_sum = stats["qwen"]["testcase_pass_sum"]
     opus_testcase_pass_sum = stats["opus"]["testcase_pass_sum"]
     all_scores = [score for scores in scores_by_model.values() for score in scores]
-    all_zero_exception = (
+    all_models_zero = (
         not errors
         and len(all_scores) == sum(REQUIRED_COUNTS.values())
         and all(score == 0 for score in all_scores)
@@ -156,36 +156,31 @@ def evaluate(value: dict[str, Any], expected_identity: dict[str, Any] | None = N
         and all(score == 1 for score in all_scores)
     )
     stats["distinction"] = {
-        "all_models_zero_exception": all_zero_exception,
+        "all_models_zero": all_models_zero,
+        "all_models_zero_exception": False,
         "qwen_opus_full_score": qwen_opus_full_score,
         "all_models_full_score": all_models_full_score,
         "score_tie": opus_score_sum == qwen_score_sum,
-        "testcase_tiebreak_pass": (
-            opus_score_sum == qwen_score_sum
-            and opus_testcase_pass_sum > qwen_testcase_pass_sum
-        ),
+        "testcase_tiebreak_pass": False,
+        "opus_testcase_advantage": opus_testcase_pass_sum > qwen_testcase_pass_sum,
+        "strict_score_gap_pass": not errors and opus_score_sum > qwen_score_sum,
+        "policy_version": "2026-10-15-strict-score-gap",
         "rule": (
-            "Opus score sum must exceed Qwen; when score sums tie, Opus testcase pass sum "
-            "must exceed Qwen, unless every required model run is VALID/0. Full scores on "
-            "both primary models are flagged in stats but are no longer rejected on their own"
+            "Qwen model_score_sum must be strictly less than Opus model_score_sum; "
+            "testcase advantage cannot rescue a score tie; all-zero ties are rejected"
         ),
     }
-    # A full score on both primary models is no longer an automatic rejection.
-    # The primary distinction rule below still has to hold, and the two
-    # full-score flags stay in stats so a reviewer can see the borderline case.
-    if not errors and not all_zero_exception:
-        if opus_score_sum < qwen_score_sum:
+    if qwen_opus_full_score:
+        errors.append(
+            "model distinction gate failed: Qwen and Opus are both full-score across "
+            "all required runs; an all-full primary-model task is too easy"
+        )
+    elif not errors:
+        if opus_score_sum <= qwen_score_sum:
             errors.append(
-                "model distinction gate failed: Opus model_score_sum is lower than "
-                "Qwen model_score_sum"
-            )
-        elif (
-            opus_score_sum == qwen_score_sum
-            and opus_testcase_pass_sum <= qwen_testcase_pass_sum
-        ):
-            errors.append(
-                "model distinction gate failed: Opus and Qwen model_score_sum are tied, "
-                "but Opus testcase_pass_sum is not strictly greater than Qwen"
+                "model distinction gate failed: Qwen model_score_sum must be strictly "
+                "less than Opus model_score_sum; score ties cannot pass, including "
+                "all-zero ties or better Opus testcase counts"
             )
     return {"pass": not errors, "errors": errors, "stats": stats, "task": identity}
 

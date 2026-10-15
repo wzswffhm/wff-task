@@ -1,4 +1,4 @@
-# 十项人工质量复核模板
+# 十四项人工质量复核模板
 
 复制本模板到质检输出目录的 `manual-review.md`。每项写 `PASS/FAIL/BLOCKED` 和可定位证据。
 不能只写主观结论；至少给文件路径、testcase ID、关键行为或原始 job 路径。
@@ -22,12 +22,16 @@
 | 题面与测试一致：双向映射完整，检查真实功能，不绑定 Golden 私有写法 |  |  |
 | 无 Hack：没有联网取答案、git 拉答案、搜索 Golden/隐藏测试、改测试或 Verifier 骗分 |  |  |
 | Windows 价值：离开目标 Windows Runtime 后核心行为会消失或实质变化 |  |  |
-| 全模型区分度：已分析 Qwen/Opus/GLM/Kimi 全部规定运行，Qwen 与 Opus 未同时三轮满分，且不存在全模型满分题 |  |  |
+| 严格模型区分度：完整规定有效运行中 Qwen 正式分总和低于 Opus；平分、全零、双方满分均不能通过 |  |  |
 | 范围、版本、公式、镜像、测试树、Task/ZIP Hash 和运行批次身份已冻结 |  |  |
 | WIP 94 项完整登记，N/A 均有适用性依据 |  |  |
 | D01–D20 全部有结论和原始证据 |  |  |
 | 正式分已从 required testcase 和冻结公式独立复算 |  |  |
 | 原始证据、历史结果、修改版本和干净复验完整闭环 |  |  |
+| 镜像远端交付：实际镜像可拉取、甲方有访问权限、目标环境兼容、新容器就绪、同镜像 Harbor 执行成功 |  |  |
+| 实际系统不早于 2019，优先 2025；不是 Nano Server/Server Core，基础来源可追踪且未额外裁剪 |  |  |
+| 任务与执行链用到的工具在 Dockerfile 中可复现配置，每项均有安装/基础自检、版本和真实功能证据 |  |  |
+| 实际嵌套虚拟化：外层 VM、扩展暴露、内层 hypervisor/Windows 启动和当前 Task/jobs 绑定均有原始证据 |  |  |
 | `instruction.md` 的每项公开要求都能映射到 required testcase |  |  |
 | 每个 required testcase 都能反向映射到题面或公开契约，没有事后隐藏要求 |  |  |
 | P2P 在初始态通过且与修改范围相关；核心 F2P 在 NOP 失败、Golden 后通过 |  |  |
@@ -44,6 +48,10 @@
 
 ## 最终结论
 
+新增项按 [image-delivery-gate.md](image-delivery-gate.md) 逐项填写
+`quality-review.json.image_delivery`。缺证据写 BLOCKED，确认交付问题写 FAIL；不得仅凭镜像短名
+认定未发布，也不得用本机已有镜像的成功日志作为甲方交付证明。
+
 ```text
 自动结论：
 人工结论：
@@ -51,3 +59,7 @@
 复核人：
 复核时间：
 ```
+
+最新四项要求、六项简化必查表和两个新增结构化键见 [current-project-policy.md](current-project-policy.md)。
+
+嵌套环境复核须填写 `nested_virtualization`，细节见 [nested-virtualization-gate.md](nested-virtualization-gate.md)。

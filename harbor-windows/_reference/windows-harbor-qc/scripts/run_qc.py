@@ -183,6 +183,10 @@ def collect_referenced_paths(task: Path) -> list[str]:
 def static_check(task: Path) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    from windows_image_policy import inspect_windows_dockerfile
+    image_policy = inspect_windows_dockerfile(task)
+    errors.extend(image_policy["errors"])
+    warnings.extend(image_policy["warnings"])
     # source.json is optional provenance metadata; the executable Harbor task
     # contract is enforced by task.toml, environment, tests, and solution.
     required_top = ["task.toml", "instruction.md", "environment", "tests", "solution"]

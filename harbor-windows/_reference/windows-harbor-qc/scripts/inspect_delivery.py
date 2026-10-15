@@ -6,6 +6,7 @@ import json
 import tomllib
 from pathlib import Path
 from typing import Any
+from windows_image_policy import inspect_windows_dockerfile
 
 
 TASK_ROOT_ITEMS = ("task.toml", "instruction.md", "environment", "solution", "tests", "jobs")
@@ -85,6 +86,9 @@ def inspect_delivery(root: Path) -> dict[str, Any]:
     root = root.resolve()
     errors: list[str] = []
     warnings: list[str] = []
+    image_policy = inspect_windows_dockerfile(root)
+    errors.extend(image_policy["errors"])
+    warnings.extend(image_policy["warnings"])
     for name in TASK_ROOT_ITEMS:
         if not (root / name).exists():
             errors.append(f"missing direct Harbor root item: {name}{'/' if '.' not in name else ''}")
@@ -111,6 +115,11 @@ def inspect_delivery(root: Path) -> dict[str, Any]:
                 errors.append("Task has no pinned Docker image")
             elif image.strip().casefold() == "latest" or image.strip().casefold().endswith(":latest"):
                 errors.append("Docker image uses the floating latest tag")
+            top_image = config.get("docker_image")
+            env_config = config.get("environment")
+            nested_image = env_config.get("docker_image") if isinstance(env_config, dict) else None
+            if isinstance(top_image, str) and isinstance(nested_image, str) and top_image.strip() != nested_image.strip():
+                errors.append("task.toml docker_image conflicts with environment.docker_image")
         except Exception as exc:
             errors.append(f"cannot parse/hash direct Harbor Task: {exc}")
 
@@ -188,6 +197,7 @@ def inspect_delivery(root: Path) -> dict[str, Any]:
         "task_root": str(root) if task_toml.is_file() else None,
         "task": identity,
         "task_config": config,
+        "windows_image_static": image_policy,
         "testcase_count": testcase_count,
         "format": "direct-harbor-task-with-jobs-v1",
     }

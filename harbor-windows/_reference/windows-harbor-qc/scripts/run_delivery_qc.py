@@ -11,6 +11,9 @@ from types import SimpleNamespace
 from typing import Any
 
 from inspect_delivery import inspect_delivery
+from image_delivery_review import image_review_template, validate_image_review
+from windows_image_policy import windows_image_template, tools_template, validate_windows_image, validate_tools
+from nested_virtualization_review import nested_virtualization_template, validate_nested_virtualization
 from run_qc import check_archive_root_name, run as run_harbor_qc, safe_extract
 from validate_model_gate import evaluate
 from validate_model_jobs import validate_jobs
@@ -27,6 +30,10 @@ QUALITY_GATES = {
     "dynamic_d01_d20_complete": "采购手册 D01-D20 已逐项完成动态审计",
     "independent_score_recompute": "已从 required testcase 和冻结公式独立复算正式分数",
     "evidence_retest_integrity": "原始证据、历史版本、整改和干净复验已闭环",
+    "image_delivery": "成品镜像远端可获取、甲方有权限、目标环境可启动并执行题目",
+    "windows_image_policy": "Windows 镜像不早于 2019，优先 2025，禁止 Nano Server/Server Core 和额外裁剪",
+    "toolchain_in_image": "实际使用的工具通过 Dockerfile 配置，并在成品容器内完成版本和功能验证",
+    "nested_virtualization": "实际使用嵌套虚拟化，外层 VM/扩展暴露/内层运行和当前 jobs 证据完整",
 }
 
 
@@ -45,7 +52,7 @@ def find_delivery_root(root: Path) -> Path:
 
 
 def quality_review_template() -> dict[str, Any]:
-    return {
+    template = {
         key: {
             "status": "BLOCKED",
             "evidence": [],
@@ -53,14 +60,20 @@ def quality_review_template() -> dict[str, Any]:
         }
         for key, label in QUALITY_GATES.items()
     }
+    template["image_delivery"] = image_review_template()
+    template["windows_image_policy"] = windows_image_template()
+    template["toolchain_in_image"] = tools_template()
+    template["nested_virtualization"] = nested_virtualization_template()
+    return template
 
 
-def load_quality_review(path: Path | None) -> dict[str, Any]:
+def load_quality_review(path: Path | None, expected_image: str | None = None,
+                        expected_identity: dict[str, Any] | None = None) -> dict[str, Any]:
     if path is None:
         return {
             "conclusion": "BLOCKED",
             "provided": False,
-            "errors": ["未提供十项人工质量复核；自动检查通过也不能签发最终 PASS"],
+            "errors": ["未提供十四项人工质量复核；自动检查通过也不能签发最终 PASS"],
             "items": quality_review_template(),
         }
     try:
@@ -100,6 +113,22 @@ def load_quality_review(path: Path | None) -> dict[str, Any]:
             "evidence": evidence if isinstance(evidence, list) else [],
             "notes": notes,
         }
+        if key == "image_delivery":
+            errors.extend(validate_image_review(item, expected_image))
+            for field in ("configured_image", "resolved_image_digest", "target_profile", "checks"):
+                items[key][field] = item.get(field)
+        elif key == "windows_image_policy":
+            errors.extend(validate_windows_image(item, expected_image))
+            for field in ("configured_image", "windows_build", "release_year", "family", "untrimmed", "runtime_bases"):
+                items[key][field] = item.get(field)
+        elif key == "toolchain_in_image":
+            errors.extend(validate_tools(item))
+            items[key]["tools"] = item.get("tools")
+        elif key == "nested_virtualization":
+            errors.extend(validate_nested_virtualization(item, expected_image, expected_identity))
+            for field, value in item.items():
+                if field not in {"status", "evidence", "notes", "label"}:
+                    items[key][field] = value
     if errors:
         conclusion = "BLOCKED"
     elif "FAIL" in statuses:
@@ -117,7 +146,7 @@ def markdown(payload: dict[str, Any]) -> str:
               f"- 四模型门禁：`{'PASS' if payload['model_gate']['pass'] else 'FAIL'}`",
               f"- 四模型原始 jobs：`{'PASS' if payload['model_jobs']['pass'] else 'FAIL'}`",
               f"- Oracle/NOP：`{payload['harbor']['conclusion']}`",
-              f"- 十项人工质量复核：`{payload['quality_review']['conclusion']}`", ""]
+              f"- 十四项人工质量复核：`{payload['quality_review']['conclusion']}`", ""]
     sections = (("交付目录", payload["delivery_layout"]),
                 ("模型门禁", payload["model_gate"]),
                 ("模型 jobs", payload["model_jobs"]))
@@ -130,7 +159,7 @@ def markdown(payload: dict[str, Any]) -> str:
         if not section.get("errors") and not section.get("warnings"):
             lines.append("- 通过")
         lines.append("")
-    lines += ["## 十项人工质量硬门禁", ""]
+    lines += ["## 十四项人工质量硬门禁", ""]
     for key, label in QUALITY_GATES.items():
         item = payload["quality_review"].get("items", {}).get(key, {})
         lines.append(f"- **{label}**：`{item.get('status', 'BLOCKED')}`")
@@ -138,14 +167,27 @@ def markdown(payload: dict[str, Any]) -> str:
             lines.append(f"  - 证据：{evidence}")
         if item.get("notes"):
             lines.append(f"  - 说明：{item['notes']}")
+        if key == "image_delivery":
+            for field in ("configured_image", "resolved_image_digest", "target_profile"):
+                if item.get(field) is not None:
+                    lines.append(f"  - {field}：{json.dumps(item[field], ensure_ascii=False)}")
+            for name, check in (item.get("checks") or {}).items():
+                if isinstance(check, dict):
+                    lines.append(f"  - {name}：`{check.get('status', 'BLOCKED')}`；{check.get('notes', '')}")
+                    for evidence in check.get("evidence") or []:
+                        lines.append(f"    - 证据：{evidence}")
+        elif key in {"windows_image_policy", "toolchain_in_image", "nested_virtualization"}:
+            for field, value in item.items():
+                if field not in {"label", "status", "evidence", "notes"} and value is not None:
+                    lines.append(f"  - {field}：{json.dumps(value, ensure_ascii=False)}")
     for error in payload["quality_review"].get("errors") or []:
         lines.append(f"- 错误：{error}")
     lines.append("")
     lines += ["## 原始证据", "",
               "- `harbor/`：真实 Oracle/NOP 报告、命令、job 和 CLI 日志",
               "- `delivery-layout.json`：目录与 task_id/version/hash 绑定",
-              "- `model-gate.json`：Qwen×3 与 Opus×3 的次数、分数和区分度",
-              "- `model-jobs.json`：12 个 Harbor jobs（6 个模型、3 个 Oracle、3 个 NOP）交叉校验",
+              "- `model-gate.json`：四模型次数、分数和区分度",
+              "- `model-jobs.json`：14 个 Harbor jobs（8 个模型、3 个 Oracle、3 个 NOP）交叉校验",
               "- 人工证据：WIP 94 项、D01-D20、逐项证据链、Hack 事件和独立复算文件", ""]
     return "\n".join(lines)
 
@@ -198,7 +240,10 @@ def execute(args: argparse.Namespace) -> int:
         harbor_code = 1
         harbor = {"conclusion": "FAIL", "reason": "no valid Task root was available"}
 
-    quality_review = load_quality_review(getattr(args, "quality_review", None))
+    task_config = layout.get("task_config") or {}
+    expected_image = task_config.get("docker_image") or (task_config.get("environment") or {}).get("docker_image")
+    quality_review = load_quality_review(getattr(args, "quality_review", None), expected_image,
+                                         layout.get("task") or {})
     write_json(out / "quality-review.json", quality_review)
     if harbor_code == 2 or harbor.get("conclusion") == "BLOCKED":
         automated_conclusion = "BLOCKED"
@@ -232,7 +277,7 @@ def main() -> int:
     parser.add_argument("--environment", help="Harbor environment import override")
     parser.add_argument("--force-build", action="store_true")
     parser.add_argument("--quality-review", type=Path,
-                        help="十项人工质量复核 JSON；缺失时最终结论最多为 BLOCKED")
+                        help="十四项人工质量复核 JSON（含嵌套虚拟化）；缺失时最终结论最多为 BLOCKED")
     args = parser.parse_args()
     if args.attempts < 3:
         parser.error("--attempts must be at least 3")

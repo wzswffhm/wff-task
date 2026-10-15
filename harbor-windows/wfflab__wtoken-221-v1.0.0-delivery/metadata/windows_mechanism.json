@@ -1,0 +1,58 @@
+{
+  "schema_version": "windows-mechanism-gate-v1",
+  "task_id": "wfflab__wtoken-221",
+
+  "counterfactual": {
+    "question": "把目标 OS 换成 Linux/macOS，主要实现、错误根因和 Evaluator 是否基本不变？",
+    "answer": "否",
+    "reason": "主要实现只能由 Win32 令牌接口构成：特权清单要先 OpenProcessToken 拿到进程令牌，再用 GetTokenInformation(TokenPrivileges) 读回一张按 LUID 索引、每项带属性字的数组；名称与标识的换算只能走 LookupPrivilegeValue 与 LookupPrivilegeName；把某个特权打开或关掉只能走 AdjustTokenPrivileges，它写的是同一个属性字；提升状态与强制完整性标签只能从 TokenElevation、TokenElevationType 与 TokenIntegrityLevel 读出。这些入口在 Linux/macOS 上没有对等物：POSIX 把权限建模成用户标识加补充组，没有『一项权限既存在又可以被单独关掉』这种记录，因此本任务的核心区分点——持有与启用是两个独立维度——在 POSIX 上根本无法表达，更没有以 LUID 为键的特权数组可以读写。错误根因同样只在 Windows 语义下成立：缺陷实现之所以把『出现过』当成『已打开』，正因为 Windows 的令牌把这两件事拆成了两个维度；这在 POSIX 上不会发生。Evaluator 必须在真实 Windows Runtime 上触发，因为它要自己打开令牌、独立读回属性字、通过候选的 set_privilege 改动之后再自己复查属性字，并把提升状态与完整性标签与系统读到的值对照；换到别的操作系统，这些判据一条都无法复算。"
+  },
+
+  "exclusive_declaration": {
+    "quote": "本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。"
+  },
+
+  "mechanisms": [
+    {
+      "name": "令牌特权数组读取（OpenProcessToken + GetTokenInformation(TokenPrivileges)）",
+      "instruction_quote": "`privileges()` 必须返回令牌上**实际持有**的每一个特权，一个不漏、一个不多；键是特权名，值是该特权**此刻是否已启用**。",
+      "test_ref": "verifier/tests/test_wtoken_semantics.py#L249-L263",
+      "f2p_case": "f2p-inventory-marks-disabled-privileges-as-disabled"
+    },
+    {
+      "name": "持有与启用是两个维度（SE_PRIVILEGE_ENABLED 属性位）",
+      "instruction_quote": "`has_privilege(name)` 回答的是**是否持有**：对一个持有但当前关闭的特权必须返回 `True`。",
+      "test_ref": "verifier/tests/test_wtoken_semantics.py#L271-L279",
+      "f2p_case": "f2p-held-and-enabled-disagree-for-a-disabled-privilege"
+    },
+    {
+      "name": "启用位写入（AdjustTokenPrivileges）且可被外部独立观测",
+      "instruction_quote": "`set_privilege(name, True)` 与 `set_privilege(name, False)` 必须真的改变令牌上该特权的启用属性。",
+      "test_ref": "verifier/tests/test_wtoken_semantics.py#L280-L289",
+      "f2p_case": "f2p-enabling-a-privilege-is-visible-to-the-system"
+    },
+    {
+      "name": "标识换算（LookupPrivilegeValue / LookupPrivilegeName）",
+      "instruction_quote": "`privilege_luid(name)` 必须返回该系统为该特权使用的标识，并与系统接口给出的值相同。",
+      "test_ref": "verifier/tests/test_wtoken_semantics.py#L318-L331",
+      "f2p_case": "f2p-luid-matches-the-system-for-every-held-privilege"
+    },
+    {
+      "name": "提升状态（TokenElevation 与 TokenElevationType）",
+      "instruction_quote": "`elevation()` 必须反映令牌**真实的**提升状态与提升类型，不得对一个已提升的令牌报告未提升。",
+      "test_ref": "verifier/tests/test_wtoken_semantics.py#L364-L370",
+      "f2p_case": "f2p-elevation-matches-the-token"
+    },
+    {
+      "name": "强制完整性标签（TokenIntegrityLevel）",
+      "instruction_quote": "`integrity_level()` 必须返回令牌强制完整性级别的名称，而不是占位字符串。",
+      "test_ref": "verifier/tests/test_wtoken_semantics.py#L371-L383",
+      "f2p_case": "f2p-integrity-level-names-the-token-level"
+    }
+  ],
+
+  "non_windows_must_fail": {
+    "file": "environment/validate_environment.ps1",
+    "evidence": "Fail 'the host platform is not Windows (Win32NT), so the wtoken contract cannot be graded here'"
+  }
+}

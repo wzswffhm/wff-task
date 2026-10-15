@@ -68,7 +68,20 @@ ZIP 必须拒绝绝对路径、盘符、`..`、空路径、Windows 保留名、�
 
 ## 3. 题面、测试和 Windows 价值
 
-本节与 [quality-gates.md](quality-gates.md) 中的十项人工质量门禁同为硬性要求。目录、
+先阅读 [current-project-policy.md](current-project-policy.md) 的镜像、工具、Windows 价值和严格
+分差规则，以及六项简化必查表。Nano Server、Server Core 均禁止；实际 Windows 镜像版本不早于
+2019，优先 2025；工具安装/部署必须可从 Dockerfile 复现并有成品容器功能验证。
+
+### 镜像交付检查（新增硬门禁）
+
+先按 [image-delivery-gate.md](image-delivery-gate.md) 冻结甲方宿主 build、架构、隔离方式、构建
+能力和仓库权限。显式远端拉取实际成品镜像，保存退出码、日志和 digest，证明甲方可访问，并在
+目标同等环境中新容器启动和执行 Harbor Oracle/NOP。本地已有镜像、Dockerfile、本地 Hyper-V
+成功或旧版控制日志不能替代该证明。短名只提示核验，不能直接判未发布；质检机网络/权限或
+目标信息不足写 `BLOCKED`，确认交付缺陷写 `FAIL`。填写 `quality-review.json.image_delivery`，
+缺少该项不得签发最终 PASS。目标无构建能力时不得用本地构建路径作为交付方案。
+
+本节与 [quality-gates.md](quality-gates.md) 中的十四项人工质量门禁同为硬性要求。目录、
 模型分差和 Oracle/NOP 总分通过，不能替代逐评分项、逐 testcase 和逐模型轨迹复核。
 
 - 每个计分 testcase 都能双向追溯到题面/公开契约；不能新增未声明要求或与题面相反的约束。
@@ -98,6 +111,9 @@ INVALID: 缺失、重复、SKIP、ERROR、NOT_RUN、解析错误、授权/Runner
 不得用 `reward=0` 把 `INVALID` 转成 `VALID/0`；不得缩小分母、删除失败 testcase、使用权重/部分分/LLM Judge 或主观软分。`score`、verifier report、逐项终态和 Harbor reward 必须互相一致。
 
 ## 5. Oracle/NOP 动态门禁
+
+正式执行先按 [nested-virtualization-gate.md](nested-virtualization-gate.md) 验证实际嵌套拓扑和
+当前 jobs 的执行层。非嵌套实测不能通过；仅本地 Hyper-V 或普通 process 容器成功不足以证明。
 
 每轮必须是独立的 Harbor 调用、新 job 名和干净环境：
 
@@ -149,13 +165,11 @@ Harbor 原始 job。
 原始响应、候选补丁、trajectory、verifier report/reward、Task checksum 和运行时间。
 提示词不得人为加“中文口语化提示：”前缀。
 
-正式区分度按以下顺序判断：
-
-```text
-Opus model_score_sum > Qwen model_score_sum
-```
-
-先检查过易满分题：Qwen 三次和 Opus 三次同时全部 `VALID/1` 时直接失败；Qwen 3、Opus 3、GLM 1、Kimi 1 共 8 次运行全部满分时必须明确记录为全模型满分失败。未触发满分拒绝时，若 Qwen 与 Opus 的 `model_score_sum` 相等，则使用同一 required testcase 集合上的累计通过数作为二级判据：只有 `Opus testcase_pass_sum > Qwen testcase_pass_sum` 才通过。若两者总分相等且 testcase 累计通过数也未严格拉开，则失败；唯一例外是 8 次模型运行全部有效且全部为 0，此时零分平局不因区分度单独返修。GLM/Kimi 不参与主模型分差，GLM 1 而 Opus 0 本身不触发返修，但要纳入全模型结果分布分析；缺少规定 job、运行无效或原始证据不完整仍然不通过。`INVALID`、基础设施失败或缺结果不能按 0 分计入。
+正式区分度按 2026-10-15 新口径：同一 required 集合、冻结版本和规定运行数下，所有主模型运行
+必须 VALID，且 `Qwen model_score_sum < Opus model_score_sum`。总分相等一律失败，包含全零
+平局和 Opus testcase 更多的情况；双方三轮全满分也失败。testcase 累计通过数只用于逐项表现
+分析，不替代正式 reward 差距。GLM/Kimi 不参与主分差；缺少规定 job、运行无效或证据不完整
+仍不通过。INVALID/基础设施失败不得当作 0 计入。旧全零例外和平分二级判据已经取消。
 
 每个运行必须绑定当前 `task_id + task_version + task_hash`；所有 Harbor `task_checksum`
 必须一致，并等于从当前交付 Task 目录重新计算的 checksum。仅重新生成 evidence 索引不能
@@ -169,7 +183,6 @@ Opus model_score_sum > Qwen model_score_sum
 - 缺少顶层 `evidence/` 目录。
 - 缺少顶层 `metadata/` 目录。
 - `task.toml` 缺 network policy 字段。
-- 规定的 8 次模型运行全部 `VALID/0`，因此 Opus 0 = Qwen 0。
 - 泛化的“每模型运行次数不足”。固定的 14 个原生 Harbor job 仍是标准目录硬门禁；缺任一规定 job 应写成目录/原始证据缺件。
 - GLM 为 1、Opus 为 0；GLM 不参与 Opus/Qwen 主分差。
 - testcase 超过 27 条；仅人工复核，少于 5 条才硬失败。
@@ -178,7 +191,7 @@ Opus model_score_sum > Qwen model_score_sum
 
 Windows 反事实价值不足、标准 Harbor 无法加载、Solution 缺失、Golden 不稳定、NOP/P2P/F2P 门禁失败、测试绑定 Golden 私有写法、基础设施故障被记成模型 0、答案/测试/凭据泄漏、环境不可恢复、旧产物污染、来源授权不清、重复/薄题、无法在预算内稳定运行，任一项都不能进入正式集。修复后必须提升版本和 Hash，在新的干净结果目录完整复验。
 
-此外，十项人工质量复核缺失或证据不足时只能判 `BLOCKED`，不能签发最终 `PASS`。任一项
+此外，十四项人工质量复核缺失或证据不足时只能判 `BLOCKED`，不能签发最终 `PASS`。任一项
 确认失败时，整题判 `FAIL`。
 
 ## 10. 采购手册完整性门禁
