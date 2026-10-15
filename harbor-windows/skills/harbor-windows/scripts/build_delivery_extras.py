@@ -77,8 +77,8 @@ BATCH_FILES = {
         "model_score_sum,testcase_pass_sum,validity,notes\n"
         "TODO,Qwen3.8-Max-0902,TODO,3,0,0,0,0,PENDING,TODO\n"
         "TODO,Opus 5,TODO,3,0,0,0,0,PENDING,TODO\n"
-        "TODO,GLM-5.3,TODO,1,0,0,0,0,PENDING,TODO\n"
-        "TODO,Kimi K3,TODO,1,0,0,0,0,PENDING,TODO\n"
+        "TODO,GLM-5.3,TODO,0,0,0,0,0,OPTIONAL,自 2026-10-13 起可选，不参与主判据\n"
+        "TODO,Kimi K3,TODO,0,0,0,0,0,OPTIONAL,自 2026-10-13 起可选，不参与主判据\n"
     ),
     "known_issues.md": (
         "# 已知问题\n\n"
@@ -131,13 +131,19 @@ def read_task_toml(assets, tid):
     m = re.search(r'^\s*version\s*=\s*"([^"]+)"', txt, re.M)
     if m:
         out["version"] = m.group(1)
-    # task.toml 不得写 docker_image；镜像引用取自 environment/Dockerfile 的 FROM
-    df = os.path.join(assets, tid, "environment", "Dockerfile")
-    if os.path.isfile(df):
-        dm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
-                       open(df, encoding="utf-8", errors="replace").read())
-        if dm:
-            out["docker_image"] = dm.group(1)
+    # 镜像引用：task.toml 顶层 docker_image 是权威声明（甲方 QC 必备项），
+    # 与 environment/Dockerfile 的 FROM 必须逐字一致；这里优先读 task.toml，
+    # 缺失时才回落到 Dockerfile 的 FROM（并会在 manifest 里留 TODO 痕迹）。
+    m = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', txt)
+    if m:
+        out["docker_image"] = m.group(1)
+    else:
+        df = os.path.join(assets, tid, "environment", "Dockerfile")
+        if os.path.isfile(df):
+            dm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
+                           open(df, encoding="utf-8", errors="replace").read())
+            if dm:
+                out["docker_image"] = dm.group(1)
     m = re.search(r'\[metadata\][^\[]*?tags\s*=\s*\[([^\]]*)\]', txt, re.S)
     if m:
         out["tags"] = [t.strip().strip('"') for t in m.group(1).split(",") if t.strip()]

@@ -1,0 +1,967 @@
+diff --git a/README.md b/README.md
+index dd19b6f..cc948db 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # wcancel
+ 
+-Overlapping (asynchronous) reads with per-object cancellation.
++Overlapping (asynchronous) reads with per-request cancellation.
+ 
+ The collector reads large inputs by handing several reads to the operating system
+ at once instead of blocking on one read at a time. A download is split into
+@@ -22,21 +22,37 @@ print(completion.status, completion.bytes_read)
+ | name | meaning |
+ |---|---|
+ | `submit(handle, size, offset=0)` | start one overlapping read and return the `Request` for it |
+-| `cancel(request)` | abandon one outstanding read; `True` when the read has been given up |
+-| `cancel_all(handle)` | abandon every outstanding read on `handle`; returns how many were given up |
++| `cancel(request)` | abandon that one outstanding read; `True` when this call took it away, `False` when there was nothing to abandon |
++| `cancel_all(handle)` | abandon every read outstanding on `handle`; returns how many this call took away |
+ | `wait(request, timeout=None)` | wait for one read and return its `Completion` |
+ | `is_overlapped(handle)` | whether the object can carry overlapping operations |
+ | `handle_kind(handle)` | `file` / `pipe` / `console` / `unknown` |
+ | `WCancelError` | carries a `kind` of `unsupported` / `badarg` / `os` / `timeout` |
+ 
+-A `Request` exposes `handle`, `size` and `offset`. A `Completion` exposes
+-`bytes_read` and `status`, where `status` is `"completed"` or `"cancelled"`.
++A `Request` exposes `handle`, `size`, `offset` and, once the read has settled,
++the bytes it delivered as `data`. A `Completion` exposes `bytes_read` and
++`status`, where `status` is `"completed"` or `"cancelled"`.
++
++## Cancelling one read
++
++Cancellation names one request's own control block, so it is precise: the system
++takes away exactly that read and leaves the shards submitted alongside it
++outstanding, still able to deliver their bytes. The call works from any thread,
++and the read it abandons settles as `status == "cancelled"` with the byte count
++it had managed to deliver -- a distinct outcome, never an I/O failure.
++`cancel_all()` is the only entry point that stops reads in bulk.
++
++`cancel()` reports `True` only when the read was still outstanding and this call
++is what gave it up. A read that has already finished, or that has already been
++given up, reports `False`.
+ 
+ ## Supported platforms
+ 
+-The read layer runs on Windows; the objects it reads from are opened for
+-overlapping use by the caller. `docs/NOTES.md` describes how the module was
+-originally laid out and is kept for history only.
++The read layer runs on Windows. An object that was not opened for overlapping
++use cannot keep several reads outstanding, so `submit()` rejects it with
++`WCancelError(kind="unsupported")` instead of quietly falling back to a blocking
++read. `docs/NOTES.md` describes how the module was originally laid out and is
++kept for history only.
+ 
+ ## Tests
+ 
+diff --git a/wcancel/__init__.py b/wcancel/__init__.py
+index 7879c60..ff2380d 100644
+--- a/wcancel/__init__.py
++++ b/wcancel/__init__.py
+@@ -1,4 +1,4 @@
+-"""wcancel -- overlapping reads with per-object cancellation.
++"""wcancel -- overlapping reads with per-request cancellation.
+ 
+ The collector reads large inputs as *overlapping* (asynchronous) I/O: instead of
+ blocking on one read, it hands several reads to the operating system at once and
+@@ -6,6 +6,13 @@ picks up their results later.  A download is split into shards, each shard is
+ one overlapping read of the same source object, and a user who drops a shard
+ asks the module to abandon that shard while the others keep running.
+ 
++Cancellation is per request.  Abandoning one shard names that shard's own
++control block, so the system takes away exactly that read: the shards submitted
++alongside it stay outstanding and go on to deliver their bytes.  The call works
++from any thread, not only from the one that submitted the read, and a read the
++system took away settles as its own outcome -- ``status == "cancelled"`` -- and
++is never reported as an I/O failure.
++
+ Typical use::
+ 
+     request = submit(handle, size=65536, offset=0)
+@@ -20,10 +27,16 @@ Public API
+ 
+ ``submit(handle, size, offset=0) -> Request``
+     Start one overlapping read of ``size`` bytes at ``offset`` on ``handle``.
++    Raises ``WCancelError(kind="unsupported")`` when the object cannot carry
++    overlapping reads, rather than falling back to a blocking read.
+ ``cancel(request) -> bool``
+-    Abandon one outstanding read.  ``True`` when the read has been given up.
++    Abandon that one outstanding read, and only that one.  ``True`` when this
++    call is what took the read away from the system; ``False`` when there was
++    nothing to abandon, because the read had already finished or had already
++    been given up.
+ ``cancel_all(handle) -> int``
+-    Abandon every outstanding read on ``handle``; the count given up is returned.
++    Abandon every read this module has outstanding on ``handle`` -- the only
++    batch form -- and return how many this call took away.
+ ``wait(request, timeout=None) -> Completion``
+     Wait for one read to finish.  ``timeout`` is in seconds and defaults to no
+     deadline.
+@@ -34,12 +47,14 @@ Public API
+ ``WCancelError``
+     Carries a ``kind`` of ``unsupported`` / ``badarg`` / ``os`` / ``timeout``.
+ ``Request``
+-    One submitted read; exposes ``handle``, ``size`` and ``offset``.
++    One submitted read; exposes ``handle``, ``size``, ``offset`` and, once the
++    read has settled, the bytes it delivered as ``data``.
+ ``Completion``
+     The outcome of a read; exposes ``bytes_read`` and ``status``, where
+     ``status`` is ``"completed"`` or ``"cancelled"``.
+ 
+-See ``docs/NOTES.md`` for how the module was originally laid out.
++``docs/NOTES.md`` describes how the module was originally laid out and is kept
++for history only; it does not describe the behaviour above.
+ """
+ 
+ from .errors import WCancelError
+diff --git a/wcancel/_winapi.py b/wcancel/_winapi.py
+index 1432894..b16a9ec 100644
+--- a/wcancel/_winapi.py
++++ b/wcancel/_winapi.py
+@@ -1,11 +1,23 @@
+ """Thin ctypes bindings for the Win32 calls that :mod:`wcancel` needs.
+ 
+-Only what the current implementation actually calls is bound here; ``kernel32``
+-is loaded lazily so that importing the package stays cheap.
++Only what the implementation actually calls is bound here; ``kernel32`` and
++``ntdll`` are loaded lazily so that importing the package stays cheap.
++
++Two points of Win32 behaviour shape this module:
++
++* ``CancelIo`` abandons *every* request the **calling thread** has outstanding
++  on an object, so it can neither single out one request nor reach a request
++  that was issued by another thread.  ``CancelIoEx`` takes the ``OVERLAPPED``
++  control block of one request and works from any thread, which is what a
++  per-request cancellation entry point needs.
++* A request that the system abandoned settles with
++  ``ERROR_OPERATION_ABORTED``.  That is a distinct outcome, not an I/O failure,
++  and the read layer reports it as such.
+ """
+ 
+ import ctypes
+ import os
++import time
+ from ctypes import wintypes
+ 
+ from .errors import WCancelError
+@@ -20,7 +32,9 @@ FILE_TYPE_REMOTE = 0x8000
+ 
+ ERROR_SUCCESS = 0
+ ERROR_INVALID_HANDLE = 6
++ERROR_HANDLE_EOF = 38
+ ERROR_INVALID_PARAMETER = 87
++ERROR_BROKEN_PIPE = 109
+ ERROR_OPERATION_ABORTED = 995
+ ERROR_IO_INCOMPLETE = 996
+ ERROR_IO_PENDING = 997
+@@ -31,19 +45,36 @@ WAIT_TIMEOUT = 0x00000102
+ WAIT_FAILED = 0xFFFFFFFF
+ INFINITE = 0xFFFFFFFF
+ 
++# ``NtQueryInformationFile`` information class that reports the mode an object
++# was opened in, and the two mode bits that mean "this object was opened for
++# synchronous use and can therefore not carry overlapping requests".
+ FILE_MODE_INFORMATION_CLASS = 16
++FILE_SYNCHRONOUS_IO_ALERT = 0x00000010
++FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
++
++STATUS_SUCCESS = 0
+ 
+ _IS_WINDOWS = os.name == "nt"
+ 
+ _kernel32 = None
++_ntdll = None
+ 
+ 
+ class FILE_MODE_INFORMATION(ctypes.Structure):
+-    """Payload of ``GetFileInformationByHandleEx(FileModeInformation)``."""
++    """Payload of ``NtQueryInformationFile(FileModeInformation)``."""
+ 
+     _fields_ = [("Mode", wintypes.DWORD)]
+ 
+ 
++class IO_STATUS_BLOCK(ctypes.Structure):
++    """Result block of the native query calls."""
++
++    _fields_ = [
++        ("Status", ctypes.c_long),
++        ("Information", ctypes.c_size_t),
++    ]
++
++
+ class OVERLAPPED(ctypes.Structure):
+     """The asynchronous-I/O control block handed to ``ReadFile``/``WriteFile``."""
+ 
+@@ -67,24 +98,37 @@ def _win32_types_ok():
+                for name in ("HANDLE", "DWORD", "BOOL", "LPCWSTR", "LPVOID"))
+ 
+ 
+-def _kernel32_dll():
+-    """The shared ``kernel32`` instance, loaded on first use."""
+-    global _kernel32
++def _require_windows():
+     if not _IS_WINDOWS:
+         raise WCancelError(
+             "overlapping I/O requires the Win32 API, which exists only on Windows",
+             kind="unsupported",
+         )
++    if not _win32_types_ok():
++        raise WCancelError(
++            "this interpreter does not expose the Win32 ctypes types",
++            kind="unsupported",
++        )
++
++
++def _kernel32_dll():
++    """The shared ``kernel32`` instance, loaded on first use."""
++    global _kernel32
++    _require_windows()
+     if _kernel32 is None:
+-        if not _win32_types_ok():
+-            raise WCancelError(
+-                "this interpreter does not expose the Win32 ctypes types",
+-                kind="unsupported",
+-            )
+         _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+     return _kernel32
+ 
+ 
++def _ntdll_dll():
++    """The shared ``ntdll`` instance, loaded on first use."""
++    global _ntdll
++    _require_windows()
++    if _ntdll is None:
++        _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
++    return _ntdll
++
++
+ def last_error():
+     """The Win32 error code left by the most recent call."""
+     return int(ctypes.get_last_error())
+@@ -116,7 +160,9 @@ def describe(error):
+     """A short human-readable name for a Win32 error code."""
+     names = {
+         ERROR_INVALID_HANDLE: "ERROR_INVALID_HANDLE",
++        ERROR_HANDLE_EOF: "ERROR_HANDLE_EOF",
+         ERROR_INVALID_PARAMETER: "ERROR_INVALID_PARAMETER",
++        ERROR_BROKEN_PIPE: "ERROR_BROKEN_PIPE",
+         ERROR_OPERATION_ABORTED: "ERROR_OPERATION_ABORTED",
+         ERROR_IO_INCOMPLETE: "ERROR_IO_INCOMPLETE",
+         ERROR_IO_PENDING: "ERROR_IO_PENDING",
+@@ -128,6 +174,30 @@ def describe(error):
+     return "%s (%d)" % (label, int(error))
+ 
+ 
++def _nt_to_dos(status):
++    """Translate an ``NTSTATUS`` into the Win32 error code it stands for."""
++    try:
++        convert = _ntdll_dll().RtlNtStatusToDosError
++        convert.argtypes = [ctypes.c_ulong]
++        convert.restype = ctypes.c_ulong
++        return int(convert(ctypes.c_ulong(int(status) & 0xFFFFFFFF)))
++    except WCancelError:
++        raise
++    except Exception:
++        return ERROR_INVALID_PARAMETER
++
++
++def _internal_high(overlapped):
++    """The byte count the system left in a control block."""
++    try:
++        value = overlapped.InternalHigh
++    except Exception:
++        return 0
++    if value is None:
++        return 0
++    return int(value)
++
++
+ # --------------------------------------------------------------- operations
+ 
+ def open_event():
+@@ -166,20 +236,30 @@ def file_type(handle):
+     get_file_type = kernel32.GetFileType
+     get_file_type.argtypes = [wintypes.HANDLE]
+     get_file_type.restype = wintypes.DWORD
++    ctypes.set_last_error(0)
+     return int(get_file_type(wintypes.HANDLE(int(handle))))
+ 
+ 
+ def file_mode(handle):
+-    """Return the ``Mode`` word of ``GetFileInformationByHandleEx``."""
+-    kernel32 = _kernel32_dll()
+-    query = kernel32.GetFileInformationByHandleEx
+-    query.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+-    query.restype = wintypes.BOOL
++    """Return the mode word the object was opened with.
++
++    The mode is what tells an overlapping-capable object from one that was
++    opened for synchronous use; it is only reachable through the native query
++    call, as ``GetFileInformationByHandleEx`` does not expose this class.
++    """
++    ntdll = _ntdll_dll()
++    query = ntdll.NtQueryInformationFile
++    query.argtypes = [wintypes.HANDLE, ctypes.POINTER(IO_STATUS_BLOCK),
++                      wintypes.LPVOID, wintypes.ULONG, ctypes.c_int]
++    query.restype = ctypes.c_long
++
++    block = IO_STATUS_BLOCK()
+     info = FILE_MODE_INFORMATION()
+-    ok = query(wintypes.HANDLE(int(handle)), FILE_MODE_INFORMATION_CLASS,
+-               ctypes.byref(info), ctypes.sizeof(info))
+-    if not ok:
+-        error = last_error()
++    status = int(query(wintypes.HANDLE(int(handle)), ctypes.byref(block),
++                       ctypes.byref(info), ctypes.sizeof(info),
++                       FILE_MODE_INFORMATION_CLASS))
++    if status != STATUS_SUCCESS:
++        error = _nt_to_dos(status)
+         raise WCancelError(
+             "the mode of object %r could not be read (%s)" % (handle, describe(error)),
+             kind=error_kind(error),
+@@ -188,11 +268,44 @@ def file_mode(handle):
+     return int(info.Mode)
+ 
+ 
++def supports_overlapped(handle):
++    """Whether one object can carry overlapping requests.
++
++    A character device never can.  For everything else the question is settled
++    by the mode the object was opened with: an object opened for synchronous
++    use serialises its requests inside the system and cannot keep several of
++    them outstanding.
++    """
++    number = int(handle)
++    raw = file_type(number)
++    if raw == FILE_TYPE_UNKNOWN:
++        error = last_error()
++        if error:
++            raise WCancelError(
++                "the object class could not be read (%s)" % describe(error),
++                kind=error_kind(error),
++                handle=number,
++            )
++    elif raw & ~FILE_TYPE_REMOTE == FILE_TYPE_CHAR:
++        return False
++
++    try:
++        mode = file_mode(number)
++    except WCancelError as err:
++        if err.kind == "badarg":
++            raise
++        # The mode could not be read for a reason that says nothing about the
++        # object's capability; let the read itself be the judge.
++        return True
++    return not bool(mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT))
++
++
+ def start_read(handle, buffer, size, offset, overlapped):
+     """Issue a ``ReadFile`` for ``handle`` and report how it ended.
+ 
+-    Returns ``(ok, error)``: ``ok`` is the ``ReadFile`` result and ``error`` is
+-    the Win32 error code that came with it.
++    Returns ``(ok, error, transferred)``: ``ok`` is the ``ReadFile`` result,
++    ``error`` the Win32 error code that came with it and ``transferred`` the
++    byte count ``ReadFile`` reported when it served the read straight away.
+     """
+     kernel32 = _kernel32_dll()
+     read_file = kernel32.ReadFile
+@@ -206,45 +319,19 @@ def start_read(handle, buffer, size, offset, overlapped):
+     overlapped.OffsetHigh = (int(offset) >> 32) & 0xFFFFFFFF
+ 
+     transferred = wintypes.DWORD(0)
++    ctypes.set_last_error(0)
+     ok = read_file(wintypes.HANDLE(int(handle)), buffer, int(size),
+                    ctypes.byref(transferred), ctypes.byref(overlapped))
+     if ok:
+-        return True, ERROR_SUCCESS
+-    return False, last_error()
+-
+-
+-def wait_for_read(handle, overlapped, event, timeout_ms):
+-    """Wait for one outstanding read and report how it ended.
+-
+-    Returns ``(outcome, bytes_read, error)`` with ``outcome`` one of
+-    ``"completed"``, ``"timeout"`` or ``"error"``.
+-    """
+-    kernel32 = _kernel32_dll()
+-    wait = kernel32.WaitForSingleObject
+-    wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+-    wait.restype = wintypes.DWORD
+-
+-    status = int(wait(wintypes.HANDLE(int(event)), wintypes.DWORD(int(timeout_ms))))
+-    if status == WAIT_TIMEOUT:
+-        return "timeout", 0, ERROR_IO_INCOMPLETE
+-    if status == WAIT_FAILED:
+-        error = last_error()
+-        raise WCancelError(
+-            "waiting for the request failed (%s)" % describe(error),
+-            kind=error_kind(error),
+-            handle=handle,
+-        )
+-
+-    completed, error, transferred = read_status(handle, overlapped)
+-    if completed:
+-        return "completed", transferred, ERROR_SUCCESS
+-    return "error", transferred, error
++        return True, ERROR_SUCCESS, int(transferred.value)
++    return False, last_error(), int(transferred.value)
+ 
+ 
+-def read_status(handle, overlapped):
+-    """Read the state of one request without blocking.
++def read_status(handle, overlapped, block=False):
++    """Read the state of one request.
+ 
+-    Returns ``(completed, error, bytes_read)``.
++    Returns ``(completed, error, bytes_read)``.  With ``block`` false the call
++    never waits.
+     """
+     kernel32 = _kernel32_dll()
+     result = kernel32.GetOverlappedResult
+@@ -253,30 +340,103 @@ def read_status(handle, overlapped):
+     result.restype = wintypes.BOOL
+ 
+     transferred = wintypes.DWORD(0)
++    ctypes.set_last_error(0)
+     ok = result(wintypes.HANDLE(int(handle)), ctypes.byref(overlapped),
+-                ctypes.byref(transferred), False)
++                ctypes.byref(transferred), bool(block))
+     if ok:
+         return True, ERROR_SUCCESS, int(transferred.value)
+     return False, last_error(), int(transferred.value)
+ 
+ 
+-def cancel(handle):
+-    """Ask the system to abandon the I/O that this thread has outstanding.
++def poll_read(handle, overlapped, block=False):
++    """Classify how one request stands right now.
+ 
+-    Returns ``True`` when the system accepted the request.
++    Returns ``(state, bytes_read, error)`` with ``state`` one of
++    ``"completed"``, ``"cancelled"``, ``"pending"`` or ``"error"``.
++    """
++    ok, error, transferred = read_status(handle, overlapped, block)
++    if ok:
++        return "completed", transferred, ERROR_SUCCESS
++    settled = max(int(transferred), _internal_high(overlapped))
++    if error == ERROR_HANDLE_EOF:
++        # Nothing left to read: the request delivered what there was.
++        return "completed", settled, ERROR_SUCCESS
++    if error == ERROR_OPERATION_ABORTED:
++        return "cancelled", settled, error
++    if error in (ERROR_IO_INCOMPLETE, ERROR_IO_PENDING):
++        return "pending", 0, error
++    return "error", settled, error
++
++
++def wait_for_read(handle, overlapped, event, timeout_ms):
++    """Wait for one outstanding read and report how it ended.
++
++    Returns ``(outcome, bytes_read, error)`` with ``outcome`` one of
++    ``"completed"``, ``"cancelled"``, ``"timeout"`` or ``"error"``.
+     """
+     kernel32 = _kernel32_dll()
+-    cancel_io = kernel32.CancelIo
+-    cancel_io.argtypes = [wintypes.HANDLE]
+-    cancel_io.restype = wintypes.BOOL
++    wait = kernel32.WaitForSingleObject
++    wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
++    wait.restype = wintypes.DWORD
+ 
+-    ok = cancel_io(wintypes.HANDLE(int(handle)))
+-    if not ok:
+-        error = last_error()
++    timeout_ms = int(timeout_ms)
++    unbounded = timeout_ms == INFINITE
++    deadline = None if unbounded else time.monotonic() + timeout_ms / 1000.0
++
++    while True:
++        if unbounded:
++            slice_ms = INFINITE
++        else:
++            left = deadline - time.monotonic()
++            slice_ms = max(0, int(left * 1000))
++
++        ctypes.set_last_error(0)
++        status = int(wait(wintypes.HANDLE(int(event)), wintypes.DWORD(slice_ms)))
++        if status == WAIT_FAILED:
++            error = last_error()
++            raise WCancelError(
++                "waiting for the request failed (%s)" % describe(error),
++                kind=error_kind(error),
++                handle=handle,
++            )
++
++        # Whether the event fired or the deadline passed, the control block is
++        # the authority on how the request stands.  Once the event has fired
++        # the blocking form of the query is used, since it then cannot wait
++        # longer than the request takes to settle.
++        state, bytes_read, error = poll_read(handle, overlapped,
++                                             block=status != WAIT_TIMEOUT)
++        if state != "pending":
++            return state, bytes_read, error
++        if not unbounded and time.monotonic() >= deadline:
++            return "timeout", 0, ERROR_IO_INCOMPLETE
++        # Nothing has settled yet; wait again rather than report a deadline
++        # that has not been reached.  The pause keeps the unlikely case of a
++        # signalled event over an unsettled control block from spinning.
++        time.sleep(0.001)
++
++
++def cancel_request(handle, overlapped):
++    """Ask the system to abandon exactly one outstanding request.
++
++    Returns ``(accepted, error)``.  ``accepted`` is false with
++    ``ERROR_NOT_FOUND`` when the system no longer holds that request, which is
++    what it reports for a request that has already settled.
++    """
++    kernel32 = _kernel32_dll()
++    try:
++        cancel_io_ex = kernel32.CancelIoEx
++    except AttributeError:
+         raise WCancelError(
+-            "the outstanding I/O of object %r could not be abandoned (%s)"
+-            % (handle, describe(error)),
+-            kind=error_kind(error),
++            "this system cannot abandon a single overlapping request",
++            kind="unsupported",
+             handle=handle,
+         )
+-    return True
++    cancel_io_ex.argtypes = [wintypes.HANDLE, ctypes.POINTER(OVERLAPPED)]
++    cancel_io_ex.restype = wintypes.BOOL
++
++    ctypes.set_last_error(0)
++    ok = cancel_io_ex(wintypes.HANDLE(int(handle)), ctypes.byref(overlapped))
++    if ok:
++        return True, ERROR_SUCCESS
++    return False, last_error()
+diff --git a/wcancel/kinds.py b/wcancel/kinds.py
+index 1297a62..3348710 100644
+--- a/wcancel/kinds.py
++++ b/wcancel/kinds.py
+@@ -8,6 +8,7 @@ helpers here answer the questions the read layer asks about such an object.
+ from . import _winapi
+ from .errors import WCancelError
+ 
++
+ _FILE_KINDS = {
+     _winapi.FILE_TYPE_DISK: "file",
+     _winapi.FILE_TYPE_CHAR: "console",
+@@ -15,12 +16,17 @@ _FILE_KINDS = {
+ }
+ 
+ 
+-def handle_kind(handle):
+-    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``."""
++def _usable_handle(handle):
+     number = _winapi.as_number(handle)
+     if not _winapi.is_usable_handle(number):
+         raise WCancelError("not a usable object handle: %r" % (handle,),
+-                           kind="os", handle=handle)
++                           kind="badarg", handle=handle)
++    return number
++
++
++def handle_kind(handle):
++    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``."""
++    number = _usable_handle(handle)
+ 
+     raw = _winapi.file_type(number)
+     if raw == _winapi.FILE_TYPE_UNKNOWN:
+@@ -38,13 +44,13 @@ def handle_kind(handle):
+ def is_overlapped(handle):
+     """Return ``True`` when ``handle`` can carry overlapping operations.
+ 
++    The answer is read off the object itself -- its class and the mode it was
++    opened in -- and not assumed from where the handle came from: the read
++    layer is handed objects by its callers, and an object opened for
++    synchronous use serialises its requests inside the system instead of
++    keeping several of them outstanding.
++
+     ``handle`` must be an integer object handle.
+     """
+-    number = _winapi.as_number(handle)
+-    if not _winapi.is_usable_handle(number):
+-        raise WCancelError("not a usable object handle: %r" % (handle,),
+-                           kind="os", handle=handle)
+-    # The read layer has always taken its objects from the pipe factory, which
+-    # opens everything for overlapping use, so the answer is the same for every
+-    # object the module is asked about.
+-    return True
++    number = _usable_handle(handle)
++    return bool(_winapi.supports_overlapped(number))
+diff --git a/wcancel/proc.py b/wcancel/proc.py
+index 3d0fa2a..5074d50 100644
+--- a/wcancel/proc.py
++++ b/wcancel/proc.py
+@@ -3,20 +3,40 @@
+ A read is submitted against an object handle and stays outstanding until the
+ data arrives or the caller gives up on it.  A :class:`Request` is the handle the
+ caller keeps for one such read; a :class:`Completion` is what it finally
+-produced.  Requests made on one object may be abandoned either one at a time or
+-as a batch.
++produced.
++
++Each request carries its own control block and its own completion event, so
++every entry point here works on one request at a time:
++
++* :func:`cancel` names the control block of one request, which is what lets the
++  system abandon that request and leave its siblings outstanding, and what lets
++  the call come from a thread other than the one that submitted the read.
++* :func:`cancel_all` is the only batch form, and it walks the requests this
++  module submitted on one object, abandoning them one by one.
++* :func:`wait` reports an abandoned request as its own outcome, ``"cancelled"``,
++  rather than as a read failure.
+ """
+ 
+ import ctypes
++import threading
+ 
+ from . import _winapi
+ from .errors import WCancelError
++from .kinds import is_overlapped
+ 
+ DEFAULT_TIMEOUT_MS = 0xFFFFFFFF
+ 
+-# The requests this process has submitted on each object, keyed by handle number.
++# The requests this process has submitted on each object, keyed by handle
++# number.  A request stays listed until it settles: the system keeps a
++# reference to its control block and its buffer for as long as the read is
++# outstanding, so neither may be released before then.
+ _pending = {}
+ 
++# Guards ``_pending`` and the bookkeeping fields of every request in it.  Only
++# calls that cannot block are made while it is held, so a thread parked in
++# :func:`wait` never keeps another thread out of :func:`cancel`.
++_registry_lock = threading.RLock()
++
+ 
+ class Completion(object):
+     """The outcome of one read request.
+@@ -45,7 +65,23 @@ class Request(object):
+         self._event = event
+         self._submitted = False
+         self._result = None
++        self._failure = None
+         self._state = "pending"
++        self._cancel_sent = False
++        self._waiters = 0
++
++    @property
++    def data(self):
++        """The bytes this read has delivered, once it has settled.
++
++        ``None`` while the read is still outstanding: the system owns the
++        buffer until then.
++        """
++        with _registry_lock:
++            result = self._result
++            if result is None:
++                return None
++            return self._buffer.raw[:result.bytes_read]
+ 
+     def __repr__(self):
+         return "Request(handle=%d, offset=%d, size=%d)" % (self.handle, self.offset, self.size)
+@@ -65,14 +101,23 @@ def _as_timeout(timeout):
+                            kind="badarg")
+     if timeout < 0:
+         raise WCancelError("timeout must not be negative, got %r" % (timeout,), kind="badarg")
+-    return int(timeout * 1000)
++    milliseconds = int(timeout * 1000)
++    if milliseconds <= 0 and timeout > 0:
++        # Keep a short deadline from collapsing into "do not wait at all".
++        milliseconds = 1
++    return milliseconds
+ 
+ 
+-def _outstanding(handle):
+-    return list(_pending.get(int(handle), ()))
++def _usable_handle(handle):
++    number = _winapi.as_number(handle)
++    if not _winapi.is_usable_handle(number):
++        raise WCancelError("not a usable object handle: %r" % (handle,), kind="badarg",
++                           handle=handle)
++    return number
+ 
+ 
+ def _forget(request):
++    """Drop a settled request from the list of outstanding reads."""
+     entries = _pending.get(request.handle)
+     if not entries:
+         return
+@@ -84,28 +129,73 @@ def _forget(request):
+         _pending.pop(request.handle, None)
+ 
+ 
++def _release(request):
++    """Close a settled request's event once nobody is waiting on it."""
++    if request._waiters:
++        return
++    event = request._event
++    if event:
++        request._event = 0
++        _winapi.close(event)
++
++
++def _send_cancel(request):
++    """Abandon one outstanding request.
++
++    Returns ``True`` only when the system took the request away because of this
++    call.  A request it no longer holds -- one that has already settled -- is
++    reported as ``False``.
++    """
++    state, _bytes_read, _error = _winapi.poll_read(request.handle, request._overlapped)
++    if state != "pending":
++        # The read is already settled; there is nothing left to abandon.  The
++        # outcome itself is left for ``wait()`` to report.
++        return False
++
++    accepted, error = _winapi.cancel_request(request.handle, request._overlapped)
++    if accepted:
++        request._cancel_sent = True
++        return True
++    if error == _winapi.ERROR_NOT_FOUND:
++        # The request settled between the look and the call.
++        return False
++    raise WCancelError(
++        "the read on object %r could not be abandoned (%s)"
++        % (request.handle, _winapi.describe(error)),
++        kind=_winapi.error_kind(error),
++        handle=request.handle,
++    )
++
++
+ def submit(handle, size, offset=0):
+     """Start one overlapping read of ``size`` bytes at ``offset``.
+ 
+-    Returns the :class:`Request` that keeps track of it.
++    Returns the :class:`Request` that keeps track of it.  Raises
++    :class:`WCancelError` with ``kind="unsupported"`` when the object cannot
++    carry overlapping reads: a read layer that quietly fell back to a blocking
++    read would leave the caller holding a request it cannot abandon.
+     """
+-    number = _winapi.as_number(handle)
+-    if not _winapi.is_usable_handle(number):
+-        raise WCancelError("not a usable object handle: %r" % (handle,), kind="badarg",
+-                           handle=handle)
++    number = _usable_handle(handle)
+     if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+         raise WCancelError("size must be a positive number of bytes, got %r" % (size,),
+                            kind="badarg")
+     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+         raise WCancelError("offset must not be negative, got %r" % (offset,), kind="badarg")
+ 
++    if not is_overlapped(number):
++        raise WCancelError(
++            "object %r cannot carry overlapping reads" % (handle,),
++            kind="unsupported",
++            handle=handle,
++        )
++
+     event = _winapi.open_event()
+     buffer = ctypes.create_string_buffer(size)
+     overlapped = _winapi.OVERLAPPED()
+     overlapped.hEvent = event
+     request = Request(number, size, offset, buffer, overlapped, event)
+     try:
+-        ok, error = _winapi.start_read(number, buffer, size, offset, overlapped)
++        ok, error, transferred = _winapi.start_read(number, buffer, size, offset, overlapped)
+     except WCancelError:
+         _winapi.close(event)
+         raise
+@@ -113,13 +203,18 @@ def submit(handle, size, offset=0):
+     request._submitted = True
+     if ok:
+         # The read was served straight away and never became outstanding.
+-        _done, _error, transferred = _winapi.read_status(number, overlapped)
+-        request._state = "done"
+-        request._result = Completion(transferred, "completed")
++        state, bytes_read, _error = _winapi.poll_read(number, overlapped)
++        if state != "completed":
++            bytes_read = transferred
++        with _registry_lock:
++            request._state = "done"
++            request._result = Completion(bytes_read, "completed")
++            request._event = 0
+         _winapi.close(event)
+         return request
+     if error == _winapi.ERROR_IO_PENDING:
+-        _pending.setdefault(number, []).append(request)
++        with _registry_lock:
++            _pending.setdefault(number, []).append(request)
+         return request
+ 
+     _winapi.close(event)
+@@ -131,81 +226,113 @@ def submit(handle, size, offset=0):
+ 
+ 
+ def cancel(request):
+-    """Abandon one outstanding read.
++    """Abandon one outstanding read, and only that one.
+ 
+-    Returns ``True`` when the read has been given up.
++    Returns ``True`` when this call is what took the read away from the system,
++    and ``False`` when there was nothing to abandon: the read had already
++    settled, or it had already been given up.  The reads submitted alongside it
++    on the same object stay outstanding and go on to deliver their data.
+     """
+     request = _as_request(request)
+-    if request._state == "cancelled":
+-        return True
+-
+-    if request._state == "pending":
+-        done, _error, _transferred = _winapi.read_status(request.handle, request._overlapped)
+-        if done:
+-            request._state = "done"
+-
+-    if request._state == "pending":
+-        _winapi.cancel(request.handle)
+-        request._state = "cancelled"
+-
+-    _forget(request)
+-    return True
++    with _registry_lock:
++        if not request._submitted:
++            raise WCancelError("the request was never submitted: %r" % (request,),
++                               kind="badarg")
++        if request._state != "pending" or request._cancel_sent:
++            # Already settled, already reported, or already given up.
++            return False
++        return _send_cancel(request)
+ 
+ 
+ def cancel_all(handle):
+-    """Abandon every outstanding read on one object.
++    """Abandon every outstanding read this module submitted on one object.
+ 
+-    Returns how many requests were given up.
++    Returns how many reads this call took away from the system; reads that had
++    already settled or had already been given up are not counted.
+     """
+-    number = _winapi.as_number(handle)
+-    if not _winapi.is_usable_handle(number):
+-        raise WCancelError("not a usable object handle: %r" % (handle,), kind="badarg",
+-                           handle=handle)
+-
+-    outstanding = _outstanding(number)
+-    if not outstanding:
+-        return 0
+-
+-    # The batch entry point of the read layer walks the objects it knows about
+-    # and asks the system to abandon what is outstanding on each of them.
+-    _winapi.cancel(number)
+-    for request in outstanding:
+-        request._state = "cancelled"
+-    _pending.pop(number, None)
+-    return len(outstanding)
++    number = _usable_handle(handle)
++    with _registry_lock:
++        outstanding = list(_pending.get(number, ()))
++        given_up = 0
++        for request in outstanding:
++            if request._state != "pending" or request._cancel_sent:
++                continue
++            if _send_cancel(request):
++                given_up += 1
++        return given_up
+ 
+ 
+ def wait(request, timeout=None):
+     """Wait for one read to finish and return its :class:`Completion`.
+ 
+-    Raises :class:`WCancelError` with ``kind="timeout"`` when the read is still
+-    outstanding after ``timeout`` seconds, and ``kind="os"`` when the read ended
+-    in failure.
++    A read the system abandoned settles as ``status == "cancelled"`` with the
++    byte count it had managed to deliver; that is an outcome of its own and is
++    never reported as a failure.  Raises :class:`WCancelError` with
++    ``kind="timeout"`` when the read is still outstanding after ``timeout``
++    seconds, and ``kind="os"`` when the read ended in failure.
+     """
+     request = _as_request(request)
+-    if request._state == "done" and request._result is not None:
+-        return request._result
+-
+     timeout_ms = _as_timeout(timeout)
+-    outcome, bytes_read, error = _winapi.wait_for_read(
+-        request.handle, request._overlapped, request._event, timeout_ms)
+ 
+-    if outcome == "timeout":
+-        raise WCancelError(
+-            "the read on object %r is still outstanding after %r seconds"
+-            % (request.handle, timeout),
+-            kind="timeout",
+-            handle=request.handle,
+-        )
+-    if outcome == "error":
++    with _registry_lock:
++        if not request._submitted:
++            raise WCancelError("the request was never submitted: %r" % (request,),
++                               kind="badarg")
++        if request._result is not None:
++            return request._result
++        if request._failure is not None:
++            raise request._failure
++        event = request._event
++        overlapped = request._overlapped
++        if not event:
++            raise WCancelError(
++                "the request on object %r is no longer waitable" % (request.handle,),
++                kind="badarg",
++                handle=request.handle,
++            )
++        request._waiters += 1
++
++    try:
++        outcome, bytes_read, error = _winapi.wait_for_read(
++            request.handle, overlapped, event, timeout_ms)
++    except WCancelError as err:
++        with _registry_lock:
++            request._waiters -= 1
++            if request._state == "pending":
++                request._state = "done"
++                request._failure = err
++                _forget(request)
++            _release(request)
++        raise
++
++    with _registry_lock:
++        request._waiters -= 1
++        if request._result is not None:
++            return request._result
++        if request._failure is not None:
++            raise request._failure
++
++        if outcome == "timeout":
++            # The read is still outstanding, so it stays listed and waitable.
++            raise WCancelError(
++                "the read on object %r is still outstanding after %r seconds"
++                % (request.handle, timeout),
++                kind="timeout",
++                handle=request.handle,
++            )
++
++        request._state = "done"
+         _forget(request)
+-        raise WCancelError(
++        if outcome in ("completed", "cancelled"):
++            request._result = Completion(bytes_read, outcome)
++            _release(request)
++            return request._result
++
++        failure = WCancelError(
+             "the read on object %r failed (%s)" % (request.handle, _winapi.describe(error)),
+             kind=_winapi.error_kind(error),
+             handle=request.handle,
+         )
+-
+-    _forget(request)
+-    request._state = "done"
+-    request._result = Completion(bytes_read, "completed")
+-    return request._result
++        request._failure = failure
++        _release(request)
++        raise failure

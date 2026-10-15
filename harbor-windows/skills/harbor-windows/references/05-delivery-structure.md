@@ -93,7 +93,11 @@ delivery-<batch>-<version>/
 > 仅在收件方**明确要求**纯参与方包（Harbor 四件套）时才导出精简形态，
 > 且必须在 `delivery-extras/` 留一份完整题与哈希，供甲方比对。
 > 交付 ZIP 由 `scripts/package_task_zip.py` 生成：**含** `solution/`、`source.json`、
-> 隐藏测试副本与 `jobs/`，仅排除 `extras/`、缓存与凭据。
+> 隐藏测试副本与 `jobs/`；**排除** `extras/`、`environment/evidence/**`、`REFIT-*.md`、
+> `verifier/WINDOWS_VALUE.md`、`solution/oracle.patch`、缓存与凭据。
+> 打包前会对整个题包跑一次**自我否认表述扫描**（与 F6 同实现），命中即拒发（`exit 2`，
+> 打印 `文件:行号`）—— 219 的 F6 命中正是来自包内 `REFIT-2026-10-13.md` 与
+> `verifier/WINDOWS_VALUE.md`，这两类文件从此不进交付 ZIP。
 
 > 交付包内**不得**出现自我否认 Windows 价值的表述（「按通用编码能力归类」等）——
 > 该判据由 `references/12-windows-mechanism-gate.md` 的 F6 强制，且**不可豁免**。
@@ -145,7 +149,8 @@ delivery-<batch>-<version>/
 | 剔除轮 | 上游 provider/网关故障（`agent_status ∈ {error, no_tool_call}`）**保留但不计分**，标记 `excluded` 并写明原因——这是资格门禁的剔除依据，不得伪装成 0 分 |
 | 禁入内容 | `solution/`、答案、隐藏用例、凭据；打包前做一次凭据模式扫描 |
 | 仓库内位置 | 先落 `<task-id>/jobs/`（一题一目录、可单独打包）；组装交付批次包时移到 `outside_harbor-assets/` 下与 `<task-id>/` **平级** |
-| 工具 | `scripts/build_jobs.py` 由资格汇总（`model_runs_summary_*.json`）生成 `jobs/`；`scripts/build_required_testcases.py` 生成 `tests/required_testcases.json`；`scripts/package_task_zip.py` 打交付 ZIP（含 `solution/`、`source.json`、`jobs/`，仅排除 `extras/` 与缓存） |
+| 工具 | `scripts/build_jobs.py` 由资格汇总（`model_runs_summary_*.json`）生成 `jobs/`；`scripts/build_required_testcases.py` 生成 `tests/required_testcases.json`；`scripts/package_task_zip.py` 打交付 ZIP（含 `solution/`、`source.json`、`jobs/`；排除 `extras/`、`environment/evidence/**`、`REFIT-*.md`、`verifier/WINDOWS_VALUE.md`、`solution/oracle.patch` 与缓存；打包前跑自认句扫描，命中即拒发） |
+| **条数** | `jobs/` 恰好 **12 个** job：**Qwen×3 + Opus×3 + Oracle×3 + NOP×3**（甲方 `validate_model_jobs.py`）。GLM/Kimi 自 2026-10-13 起**可选**，不占这 12 个名额、也不参与主判据 |
 
 ### 2.6 甲方 QC（`windows-harbor-qc`）必备件 —— 交付前必查
 
@@ -238,8 +243,8 @@ delivery-<batch>-<version>/
 
 - [ ] `outside_harbor/` 与 `outside_harbor-assets/` 引用**同一身份三元组**
 - [ ] Task 目录内**无**自定义必需字段
-- [ ] `outside_harbor-assets/jobs/` 存在；每个 `<job-id>/` 同时含 `agent/` 与 `verifier/`，
-      作业 ID 与资格汇总一一对应、无重复
+- [ ] `outside_harbor-assets/jobs/` 存在；**恰好 12 个 job**（Qwen×3 + Opus×3 + Oracle×3 + NOP×3；GLM/Kimi 可选、不计入），
+      每个 `<job-id>/` 同时含 `agent/` 与 `verifier/`，作业 ID 与资格汇总一一对应、无重复
 - [ ] `jobs/` 内剔除轮已标 `excluded` 并写明原因；无 `solution/`、答案、隐藏用例、凭据
 - [ ] 交付 ZIP **含** `source.json`、`solution/`（`README.md` + `solve.ps1`/`solve.bat`）、
       `tests/required_testcases.json`（含 F2P 与 P2P）、`jobs/`；**不含** `extras/`、`*.pyc`

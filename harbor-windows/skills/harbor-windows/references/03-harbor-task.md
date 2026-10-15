@@ -70,11 +70,20 @@ tags = ["coding", "windows", "windows-bench"]
 
 ### 镜像身份要求
 
-- **`task.toml` 不得写 `docker_image`**：基础镜像只在 `environment/Dockerfile` 的
-  `FROM` 里声明，并 pin 到不可变 digest（禁止 `latest`）
+- **`task.toml` 顶层必须写 `docker_image`**：取值与 `environment/Dockerfile` 的 `FROM`
+  **逐字一致**，并 pin 到不可变 digest（**禁止 `latest`**）。
+  依据：随包甲方脚本把它当必备项 —— `run_qc.py:static_check` 缺则报
+  `task.toml has no docker_image`，`inspect_delivery.py` 缺则报
+  `Task has no pinned Docker image`，两者都会直接判 `FAIL`。
+
+  ```toml
+  docker_image = "mcr.microsoft.com/windows/servercore:ltsc2022@sha256:76cf422c98ca437b308374d0498280541fa42ac7061bb44015a6c8b70cf4db6a"
+  ```
+
 - **镜像标签不是不可变身份**，必须在 `delivery-extras` 中**另存实际 Digest**
-- Harbor JSON、`environment/Dockerfile` 的 `FROM`、`swelive_spec.json`
-  三处的镜像引用必须**统一**
+- `task.toml`、`environment/Dockerfile` 的 `FROM`、`swelive_spec.json`
+  三处的镜像引用必须**统一**（现行形态下 `swelive_spec.json` 已不在题包内，
+  该项退化为"若存在则必须一致"）
 
 ---
 

@@ -10,8 +10,10 @@
 2. 把 `task_hash` / `task_version` 回写到身份文件：`task.toml`、
    `tests/swelive_spec.json`、`platform_import.json`、`extras/metadata/manifest.json`，
    并把各制品 sha256 写进 manifest.artifacts。
-   **`task.toml` 只写 `task_hash` 与 `version`，不写 `docker_image`**：
-   基础镜像只由 `environment/Dockerfile` 的 `FROM` 声明。
+   **`task.toml` 的 `docker_image` 是甲方 QC 必备项，本脚本不回写它**：
+   镜像引用由出题人写在 `task.toml` 顶层，且必须与 `environment/Dockerfile` 的 `FROM`
+   逐字一致、pin 到不可变 digest（禁止 `latest`）。若发现两者不一致，本脚本会直接
+   报错退出，避免把不一致的身份交给甲方。
 3. 重新生成 `_index/checksums.sha256`（覆盖整个题包类型目录）。
 
 ## 用法
@@ -145,10 +147,25 @@ def sync_task(pkg: str, tid: str, write: bool, log) -> str:
     # ---------------- task.toml ----------------
     tt = open(tt_p, encoding="utf-8", errors="replace").read()
     orig_tt = tt
+
+    # 镜像身份核对（只读不写）：task.toml 顶层 docker_image 是甲方 QC 必备项，
+    # 必须与 environment/Dockerfile 的 FROM 逐字一致。
+    tt_img = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', tt)
+    df_p = os.path.join(task_dir, "environment", "Dockerfile")
+    df_from = None
+    if os.path.isfile(df_p):
+        dm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
+                       open(df_p, encoding="utf-8", errors="replace").read())
+        df_from = dm.group(1) if dm else None
+    if not tt_img:
+        raise SystemExit("%s: task.toml 缺顶层 docker_image（甲方 QC 必备项："
+                         "run_qc.py 报 'task.toml has no docker_image'、"
+                         "inspect_delivery.py 报 'Task has no pinned Docker image'）" % tid)
+    if df_from and tt_img.group(1) != df_from:
+        raise SystemExit("%s: task.toml 的 docker_image 与 environment/Dockerfile 的 FROM 不一致：\n"
+                         "  task.toml : %s\n  Dockerfile: %s" % (tid, tt_img.group(1), df_from))
     tt = re.sub(r'(?m)^version\s*=\s*"[^"]*"', 'version = "%s"' % version, tt, count=1)
     tt = re.sub(r'task_hash(\s*=\s*)[0-9a-f]{64}', r'task_hash\g<1>' + task_hash, tt)
-    # task.toml 的 docker_image 与 environment/Dockerfile 的 FROM 必须一致；
-    # 这里只回写 version / task_hash，镜像引用另回写到 platform_import.json / manifest.json。
     if tt != orig_tt:
         log("  task.toml 已更新（version / task_hash）")
         if write:

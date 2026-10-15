@@ -20,8 +20,24 @@ ZIP 名 = `<task-id>-v<题目版本>-delivery.zip`，ZIP 根 = **同名目录**�
 > （"不能因为普通 Agent 不应看到它就把组织方题包里的参考解删掉"），`source.json` 与
 > `tests/required_testcases.json` 同样是必备件。**不要**再把它们排除。
 
-**排除**（不得进入交付 ZIP）：`extras/`（题外伴随材料，其中历史判分沙箱副本还会污染甲方
-静态检查）、`__pycache__/`、`.pytest_cache/`、`*.pyc`、`.DS_Store`。
+**排除**（不得进入交付 ZIP）：
+
+| 类别 | 条目 | 为什么 |
+|---|---|---|
+| 题外伴随材料 | `extras/`、`environment/evidence/**` | 历史判分沙箱副本会污染甲方静态检查；证据属 `delivery-extras/`，不是题包内容 |
+| 整改过程文档 | `REFIT-*.md` | 返修记录，会被甲方引为"包内自述"，且 219 的 F6 命中正来自它 |
+| 自述类说明 | `verifier/WINDOWS_VALUE.md` | 价值主张说明属过程材料；F6 判据就扫它，不该随包外发 |
+| 参考解补丁 | `solution/oracle.patch` | 与 `solution/reference/**` + `solve.ps1` 重复；旧形态残留 |
+| 缓存/凭据 | `__pycache__/`、`.pytest_cache/`、`*.pyc`、`.DS_Store` | 平台校验与泄漏门禁均不接受 |
+
+**出包前自检（命中即拒绝出包，退出码 2）**：
+
+1. 必备件齐全（`source.json` / `solution/README.md` / `solution/solve.ps1|solve.bat` /
+   `tests/required_testcases.json`）；
+2. ZIP 内不得含禁入内容（上表）；
+3. **自我否认 Windows 价值表述扫描**：对**整个题包**（不只是将被打包的部分）跑
+   `self_denial_scan.scan_self_denial`，命中即拒发并打印 `文件:行号`。
+   这条与 `check_windows_mechanism.py` 的 F6 共享同一实现 —— 门禁与打包必须同口径。
 
 用法：
     python package_task_zip.py --task-dir harbor-windows/wfflab__wreparse-217 --out-dir out/
@@ -31,13 +47,24 @@ ZIP 名 = `<task-id>-v<题目版本>-delivery.zip`，ZIP 根 = **同名目录**�
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import os
+import sys
 import zipfile
 from pathlib import Path
 
+# 脚本按文件路径并列存放：就地导入共享的自我否认扫描实现（与 F6 同源）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from self_denial_scan import format_hits, scan_self_denial  # noqa: E402
+
 SKIP_DIRS = {"extras", "__pycache__", ".pytest_cache", ".git", ".mypy_cache"}
 SKIP_FILES = {".DS_Store"}
+
+# 目录级禁入（相对题包根，POSIX 形式）
+BANNED_REL_DIRS = ("environment/evidence",)
+# 文件级禁入（相对题包根，支持 `*` 通配）
+BANNED_REL_FILES = ("REFIT-*.md", "verifier/WINDOWS_VALUE.md", "solution/oracle.patch")
 
 
 def skip_dir(name: str) -> bool:
@@ -46,6 +73,36 @@ def skip_dir(name: str) -> bool:
 
 def skip_file(name: str) -> bool:
     return name in SKIP_FILES or name.endswith(".pyc")
+
+
+def _rel_posix(path: Path, task_dir: Path) -> str:
+    return path.relative_to(task_dir).as_posix()
+
+
+def banned_rel_path(rel: str) -> bool:
+    """rel 为相对题包根的 POSIX 路径；命中即不得进入交付 ZIP。"""
+    for banned_dir in BANNED_REL_DIRS:
+        if rel == banned_dir or rel.startswith(banned_dir + "/"):
+            return True
+    for pattern in BANNED_REL_FILES:
+        if fnmatch.fnmatch(rel, pattern):
+            return True
+        # 允许题包内再套一层（例如解压后多一层目录）时仍能命中同名文件
+        if pattern.startswith("*/") and fnmatch.fnmatch(rel, pattern):
+            return True
+    return False
+
+
+def banned_rel_dir(rel: str) -> bool:
+    for banned_dir in BANNED_REL_DIRS:
+        if rel == banned_dir or rel.startswith(banned_dir + "/"):
+            return True
+    return False
+
+
+def scan_denial(task_dir: Path) -> list[dict]:
+    """出包前的自我否认表述扫描（复用 F6 的共享实现）。"""
+    return scan_self_denial(task_dir)
 
 
 def sha256_of(path: Path) -> str:
@@ -77,6 +134,10 @@ def collect(task_dir: Path, include_jobs: bool, root_name: str) -> list[tuple[Pa
     """返回 (绝对路径, zip 内相对路径) 列表；空目录以 (目录, 'dir/') 形式登记。
 
     root_name = ZIP 名去 `.zip`（由 task_id + 版本派生），**不要**用 task_dir.name。
+
+    禁入名单（`BANNED_REL_DIRS` / `BANNED_REL_FILES`）在这里生效：
+    `REFIT-*.md`、`verifier/WINDOWS_VALUE.md`、`solution/oracle.patch`、
+    `environment/evidence/**` 一律不进交付 ZIP。
     """
     entries: list[tuple[Path, str]] = []
 
@@ -88,7 +149,19 @@ def collect(task_dir: Path, include_jobs: bool, root_name: str) -> list[tuple[Pa
             dirnames[:] = []
             continue
 
-        dirnames[:] = sorted(d for d in dirnames if not skip_dir(d))
+        rel_dir_posix = rel_dir.as_posix()
+        if rel_dir_posix != "." and banned_rel_dir(rel_dir_posix):
+            dirnames[:] = []
+            continue
+
+        kept_dirs = []
+        for d in dirnames:
+            child_rel = d if rel_dir_posix == "." else f"{rel_dir_posix}/{d}"
+            if skip_dir(d) or banned_rel_dir(child_rel):
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = sorted(kept_dirs)
+
         files = sorted(f for f in filenames if not skip_file(f))
 
         if not dirnames and not files:
@@ -97,7 +170,10 @@ def collect(task_dir: Path, include_jobs: bool, root_name: str) -> list[tuple[Pa
             continue
 
         for f in files:
-            arc = f"{root_name}/{(rel_dir / f).as_posix()}"
+            rel = f if rel_dir_posix == "." else f"{rel_dir_posix}/{f}"
+            if banned_rel_path(rel):
+                continue
+            arc = f"{root_name}/{rel}"
             entries.append((current / f, arc))
 
     return entries
@@ -155,6 +231,18 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_zip = out_dir / f"{bundle}.zip"
 
+    # 包内自认句扫描：放在写 ZIP **之前**，命中即拒发（避免留下一个不该存在的产物）
+    denial_hits = scan_denial(task_dir)
+    if denial_hits:
+        print("!! 题包内出现自我否认 Windows 价值的表述，拒绝打包（F6 同口径）：")
+        for hit in denial_hits:
+            print(f"   - {hit['file']}:{hit['line']}  {hit['why']}")
+            print(f"       {hit['text']}")
+        print(f"   合计 {len(denial_hits)} 处：{format_hits(denial_hits)}")
+        print("   处置：要么给题注入真实 Windows 机制后发新版，要么按甲方口径移出 Windows 池；"
+              "删掉那句话不算整改（判据在题面与测试里，甲方下一轮照样判不合格）。")
+        return 2
+
     entries = collect(task_dir, include_jobs=not args.no_jobs, root_name=bundle)
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for path, arc in entries:
@@ -196,6 +284,15 @@ def main() -> int:
     if leaked:
         print("!! 交付 ZIP 含禁入内容：")
         for n in leaked:
+            print(f"   - {n}")
+        return 2
+
+    # 二次防线：即使禁入名单有漏，压缩出来的条目也必须全部合规
+    banned_entries = [n for n in names
+                      if banned_rel_path(n[len(root_name) + 1:]) and not n.endswith("/")]
+    if banned_entries:
+        print("!! 交付 ZIP 含禁入名单内的条目，拒绝打包：")
+        for n in banned_entries:
             print(f"   - {n}")
         return 2
 

@@ -42,7 +42,7 @@ description: >
    **任何**一轮（环境验证、Golden/no-change 对照、模型验证）之前，必须先对待交付形态的题包
    执行甲方 `windows-harbor-qc` 自检并达到退出码 `0`（PASS）。**自检未过就开跑 = 整批白跑**：
    待检缺陷全是静态可查的（TOML 能否解析、引用文件是否存在、文件命名、Task dirhash），
-   而一轮完整验证要花 8 轮模型调用 + 6 轮对照。
+   而一轮完整验证要花 12 轮（Qwen×3 + Opus×3 + Oracle×3 + NOP×3；GLM/Kimi 自 2026-10-13 起可选）。
    自检 PASS 后题包内容即**冻结**，任何后续改动（哪怕只改一个注释）都会改变 Harbor dirhash，
    使已跑出的 `task_checksum` 全部失效、必须全部重跑。
    → 详见「4.5 跑分前置门（硬性）」与 `references/06-acceptance-gates.md`
@@ -197,7 +197,16 @@ SKILL=<skill目录>
 python "$SKILL/scripts/check_windows_mechanism.py" --task-dir <题包目录>          # 必须 exit 0
 # ② 题包结构与身份校验（已内置 ①）
 python "$SKILL/scripts/validate_package.py" --package <题包根目录> --schema-version 1.3
+# ③ 只查 F6 自认句（含被"引用来源/否定前缀"判据抑制条目的核对视图）
+python "$SKILL/scripts/self_denial_scan.py" <题包目录> --include-suppressed
 ```
+
+> **口径冲突时以随包甲方脚本为准**：`validate_package.py` 是本地零成本预检，
+> 判据按 `_reference/windows-harbor-qc/scripts/` 对齐
+> （`inspect_delivery.py` / `run_qc.py:static_check` / `validate_model_jobs.py`）。
+> 凡甲方不检查、只属于**历史形态**的项（旧 `outside_harbor-assets/` 嵌套式、`extras/`、
+> `platform_import.json`、`swelive_spec.json`、顶层 `_index/`、GLM/Kimi 必需、
+> `[agent]`/`[verifier]` 段落）**一律不再判 FAIL** —— 现行 5 个生效包都不带它们。
 
 > **为什么机制门禁排在最前**：题面与判据若落在平台无关的字节层，甲方会以
 > 「Windows 专属价值低」直接退回（216/215/218 的实际结局），与测试做得多细无关。
@@ -239,17 +248,29 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 | jobs 结构 | 每个 job 含 `config.json` + `lock.json` + `result.json` + `trial.log` + `artifacts/manifest.json` + `verifier/{result.json,reward.txt,test-stdout.txt,verifier.log}`；模型轮另有 `agent/model-result.json` + `agent/trajectory.jsonl`；Oracle 轮另有 `agent/oracle.txt` + `agent/qc-oracle-application.json` |
 | 判分证据 | `verifier/result.json` 的有效性、二值分数与 testcase 集合必须被自检脚本认可；`tests/required_testcases.json` 存在，且与各 job 的 testcase 集合**逐字一致**（以 `report.md` 报错为准，不要凭记忆自拟协议） |
 | 身份 | 全部 job 的 `task_checksum` 与交付包的 **Harbor dirhash 完全一致** |
+| jobs 数量 | `jobs/` 恰好 **12 个** job 目录（须含 `result.json`）：**Qwen×3 + Opus×3 + Oracle×3 + NOP×3**（甲方 `validate_model_jobs.py` 的 `REQUIRED_COUNTS={"qwen":3,"opus":3}` + 3 Oracle + 3 NOP）。GLM/Kimi 自 2026-10-13 起**可选**，既不参与主判据、也不计入这 12 个 |
 
-> ⚠️ **已知差异（2026-10-13 起）：`task.toml` 不得写 `docker_image`**。
-> 基础镜像只由 `environment/Dockerfile` 的 `FROM` 声明并 pin 到不可变 digest。
-> 甲方 QC 的 `run_qc.py` 仍把该字段当作必需项，缺失会写 `task.toml has no docker_image`
-> 并把「静态结构」判为 FAIL、退出码 `1` —— **这正是预期行为**，不要为过检查把字段写回去；
-> 正确做法是在交付说明里记录该差异（详见 `references/06-acceptance-gates.md` 零节）。
-> 两个配套坑：`run_qc.py` 的 `--attempts` 最小为 `3`（传 `1`/`2` 会在 argparse
-> 阶段直接退出，日志里只剩一句 usage，极易误判成容器起不来）；**Harbor 侧不受影响** ——
-> `harbor/environments/definition.py` 的 `should_use_prebuilt_docker_image()` 在
-> `docker_image` 为空时返回 `False`，于是自动回落到 `environment/Dockerfile` 构建，
-> `--force-build` 只是排除缓存的额外保险。
+> ✅ **镜像口径（2026-10-14 核定，取代旧写法）：`task.toml` 顶层必须写 `docker_image`**。
+> 该字段与 `environment/Dockerfile` 的 `FROM` **逐字一致**，并 pin 到不可变 digest
+> （**禁止 `latest`**）。`harbor-windows/` 下 4 个已跑分的生效包全部这么写，值统一为
+> `mcr.microsoft.com/windows/servercore:ltsc2022@sha256:76cf422c98ca437b308374d0498280541fa42ac7061bb44015a6c8b70cf4db6a`。
+> 依据是随包甲方脚本把它当**必需项**：`run_qc.py:static_check` 缺则报
+> `task.toml has no docker_image`，`inspect_delivery.py:inspect_delivery` 缺则报
+> `Task has no pinned Docker image` —— 两者都会把交付判 `FAIL`。
+> **旧文档里「task.toml 不得写 docker_image、该静态 FAIL 属预期」的说法已作废**
+> （那是把甲方必备项误当成已知差异）。
+> 两个配套坑仍然有效：`run_qc.py` 的 `--attempts` 最小为 `3`（传 `1`/`2` 会在 argparse
+> 阶段直接退出，日志里只剩一句 usage，极易误判成容器起不来）；镜像 digest 变更属于
+> 影响 `environment/Dockerfile` 的修改，**必须升级题目版本并整批重跑**。
+
+> ⚠️ **`.ps1` / `.bat` 里不得写「必须存在的目录」的字面量路径**（2026-10-14 定位）。
+> 甲方 `run_qc.py:collect_referenced_paths` 会扫描 `.ps1/.psm1/.bat/.cmd` 里的路径形态
+> 字符串，并在 `task/`、`task/tests/`、`task/environment/`、`task/solution/`、
+> `task/environment/workspace/` 下查文件；查不到即报 `referenced files are missing`
+> 并把静态门判 `FAIL`。实测根因：某包 `verifier/negative_access_probe.ps1:121` 写了
+> 指向**已删除目录**的字面量 `'tests\verifier'`。
+> **正确做法**：目录存在性断言改成**动态发现**（例如枚举 `tests/` 的子目录后断言其中
+> **不含** `test_*_semantics.py`），不要把目录名字面量写进脚本。
 
 > ⚠️ **`adapter.toml` 的经典坑**：甲方 `inspect_delivery.py` 读的是**扁平 key**
 > （`prepare` / `validate` / `run` / `restore` / `cleanup` / `workspace`）。
@@ -275,6 +296,9 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的全部文件，因此：
 > `verifier/verifier.log` / `artifacts/manifest.json`，且 `task_checksum` 与交付包不一致。
 > 这些**全部**在跑第一轮之前就能查出来。215 v2.1.0 与 216 v1.2.0 也已带着同一个
 > `adapter.toml` 缺陷交付甲方。**先自检，再花钱。**
+>
+> **现行轮数是 12 轮**（2026-10-13 起）：Qwen×3 + Opus×3 + Oracle×3 + NOP×3；
+> 上面 218 的「14 轮」是**历史事实的记录**（当时含 GLM/Kimi 各 1），不是现行要求。
 
 ### 5. Windows 环境验证
 
@@ -508,11 +532,12 @@ testcase 与题面冲突 / 靠字符串正则 Diff 判定 / 用权重部分分�
 | `references/09-gz-package-analysis.md` | 对 `Windows_SWE_d70d30df` 27 题现包的实测分析 |
 | `scripts/validate_package.py` | 题包结构与身份一致性校验（**已内置 Windows 机制门禁，输出 `[Windows机制]` 类别**） |
 | `scripts/check_windows_mechanism.py` | **★ Windows 专属机制门禁（F1–F6）可复算校验器**：读 `metadata/windows_mechanism.json`，校验机制↔题面↔F2P 用例三方锚点、环境层"非 Windows 必失败"证据，并扫描包内自我否认表述。退出码 `0` 才算过 |
+| `scripts/self_denial_scan.py` | **F6 自认句扫描的共享实现**：`check_windows_mechanism.py` 与 `package_task_zip.py` 共用同一份判据表；容忍关键词夹字（`通用编码…能力`，≤8 字符），并对"引用来源 / 否定前缀"两类上下文做防误报抑制（`--include-suppressed` 可核对被抑制条目） |
 | `scripts/build_delivery_extras.py` | 批量生成 delivery-extras 骨架 |
 | `scripts/build_jobs.py` | **由资格汇总生成 `jobs/<job-id>/{agent,verifier}`**（故障轮保留并标 `excluded`；含凭据扫描） |
 | `scripts/build_required_testcases.py` | **生成甲方 QC 必备的 `tests/required_testcases.json`**（F2P/P2P 依据取自 candidate/golden 对照或 `swelive_spec.json`） |
 | `scripts/align_report_protocol.py` | **对齐甲方 QC 报告协议 aggregate-v1**：rubric `test_ids` 加 `f2p-`/`p2p-` 前缀、重建清单、同步 `judge.toml` 的 `source_sha256` |
-| `scripts/package_task_zip.py` | **打交付 ZIP**：含 `solution/`、`source.json`、`tests/`、`jobs/`；仅排除 `extras/` 与缓存；ZIP 名 = `<task_id>-v<版本>-delivery`，缺必备件即拒发 |
+| `scripts/package_task_zip.py` | **打交付 ZIP**：含 `solution/`、`source.json`、`tests/`、`jobs/`；排除 `extras/`、`environment/evidence/**`、`REFIT-*.md`、`verifier/WINDOWS_VALUE.md`、`solution/oracle.patch` 与缓存；**打包前自发认句扫描（命中即拒发）**；ZIP 名 = `<task_id>-v<版本>-delivery`，缺必备件即拒发 |
 | `scripts/hash_package.py` | 身份三元组 `task_hash` 的计算与四处回写（公式只含 instruction / test_patch / oracle_patch / Dockerfile） |
 | `scripts/run_model_validation.py` | **4 模型自动化验证 + 区分度准入计算** |
 | 仓库根 `models.local.json` | 模型端点与凭据的**唯一来源**（脚本自动上溯定位；含明文凭据，按甲方要求纳入版本控制） |

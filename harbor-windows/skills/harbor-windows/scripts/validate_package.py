@@ -1,14 +1,41 @@
 #!/usr/bin/env python3
-"""
-validate_package.py — Windows 专项 Coding Bench 题包校验器
+# -*- coding: utf-8 -*-
+"""validate_package.py — Windows 专项 Coding Bench 题包校验器（现行形态对齐版）
 
-按《Windows 专项 Coding Bench 数据采购》(windwos-第二版) 的验收门禁，
-对题包做结构与身份一致性校验，输出 PASS/FAIL/FLAG 报告。
+## 口径优先级（重要）
+
+**冲突时一律以随包甲方脚本 `_reference/windows-harbor-qc/scripts/` 的行为为准**：
+
+| 甲方脚本 | 本校验器对应的检查 |
+|---|---|
+| `inspect_delivery.py: inspect_delivery` | 顶层件、`task.toml` 身份/镜像、`required_testcases.json` 条数、`adapter.toml` |
+| `run_qc.py: static_check` | `environment/` 七件、`tests/` 六件、`docker_image`、`judge.toml` ↔ `rubric.json` 哈希 |
+| `validate_model_gate.py` / `validate_model_jobs.py` | `jobs/` 12 个 job（`REQUIRED_COUNTS={"qwen":3,"opus":3}` + Oracle×3 + NOP×3） |
+
+本脚本只是**本地零成本预检**（甲方自检是阶段 4.5 的硬门，不能替代）。
+凡甲方工具不检查、只属于**历史形态**的项（旧 `outside_harbor-assets/` 嵌套式、
+`extras/`、`platform_import.json`、`swelive_spec.json`、`_index/`、GLM/Kimi 必需、
+`[agent]`/`[verifier]` 段落），一律**不再判 FAIL**：现行 5 个生效包都不带它们。
+
+## 现行形态（唯一事实来源 = `harbor-windows/` 下的生效题包）
+
+```
+<task-id>-v<版本>-delivery/
+├── task.toml            # 必须含顶层 docker_image，且与 environment/Dockerfile 的 FROM 逐字一致
+├── instruction.md
+├── source.json
+├── environment/         # 七件：adapter.toml Dockerfile prepare.ps1 validate_environment.ps1 run.ps1 restore.ps1 cleanup.ps1
+├── tests/               # 六件：test.ps1 run_tests.ps1 aggregate_results.ps1 judge.toml rubric.json required_testcases.json
+├── solution/            # README.md + solve.ps1|solve.bat（+ reference/**）
+├── verifier/            # 判分侧资产（负访问探针、rubric.conditions.json 等）
+├── jobs/                # 12 个 job：qwen×3 + opus×3 + Oracle×3 + NOP×3
+└── metadata/            # windows_mechanism.json（F1–F6 门禁产物）
+```
 
 用法：
     python validate_package.py --package <题包根目录>
     python validate_package.py --package <题包根目录> --json report.json
-    python validate_package.py --harbor-assets <harbor-assets目录> --extras <delivery-extras目录>
+    python validate_package.py --task-dir <单个题包目录>
 
 退出码：
     0  全部通过（可能含 FLAG 警告）
@@ -23,7 +50,43 @@ import os
 import re
 import sys
 
-# ---------------------------------------------------------------- 工具
+# ---------------------------------------------------------------- 常量
+
+# 标准 Harbor 五件套（规范 5.1）—— 与 inspect_delivery.TASK_ROOT_ITEMS 一致
+REQUIRED_TASK_FILES = ["task.toml", "instruction.md"]
+REQUIRED_TASK_DIRS = ["environment", "solution", "tests"]
+
+# 甲方 run_qc.static_check 的 environment/ 七件
+REQUIRED_ENV_FILES = ["adapter.toml", "Dockerfile", "prepare.ps1", "validate_environment.ps1",
+                      "run.ps1", "restore.ps1", "cleanup.ps1"]
+
+# 甲方 run_qc.static_check 的 tests/ 六件
+REQUIRED_TESTS_FILES = ["test.ps1", "run_tests.ps1", "aggregate_results.ps1",
+                        "judge.toml", "rubric.json", "required_testcases.json"]
+
+# 甲方 validate_model_jobs：qwen/opus 各 3，外加 Oracle×3 + NOP×3
+REQUIRED_MODEL_COUNTS = {"qwen": 3, "opus": 3}
+REQUIRED_ORACLE_JOBS = 3
+REQUIRED_NOP_JOBS = 3
+
+# required_testcases.json 条数区间（甲方：<5 判 FAIL；>27 只告警）
+MIN_TESTCASES = 5
+MAX_TESTCASES = 27
+
+# 严禁出现在 Agent 可见环境中的内容
+FORBIDDEN_IN_ENV = ["solution", "oracle", "golden", "answer", "reward"]
+
+# 已知的题面泄漏信号
+LEAK_PATTERNS = [
+    (re.compile(r"golden[_\s-]?patch", re.I), "提到 Golden Patch"),
+    (re.compile(r"oracle[_\s-]?patch", re.I), "提到 Oracle Patch"),
+    (re.compile(r"hidden[_\s-]?test", re.I), "提到隐藏测试"),
+    (re.compile(r"FAIL_TO_PASS|PASS_TO_PASS", re.I), "提到 F2P/P2P 标识"),
+    (re.compile(r"reward(\.json|\.txt)?\b", re.I), "提到 Reward 产物"),
+]
+
+INVALID_MARKER = re.compile(r"===SWELIVE_INVALID\s+([^=]+)===")
+
 
 def sha256(path):
     h = hashlib.sha256()
@@ -69,30 +132,10 @@ class Report:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- 校验项
-
-# 标准 Harbor 五件套（规范 5.1）
-REQUIRED_TASK_FILES = ["task.toml", "instruction.md"]
-REQUIRED_TASK_DIRS = ["environment", "solution", "tests"]
-
-# 严禁出现在 Agent 可见环境中的内容
-FORBIDDEN_IN_ENV = ["solution", "oracle", "golden", "answer", "reward"]
-FORBIDDEN_IN_TESTS_VISIBLE = ["oracle.patch", "golden_output"]
-
-# 已知的题面泄漏信号
-LEAK_PATTERNS = [
-    (re.compile(r"golden[_\s-]?patch", re.I), "提到 Golden Patch"),
-    (re.compile(r"oracle[_\s-]?patch", re.I), "提到 Oracle Patch"),
-    (re.compile(r"hidden[_\s-]?test", re.I), "提到隐藏测试"),
-    (re.compile(r"FAIL_TO_PASS|PASS_TO_PASS", re.I), "提到 F2P/P2P 标识"),
-    (re.compile(r"reward(\.json|\.txt)?\b", re.I), "提到 Reward 产物"),
-]
-
-INVALID_MARKER = re.compile(r"===SWELIVE_INVALID\s+([^=]+)===")
-
+# ---------------------------------------------------------------- 现行形态检查
 
 def check_structure(task_dir, r):
-    """检查标准 Harbor 五件套结构。"""
+    """五件套 + solution 入口（inspect_delivery.TASK_ROOT_ITEMS / run_qc.static_check）。"""
     missing = []
     for f in REQUIRED_TASK_FILES:
         if not os.path.isfile(os.path.join(task_dir, f)):
@@ -102,13 +145,179 @@ def check_structure(task_dir, r):
             missing.append(d + "/")
     if missing:
         r.fail("结构", f"缺失标准 Harbor 必需项: {', '.join(missing)}",
-               "规范 5.1 要求五件套: task.toml / instruction.md / environment/ / solution/ / tests/")
+               "五件套 = task.toml / instruction.md / environment/ / solution/ / tests/")
     else:
         r.ok("结构", "标准 Harbor 五件套齐全")
 
+    sol = os.path.join(task_dir, "solution")
+    if os.path.isdir(sol):
+        entries = [f for f in ("solve.ps1", "solve.bat") if os.path.isfile(os.path.join(sol, f))]
+        if entries:
+            r.ok("结构", f"solution/ 具备标准入口: {', '.join(entries)}")
+        else:
+            r.fail("结构", "solution/ 缺 solve.ps1 / solve.bat 入口",
+                   "甲方 run_qc.static_check: solution must provide solve.ps1 or solve.bat")
+
+
+def check_env_required(task_dir, r):
+    """environment/ 七件（甲方 run_qc.static_check）。"""
+    env = os.path.join(task_dir, "environment")
+    if not os.path.isdir(env):
+        return
+    missing = [f for f in REQUIRED_ENV_FILES if not os.path.isfile(os.path.join(env, f))]
+    if missing:
+        r.fail("environment", f"缺 environment/ 必备件: {', '.join(missing)}",
+               f"甲方要求七件: {' '.join(REQUIRED_ENV_FILES)}")
+    else:
+        r.ok("environment", "environment/ 七件齐全")
+
+    adapter = os.path.join(env, "adapter.toml")
+    if os.path.isfile(adapter):
+        try:
+            import tomllib
+            with open(adapter, "rb") as fh:
+                data = tomllib.load(fh)
+            keys = ("prepare", "validate", "run", "restore", "cleanup", "workspace")
+            missing_keys = [k for k in keys if not data.get(k)]
+            if missing_keys:
+                r.fail("environment", f"adapter.toml 缺扁平 key: {', '.join(missing_keys)}",
+                       "甲方 inspect_delivery 读的是扁平 key（不是 [prepare] 之类的表）")
+            else:
+                unresolved = [k for k in keys
+                              if not os.path.exists(os.path.join(env, str(data[k])))]
+                if unresolved:
+                    r.fail("environment", f"adapter.toml 指向的文件缺失: {', '.join(unresolved)}")
+                else:
+                    r.ok("environment", "adapter.toml 可被 TOML 解析，六个扁平 key 均已解析到真实文件")
+        except Exception as exc:  # noqa: BLE001
+            r.fail("environment", f"environment/adapter.toml 无法解析: {type(exc).__name__}: {exc}",
+                   "典型坑：同时写扁平 key 与同名 [table]，TOML 会直接报 Cannot overwrite a value")
+
+
+def check_tests_required(task_dir, r):
+    """tests/ 六件 + INVALID 区分 + 二值判分（甲方 run_qc.static_check）。"""
+    tests = os.path.join(task_dir, "tests")
+    if not os.path.isdir(tests):
+        return
+    files = sorted(os.listdir(tests))
+    r.ok("tests", f"tests/ 文件: {', '.join(files)}")
+
+    missing = [f for f in REQUIRED_TESTS_FILES if f not in files]
+    if missing:
+        r.fail("tests", f"缺 tests/ 必备件: {', '.join(missing)}",
+               f"甲方要求六件: {' '.join(REQUIRED_TESTS_FILES)}")
+    else:
+        r.ok("tests", "tests/ 六件齐全（含甲方必备的 judge.toml / rubric.json / required_testcases.json）")
+
+    entry = None
+    for cand in ("test.ps1", "test.sh", "test.py"):
+        if cand in files:
+            entry = os.path.join(tests, cand)
+            break
+    if not entry:
+        r.fail("tests", "未找到验证入口（test.ps1 / test.sh / test.py）")
+        return
+    txt = open(entry, encoding="utf-8", errors="replace").read()
+
+    if INVALID_MARKER.search(txt) or "INVALID" in txt.upper():
+        r.ok("INVALID 区分", "验证入口具备 INVALID 标记能力")
+    else:
+        r.fail("INVALID 区分", "验证入口未区分 INVALID（基础设施故障不得伪装成模型 0 分）",
+               "存在 required 未执行/缺失/SKIP 或基础设施异常须标为 INVALID")
+
+    has_binary = bool(re.search(r"(reward|score)\s*=\s*(1|1\.0|0|0\.0)\b", txt)) or \
+                 "reward.txt" in txt or "reward.json" in txt
+    if has_binary:
+        r.ok("二值判分", "存在二值评分产物写出")
+    else:
+        r.flag("二值判分", "未在验证入口检测到 reward 产物写出；确认评分由聚合器完成")
+
+    # 现行形态：judge.toml 的 source_sha256 必须等于 rubric.json 的**实字节** sha256
+    judge_p = os.path.join(tests, "judge.toml")
+    rubric_p = os.path.join(tests, "rubric.json")
+    if os.path.isfile(judge_p) and os.path.isfile(rubric_p):
+        try:
+            import tomllib
+            with open(judge_p, "rb") as fh:
+                judge = tomllib.load(fh)
+            declared = judge.get("source_sha256") or judge.get("rubric_sha256")
+            actual = sha256(rubric_p)
+            if not declared:
+                r.fail("判分配置", "judge.toml 缺 source_sha256",
+                       "甲方静态门：judge.toml rubric hash does not match rubric.json")
+            elif str(declared).lower() != actual:
+                r.fail("判分配置", "judge.toml 的 source_sha256 与 rubric.json 实字节 sha256 不一致",
+                       f"judge.toml : {declared}\nrubric.json: {actual}")
+            else:
+                r.ok("判分配置", f"judge.toml.source_sha256 与 rubric.json 实字节 sha256 一致 ({actual[:12]}…)")
+        except Exception as exc:  # noqa: BLE001
+            r.fail("判分配置", f"judge.toml 解析失败: {type(exc).__name__}: {exc}")
+
+    # rubric.json 必须可解析为对象，且 test_ids 覆盖 required_testcases.json
+    req_p = os.path.join(tests, "required_testcases.json")
+    if os.path.isfile(rubric_p) and os.path.isfile(req_p):
+        try:
+            rubric = json.load(open(rubric_p, encoding="utf-8"))
+            rows = json.load(open(req_p, encoding="utf-8"))
+            declared_ids = set()
+            for item in rubric.get("items") or []:
+                declared_ids.update(item.get("test_ids") or [])
+            actual_ids = {str(row.get("id")) for row in rows if isinstance(row, dict)}
+            undeclared = sorted(actual_ids - declared_ids)
+            if undeclared:
+                r.fail("判分配置", f"required_testcases.json 有 {len(undeclared)} 条未在 rubric.json 声明",
+                       ", ".join(undeclared[:8]))
+            else:
+                r.ok("判分配置", f"rubric.json 覆盖全部 {len(actual_ids)} 条 required testcase")
+        except Exception as exc:  # noqa: BLE001
+            r.fail("判分配置", f"rubric.json / required_testcases.json 读取失败: {exc}")
+
+
+def check_required_testcases(task_dir, r):
+    """required_testcases.json：顶层数组、5–27 条、id 唯一、同时含 F2P 与 P2P。"""
+    p = os.path.join(task_dir, "tests", "required_testcases.json")
+    if not os.path.isfile(p):
+        return
+    try:
+        data = json.load(open(p, encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        r.fail("required_testcases", f"解析失败: {exc}")
+        return
+    if not isinstance(data, list):
+        r.fail("required_testcases", "顶层必须是数组（甲方：must be a list）")
+        return
+    n = len(data)
+    if n < MIN_TESTCASES:
+        r.fail("required_testcases", f"只有 {n} 条，少于甲方要求的 {MIN_TESTCASES} 条")
+    elif n > MAX_TESTCASES:
+        r.flag("required_testcases", f"有 {n} 条，超过 {MAX_TESTCASES} 条需人工复核范围",
+               "甲方口径：>27 只告警，本身不阻塞 QC")
+    else:
+        r.ok("required_testcases", f"{n} 条（{MIN_TESTCASES}–{MAX_TESTCASES} 区间内）")
+
+    ids, groups = [], {}
+    bad = []
+    for row in data:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or \
+                row.get("group") not in ("F2P", "P2P"):
+            bad.append(str(row)[:60])
+            continue
+        ids.append(row["id"])
+        groups[row["id"]] = row["group"]
+    if bad:
+        r.fail("required_testcases", f"{len(bad)} 条缺少 id 或 group 不是 F2P/P2P", "\n".join(bad[:5]))
+    if len(ids) != len(set(ids)):
+        r.fail("required_testcases", "required testcase id 有重复")
+    if groups and (not any(g == "F2P" for g in groups.values())
+                   or not any(g == "P2P" for g in groups.values())):
+        r.fail("required_testcases", "必须同时含 F2P 与 P2P")
+    elif groups:
+        f2p = sum(1 for g in groups.values() if g == "F2P")
+        r.ok("required_testcases", f"F2P={f2p} P2P={len(groups) - f2p}")
+
 
 def check_task_toml(task_dir, r, expect_schema=None):
-    """检查 task.toml 关键字段。"""
+    """task.toml 关键字段（含现行硬性 docker_image 口径）。"""
     p = os.path.join(task_dir, "task.toml")
     if not os.path.isfile(p):
         return None
@@ -122,15 +331,12 @@ def check_task_toml(task_dir, r, expect_schema=None):
         ver = m.group(1)
         r.ok("task.toml", f"version = {ver}")
 
-    # 目标 Schema 版本与「题目 version」是两个不同口径：
-    # 前者来自 task.toml 顶部注释的显式声明，后者是题目内容版本号。
-    # 优先读显式声明；缺失时才退回 version 比较，并说明口径差异。
+    # 目标 Schema 与题目 version 是两个口径：前者来自顶部注释的显式声明。
     ms = re.search(r'目标\s*Schema\s*[:：]\s*([0-9.]+)', txt)
     if ms:
         schema = ms.group(1)
         if expect_schema and schema != expect_schema:
-            r.flag("task.toml", f"声明目标 Schema '{schema}' 与期望 '{expect_schema}' 不一致",
-                   "确认平台冻结的 Harbor Schema 版本；任何影响题面/环境/Solution/Tests 的修改须升级版本")
+            r.flag("task.toml", f"声明目标 Schema '{schema}' 与期望 '{expect_schema}' 不一致")
         else:
             r.ok("task.toml", f"目标 Schema = {schema}（与期望一致）")
     elif expect_schema and ver:
@@ -139,45 +345,160 @@ def check_task_toml(task_dir, r, expect_schema=None):
                f"与 --schema-version '{expect_schema}' 不是同一口径，无法直接比较",
                "建议在 task.toml 顶部注释显式声明「目标 Schema: X.Y」以便校验")
 
-    # 关键段落
-    for section in ["[metadata]", "[agent]", "[verifier]", "[environment]"]:
-        if section in txt:
-            r.ok("task.toml", f"含 {section}")
-        else:
-            r.fail("task.toml", f"缺少 {section}")
-
-    # 资源与超时
-    for field in ["timeout_sec", "cpus", "memory", "storage"]:
-        if field in txt:
-            r.ok("task.toml", f"含 {field}")
-        else:
-            r.flag("task.toml", f"缺少 {field}")
-
-    # 甲方 2026-10-14 确认：task.toml 需要携带 docker_image（交付自检与随包 QC 都读它），
-    # 基础镜像同时仍须与 environment/Dockerfile 的 FROM 一致并钉住 digest。
-    m = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', txt)
-    if not m:
-        r.fail("task.toml", "task.toml 缺 docker_image",
-               "甲方口径：task.toml 需声明基础镜像，且与 environment/Dockerfile 的 FROM 一致")
-    elif m.group(1).strip() == "latest" or m.group(1).strip().endswith(":latest"):
-        r.fail("task.toml", "docker_image 不得使用浮动 latest tag", m.group(1))
+    # 甲方 inspect_delivery 读的身份字段
+    tid = re.search(r'(?m)^\s*task_id\s*=\s*"([^"]+)"', txt)
+    if tid:
+        r.ok("task.toml", f"task_id = {tid.group(1)}")
     else:
-        r.ok("task.toml", "docker_image 已声明并钉住 digest")
+        r.fail("task.toml", "缺 task_id（[metadata].task_id 或顶层 task_id）")
 
-    # 12 小时上限（规范：单次端到端原则上 ≤12h）
+    # 现行硬性口径：task.toml **必须**写 docker_image，且与 Dockerfile 的 FROM 逐字一致。
+    # 依据：甲方 run_qc.static_check 与 inspect_delivery 都把它当必需项
+    #   （缺则 "task.toml has no docker_image" / "Task has no pinned Docker image"）。
+    img = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', txt)
+    df_p = os.path.join(task_dir, "environment", "Dockerfile")
+    df_from = None
+    if os.path.isfile(df_p):
+        fm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
+                       open(df_p, encoding="utf-8", errors="replace").read())
+        df_from = fm.group(1) if fm else None
+    if not img:
+        r.fail("task.toml", "task.toml 缺顶层 docker_image",
+               "甲方必备项：缺则 run_qc 报 'task.toml has no docker_image'、"
+               "inspect_delivery 报 'Task has no pinned Docker image'")
+    else:
+        value = img.group(1).strip()
+        if value.casefold() == "latest" or value.casefold().endswith(":latest"):
+            r.fail("task.toml", "docker_image 不得使用浮动 latest tag", value)
+        elif "@sha256:" not in value:
+            r.fail("task.toml", "docker_image 未 pin 到不可变 digest（缺 @sha256:）", value)
+        elif df_from is None:
+            r.flag("task.toml", "environment/Dockerfile 缺 FROM，无法核对镜像一致性")
+        elif value != df_from:
+            r.fail("task.toml", "docker_image 与 environment/Dockerfile 的 FROM 不一致",
+                   f"task.toml : {value}\nDockerfile: {df_from}")
+        else:
+            r.ok("task.toml", f"docker_image 与 Dockerfile FROM 逐字一致，已 pin digest ({value[-18:]})")
+
+    # 12 小时上限
     am = re.search(r"\[agent\][^\[]*?timeout_sec\s*=\s*([\d.]+)", txt, re.S)
     if am:
         secs = float(am.group(1))
         if secs > 43200:
-            r.flag("task.toml", f"agent.timeout_sec = {secs:.0f}s ({secs/3600:.1f}h) 超过 12 小时上限",
-                   "规范要求单次端到端评测原则上不超过 12 小时；需在 quality_review.md 说明理由")
+            r.flag("task.toml", f"agent.timeout_sec = {secs:.0f}s ({secs/3600:.1f}h) 超过 12 小时上限")
         else:
             r.ok("task.toml", f"agent.timeout_sec = {secs/3600:.1f}h（≤12h）")
     return txt
 
 
+def check_jobs(task_dir, r):
+    """jobs/ 结构：12 个 job = qwen×3 + opus×3 + Oracle×3 + NOP×3。
+
+    判据与甲方 `validate_model_jobs.validate_jobs` 一致：job 目录须含 `result.json`；
+    目录名按 `model-<alias>-N` / `ctl-oracle-N` / `ctl-nop-N` 归类。
+    """
+    jobs = os.path.join(task_dir, "jobs")
+    if not os.path.isdir(jobs):
+        r.fail("jobs", "缺 jobs/ 目录",
+               "甲方 validate_model_jobs 要求 12 个 job（qwen×3 + opus×3 + Oracle×3 + NOP×3）；"
+               "尚未跑分时属真实缺件，跑分后补齐再交付")
+        return
+    job_dirs = sorted(d for d in os.listdir(jobs)
+                      if os.path.isdir(os.path.join(jobs, d))
+                      and os.path.isfile(os.path.join(jobs, d, "result.json")))
+    expected = sum(REQUIRED_MODEL_COUNTS.values()) + REQUIRED_ORACLE_JOBS + REQUIRED_NOP_JOBS
+
+    counts = {"qwen": 0, "opus": 0, "oracle": 0, "nop": 0, "unknown": []}
+    for name in job_dirs:
+        low = name.casefold()
+        if "oracle" in low:
+            counts["oracle"] += 1
+        elif "nop" in low:
+            counts["nop"] += 1
+        elif "qwen" in low:
+            counts["qwen"] += 1
+        elif "opus" in low:
+            counts["opus"] += 1
+        else:
+            counts["unknown"].append(name)
+
+    if len(job_dirs) != expected:
+        r.fail("jobs", f"jobs/ 有 {len(job_dirs)} 个 job，甲方要求恰好 {expected} 个",
+               f"已识别: qwen={counts['qwen']} opus={counts['opus']} "
+               f"oracle={counts['oracle']} nop={counts['nop']}")
+    else:
+        r.ok("jobs", f"jobs/ 恰好 {expected} 个 job")
+
+    for model, want in REQUIRED_MODEL_COUNTS.items():
+        if counts[model] != want:
+            r.fail("jobs", f"{model} 轮有 {counts[model]} 个 job，甲方要求 {want} 个")
+    for agent, want in (("oracle", REQUIRED_ORACLE_JOBS), ("nop", REQUIRED_NOP_JOBS)):
+        if counts[agent] != want:
+            r.fail("jobs", f"{agent} 轮有 {counts[agent]} 个 job，甲方要求 {want} 个")
+    if counts["unknown"]:
+        r.flag("jobs", f"无法归类的 job 目录: {', '.join(counts['unknown'][:6])}")
+    if counts["qwen"] == 3 and counts["opus"] == 3 and \
+            counts["oracle"] == 3 and counts["nop"] == 3:
+        r.ok("jobs", "12 个 job 分布正确（Qwen×3 + Opus×3 + Oracle×3 + NOP×3）")
+
+    # 必备件（甲方 COMMON_FILES + 两个控制轮的专属文件）
+    common = ["config.json", "lock.json", "result.json", "trial.log", "artifacts/manifest.json",
+              "verifier/result.json", "verifier/reward.txt", "verifier/test-stdout.txt",
+              "verifier/verifier.log"]
+    model_files = ["agent/model-result.json", "agent/trajectory.jsonl"]
+    oracle_files = ["agent/oracle.txt", "agent/qc-oracle-application.json"]
+    missing = []
+    for name in job_dirs:
+        base = os.path.join(jobs, name)
+        low = name.casefold()
+        need = list(common)
+        if "oracle" in low:
+            need += oracle_files
+        elif "nop" not in low:
+            need += model_files
+        miss = [f for f in need if not os.path.isfile(os.path.join(base, f))]
+        if miss:
+            missing.append(f"{name}: {', '.join(miss)}")
+    if missing:
+        r.flag("jobs", f"{len(missing)} 个 job 缺必备文件（以甲方 report.md 报错为准）",
+               "\n".join(missing[:6]))
+    elif job_dirs:
+        r.ok("jobs", "全部 job 的必备文件齐全")
+
+
+def check_identity_harbor(task_dir, r):
+    """身份字段 + Harbor dirhash 可复算（对齐 inspect_delivery）。"""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        here = os.path.dirname(os.path.abspath(__file__))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_qc_inspect_delivery",
+            os.path.join(here, "..", "..", "..", "_reference", "windows-harbor-qc",
+                         "scripts", "inspect_delivery.py"))
+        # 随包甲方脚本缺失时静默跳过（本仓库结构可能不同）
+        if spec is None or not os.path.isfile(spec.origin or ""):
+            raise FileNotFoundError("bundled inspect_delivery.py not found")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        info = mod.inspect_delivery(__import__("pathlib").Path(task_dir))
+        ident = info.get("task") or {}
+        for field in ("task_id", "task_version", "task_hash", "harbor_task_checksum"):
+            if not ident.get(field):
+                r.fail("身份", f"Task has no {field}")
+        if ident.get("task_id"):
+            r.ok("身份", f"task_id={ident['task_id']} task_version={ident.get('task_version')} "
+                         f"dirhash={str(ident.get('harbor_task_checksum'))[:12]}…")
+        rc = os.path.join(task_dir, "tests", "required_testcases.json")
+        if os.path.isfile(rc) and info.get("testcase_count") is not None:
+            r.ok("身份", f"甲方口径 testcase_count = {info['testcase_count']}")
+    except Exception as exc:  # noqa: BLE001
+        r.flag("身份", f"未使用随包甲方 inspect_delivery.py 复算身份（{type(exc).__name__}），"
+                       f"仅做本地字段检查")
+
+
 def check_instruction_no_leak(task_dir, r):
-    """检查 instruction.md 是否泄漏解法/答案。"""
+    """instruction.md 是否泄漏解法/答案。"""
     p = os.path.join(task_dir, "instruction.md")
     if not os.path.isfile(p):
         return
@@ -192,7 +513,6 @@ def check_instruction_no_leak(task_dir, r):
     else:
         r.ok("题面泄漏", "instruction.md 未命中已知泄漏信号")
 
-    # 题面长度合理性（薄题检查）
     if len(txt.strip()) < 80:
         r.flag("题面质量", f"instruction.md 仅 {len(txt.strip())} 字符，可能是薄题")
     else:
@@ -200,7 +520,7 @@ def check_instruction_no_leak(task_dir, r):
 
 
 def check_env_no_solution(task_dir, r):
-    """检查 environment/ 是否混入 Solution / 隐藏测试。"""
+    """environment/ 是否混入 Solution / 隐藏测试。"""
     env = os.path.join(task_dir, "environment")
     if not os.path.isdir(env):
         return
@@ -208,24 +528,16 @@ def check_env_no_solution(task_dir, r):
     for root, dirs, files in os.walk(env):
         for name in files + dirs:
             low = name.lower()
-            for token in FORBIDDEN_IN_ENV:
-                if token in low:
-                    bad.append(os.path.relpath(os.path.join(root, name), task_dir))
-                    break
+            if any(token in low for token in FORBIDDEN_IN_ENV):
+                bad.append(os.path.relpath(os.path.join(root, name), task_dir))
     if bad:
-        r.fail("环境泄漏", f"environment/ 内出现疑似 Solution/答案: {', '.join(bad[:10])}",
-               "environment/ 禁止泄露 Solution 和隐藏 Tests")
+        r.fail("环境泄漏", f"environment/ 内出现疑似 Solution/答案: {', '.join(bad[:10])}")
     else:
         r.ok("环境泄漏", "environment/ 未见 Solution/答案/隐藏测试")
 
 
 def check_windows_value(task_dir, r, extras_dir=None, allow_legacy_exempt=False):
-    """检查 Windows 专属机制门禁（references/12-windows-mechanism-gate.md）。
-
-    判据来自甲方质检：题目主要实现 / 错误根因 / Evaluator 必须实质依赖 Windows 平台语义，
-    且包内不得出现自我否认 Windows 价值的表述。实现委托给同目录
-    check_windows_mechanism.py，保证"可复算、可单独运行"。
-    """
+    """Windows 专属机制门禁 F1–F6（references/12-windows-mechanism-gate.md）。"""
     try:
         import importlib.util
         here = os.path.dirname(os.path.abspath(__file__))
@@ -249,375 +561,18 @@ def check_windows_value(task_dir, r, extras_dir=None, allow_legacy_exempt=False)
         r.flag("Windows机制", f"{tid}: {w}")
 
 
-def check_tests(task_dir, r):
-    """检查 tests/ 是否具备二值判分与 INVALID 区分能力。"""
-    tests = os.path.join(task_dir, "tests")
-    if not os.path.isdir(tests):
-        return
-    files = os.listdir(tests)
-    r.ok("tests", f"tests/ 文件: {', '.join(sorted(files))}")
-
-    # 识别验证入口
-    entry = None
-    for cand in ["test.ps1", "test.sh", "run_tests.sh", "test.py"]:
-        if cand in files:
-            entry = os.path.join(tests, cand)
-            break
-    if not entry:
-        r.fail("tests", "未找到验证入口（test.ps1 / test.sh / test.py）")
-        return
-
-    txt = open(entry, encoding="utf-8", errors="replace").read()
-
-    # INVALID 区分能力（规范 6.2 / 10.3）
-    if INVALID_MARKER.search(txt) or "INVALID" in txt.upper():
-        r.ok("INVALID 区分", "验证入口具备 INVALID 标记能力")
-    else:
-        r.fail("INVALID 区分", "验证入口未区分 INVALID（基础设施故障不得伪装成模型 0 分）",
-               "规范 6.2: 存在 required 未执行/缺失/SKIP 或基础设施异常须标为 INVALID")
-
-    # 二值判分
-    has_binary = bool(re.search(r"(reward|score)\s*=\s*(1|1\.0|0|0\.0)\b", txt)) or \
-                 "reward.txt" in txt or "reward.json" in txt
-    if has_binary:
-        r.ok("二值判分", "存在二值评分产物写出")
-    else:
-        r.flag("二值判分", "未在验证入口检测到 reward 产物写出；确认评分由 grade.py 等完成")
-
-    # 旧评分语义残留（规范 9 第 6 项）
-    for legacy in ["judge.toml", "rubric.json"]:
-        if legacy in files:
-            r.fail("旧评分残留", f"tests/ 仍含 {legacy}",
-                   "规范第九章要求清除 judge.toml / rubric.json 的权重与部分分语义，改为 required F2P/P2P 二值判分")
-
-    # grade.py 二值语义
-    grade = os.path.join(tests, "grade.py")
-    if os.path.isfile(grade):
-        gt = open(grade, encoding="utf-8", errors="replace").read()
-        if re.search(r"score\s*=\s*1\.0\s*if\s+resolved\s+else\s+0\.0", gt):
-            r.ok("二值判分", "grade.py 实现 resolved → 1.0 / 0.0")
-        if "FAIL_TO_PASS" in gt and "PASS_TO_PASS" in gt:
-            r.ok("F2P/P2P", "grade.py 引用 FAIL_TO_PASS 与 PASS_TO_PASS")
-        else:
-            r.fail("F2P/P2P", "grade.py 未引用 F2P/P2P")
-        # 权重/部分分残留
-        if re.search(r"weight\s*[:=]", gt):
-            weights = re.findall(r"weight\s*[:=]\s*([\d.]+)", gt)
-            nonzero = [w for w in weights if float(w) not in (0.0, 1.0)]
-            if nonzero:
-                r.fail("权重残留", f"grade.py 存在非 0/1 权重: {nonzero}",
-                       "规范禁止 testcase 权重与部分分")
-            else:
-                r.ok("权重检查", "grade.py 无部分分权重（仅 0/1）")
-
-
-def check_no_change_and_golden_shape(task_dir, r):
-    """检查是否存在 Golden / no-change 证据线索。"""
-    tests = os.path.join(task_dir, "tests")
-    if not os.path.isdir(tests):
-        return
-    files = " ".join(os.listdir(tests)).lower()
-    spec = os.path.join(tests, "swelive_spec.json")
-    if os.path.isfile(spec):
-        try:
-            d = json.load(open(spec, encoding="utf-8"))
-            ve = d.get("verification_evidence", {})
-            if ve:
-                r.ok("运行证据声明", f"verification_evidence: {json.dumps(ve, ensure_ascii=False)}")
-                if ve.get("required_base_runs") and ve.get("required_oracle_runs"):
-                    r.ok("3+3 声明", f"声明 base/oracle 各 {ve.get('required_base_runs')}/{ve.get('required_oracle_runs')} 次")
-            else:
-                r.flag("运行证据声明", "swelive_spec.json 缺 verification_evidence")
-            if d.get("FAIL_TO_PASS") and d.get("PASS_TO_PASS"):
-                r.ok("F2P/P2P 声明", f"F2P={len(d['FAIL_TO_PASS'])} P2P={len(d['PASS_TO_PASS'])}")
-            else:
-                r.fail("F2P/P2P 声明", "spec 缺 FAIL_TO_PASS 或 PASS_TO_PASS")
-        except Exception as e:
-            r.fail("spec 解析", f"swelive_spec.json 解析失败: {e}")
-    else:
-        r.flag("spec", "未找到 swelive_spec.json（若用其他元数据文件请忽略）")
-
-
-def check_extras(extras_dir, r):
-    """检查 delivery-extras 伴随材料（规范 5.4 / 5.5）。"""
-    if not extras_dir or not os.path.isdir(extras_dir):
-        r.fail("伴随材料", "未提供 delivery-extras/ 目录",
-               "规范 5.1: 缺少伴随材料的题目不得验收")
-        return
-
-    batch_files = ["batch_manifest.csv", "knowledge_tree_coverage_report.csv",
-                   "validation_report.md", "model_summary.csv", "known_issues.md",
-                   "checksums.sha256", "CHANGELOG.md"]
-    missing_batch = [f for f in batch_files if not os.path.isfile(os.path.join(extras_dir, f))]
-    if missing_batch:
-        r.fail("伴随材料", f"批次级文件缺失: {', '.join(missing_batch)}")
-    else:
-        r.ok("伴随材料", "批次级 7 个汇总文件齐全")
-
-    tasks_dir = os.path.join(extras_dir, "tasks")
-    if not os.path.isdir(tasks_dir):
-        r.fail("伴随材料", "缺 delivery-extras/tasks/ 目录")
-        return
-
-    task_ids = sorted(os.listdir(tasks_dir))
-    if not task_ids:
-        r.fail("伴随材料", "delivery-extras/tasks/ 为空")
-        return
-    r.ok("伴随材料", f"伴随材料覆盖 {len(task_ids)} 题")
-
-    per_task = ["metadata", "evidence", "model_runs", "testcase_mapping.csv",
-                "quality_review.md", "remediation_and_retest.md"]
-    for tid in task_ids:
-        base = os.path.join(tasks_dir, tid)
-        miss = [x for x in per_task if not os.path.exists(os.path.join(base, x))]
-        if miss:
-            r.fail("伴随材料", f"{tid} 缺: {', '.join(miss)}")
-        else:
-            r.ok("伴随材料", f"{tid} 六项齐全")
-
-        # model_runs 四模型
-        mr = os.path.join(base, "model_runs")
-        if os.path.isdir(mr):
-            models = [d.lower() for d in os.listdir(mr)]
-            for want in ["qwen", "opus"]:
-                if not any(want in m for m in models):
-                    r.fail("多模型", f"{tid} model_runs 缺 {want}")
-            for want in ["glm", "kimi"]:
-                if not any(want in m for m in models):
-                    r.fail("多模型", f"{tid} model_runs 缺 {want}")
-
-        # evidence 五项
-        ev = os.path.join(base, "evidence")
-        if os.path.isdir(ev):
-            evs = [d.lower() for d in os.listdir(ev)]
-            for want in ["no_change", "golden", "clean_room"]:
-                if not any(want in e for e in evs):
-                    r.flag("对照证据", f"{tid} evidence 缺 {want}")
-
-
-def check_identity(harbor_dir, assets_dir, r):
-    """检查 harbor JSON 与 assets 的身份一致性。"""
-    if not harbor_dir or not os.path.isdir(harbor_dir):
-        r.flag("身份", "未提供 harbor/ 平台 JSON 目录，跳过身份校验")
-        return
-    if not assets_dir or not os.path.isdir(assets_dir):
-        r.flag("身份", "未提供 harbor-assets/ 目录，跳过身份校验")
-        return
-
-    jsons = [f for f in os.listdir(harbor_dir) if f.endswith(".json")]
-    assets = [d for d in os.listdir(assets_dir) if os.path.isdir(os.path.join(assets_dir, d))]
-
-    json_ids = {os.path.splitext(f)[0] for f in jsons}
-    asset_ids = set(assets)
-
-    only_json = json_ids - asset_ids
-    only_asset = asset_ids - json_ids
-    if only_json:
-        r.fail("身份", f"仅在 harbor/ 出现的 task_id: {sorted(only_json)}")
-    if only_asset:
-        r.fail("身份", f"仅在 harbor-assets/ 出现的 task_id: {sorted(only_asset)}")
-    if not only_json and not only_asset:
-        r.ok("身份", f"{len(json_ids)} 题在 harbor/ 与 harbor-assets/ 中一一对应")
-
-    # 检查每题的 instance_id 一致性
-    for f in jsons:
-        p = os.path.join(harbor_dir, f)
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-        except Exception as e:
-            r.fail("身份", f"{f} 解析失败: {e}")
-            continue
-        iid = d.get("instance_id")
-        expect = os.path.splitext(f)[0]
-        if iid != expect:
-            r.fail("身份", f"{f}: instance_id='{iid}' 与文件名 '{expect}' 不一致",
-                   "规范 5.5: task_id 在文件名、task.toml、来源材料、平台配置中必须一致")
-        # task.toml 需携带 docker_image；镜像身份再与 environment/Dockerfile 的 FROM 核对
-        tt = os.path.join(assets_dir, expect, "task.toml")
-        if os.path.isfile(tt):
-            ttt = open(tt, encoding="utf-8", errors="replace").read()
-            if re.search(r"(?m)^\s*docker_image\s*=", ttt):
-                r.ok("镜像声明", f"{expect} task.toml 已写 docker_image")
-            else:
-                r.fail("身份", f"{expect}: task.toml 缺 docker_image",
-                       "甲方口径：task.toml 需声明基础镜像")
-            df = os.path.join(assets_dir, expect, "environment", "Dockerfile")
-            if os.path.isfile(df) and d.get("docker_image"):
-                dft = open(df, encoding="utf-8", errors="replace").read()
-                fm = re.search(r"(?mi)^\s*FROM\s+(\S+)", dft)
-                if fm and fm.group(1) != d["docker_image"]:
-                    r.flag("镜像一致",
-                           f"{expect}: Dockerfile FROM 与 harbor JSON 的 docker_image 不一致",
-                           f"Dockerfile: {fm.group(1)}\nharbor: {d['docker_image']}")
-                elif fm:
-                    r.ok("镜像一致", f"{expect} Dockerfile FROM 与 harbor JSON 一致")
-
-        # 缺 solution 提示
-        if not os.path.isdir(os.path.join(assets_dir, expect, "solution")):
-            r.fail("结构", f"{expect} 缺 solution/ 目录",
-                   "规范 5.1 五件套要求提供 Oracle/Reference Solution")
-
-
-def check_digest_recorded(pkg_root, r):
-    """检查镜像不可变 Digest 是否另存。"""
-    found = []
-    for root, dirs, files in os.walk(pkg_root):
-        for f in files:
-            if "image" in f.lower() and f.endswith(".json"):
-                found.append(os.path.join(root, f))
-    if not found:
-        r.flag("镜像身份", "未找到镜像清单文件（应另存不可变 Digest）")
-        return
-    for p in found:
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-            s = json.dumps(d)
-            if "sha256:" in s or "digest" in s.lower():
-                r.ok("镜像身份", f"{os.path.basename(p)} 含 digest 记录")
-            else:
-                r.flag("镜像身份", f"{os.path.basename(p)} 未见 digest 字段",
-                       "规范 5.5: 镜像标签不是不可变身份，必须另存实际 Digest")
-        except Exception as e:
-            r.fail("镜像身份", f"{os.path.basename(p)} 解析失败: {e}")
-
-
-def check_flat_identity(tid, base, r):
-    """平铺布局下的身份一致性：platform_import ↔ task.toml ↔ spec ↔ manifest。"""
-    pi_p = os.path.join(base, "platform_import.json")
-    tt_p = os.path.join(base, "task.toml")
-    sp_p = os.path.join(base, "tests", "swelive_spec.json")
-    mn_p = os.path.join(base, "extras", "metadata", "manifest.json")
-
-    for name, p in [("platform_import.json", pi_p), ("task.toml", tt_p),
-                    ("tests/swelive_spec.json", sp_p),
-                    ("extras/metadata/manifest.json", mn_p)]:
-        if not os.path.isfile(p):
-            r.fail("身份", f"{tid}: 缺 {name}")
-            return
-
-    try:
-        pi = json.load(open(pi_p, encoding="utf-8"))
-        sp = json.load(open(sp_p, encoding="utf-8"))
-        mn = json.load(open(mn_p, encoding="utf-8"))
-    except Exception as e:
-        r.fail("身份", f"{tid}: 身份文件解析失败: {e}")
-        return
-    tt = open(tt_p, encoding="utf-8", errors="replace").read()
-
-    # instance_id ↔ 目录名
-    if pi.get("instance_id") != tid:
-        r.fail("身份", f"{tid}: platform_import.instance_id='{pi.get('instance_id')}' 与目录名不一致")
-    else:
-        r.ok("身份", f"{tid}: instance_id 与目录名一致")
-
-    # task_hash 四处一致
-    m = re.search(r'task_hash\s*=\s*"?([0-9a-f]{64})"?', tt)
-    hashes = {
-        "platform_import.json": pi.get("task_hash"),
-        "tests/swelive_spec.json": sp.get("task_hash"),
-        "extras/metadata/manifest.json": mn.get("task_hash"),
-        "task.toml": m.group(1) if m else None,
-    }
-    uniq = {v for v in hashes.values() if v}
-    if None in hashes.values() or len(uniq) != 1:
-        r.fail("身份", f"{tid}: task_hash 在四处不一致",
-               "\n".join(f"  {k} = {v}" for k, v in hashes.items()))
-    else:
-        hv = next(iter(uniq))
-        if len(hv) != 64:
-            r.fail("身份", f"{tid}: task_hash 非 64 位十六进制: {hv}")
-        else:
-            r.ok("身份", f"{tid}: 四处 task_hash 一致 ({hv[:12]}…)")
-
-    # task_version 一致
-    vers = {pi.get("task_version"), sp.get("task_version"), mn.get("task_version")}
-    if None in vers or len(vers) != 1:
-        r.fail("身份", f"{tid}: task_version 不一致 {sorted(str(v) for v in vers)}")
-    else:
-        r.ok("身份", f"{tid}: task_version = {next(iter(vers))}")
-
-    # 镜像身份：task.toml ↔ environment/Dockerfile 的 FROM ↔ spec ↔ platform_import。
-    # 甲方 2026-10-14 确认 task.toml 需要携带 docker_image，因此它同时参与核对。
-    tm = re.search(r'(?m)^\s*docker_image\s*=\s*"([^"]+)"', tt)
-    if not tm:
-        r.fail("身份", f"{tid}: task.toml 缺 docker_image")
-    dft_p = os.path.join(os.path.dirname(tt_p), "environment", "Dockerfile")
-    fm = None
-    if os.path.isfile(dft_p):
-        fm = re.search(r"(?mi)^\s*FROM\s+(\S+)",
-                       open(dft_p, encoding="utf-8", errors="replace").read())
-    trio = {"task.toml": tm.group(1) if tm else None,
-            "environment/Dockerfile": fm.group(1) if fm else None,
-            "swelive_spec.json": sp.get("image_ref"),
-            "platform_import.json": pi.get("docker_image")}
-    vals = {v for v in trio.values() if v}
-    if None in trio.values() or len(vals) != 1:
-        r.flag("镜像一致", f"{tid}: 镜像引用多处不一致", str(trio))
-    else:
-        r.ok("镜像一致", f"{tid}: task.toml / Dockerfile FROM / spec / platform_import 一致")
-
-
-def check_flat_extras(tid, base, r):
-    """平铺布局下每题自带的 extras/ 伴随材料。"""
-    ex = os.path.join(base, "extras")
-    if not os.path.isdir(ex):
-        r.fail("伴随材料", f"{tid}: 缺 extras/ 目录")
-        return
-
-    per_task = ["metadata", "evidence", "model_runs", "testcase_mapping.csv",
-                "quality_review.md", "remediation_and_retest.md"]
-    miss = [x for x in per_task if not os.path.exists(os.path.join(ex, x))]
-    if miss:
-        r.fail("伴随材料", f"{tid} extras 缺: {', '.join(miss)}")
-    else:
-        r.ok("伴随材料", f"{tid} 六项齐全")
-
-    md = os.path.join(ex, "metadata")
-    if os.path.isdir(md):
-        for f in ["source_and_license.json", "labels.json",
-                  "lineage_and_contamination.json", "manifest.json"]:
-            if not os.path.isfile(os.path.join(md, f)):
-                r.fail("伴随材料", f"{tid} metadata 缺 {f}")
-
-    mr = os.path.join(ex, "model_runs")
-    if os.path.isdir(mr):
-        models = [d.lower() for d in os.listdir(mr)]
-        for want in ["qwen", "opus", "glm", "kimi"]:
-            if not any(want in m for m in models):
-                r.fail("多模型", f"{tid} model_runs 缺 {want}")
-
-    ev = os.path.join(ex, "evidence")
-    if os.path.isdir(ev):
-        evs = [d.lower() for d in os.listdir(ev)]
-        for want in ["no_change", "golden", "clean_room",
-                     "negative_and_equivalent_controls", "cleanup_and_restore"]:
-            if not any(want in e for e in evs):
-                r.flag("对照证据", f"{tid} evidence 缺 {want}")
-
-
-def check_index_dir(idx, n, r):
-    """目录级汇总材料 _index/。"""
-    if not os.path.isdir(idx):
-        r.fail("伴随材料", "缺 _index/ 目录级汇总目录")
-        return
-    need = ["tasks_index.csv", "knowledge_tree_coverage_report.csv",
-            "validation_report.md", "model_summary.csv", "known_issues.md",
-            "checksums.sha256", "CHANGELOG.md"]
-    missing = [f for f in need if not os.path.isfile(os.path.join(idx, f))]
-    if missing:
-        r.fail("伴随材料", f"_index/ 缺: {', '.join(missing)}")
-    else:
-        r.ok("伴随材料", f"_index/ 目录级 7 个汇总文件齐全（覆盖 {n} 题）")
-
-    # tasks_index.csv 行数应与题数一致
-    p = os.path.join(idx, "tasks_index.csv")
-    if os.path.isfile(p):
-        rows = [ln for ln in open(p, encoding="utf-8").read().splitlines() if ln.strip()]
-        body = len(rows) - 1  # 去掉表头
-        if body != n:
-            r.flag("伴随材料", f"tasks_index.csv 数据行 {body} ≠ 题数 {n}")
-        else:
-            r.ok("伴随材料", f"tasks_index.csv 覆盖全部 {n} 题")
+def check_task(task_dir, r, schema_version=None, extras=None):
+    """单个平铺题包的全部现行形态检查。"""
+    check_structure(task_dir, r)
+    check_task_toml(task_dir, r, schema_version)
+    check_instruction_no_leak(task_dir, r)
+    check_env_no_solution(task_dir, r)
+    check_env_required(task_dir, r)
+    check_tests_required(task_dir, r)
+    check_required_testcases(task_dir, r)
+    check_identity_harbor(task_dir, r)
+    check_windows_value(task_dir, r, extras)
+    check_jobs(task_dir, r)
 
 
 def check_flat_package(pkg, r, schema_version, extras=None):
@@ -634,125 +589,50 @@ def check_flat_package(pkg, r, schema_version, extras=None):
 
     r.ok("模式", f"平铺校验 {len(tasks)} 题（{pkg}）")
     for tid, full in tasks:
-        check_structure(full, r)
-        check_task_toml(full, r, schema_version)
-        check_instruction_no_leak(full, r)
-        check_env_no_solution(full, r)
-        check_windows_value(full, r, extras)
-        check_tests(full, r)
-        check_no_change_and_golden_shape(full, r)
-        check_flat_identity(tid, full, r)
-        check_flat_extras(tid, full, r)
-
-    check_index_dir(os.path.join(pkg, "_index"), len(tasks), r)
-    check_digest_recorded(pkg, r)
+        check_task(full, r, schema_version, extras)
 
 
 # ---------------------------------------------------------------- 主流程
 
 def main():
-    ap = argparse.ArgumentParser(description="Windows 专项 Coding Bench 题包校验器")
-    ap.add_argument("--package", help="题包根目录（自动探测 harbor/ harbor-assets/ delivery-extras/）")
-    ap.add_argument("--harbor-assets", help="harbor-assets 目录（含每题子目录）")
-    ap.add_argument("--harbor", help="harbor 目录（平台 JSON）")
-    ap.add_argument("--extras", help="delivery-extras 目录")
+    ap = argparse.ArgumentParser(
+        description="Windows 专项 Coding Bench 题包校验器（现行形态；冲突时以随包甲方脚本为准）")
+    ap.add_argument("--package", help="平铺题包根目录（其下每个含 task.toml 的子目录为一题）")
+    ap.add_argument("--task-dir", help="单个题包目录（含 task.toml）")
+    ap.add_argument("--extras", help="delivery-extras 目录（门禁产物可能在其 tasks/<id>/metadata/ 下）")
     ap.add_argument("--schema-version", default="1.3", help="期望的 Harbor Schema 版本（默认 1.3）")
     ap.add_argument("--json", help="把结果写入 JSON 文件")
+    ap.add_argument("--allow-legacy-exempt", action="store_true",
+                    help="允许历史包通过 WINDOWS_MECHANISM_EXEMPT.md 把 F1–F5 降级为 FLAG（F6 不免除）")
     args = ap.parse_args()
 
+    if not args.package and not args.task_dir:
+        print("错误: 需指定 --package 或 --task-dir", file=sys.stderr)
+        return 2
+
     r = Report()
-
     pkg = args.package
-    assets = args.harbor_assets
-    harbor = args.harbor
-    extras = args.extras
 
-    if pkg:
+    if args.task_dir:
+        td = os.path.abspath(args.task_dir)
+        if not os.path.isdir(td):
+            print(f"错误: 目录不存在 {td}", file=sys.stderr)
+            return 2
+        r.ok("模式", f"单题校验: {td}")
+        check_task(td, r, args.schema_version, args.extras)
+    else:
+        pkg = os.path.abspath(pkg)
         if not os.path.isdir(pkg):
             print(f"错误: 目录不存在 {pkg}", file=sys.stderr)
             return 2
-        # 自动探测（兼容 harbor/ 与 outside_harbor/ 两种命名）
-        for name in ["harbor", "outside_harbor"]:
-            cand = os.path.join(pkg, name)
-            if os.path.isdir(cand) and not harbor:
-                harbor = cand
-        for name in ["harbor-assets", "outside_harbor-assets"]:
-            cand = os.path.join(pkg, name)
-            if os.path.isdir(cand) and not assets:
-                assets = cand
-        # 若直接指向某题目录
-        if not assets and os.path.isfile(os.path.join(pkg, "task.toml")):
-            assets = os.path.dirname(pkg)
-            pkg = os.path.dirname(pkg)
-        cand = os.path.join(pkg, "delivery-extras")
-        if os.path.isdir(cand) and not extras:
-            extras = cand
-
-        # 平铺布局：pkg 下直接存在含 task.toml 的题目录（harbor-windows 型目录）
-        if not assets and not harbor:
-            flat = [d for d in sorted(os.listdir(pkg))
-                    if os.path.isdir(os.path.join(pkg, d))
-                    and os.path.isfile(os.path.join(pkg, d, "task.toml"))]
-            if flat:
-                check_flat_package(pkg, r, args.schema_version, extras)
-                print(r.render())
-                if args.json:
-                    c = r.counts()
-                    with open(args.json, "w", encoding="utf-8") as f:
-                        json.dump({"summary": c, "items": r.items}, f,
-                                  ensure_ascii=False, indent=2)
-                    print(f"\n报告已写入 {args.json}")
-                return 1 if r.counts()["FAIL"] else 0
-
-    if not assets and not pkg:
-        print("错误: 需指定 --package 或 --harbor-assets", file=sys.stderr)
-        return 2
-
-    # 单题模式
-    if assets and os.path.isfile(os.path.join(assets, "task.toml")):
-        r.ok("模式", f"单题校验: {assets}")
-        check_structure(assets, r)
-        check_task_toml(assets, r, args.schema_version)
-        check_instruction_no_leak(assets, r)
-        check_env_no_solution(assets, r)
-        check_windows_value(assets, r, extras)
-        check_tests(assets, r)
-        check_no_change_and_golden_shape(assets, r)
-    else:
-        # 多题目录模式
-        task_dirs = []
-        if assets and os.path.isdir(assets):
-            for d in sorted(os.listdir(assets)):
-                full = os.path.join(assets, d)
-                if os.path.isdir(full) and os.path.isfile(os.path.join(full, "task.toml")):
-                    task_dirs.append((d, full))
-        if not task_dirs:
-            r.fail("模式", "未找到任何含 task.toml 的题目目录")
-        else:
-            r.ok("模式", f"批量校验 {len(task_dirs)} 题")
-            for tid, full in task_dirs:
-                check_structure(full, r)
-                check_task_toml(full, r, args.schema_version)
-                check_instruction_no_leak(full, r)
-                check_env_no_solution(full, r)
-                check_windows_value(full, r, extras)
-                check_tests(full, r)
-                check_no_change_and_golden_shape(full, r)
-
-    # 身份与伴随材料
-    check_identity(harbor, assets, r)
-    check_extras(extras, r)
-    if pkg:
-        check_digest_recorded(pkg, r)
+        check_flat_package(pkg, r, args.schema_version, args.extras)
 
     print(r.render())
-
     if args.json:
         c = r.counts()
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"summary": c, "items": r.items}, f, ensure_ascii=False, indent=2)
         print(f"\n报告已写入 {args.json}")
-
     return 1 if r.counts()["FAIL"] else 0
 
 

@@ -22,34 +22,74 @@
 |---|---|
 | 交付布局门 | `environment/adapter.toml` 可被 TOML 解析；`environment/` 七个必备脚本齐全；ZIP 内层根目录名 = `<task_id>-v<版本>-delivery`；不得手改目录名 |
 | Harbor 静态门 | 五件套齐全；`.ps1` / `.bat` 内被引用的路径真实存在；无自定义必需字段；无 Solution / 隐藏 Tests / 凭据泄漏 |
-| jobs 门 | 每个 job 必备文件齐全：`config.json`、`lock.json`、`result.json`、`trial.log`、`artifacts/manifest.json`、`verifier/{result.json,reward.txt,test-stdout.txt,verifier.log}`；模型轮另需 `agent/model-result.json` + `agent/trajectory.jsonl`；Oracle 轮另需 `agent/oracle.txt` + `agent/qc-oracle-application.json` |
+| jobs 门 | `jobs/` 恰好 **12 个** job 目录（须含 `result.json`）：**Qwen×3 + Opus×3 + Oracle×3 + NOP×3**（`validate_model_jobs.py`：`expected = sum(REQUIRED_COUNTS.values()) + 6`，其中 `REQUIRED_COUNTS={"qwen":3,"opus":3}`）。**GLM/Kimi 自 2026-10-13 起可选**，既不计入这 12 个、也不参与主判据。每个 job 必备文件齐全：`config.json`、`lock.json`、`result.json`、`trial.log`、`artifacts/manifest.json`、`verifier/{result.json,reward.txt,test-stdout.txt,verifier.log}`；模型轮另需 `agent/model-result.json` + `agent/trajectory.jsonl`；Oracle 轮另需 `agent/oracle.txt` + `agent/qc-oracle-application.json` |
 | 身份门 | 全部 job 的 `task_checksum` = 交付包的 **Harbor dirhash** |
 
 > 判分证据（`verifier/result.json` 的协议字段、有效性、二值分数、testcase 集合）以自检脚本
 > `report.md` 的报错为准，**不要凭记忆自拟协议字段名**。
 
-### 已知差异：`task.toml` 不写 `docker_image`（2026-10-13 起）
+### 镜像口径：`task.toml` **必须**写 `docker_image`（2026-10-14 核定）
 
-**规范**：基础镜像只在 `environment/Dockerfile` 的 `FROM` 里声明，并 pin 到不可变
-digest（禁止 `latest`）；`task.toml` **不得**写 `docker_image`。
+**规则**：`task.toml` 顶层必须写 `docker_image`；取值与 `environment/Dockerfile` 的 `FROM`
+**逐字一致**，并 pin 到不可变 digest（**禁止 `latest`**）。
 
-**差异**：随包下发的甲方 QC（`scripts/run_qc.py` 里 `docker_image` 的取值与判空段）
-仍把该字段当作 `task.toml` 的必需项 —— 缺失即写 `task.toml has no docker_image`，
-把"静态结构"判为 `FAIL`，`run_qc.py` 退出码 `1`。
+**依据**：随包甲方脚本把它当**必需项**，缺则直接判 FAIL：
 
-**处理**：这条静态 FAIL **属预期**，不要为过检查把字段写回去。做法是：
+| 甲方脚本 | 缺失时的报错 |
+|---|---|
+| `run_qc.py:static_check`（L253-259） | `task.toml has no docker_image`（另有 `docker_image must not use floating latest tag`） |
+| `inspect_delivery.py:inspect_delivery`（L110-113） | `Task has no pinned Docker image`（另有 `Docker image uses the floating latest tag`） |
 
-- 交付说明里显式记录该差异，并引用本节
-- 其余静态项与**全部动态项**（Oracle / NOP 控制跑）必须仍然 PASS
-- 甲方更新工具包后该 FAIL 自然消失
+**现行生效包的取值**（4 个已跑分包逐字一致）：
 
-> 两个配套坑：
+```toml
+docker_image = "mcr.microsoft.com/windows/servercore:ltsc2022@sha256:76cf422c98ca437b308374d0498280541fa42ac7061bb44015a6c8b70cf4db6a"
+```
+
+> ⚠️ **旧文档的相反写法已作废**：2026-10-13 版曾写「`task.toml` 不得写 `docker_image`，
+> 缺该字段导致的静态 FAIL 属预期，不要为过检查把字段写回去」——这是把甲方的**必备项**
+> 误判成了「已知差异」。该结论错误，不要再引用。
+>
+> 仍然有效的两个配套事实：
 > 1. `run_qc.py` 的 `--attempts` 最小为 `3`；传 `1` 会在 argparse 阶段直接退出，
 >    日志里只留下 `--attempts must be at least 3`，极易误判成"容器跑不起来"。
-> 2. **Harbor 侧不受影响**：`harbor/environments/definition.py` 的
->    `should_use_prebuilt_docker_image()` 在 `docker_image` 为空时返回 `False`，
->    `has_agent_environment_definition()` 也把 `environment/Dockerfile` 当作合法定义，
->    于是 Harbor 自动回落到 Dockerfile 构建；`--force-build` 只是排除缓存的额外保险。
+> 2. Harbor 侧同时也认 `environment/Dockerfile`（`should_use_prebuilt_docker_image()`
+>    在 `docker_image` 为空时返回 `False`，于是回落到 Dockerfile 构建）——
+>    这只说明**只写一处也能跑**，不代表甲方静态门会放过缺字段的包。
+
+### 静态门：`.ps1` / `.bat` 不得写"必须存在的目录"字面量（2026-10-14 定位）
+
+甲方 `run_qc.py:collect_referenced_paths`（L158-180）会把 `.ps1/.psm1/.bat/.cmd` 里
+形如路径的字符串全部收集起来，然后在
+`task/`、`task/tests/`、`task/environment/`、`task/solution/`、`task/environment/workspace/`
+五处找对应文件；找不到且形态"显式"（含 `/` 且以已知前缀开头，或是裸文件名 + 脚本后缀）
+就报 `referenced files are missing`，Harbor 静态门直接 FAIL。
+
+**实测根因（`wfflab__wpeimg-219-v1.4.0`）**：
+`verifier/negative_access_probe.ps1:121` 写了指向**已删除目录**的字面量 `'tests\verifier'`。
+该目录在现行形态下不存在（隐藏测试副本放在 `tests/` 根、负访问探针放在 `verifier/`），
+于是静态扫描把它当成"被引用却未交付的文件"。
+
+**规则**：
+
+| 禁止 | 改用 |
+|---|---|
+| 把"必须存在"的目录名字面量写进 `.ps1`/`.bat`（如 `'tests\verifier'`、`'reference\wfmt'`） | **动态发现**：枚举父目录的子目录，对结果做断言 |
+| 用 `Test-Path 'tests\verifier'` 证明某目录不存在 | 枚举 `tests/` 的子目录，断言其中**不含** `test_*_semantics.py`（即隐藏语义测试没有被复制进可见测试目录） |
+
+```powershell
+# ❌ 会被静态扫描当成"缺失交付物"
+if (Test-Path 'tests\verifier') { Fail 'hidden suite is reachable' }
+
+# ✅ 动态发现，不产生任何目录字面量
+$semantic = Get-ChildItem -Path (Join-Path $TaskRoot 'tests') -Recurse -File -Filter 'test_*_semantics.py'
+if ($semantic) { Fail 'hidden semantic suite is reachable from the visible test directory' }
+```
+
+> 注意：这一条与第五节「已知误报」不冲突。误报指的是 `environment/workspace/**` 与
+> `solution/**` 内的**真实存在**文件被扫描器漏掉（扫描根不含这两处），处理方式是请甲方
+> 扩大解析范围；而这里说的是**真的指向不存在目录**的字面量，属于必须改写的脚本写法。
+> 两者的共同结论一样：**不要去改写测试逻辑来消 FAIL，要改的是路径写法**。
 
 ### 冻结铁律
 
@@ -65,7 +105,8 @@ Harbor dirhash 覆盖除顶层 `jobs/` 以外的**全部**文件。因此：
 
 见第一节第 **15** 条 —— **未经甲方自检 PASS 即开跑**，或**跑分后修改题包内容**。
 
-> **实例（2026-10-12）**：218 号包跑满 14 轮（8 轮模型 + 6 轮对照）后，甲方自检仍 FAIL ——
+> **实例（2026-10-12）**：218 号包跑满 14 轮（8 轮模型 + 6 轮对照，**当时口径**；现行口径是
+> 12 轮 = Qwen×3 + Opus×3 + Oracle×3 + NOP×3）后，甲方自检仍 FAIL ——
 > `adapter.toml` 第 38 行 TOML 非法、`solution/reference/wlogseg` 与
 > `tests/test_wlogseg_semantics.py` 被脚本引用却不存在、job 缺 `lock.json` /
 > `verifier/verifier.log` / `artifacts/manifest.json`、`task_checksum` 与交付包不符。

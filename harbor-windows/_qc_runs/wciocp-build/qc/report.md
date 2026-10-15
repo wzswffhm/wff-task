@@ -1,0 +1,96 @@
+# Windows Harbor 完整质检报告
+
+结论：**PASS**
+
+- 交付目录：`PASS`
+- 四模型门禁：`PASS`
+- 四模型原始 jobs：`PASS`
+- Oracle/NOP：`PASS`
+- 十项人工质量复核：`PASS`
+
+## 交付目录
+
+- 通过
+
+## 模型门禁
+
+- 通过
+
+## 模型 jobs
+
+- 通过
+
+## 十项人工质量硬门禁
+
+- **Golden/NOP 得分和逐 testcase 终态符合预期**：`PASS`
+  - 证据：harbor-windows/_qc_runs/wciocp-build/controls/controls_summary.json：Oracle ctl-oracle-1/2/3 三轮 reward 均为 1、NOP ctl-nop-1/2/3 三轮 reward 均为 0，6 轮 task_checksum 全部为 7bebdc01887e3b6114951a7acdbf412e386cbc41f91aacea78e4b8988fc11ddc
+  - 证据：jobs/ctl-oracle-1/verifier/report.json：schema_version=aggregate-v1、run_validity=VALID、14 条全部 passed、invalid=0、formal_score=1
+  - 证据：jobs/ctl-nop-1/verifier/report.json：run_validity=VALID、10 条 passed、4 条 failed、invalid=0、formal_score=0；三条 NOP 完全一致（10/14）
+  - 证据：jobs/_index/assembly_report.json：n_trials=12，12 个 job 的分数与 testcase 集合全部合法且与 tests/required_testcases.json 匹配，harbor_task_checksums 唯一值为冻结 dirhash
+  - 说明：逐 testcase 对照过三次 Oracle 与三次 NOP。NOP 得 0 的原因是缺陷版把完成通知放在进程内列表里由各等待线程自行扫描、按句柄查表取完成键、超时后把池置为降级态、且不检查对象能否承载完成通知：因此 4 条 F2P（换键改写已到达通知、并发下重复/丢失交付、超时后丢弃后续事件、非重叠对象被静默接受）全部失败，其余 10 条（含 P2P 全部）通过。这是真实功能失败，不是环境、权限、依赖或旧产物问题；回归面在 base 与 Oracle 下均未被破坏。
+- **每项评分标准和每个 testcase 判分正确**：`PASS`
+  - 证据：tests/rubric.json：5 个 programmatic 组（completion-key-delivery 0.25 / exactly-once-delivery 0.25 / capability-probe 0.15 / timeout-and-close 0.25 / regression-surface 0.10），权重和 = 1.0，无 LLM judge、无部分分
+  - 证据：tests/rubric.json 的 sha256 = 9f39034e3077e360a04522b17ef5f368452cd814e4a3bf9ecc82e4af84467e42，与 tests/judge.toml 的 source_sha256 逐字符一致；judge.toml 记录 programmatic_weight=1.0、llm_judge_weight=0.0
+  - 证据：verifier/rubric.conditions.json：五组与 rubric.json 一一对应，逐组写明所依赖的 Windows 完成端口机制（完成键随包回传 / 内核队列的原子出队 / WAIT_TIMEOUT / 文件模式能力判定）
+  - 证据：tests/run_tests.ps1 与 tests/aggregate_results.ps1：二值判分（required 全 passed 记 1，否则 0），缺测、SKIP 或执行故障一律记 INVALID（exit 2）而不是正式 0 分
+  - 证据：12 轮 verifier/report.json 的 required 集合均为 14 条，与 tests/required_testcases.json 逐条一致；每轮 invalid 均为 0
+  - 说明：case 粒度如实为 14 条：F2P 4 条（缺陷版确实失败的 4 条）+ P2P 10 条（缺陷版与参考解都通过的回归面）。立项时曾按 7 条 F2P 设计，实测发现其中 3 条（基本键回传、跨句柄键区分、close 后拒绝使用）在**任何符合本题缺陷模型**的实现下都会通过——它们与 P2P 的 take-returns-an-event 判据同构，强行让它们失败会连带 P2P 一起失败。因此按实测收敛为 F2P 4，并在 required_testcases.json 中如实标注，未虚标。唯一已知边界是 WIP VV-14（程序化占比 100% > 采购手册 50% 阈值），按 rule-matrix 双列登记为『WIP 合规 FAIL / 本题 programmatic-only 设计说明』。
+- **Testcase 严格对应题面并检查功能而非固定写法**：`PASS`
+  - 证据：tests/required_testcases.json 顶层是数组，共 14 条：F2P 4 条 + P2P 10 条，id 全部带 f2p-/p2p- 前缀
+  - 证据：tests/test_wciocp_semantics.py 的 14 个 test 函数与 required 的 14 条 id 一一对应，tests/run_tests.ps1 的 slugByFunction 映射覆盖全部 14 条
+  - 证据：verifier/tests/test_wciocp_semantics.py 与 tests/test_wciocp_semantics.py 逐字节一致，sha256 = 23f356188f9b50128530c86df69072f73862ee38f5cda3335ea4776fcdc66331
+  - 证据：隐藏套件自持内核对象：用 CreateNamedPipeW(PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED) + CreateFileW 建管道与客户端，自己登记各自的完成键、自己发起挂起读，再用 4 个线程并发 take，以『每个请求恰好回来一次且带回登记时的键』为终态判据，从不采信候选返回值
+  - 证据：题面 A–G 每项公开要求都有 required 用例覆盖（A→换键不改写已到达通知；B→并发下恰好交付一次；C→跨句柄键区分；D→超时不丢包且不破坏池；E→非重叠对象 unsupported；F→closed/badarg 分类；G→可见冒烟测试）
+  - 说明：测试只断言题面写明的公共契约与可观察终态，不绑定构造签名、私有函数名或实现路径：可见冒烟测试已改为不直接构造 Request/Event（用 __new__ + 属性赋值），因此参考解的 __slots__ 写法与缺陷版的普通类写法被同一套断言公平对待。判据中的阈值（步数/输出量）只用于判定无效槽位，不参与评分。
+- **模型没有联网取答案、搜索 Golden 或绕过评分**：`PASS`
+  - 证据：6 份 jobs/model-*/agent/patch.diff 的改动文件全部落在题面允许修改的 wciocp/ 包内：opus-1/2/3 与 qwen-2/3 只改 wciocp/_winapi.py、wciocp/kinds.py、wciocp/pool.py；无一份触碰 tests/、verifier/、rubric.json、judge.toml、reward 或任何评分通道
+  - 证据：6 份 jobs/model-*/agent/trajectory.jsonl 中，C:\\verifier / C:\\solution / C:\\tests / oracle / golden / rubric.json / test_wciocp_semantics / required_testcases / reward.json 等隐藏材料关键词命中行数均为 0
+  - 证据：environment/Dockerfile 只 COPY ["workspace/", "C:/testbed/"]；C:\\verifier、C:\\solution、C:\\tests、C:\\task\\tests、C:\\task\\solution 均不在 agent 容器内；verifier/negative_access_probe.ps1 是作答期边界探针
+  - 证据：environment/validate_environment.ps1 的隔离审计会在 workspace 内出现 oracle|golden|reference|hidden|rubric|solution|reward 命名文件时让就绪探针失败（记 INVALID 而不是 0 分）
+  - 说明：按四层分级（尝试 / 成功访问 / 实际使用 / 已证明影响成绩）逐份核对 6 份轨迹与补丁：未发现联网取答案、本地搜答案、篡改评分或复用旧产物的行为。如实记录一处瑕疵：model-qwen-1 在 workspace 根留下 5 个临时脚本（_debug.py、_debug2.py、_debug3.py、_debug4.py、_verify.py），与 agent 提示词『不要在仓库内留下调试脚本』不符；这些文件位于包外、不参与评分、也不改变任何 testcase 结果，该轮仍以 9/14 判 0 分。
+- **题目具备真实 Windows 反事实价值**：`PASS`
+  - 证据：metadata/windows_mechanism.json：counterfactual.answer=否，写明『句柄要用 CreateIoCompletionPort(handle, port, key, 0) 绑定到端口并登记完成键；完成包由内核入队、GetQueuedCompletionStatus 原子取出；epoll/kqueue 只报告就绪，io_uring 是另一套完成模型』
+  - 证据：排他声明逐字锚定 instruction.md：『本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。』
+  - 证据：4 条机制锚点各自绑定题面逐字条款 + verifier/tests/test_wciocp_semantics.py 的 test_ref（L184-L201 / L212-L228 / L252-L267 / L298-L304）+ 一条 F2P 用例
+  - 证据：skills/harbor-windows/scripts/check_windows_mechanism.py 对本题输出 PASS（exit 0），F6 扫描未命中任何自我否认表述
+  - 证据：environment/validate_environment.ps1 在非 Win32NT 主机上 Fail：'the host platform is not Windows (Win32NT), so the wciocp contract cannot be graded here'（F5 锚点）；同一探针还会真实建端口、绑管道、验证完成包带回登记键与空队列 WAIT_TIMEOUT
+  - 说明：对照实验锁在 Windows 完成端口语义上：同一模型（Opus）三轮均 14/14，而 Qwen 三轮为 9/14、13/14、14/14；失分轮报的是并发交付与完成键语义上的真实错误。用进程内列表 + 条件变量模拟完成端口，必然丢掉『一个完成包恰好被一个线程取到』这条内核保证，因此不存在平台无关的等价实现。
+- **范围、版本、公式和全部执行资产身份已冻结**：`PASS`
+  - 证据：task.toml：task_id=wfflab__wciocp-220、顶层 version=1.0、[task].version=1.0.0；docker_image 与 environment/Dockerfile 的 FROM 逐字一致并 pin 到 @sha256 摘要
+  - 证据：jobs/_index/assembly_report.json：n_trials=12，harbor_task_checksums 唯一值 = 7bebdc01887e3b6114951a7acdbf412e386cbc41f91aacea78e4b8988fc11ddc，12 个 job 无混包
+  - 证据：zip/wfflab__wciocp-220-v1.0.0-delivery.zip：275 个条目（其中 jobs 条目 206），54,609,112 字节，sha256=398f8569ecda34cde4f984084a42102e129d6b1b9b364c680fb8a6cb03e040fc；package_task_zip.py --verify 逐文件核对 258 个文件全部一致
+  - 证据：source.json 的 task_id/task_version 与 task.toml 一致；metadata/windows_mechanism.json 的 task_id 同样一致
+  - 证据：包内不含 REFIT-*.md、verifier/WINDOWS_VALUE.md、oracle.patch 等非交付文件
+  - 说明：题包在 12 轮跑完前冻结（冻结 dirhash 与 12 轮 checksum 完全一致），跑分期间只新增 jobs/ 与 _qc_runs 现场，未改动任何参与 checksum 的字节；提交前清理了全部 __pycache__/*.pyc 残留。
+- **WIP 94 项已逐项登记并提供证据或 N/A 依据**：`PASS`
+  - 证据：harbor-windows/_qc_runs/wsparse-build/wip94-review.json：total_items=94、items 长度 94、summary 与 items 实算一致，ID 集合覆盖 FC-01..13 / QD-SP-01..18 / QD-SO-01..07 / QD-IN-01..06 / ENV-01..14 / VV-01..36
+  - 证据：harbor-windows/_qc_runs/wsparse-build/wip94-review.md：表头 + 94 条 ID 行 + 合计行
+  - 证据：五个状态计数：PASS 81 / FAIL 1 / FLAG 3 / BLOCKED 8 / N/A 1；唯一 FAIL 为 VV-14（Rubric 权重占比），按双列结论登记
+  - 证据：本题为同批 Windows 题的批次级共用登记，条目引用同一份产物；220 的差异（4 条 F2P 的收敛过程、完成端口机制锚点）已在本文件与 QC 报告中标出
+  - 说明：本门禁要求『已逐项登记并附证据或 N/A 依据』，不要求 94 项全部 PASS；缺行、无证据写 PASS 才判 BLOCKED。220 复用该批次级登记，未静默豁免任何适用项。
+- **采购手册 D01-D20 已逐项完成动态审计**：`PASS`
+  - 证据：harbor-windows/_qc_runs/wsparse-build/dynamic-d01-d20-review.json：total_items=20、items 长度 20、summary 与 items 实算一致（PASS 18 / N/A 2）
+  - 证据：harbor-windows/_qc_runs/wsparse-build/dynamic-d01-d20-review.md：| ID | 维度 | 状态 | 证据摘要 | 表 + 合计行
+  - 证据：220 侧对应证据：D05（要求实际下发）可由 6 份 trajectory.jsonl 的首条 user 消息与 instruction.md 逐字比对复现；D09（等价与反例）对应 Oracle 14/14 vs NOP 10/14；D18（独立复算）见 independent_score_recompute
+  - 证据：D10（Mock 保真）为 N/A 的依据：题面与隐藏套件完全不用 Mock（无 mock/monkeypatch/stub），判据全部来自真实 CreateNamedPipeW / CreateIoCompletionPort / GetQueuedCompletionStatus / CancelIoEx
+  - 说明：20 项逐项动态审计并附实读证据；220 与 219/218/215 同为该批次级审计的适用对象，引用同一份产物并在本题 QC 报告中说明。
+- **已从 required testcase 和冻结公式独立复算正式分数**：`PASS`
+  - 证据：12 轮 reward 与包内 jobs/<job>/verifier/report.json 的 formal_score 逐一相符：Oracle 1/1/1、NOP 0/0/0、Opus 1/1/1、Qwen 0/0/1
+  - 证据：按 tests/required_testcases.json 的 14 条独立复算每轮 passed 数：Oracle 14/14/14、NOP 10/10/10、Opus 14/14/14、Qwen 9/13/14；Opus testcase 累计 42、Qwen 累计 36，与 qc/model-gate.json 的 testcase_pass_sum 一致
+  - 证据：区分度判定：sum(OPUS)=3 > sum(QWEN)=1，且 testcase 累计 42 > 36；REQUIRED_COUNTS={"qwen":3,"opus":3} 的 valid_runs 均为 3，无 tie
+  - 证据：无效槽位未计入能力分：Opus 侧被替换的轮次（兜底文本、输出截断、余额不足、模型名不稳定）全部单列在 _qc_runs/wciocp-build/INVALID-SLOTS.md，替代轮以新 trial 成功后才计入
+  - 说明：所有分数来自 Harbor 原生 job 的落盘结果，未做任何手工加权；空清单、SKIP/ERROR/NOT_RUN、解析或环境错误均不产生正式分。
+- **原始证据、历史版本、整改和干净复验已闭环**：`PASS`
+  - 证据：原始日志按精确字节保存：每个 job 保留 config.json / lock.json / result.json / trial.log 与 verifier 侧 report.json、reward.json、reward.txt、reward-details.json、test-stdout.txt；模型轮另有 agent/model-result.json、agent/trajectory.jsonl、agent/patch.diff
+  - 证据：无效槽位闭环：五批被替换轮次（opus-empty-response-20261014 3 个、opus-empty-response-round2-20261015 3 个、opus-4router-claude-opus-5-unstable-20261015 3 个、opus-5-fallback-text-20261015 44 个、opus-5-insufficient-balance-20261015 4 个）逐字节归档在 _qc_runs/wciocp-build/model-rounds/invalid-slots-archive/，注解层为 _qc_runs/wciocp-build/INVALID-SLOTS.md（含判定依据、阈值、原 trial 编号与替代结果）
+  - 证据：交付 ZIP 在质检前完成 --verify（258 个文件 sha256 全一致），sha256=398f8569ecda34cde4f984084a42102e129d6b1b9b364c680fb8a6cb03e040fc
+  - 证据：题包自检：inspect_delivery pass=True、run_qc.static_check static_pass=True、check_windows_mechanism PASS（exit 0），均以冻结 dirhash 7bebdc01887e3b6114951a7acdbf412e386cbc41f91aacea78e4b8988fc11ddc 为准
+  - 说明：本批历史版本、被替代轮次与本次结果分开保存（旧失败 job 移入 invalid-slots-archive/，不复用、不改写）；题面/环境/参考解/测试任一变更后旧轨迹作废的规则在本轮得到遵守——首轮曾因 verifier 文档在跑分期间被改写而整体作废并重跑，之后冻结未再改动任何参与 checksum 的字节。
+
+## 原始证据
+
+- `harbor/`：真实 Oracle/NOP 报告、命令、job 和 CLI 日志
+- `delivery-layout.json`：目录与 task_id/version/hash 绑定
+- `model-gate.json`：Qwen×3 与 Opus×3 的次数、分数和区分度
+- `model-jobs.json`：12 个 Harbor jobs（6 个模型、3 个 Oracle、3 个 NOP）交叉校验
+- 人工证据：WIP 94 项、D01-D20、逐项证据链、Hack 事件和独立复算文件

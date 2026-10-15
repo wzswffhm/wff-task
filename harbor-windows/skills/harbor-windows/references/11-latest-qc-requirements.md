@@ -112,3 +112,27 @@
 | 4 | 区分度按主模型判定（Opus 与 Qwen），辅助模型结论不得替代主判据 |
 | 5 | 分类与采购目标有明确对应；不得只改题名或强加平台标签 |
 | 6 | 归档为 **archive-only**：只做聚合与注解，不新增执行、评分、run id 或 task checksum |
+
+---
+
+## 8. 现行验收基数：12 个 job（2026-10-13 起）
+
+**要求**：交付包 `jobs/` 下**恰好 12 个** job 目录（每个须含 `result.json`）：
+
+| 类别 | 个数 | 说明 |
+|---|---|---|
+| Qwen3.8-Max-0902 | 3 | 主难度模型（必需） |
+| Opus 5 | 3 | 主难度模型（必需） |
+| Oracle 控制轮 | 3 | `agent.name = "oracle"`，须 VALID/1 且 required 全 PASS |
+| NOP（no-change）控制轮 | 3 | `agent.name = "nop"`，须 VALID/0、P2P 全 PASS、至少一个 F2P FAIL |
+
+**判据来源**：甲方 `validate_model_jobs.py`：
+`expected_jobs = sum(REQUIRED_COUNTS.values()) + 6`，其中
+`validate_model_gate.py: REQUIRED_COUNTS = {"qwen": 3, "opus": 3}`。
+
+**GLM / Kimi**：自 **2026-10-13** 起**可选**，既不计入这 12 个、也不参与主判据
+（`REQUIRED_COUNTS` 里根本没有 `glm` / `kimi`）。若运行了，只要求"不得有模型无关的
+infra/权限/依赖/Verifier 故障"，其结果不得替代 Opus/Qwen 的区分度结论。
+
+> 旧文档里的「14 个 job」「8 轮模型 + 6 轮对照」「GLM ≥1 次 + Kimi ≥1 次必需」
+> 均已作废 —— 那是 2026-10-12 及更早批次（含 GLM/Kimi 各 1 轮）的历史口径。

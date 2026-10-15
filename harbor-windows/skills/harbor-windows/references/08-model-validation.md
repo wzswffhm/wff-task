@@ -610,11 +610,14 @@ SSE 心跳持续、但迟迟不给内容」——此时 `read timeout`（两次�
 ```
 [ ] Qwen3.8-Max-0902 独立运行 3 次（全 VALID）
 [ ] Opus 5 独立运行 3 次（全 VALID）
+[ ] Oracle 控制轮 3 个（VALID/1，required 全 PASS）
+[ ] NOP（no-change）控制轮 3 个（VALID/0，P2P 全 PASS + 至少一个 F2P FAIL）
+[ ] jobs/ 恰好 12 个 job（Qwen×3 + Opus×3 + Oracle×3 + NOP×3）
 [ ] model_score_sum 计算正确
 [ ] 区分度满足（条件 1 或条件 2）
 [ ] 无 INVALID 未补跑
-[ ] （可选）GLM-5.3 ≥1 次有效运行
-[ ] （可选）Kimi K3 ≥1 次有效运行
+[ ] （可选）GLM-5.3 若运行则有效；2026-10-13 起不要求运行、不参与主判据
+[ ] （可选）Kimi K3 若运行则有效；2026-10-13 起不要求运行、不参与主判据
 [ ] 无模型无关 infra/权限/依赖/Verifier 故障
 [ ] Golden 3×1，无 SKIP/MISSING/ERROR/旧产物
 [ ] no-change 3×0，P2P 全过 + 核心 F2P 失败

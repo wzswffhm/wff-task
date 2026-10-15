@@ -1,0 +1,20 @@
+{
+  "alias": "opus",
+  "model": "claude-opus-5",
+  "label": "opus",
+  "protocol": "anthropic",
+  "base_url": "https://4router.net",
+  "auth": "x-api-key",
+  "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wciocp-build\\harbor_agent\\wciocp_model_agent.py",
+  "runner_sha256": "3205fd0d98c10e95cefd923c747f11622e83f0eab691deaaf3fc1dea0ed80c32",
+  "steps": 32,
+  "submitted": true,
+  "submit_summary": "## 根因\n\n`wciocp` 此前并没有使用 Windows 完成端口。它给每个读取挂一个 manual-reset event，用一个后台投递线程轮询这些 event，再把结果塞进一组 Python 列表（`_staging`/`_ready`/`_recent`），由 `take()` 从列表里挑。issue #220 的五个现象全部出自这套用户态仿造机制：\n\n- `_collect()` 用调用方自己测得的 `measured` 当下标去 `pop()`，并在列表空时从 `_recent` 环形重发历史事件 —— 既重复交付也丢包。\n- 键是在**事件成形时**用 `_key_of(handle)` 现查的，所以重新登记会改写早已到达的通知；`_keys.get(handle, 0)` 还会让未登记句柄静默拿到 `0`。\n- `_expire()` 置 `_dropped=True` 并清空 `_ready`，此后 `_deliver()` 直接 return —— 超时一次，端口永久报废。\n- `kinds.is_overlapped()` 无条件 `return True`，能力判定形同不存在。\n- `submit()` 在同步成功时既 `_deliver()` 一次、内核又会投递一次，双重交付。\n\n## 改动\n\n**`wciocp/_winapi.py`** —— 换成真正的完成端口绑定：`CreateIoCompletionPort`（创建 + 关联）、`GetQueuedCompletionStatus`、`PostQueuedCompletionStatus`、`CancelIoEx`（回落 `CancelIo`）、以及用 `NtQueryInformationFile(FileModeInformation)` 做能力判定。原型在首次使用时一次性固定（并发重设 `argtypes` 不安全），加载锁改为 `RLock`（`_configure` 持锁时会去加载 `ntdll`）。删掉了仿造机制专用的 `Event` 事件类与 `wait_for`。\n\n**`wciocp/kinds.py`** —— `is_overlapped()` 改为问内核：非文件对象（event/mutex/进程）或被记为 `FILE_SYNCHRONOUS_IO_*`（即未带 `FILE_FLAG_OVERLAPPED` 打开）的对象返回 `False`。\n\n**`wciocp/pool.py`** —— 投递线程和三层列表全部删除，端口本身就是队列：\n\n- `register()` 把句柄关联到端口，键由内核携带；不支持的对象抛 `unsupported`。重复登记只改后续读取的键。\n- `submit()` 在提交瞬间**快照**该句柄的键并随 `Request` 走。同步成功与 `ERROR_IO_PENDING` 走同一条路（两者都会产生恰好一个完成包），不再自行交付。未登记句柄抛 `badarg`，否则其完成将永远无法回收。\n- `take()` 直接在端口上等待，由内核保证每个完成包只交给一个线程。请求按 OVERLAPPED 控制块地址索引，`_finish()` 以原子 `pop` 兜底。超时只是检查自己的 deadline，**不碰端口**。\n- `close()` 幂等；取消未结束的读取并让正在等待的线程以 `status == \"cancelled\"` 收走，再 drain 残留、唤醒并等待线程退出后才释放端口句柄（若仍有线程在端口内则宁可泄漏句柄也不在其脚下关闭）。\n\n公开 API 的名称与签名未变（`Request` 新增只读属性 `key`，仅由 pool 内部构造）。\n\n## 验证\n\n真实 Windows 上：`tests/test_wciocp_basic.py` 14 项全通过。另用一次性脚本（已删除，`git status` 仅剩三个实现文件）逐条核对 A–F：键一致性与改键后旧键保留、12 线程 × 5 轮 1200 个完成**无重复无丢失**且键全部正确、同端口多句柄各自带键、超时前后已到达/后到达的通知均可取到、同步管道/同步文件/event 对象三类均抛 `unsupported`、`close()` 幂等且取消以 `cancelled` 交出、关闭后 `take`/`submit` 抛 `closed`。另补测了带偏移的 overlapped 磁盘文件读取。",
+  "input_tokens": 1,
+  "output_tokens": 50470,
+  "elapsed_sec": 1311.53,
+  "last_stop_reason": "tool_use",
+  "workspace": "C:\\testbed",
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wciocp-build\\model-rounds\\jobs\\model-opus-1\\wfflab__wciocp-220-v1.0.0-delive__LGXpkTm\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-14T16:01:13.506062+00:00"
+}

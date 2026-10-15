@@ -1,0 +1,1099 @@
+diff --git a/wciocp/_winapi.py b/wciocp/_winapi.py
+index fdedcf4..c0bf431 100644
+--- a/wciocp/_winapi.py
++++ b/wciocp/_winapi.py
+@@ -1,7 +1,15 @@
+ """Thin ctypes bindings for the Win32 calls that :mod:`wciocp` needs.
+ 
+-Only what the current implementation actually calls is bound here; ``kernel32``
+-is loaded lazily so that importing the package stays cheap.
++The completion layer is built on a real Windows I/O completion port: handles are
++associated with the port through ``CreateIoCompletionPort``, overlapping reads
++are issued with ``ReadFile``, and the notifications they produce are collected
++with ``GetQueuedCompletionStatus``.  The kernel is what delivers a notification
++exactly once and what carries the completion key back with it, so everything in
++this module is a direct binding of the calls that machinery needs; nothing here
++re-implements any part of it.
++
++``kernel32`` and ``ntdll`` are loaded lazily so that importing the package stays
++cheap.
+ """
+ 
+ import ctypes
+@@ -14,27 +22,53 @@ from .errors import WCIOCPError
+ 
+ ERROR_SUCCESS = 0
+ ERROR_INVALID_HANDLE = 6
+-ERROR_INVALID_PARAMETER = 87
+ ERROR_NOT_ENOUGH_MEMORY = 8
++ERROR_INVALID_PARAMETER = 87
++ERROR_BROKEN_PIPE = 109
++ERROR_MORE_DATA = 234
+ ERROR_IO_PENDING = 997
+ ERROR_HANDLE_EOF = 38
++ERROR_OPERATION_ABORTED = 995
++ERROR_ABANDONED_WAIT_0 = 735
++ERROR_NOT_FOUND = 1168
++ERROR_IO_INCOMPLETE = 996
+ 
+ WAIT_OBJECT_0 = 0x00000000
+ WAIT_TIMEOUT = 0x00000102
+ WAIT_FAILED = 0xFFFFFFFF
+ INFINITE = 0xFFFFFFFF
+ 
++# The largest wait a DWORD can carry while still being a real deadline.
++MAX_WAIT_MS = 0xFFFFFFFE
++
++# NT status codes that the capability probe below has to tell apart.
++STATUS_SUCCESS = 0x00000000
++STATUS_INVALID_HANDLE = 0xC0000008
++STATUS_OBJECT_TYPE_MISMATCH = 0xC0000024
++
++# ``FILE_MODE_INFORMATION`` bits: either of these says that the object was
++# opened for synchronous use and therefore cannot carry overlapping reads.
++FILE_SYNCHRONOUS_IO_ALERT = 0x00000010
++FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
++
++FileModeInformation = 16
++FileReplaceCompletionInformation = 61
++
+ _IS_WINDOWS = os.name == "nt"
+ 
+ _kernel32 = None
++_ntdll = None
++
++# ``ULONG_PTR`` is not exposed by :mod:`ctypes.wintypes` on every build.
++ULONG_PTR = ctypes.c_size_t
+ 
+ 
+ class OVERLAPPED(ctypes.Structure):
+     """The asynchronous-I/O control block handed to ``ReadFile``.
+ 
+-    ``hEvent`` carries the manual-reset event that the system signals once the
+-    read it belongs to has finished; ``InternalHigh`` carries the number of
+-    bytes that were transferred.
++    ``InternalHigh`` carries the number of bytes that were transferred.  The
++    pool leaves ``hEvent`` empty: the completion port is what reports a read,
++    so there is no per-read kernel event to wait on.
+     """
+ 
+     _fields_ = [
+@@ -46,6 +80,24 @@ class OVERLAPPED(ctypes.Structure):
+     ]
+ 
+ 
++class IO_STATUS_BLOCK(ctypes.Structure):
++    """The result block of the native ``Nt*InformationFile`` calls."""
++
++    _fields_ = [
++        ("Status", ctypes.c_void_p),
++        ("Information", ctypes.c_void_p),
++    ]
++
++
++class FILE_COMPLETION_INFORMATION(ctypes.Structure):
++    """The port/key pair that names an object's completion-port association."""
++
++    _fields_ = [
++        ("Port", wintypes.HANDLE),
++        ("Key", ctypes.c_void_p),
++    ]
++
++
+ def is_windows():
+     """Return ``True`` when running on a Windows kernel."""
+     return _IS_WINDOWS
+@@ -75,6 +127,19 @@ def _kernel32_dll():
+     return _kernel32
+ 
+ 
++def _ntdll_dll():
++    """The shared ``ntdll`` instance, loaded on first use."""
++    global _ntdll
++    if not _IS_WINDOWS:
++        raise WCIOCPError(
++            "the completion layer needs the Win32 API, which exists only on Windows",
++            kind="unsupported",
++        )
++    if _ntdll is None:
++        _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
++    return _ntdll
++
++
+ def last_error():
+     """The Win32 error code left by the most recent call."""
+     return int(ctypes.get_last_error())
+@@ -111,6 +176,12 @@ def describe(error):
+         ERROR_NOT_ENOUGH_MEMORY: "ERROR_NOT_ENOUGH_MEMORY",
+         ERROR_IO_PENDING: "ERROR_IO_PENDING",
+         ERROR_HANDLE_EOF: "ERROR_HANDLE_EOF",
++        ERROR_BROKEN_PIPE: "ERROR_BROKEN_PIPE",
++        ERROR_MORE_DATA: "ERROR_MORE_DATA",
++        ERROR_OPERATION_ABORTED: "ERROR_OPERATION_ABORTED",
++        ERROR_ABANDONED_WAIT_0: "ERROR_ABANDONED_WAIT_0",
++        ERROR_NOT_FOUND: "ERROR_NOT_FOUND",
++        WAIT_TIMEOUT: "WAIT_TIMEOUT",
+     }
+     label = names.get(int(error))
+     if label is None:
+@@ -118,6 +189,11 @@ def describe(error):
+     return "%s (%d)" % (label, int(error))
+ 
+ 
++def fits_completion_key(key):
++    """Whether ``key`` fits the ``ULONG_PTR`` the kernel carries keys in."""
++    return 0 <= int(key) < (1 << (8 * ctypes.sizeof(ULONG_PTR)))
++
++
+ # --------------------------------------------------------------- common I/O
+ 
+ def as_text(value):
+@@ -193,10 +269,27 @@ def close_handle(handle):
+         pass
+ 
+ 
++def handle_is_valid(handle):
++    """Whether ``handle`` still names a live object in this process."""
++    if not is_usable_handle(handle):
++        return False
++    kernel32 = _kernel32_dll()
++    query = kernel32.GetHandleInformation
++    query.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
++    query.restype = wintypes.BOOL
++    flags = wintypes.DWORD(0)
++    return bool(query(wintypes.HANDLE(int(handle)), ctypes.byref(flags)))
++
++
+ # ------------------------------------------------------------- kernel events
+ 
+ class Event(object):
+-    """A manual-reset kernel event, used to carry one read's completion."""
++    """A manual-reset kernel event.
++
++    The pool does not need one any more -- a completion port reports its reads
++    on its own -- but the helper is kept for callers that wait on a handle of
++    their own.
++    """
+ 
+     def __init__(self, handle):
+         self.handle = int(handle)
+@@ -223,17 +316,7 @@ class Event(object):
+ 
+         Returns one of ``"signalled"``, ``"timeout"`` or ``"error"``.
+         """
+-        kernel32 = _kernel32_dll()
+-        wait = kernel32.WaitForSingleObject
+-        wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+-        wait.restype = wintypes.DWORD
+-
+-        status = int(wait(wintypes.HANDLE(self.handle), wintypes.DWORD(int(timeout_ms))))
+-        if status == WAIT_TIMEOUT:
+-            return "timeout"
+-        if status == WAIT_FAILED:
+-            return "error"
+-        return "signalled"
++        return wait_for(self.handle, timeout_ms)
+ 
+     def close(self):
+         """Release the event."""
+@@ -243,13 +326,151 @@ class Event(object):
+         return "Event(handle=%d)" % self.handle
+ 
+ 
++# ---------------------------------------------------------- completion ports
++
++def create_completion_port(threads):
++    """Create a completion port that lets ``threads`` workers run at once."""
++    kernel32 = _kernel32_dll()
++    create_port = kernel32.CreateIoCompletionPort
++    create_port.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ULONG_PTR,
++                            wintypes.DWORD]
++    create_port.restype = wintypes.HANDLE
++
++    handle = create_port(wintypes.HANDLE(INVALID_HANDLE_VALUE), None,
++                         ULONG_PTR(0), wintypes.DWORD(int(threads)))
++    if not handle:
++        error = last_error()
++        raise WCIOCPError(
++            "the completion port could not be created (%s)" % describe(error),
++            kind=error_kind(error),
++        )
++    return int(handle)
++
++
++def associate(port, handle, key):
++    """Attach ``handle`` to ``port`` under the completion key ``key``.
++
++    Returns ``(ok, error)``.  The key handed over here is the one the kernel
++    carries back with every notification the object produces.
++    """
++    kernel32 = _kernel32_dll()
++    create_port = kernel32.CreateIoCompletionPort
++    create_port.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ULONG_PTR,
++                            wintypes.DWORD]
++    create_port.restype = wintypes.HANDLE
++
++    ctypes.set_last_error(0)
++    result = create_port(wintypes.HANDLE(int(handle)), wintypes.HANDLE(int(port)),
++                         ULONG_PTR(int(key)), wintypes.DWORD(0))
++    if not result:
++        return False, last_error()
++    return True, ERROR_SUCCESS
++
++
++def replace_completion_key(handle, port, key):
++    """Re-point an existing association of ``handle`` at ``key``.
++
++    The kernel only grew this ability in Windows 8.1, so a refusal is reported
++    rather than raised: the caller falls back to the key it recorded for the
++    reads it submits from then on.
++    """
++    try:
++        ntdll = _ntdll_dll()
++        set_information = ntdll.NtSetInformationFile
++        set_information.argtypes = [wintypes.HANDLE,
++                                    ctypes.POINTER(IO_STATUS_BLOCK),
++                                    wintypes.LPVOID, wintypes.ULONG, ctypes.c_int]
++        set_information.restype = ctypes.c_long
++
++        info = FILE_COMPLETION_INFORMATION()
++        info.Port = wintypes.HANDLE(int(port))
++        info.Key = ctypes.c_void_p(int(key))
++        block = IO_STATUS_BLOCK()
++        status = int(set_information(wintypes.HANDLE(int(handle)),
++                                     ctypes.byref(block), ctypes.byref(info),
++                                     wintypes.ULONG(ctypes.sizeof(info)),
++                                     FileReplaceCompletionInformation))
++    except Exception:
++        return False
++    return (status & 0xFFFFFFFF) == STATUS_SUCCESS
++
++
++def file_mode(handle):
++    """The ``FILE_MODE_INFORMATION`` of ``handle`` as ``(status, mode)``.
++
++    ``status`` is the raw NT status of the query, so the caller can tell "this
++    object is not a file-like object" apart from "this handle is gone".
++    """
++    ntdll = _ntdll_dll()
++    query = ntdll.NtQueryInformationFile
++    query.argtypes = [wintypes.HANDLE, ctypes.POINTER(IO_STATUS_BLOCK),
++                      wintypes.LPVOID, wintypes.ULONG, ctypes.c_int]
++    query.restype = ctypes.c_long
++
++    block = IO_STATUS_BLOCK()
++    mode = wintypes.ULONG(0)
++    status = int(query(wintypes.HANDLE(int(handle)), ctypes.byref(block),
++                       ctypes.byref(mode), wintypes.ULONG(ctypes.sizeof(mode)),
++                       FileModeInformation))
++    return status & 0xFFFFFFFF, int(mode.value)
++
++
++def get_completion(port, timeout_ms):
++    """Collect one notification from ``port``.
++
++    Returns ``(ok, bytes_transferred, key, overlapped_address, error)``.  The
++    kernel hands each queued notification to exactly one caller, and the key it
++    reports is the one the notification's object was associated under.
++    """
++    kernel32 = _kernel32_dll()
++    dequeue = kernel32.GetQueuedCompletionStatus
++    dequeue.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
++                        ctypes.POINTER(ULONG_PTR),
++                        ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD]
++    dequeue.restype = wintypes.BOOL
++
++    transferred = wintypes.DWORD(0)
++    key = ULONG_PTR(0)
++    overlapped = ctypes.c_void_p()
++    ctypes.set_last_error(0)
++    ok = dequeue(wintypes.HANDLE(int(port)), ctypes.byref(transferred),
++                 ctypes.byref(key), ctypes.byref(overlapped),
++                 wintypes.DWORD(int(timeout_ms)))
++    address = int(overlapped.value or 0)
++    if ok:
++        return True, int(transferred.value), int(key.value), address, ERROR_SUCCESS
++    return False, int(transferred.value), int(key.value), address, last_error()
++
++
++def post_completion(port, key=0, transferred=0):
++    """Queue a notification of the layer's own onto ``port``.
++
++    Used only to wake the callers that are waiting on a port being closed; the
++    notification carries no control block, so it can never be mistaken for one
++    that belongs to a read.
++    """
++    try:
++        kernel32 = _kernel32_dll()
++        post = kernel32.PostQueuedCompletionStatus
++        post.argtypes = [wintypes.HANDLE, wintypes.DWORD, ULONG_PTR,
++                         ctypes.c_void_p]
++        post.restype = wintypes.BOOL
++        return bool(post(wintypes.HANDLE(int(port)), wintypes.DWORD(int(transferred)),
++                         ULONG_PTR(int(key)), None))
++    except Exception:
++        return False
++
++
+ # --------------------------------------------------------------- operations
+ 
+ def start_read(handle, buffer, size, offset, overlapped):
+     """Issue a ``ReadFile`` for ``handle`` and report how it ended.
+ 
+     Returns ``(ok, error)``: ``ok`` is the ``ReadFile`` result and ``error`` is
+-    the Win32 error code that came with it.
++    the Win32 error code that came with it.  When ``handle`` is attached to a
++    completion port the read reports itself through that port in both cases --
++    a read that finishes right away still queues its notification -- so the
++    caller must not hand anything over itself.
+     """
+     kernel32 = _kernel32_dll()
+     read_file = kernel32.ReadFile
+@@ -264,6 +485,7 @@ def start_read(handle, buffer, size, offset, overlapped):
+     overlapped.OffsetHigh = (int(offset) >> 32) & 0xFFFFFFFF
+ 
+     transferred = wintypes.DWORD(0)
++    ctypes.set_last_error(0)
+     ok = read_file(wintypes.HANDLE(int(handle)), buffer, int(size),
+                    ctypes.byref(transferred), ctypes.byref(overlapped))
+     if ok:
+@@ -271,6 +493,30 @@ def start_read(handle, buffer, size, offset, overlapped):
+     return False, last_error()
+ 
+ 
++def cancel_read(handle, overlapped=None):
++    """Ask the system to abandon one outstanding read, or all of a handle's.
++
++    A cancelled read still reports itself through the completion port, with
++    ``ERROR_OPERATION_ABORTED``.  Returns ``(ok, error)``.
++    """
++    kernel32 = _kernel32_dll()
++    ctypes.set_last_error(0)
++    try:
++        cancel = kernel32.CancelIoEx
++        cancel.argtypes = [wintypes.HANDLE, ctypes.POINTER(OVERLAPPED)]
++        cancel.restype = wintypes.BOOL
++        block = None if overlapped is None else ctypes.byref(overlapped)
++        ok = cancel(wintypes.HANDLE(int(handle)), block)
++    except AttributeError:
++        cancel = kernel32.CancelIo
++        cancel.argtypes = [wintypes.HANDLE]
++        cancel.restype = wintypes.BOOL
++        ok = cancel(wintypes.HANDLE(int(handle)))
++    if ok:
++        return True, ERROR_SUCCESS
++    return False, last_error()
++
++
+ def transferred_bytes(overlapped):
+     """The byte count that the system wrote into an overlapping control block."""
+     return int(overlapped.InternalHigh or 0)
+diff --git a/wciocp/kinds.py b/wciocp/kinds.py
+index 0a49c4d..ac64042 100644
+--- a/wciocp/kinds.py
++++ b/wciocp/kinds.py
+@@ -1,8 +1,10 @@
+ """Classification of the objects a completion pool may be asked about.
+ 
+ The collector reads from whichever object the caller hands it: a private pipe
+-between the collector and a worker, or a file on disk.  The helper here answers
+-the question the registration layer asks about such an object.
++between the collector and a worker, a file on disk, or the output end of a
++helper process.  Only an object that was opened for overlapping use can report
++its reads through a completion port, so the registration layer has to be able to
++ask that question of an object before it accepts it.
+ """
+ 
+ from . import _winapi
+@@ -12,13 +14,43 @@ from .errors import WCIOCPError
+ def is_overlapped(handle):
+     """Return ``True`` when ``handle`` can carry overlapping operations.
+ 
+-    ``handle`` must be an integer object handle.
++    ``handle`` must be an integer object handle.  The answer is read out of the
++    object itself: an object opened for synchronous use carries one of the
++    ``FILE_SYNCHRONOUS_IO_*`` mode bits, and the system serialises its reads
++    instead of reporting them through a completion port.  An object that is not
++    file-like at all (an event, a mutex, a process) has no reads to report and
++    is reported as unable too.
++
++    A handle that names nothing in this process is a bad argument; an object
++    the mode query does not apply to is left to the completion port itself to
++    accept or refuse.
+     """
+     number = _winapi.as_number(handle)
+     if not _winapi.is_usable_handle(number):
+         raise WCIOCPError("not a usable object handle: %r" % (handle,),
+-                          kind="os", handle=handle)
+-    # The read layer has always taken its objects from the pipe factory, which
+-    # opens everything for overlapping use, so the answer is the same for every
+-    # object the module is asked about.
+-    return True
++                          kind="badarg", handle=handle)
++    if not _winapi.handle_is_valid(number):
++        raise WCIOCPError("not a usable object handle: %r" % (handle,),
++                          kind="badarg", handle=number)
++
++    try:
++        status, mode = _winapi.file_mode(number)
++    except WCIOCPError:
++        raise
++    except Exception as problem:               # pragma: no cover - defensive
++        raise WCIOCPError(
++            "the mode of object %r could not be read (%s)" % (handle, problem),
++            kind="os", handle=number)
++
++    if status == _winapi.STATUS_OBJECT_TYPE_MISMATCH:
++        # Not a file-like object: it has no I/O of its own to report.
++        return False
++    if status != _winapi.STATUS_SUCCESS:
++        # The query does not apply to this kind of object.  Objects such as
++        # sockets do carry overlapping operations, so the decision is left to
++        # the completion port, which is the thing that has to accept the
++        # object in the end.
++        return True
++
++    synchronous = _winapi.FILE_SYNCHRONOUS_IO_ALERT | _winapi.FILE_SYNCHRONOUS_IO_NONALERT
++    return (mode & synchronous) == 0
+diff --git a/wciocp/pool.py b/wciocp/pool.py
+index 95b5cd9..3056a52 100644
+--- a/wciocp/pool.py
++++ b/wciocp/pool.py
+@@ -1,10 +1,11 @@
+ """The completion layer of the collector.
+ 
+ Every object the collector reads from is opened for overlapping use, so a read
+-comes back straight away and its result turns up later.  A :class:`Pool` is the
+-place where those results are collected: objects are registered with a
+-*completion key*, reads are submitted against registered objects, and worker
+-threads call :meth:`Pool.take` to collect the notifications that come back.
++comes back straight away and its result turns up later.  A :class:`Pool` owns
++one Windows **I/O completion port**: objects are attached to that port with the
++completion key the caller registers them under, reads are submitted against
++them, and worker threads call :meth:`Pool.take` to collect the notifications the
++kernel queues onto the port.
+ 
+ Typical use::
+ 
+@@ -15,11 +16,17 @@ Typical use::
+     event = pool.take(timeout=5.0)
+     print(hex(event.key), event.bytes_read)
+ 
+-The delivery thread below watches the reads the pool has outstanding and hands
+-their results over to the list the callers of :meth:`Pool.take` read from.
++The delivery guarantees callers depend on are the port's own, not this module's:
++``GetQueuedCompletionStatus`` hands every queued notification to exactly one
++caller -- never two, never none -- and carries back the completion key the
++notification's object was attached under.  This module therefore keeps no
++notification lists, no history and no delivery thread of its own; it waits on
++the port directly from whichever thread called :meth:`take`, and a notification
++lives in exactly one place: the port's queue.
+ """
+ 
+ import ctypes
++import math
+ import threading
+ import time
+ 
+@@ -29,14 +36,13 @@ from .kinds import is_overlapped
+ 
+ DEFAULT_TIMEOUT = None
+ 
+-# How long the delivery thread is willing to sleep in one go.
+-_IDLE_SLICE = 0.05
+-# How many notifications the layer keeps around to hand back to callers.
+-_HISTORY = 32
+-# How many ids of handled notifications the layer keeps track of.
+-_TRACKED = 4096
+-# How many finished reads the layer holds on to before folding the list over.
+-_KEPT = 4096
++# How long a closing pool waits for the reads it cancelled, and for the callers
++# that are still inside the port, before it gives up on them.
++_DRAIN_SECONDS = 5.0
++# The slice a closing pool waits on the port, and between nudges of a caller.
++_DRAIN_SLICE = 0.02
++# How many reported reads are held on to before the oldest are let go.
++_RETIRED_KEPT = 256
+ 
+ 
+ class Request(object):
+@@ -50,6 +56,11 @@ class Request(object):
+         self._overlapped = overlapped
+         self._kernel_event = kernel_event
+         self._state = "outstanding"
++        self._cancelled = False
++        # The completion key the handle was registered under when this read was
++        # submitted.  A later registration must not rewrite the key of a read
++        # that was already on its way.
++        self.key = 0
+ 
+     def __repr__(self):
+         return "Request(handle=%d, offset=%d, size=%d)" % (self.handle, self.offset, self.size)
+@@ -69,6 +80,9 @@ class Event(object):
+         self.request = request
+         self.bytes_read = int(bytes_read)
+         self.status = status
++        # The Win32 error the read ended with, when it ended with one.  Kept
++        # for diagnostics only; ``status`` is what callers route on.
++        self.error = None
+ 
+     def __repr__(self):
+         return "Event(key=%r, bytes_read=%d, status=%r)" % (
+@@ -76,27 +90,28 @@ class Event(object):
+ 
+ 
+ class Pool(object):
+-    """A set of registered objects and the notifications they produce."""
++    """A completion port, the objects attached to it and the reads in flight."""
+ 
+     def __init__(self, threads=4):
+         self.threads = int(threads)
+         self._keys = {}
+-        self._outstanding = []
++        # Reads the system has not reported yet, keyed by the address of the
++        # control block the kernel hands back with their notification.
++        self._pending = {}
++        # Reads whose notification has been collected.  The kernel is done with
++        # them; they are held briefly so a caller that is still reading a
++        # buffer is not surprised by it going away.
+         self._retired = []
+-        self._staging = []
+-        self._ready = []
+-        self._recent = []
+-        self._served = 0
+-        self._handled = set()
++        # Reads that were never reported back.  Their control block and buffer
++        # must outlive this pool: the kernel may still write into them.
++        self._abandoned = []
++        # Cancelled notifications collected by :meth:`close` on behalf of the
++        # callers that were inside the port when it was closed.
++        self._handoff = []
++        self._takers = 0
+         self._mutex = threading.Lock()
+-        self._ready_lock = threading.Lock()
+-        self._cond = threading.Condition()
+-        self._closing = False
+-        self._dropped = False
+-        self._deliverer = threading.Thread(
+-            target=self._deliver_loop, name="wciocp-deliver")
+-        self._deliverer.daemon = True
+-        self._deliverer.start()
++        self._closed = False
++        self._port = _winapi.create_completion_port(self.threads)
+ 
+     def __repr__(self):
+         return "Pool(threads=%d, registered=%d)" % (self.threads, len(self._keys))
+@@ -104,7 +119,17 @@ class Pool(object):
+     # ------------------------------------------------------------ public API
+ 
+     def register(self, handle, key):
+-        """Register ``handle`` with the pool under the completion key ``key``."""
++        """Register ``handle`` with the pool under the completion key ``key``.
++
++        The handle is attached to the pool's completion port, so the key given
++        here is the one the kernel itself carries back with every notification
++        the object produces.
++
++        An object may be registered again under a different key.  That changes
++        where its *later* reads are routed only: a notification that has
++        already reached the port, and a read that is already on its way, keep
++        the key they were submitted under.
++        """
+         number = _winapi.as_number(handle)
+         if not _winapi.is_usable_handle(number):
+             raise WCIOCPError("not a usable object handle: %r" % (handle,),
+@@ -112,16 +137,42 @@ class Pool(object):
+         if isinstance(key, bool) or not isinstance(key, int):
+             raise WCIOCPError("the completion key must be an integer, got %r" % (key,),
+                               kind="badarg", handle=number)
++        if not _winapi.fits_completion_key(key):
++            raise WCIOCPError(
++                "the completion key %r does not fit a completion key" % (key,),
++                kind="badarg", handle=number)
++        self._ensure_open()
+         if not is_overlapped(number):
+             raise WCIOCPError(
+-                "object %r was not opened for overlapping use" % (handle,),
++                "object %r was not opened for overlapping use, so it cannot "
++                "report its reads through a completion port" % (handle,),
+                 kind="unsupported", handle=number)
++
+         with self._mutex:
++            self._ensure_open_locked()
++            known = self._keys.get(number)
++            if known is None:
++                self._attach(handle, number, int(key))
++                self._keys[number] = int(key)
++                return None
++
++            if known == int(key):
++                return None
++
++            # The object is attached to this port already.  Its attachment is
++            # re-pointed at the new key only while nothing of this object's is
++            # in flight, so that a read already on its way -- and a
++            # notification that has already reached the port -- is reported
++            # under the key it was submitted under.
++            in_flight = any(request.handle == number
++                            for request in self._pending.values())
++            if not in_flight:
++                _winapi.replace_completion_key(number, self._port, int(key))
+             self._keys[number] = int(key)
++            return None
+ 
+     def submit(self, handle, size, offset=0):
+         """Start one overlapping read of ``size`` bytes at ``offset``."""
+-        self._ensure_open()
+         number = _winapi.as_number(handle)
+         if not _winapi.is_usable_handle(number):
+             raise WCIOCPError("not a usable object handle: %r" % (handle,),
+@@ -132,188 +183,295 @@ class Pool(object):
+         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+             raise WCIOCPError("offset must not be negative, got %r" % (offset,),
+                               kind="badarg")
++        self._ensure_open()
+ 
+-        kernel_event = _winapi.Event.create()
+         buffer = ctypes.create_string_buffer(size)
+         overlapped = _winapi.OVERLAPPED()
+-        overlapped.hEvent = kernel_event.handle
+-        request = Request(number, size, offset, buffer, overlapped, kernel_event)
++        # No event: the port is what reports this read.
++        overlapped.hEvent = None
++        request = Request(number, size, offset, buffer, overlapped, None)
++        address = ctypes.addressof(overlapped)
++
++        with self._mutex:
++            self._ensure_open_locked()
++            if number not in self._keys:
++                raise WCIOCPError(
++                    "object %r is not registered with this pool" % (handle,),
++                    kind="badarg", handle=number)
++            request.key = self._keys[number]
++            # Recorded before the read starts: another thread may collect the
++            # notification before ``ReadFile`` has even returned here.
++            self._pending[address] = request
+ 
+         try:
+             ok, error = _winapi.start_read(number, buffer, size, offset, overlapped)
+-        except WCIOCPError:
+-            kernel_event.close()
++        except BaseException:
++            with self._mutex:
++                self._pending.pop(address, None)
+             raise
+ 
+-        if ok:
+-            request._state = "done"
+-            self._retire(request)
+-            self._deliver(number, request, _winapi.transferred_bytes(overlapped))
++        if ok or error == _winapi.ERROR_IO_PENDING:
++            # Both cases report themselves through the port: a read that
++            # finished right away still queues its notification, because the
++            # pool never asks for that notification to be skipped.
+             return request
+ 
+-        if error == _winapi.ERROR_IO_PENDING:
+-            with self._mutex:
+-                self._outstanding.append(request)
+-            return request
+-
+-        kernel_event.close()
++        # A read that failed outright queues nothing, so it must not be left
++        # behind as something a caller could wait for.
++        with self._mutex:
++            self._pending.pop(address, None)
+         raise WCIOCPError(
+             "the read on object %r could not be started (%s)"
+             % (handle, _winapi.describe(error)),
+             kind=_winapi.error_kind(error),
+-            handle=handle,
++            handle=number,
+         )
+ 
+     def take(self, timeout=DEFAULT_TIMEOUT):
+         """Collect one notification from the pool.
+ 
+         ``timeout`` is in seconds; ``None`` means the caller is willing to wait
+-        for as long as it takes.
+-        """
+-        deadline = None if timeout is None else time.monotonic() + _seconds(timeout)
+-
+-        while True:
+-            measured = len(self._staging) + len(self._ready)
+-            event = self._collect(measured)
+-            if event is not None:
+-                return event
++        for as long as it takes.  Several threads may call this at the same
++        time: the port hands each notification to exactly one of them.
+ 
+-            if self._closing:
+-                raise WCIOCPError("the pool has been closed", kind="closed")
++        A deadline that passes with nothing new on the port is reported as
++        ``kind="timeout"`` and leaves the port exactly as it was -- whatever is
++        queued on it stays queued, for this caller's next call or another
++        caller's.
++        """
++        seconds = None if timeout is None else _seconds(timeout)
++        deadline = None if seconds is None else time.monotonic() + seconds
+ 
+-            if deadline is None:
+-                remaining = _IDLE_SLICE
+-            else:
+-                remaining = deadline - time.monotonic()
+-                if remaining <= 0:
+-                    self._expire(timeout)
+-                remaining = min(remaining, _IDLE_SLICE)
++        with self._mutex:
++            self._ensure_open_locked()
++            port = self._port
++            self._takers += 1
++        try:
++            while True:
++                remaining = None if deadline is None else deadline - time.monotonic()
++                ok, transferred, key, address, error = _winapi.get_completion(
++                    port, _milliseconds(remaining))
++
++                if address:
++                    event = self._notification(ok, transferred, key, address, error)
++                    if event is not None:
++                        return event
++                    # A control block this pool does not hold: left alone
++                    # rather than handed to a caller who cannot place it.
++                    continue
+ 
+-            with self._cond:
+-                self._cond.wait(remaining)
++                if ok or error == _winapi.ERROR_SUCCESS:
++                    # A nudge posted by :meth:`close`.
++                    event = self._closing_handoff()
++                    if event is not None:
++                        return event
++                    raise WCIOCPError("the pool has been closed", kind="closed")
++
++                if error == _winapi.WAIT_TIMEOUT:
++                    if deadline is None:
++                        continue
++                    if time.monotonic() < deadline:
++                        continue
++                    raise WCIOCPError("nothing arrived within %r seconds" % (timeout,),
++                                      kind="timeout")
++
++                if error in (_winapi.ERROR_ABANDONED_WAIT_0,
++                             _winapi.ERROR_INVALID_HANDLE):
++                    event = self._closing_handoff()
++                    if event is not None:
++                        return event
++                    raise WCIOCPError("the pool has been closed", kind="closed")
++
++                raise WCIOCPError(
++                    "the completion port could not be read (%s)" % _winapi.describe(error),
++                    kind=_winapi.error_kind(error))
++        finally:
++            with self._mutex:
++                self._takers -= 1
+ 
+     def close(self):
+-        """Stop the pool and cancel the reads that are still outstanding."""
+-        if self._closing:
+-            return
+-        # The delivery thread is taken out of the picture first: from here on
+-        # nothing else touches the reads this pool holds.
+-        self._closing = True
+-        with self._cond:
+-            self._cond.notify_all()
+-        if self._deliverer is not threading.current_thread():
+-            self._deliverer.join(5.0)
++        """Stop the pool and cancel the reads that are still outstanding.
+ 
++        Calling this more than once is harmless.  Every read this pool still
++        holds is cancelled and collected, so its notification is handed over
++        with ``status == "cancelled"`` rather than left on a port that nobody
++        reads any more.
++        """
+         with self._mutex:
+-            outstanding = list(self._outstanding)
+-            del self._outstanding[:]
+-        for request in outstanding:
+-            request._state = "cancelled"
+-            self._retire(request)
+-            self._deliver(request.handle, request, 0, "cancelled")
++            if self._closed:
++                return
++            self._closed = True
++            port = self._port
++
++        self._cancel_outstanding()
++        self._drain(port)
++        self._release_waiters(port)
+ 
+     # ------------------------------------------------------------- internals
+ 
+     def _ensure_open(self):
+-        if self._closing:
++        with self._mutex:
++            self._ensure_open_locked()
++
++    def _ensure_open_locked(self):
++        if self._closed:
+             raise WCIOCPError("the pool has been closed", kind="closed")
+ 
+-    def _collect(self, measured):
+-        """Hand back one of the notifications that have arrived."""
+-        if len(self._ready) == 0:
+-            # The delivery thread hands its list over to the ready list.
+-            self._ready = list(self._staging)
+-            del self._staging[:]
+-
+-        with self._ready_lock:
+-            if self._ready:
+-                # Take the notification that sits at the place this caller was
+-                # given when it measured the list.
+-                if measured > len(self._ready):
+-                    position = len(self._ready) - 1
+-                else:
+-                    position = measured - 1
+-                event = self._ready.pop(position)
+-                self._recent.append(event)
+-                if len(self._recent) > _HISTORY:
+-                    del self._recent[0]
+-                self._served = len(self._recent)
+-            elif self._recent:
+-                # Everything the layer has collected has been handed out
+-                # already; hand back one of the notifications it holds.
+-                event = self._recent[self._served % len(self._recent)]
+-                self._served += 1
+-            else:
+-                event = None
+-            if event is not None:
+-                self._handled.add(id(event))
+-                if len(self._handled) > _TRACKED:
+-                    self._handled.clear()
+-            return event
+-
+-    def _expire(self, timeout):
+-        """Report that the caller's deadline passed."""
+-        self._dropped = True
+-        with self._ready_lock:
+-            del self._ready[:]
+-        raise WCIOCPError("nothing arrived within %r seconds" % (timeout,),
+-                          kind="timeout")
+-
+-    def _deliver(self, handle, request, bytes_read, status="completed"):
+-        """Record one finished read for the callers of :meth:`take`."""
+-        if self._closing or self._dropped:
++    def _attach(self, handle, number, key):
++        """Attach ``number`` to this pool's port under ``key``."""
++        ok, error = _winapi.associate(self._port, number, key)
++        if ok:
+             return
+-        event = Event(self._key_of(handle), request, bytes_read, status)
+-        with self._ready_lock:
+-            self._staging.append(event)
+-        with self._cond:
+-            self._cond.notify_all()
+-
+-    def _key_of(self, handle):
+-        """The completion key that is registered for ``handle``."""
++        if error == _winapi.ERROR_INVALID_PARAMETER:
++            # The object may be spoken for by a port already -- another pool's,
++            # or this one's from before the pool's table was built.  An
++            # attachment that exists cannot be made again, only re-pointed.
++            if _winapi.replace_completion_key(number, self._port, key):
++                return
++        raise self._association_failed(handle, number, error)
++
++    def _cancel_outstanding(self):
++        """Ask the system to abandon every read this pool still holds."""
+         with self._mutex:
+-            return self._keys.get(int(handle), 0)
++            pending = [request for request in self._pending.values()
++                       if not request._cancelled]
++            for request in pending:
++                request._cancelled = True
++        for request in pending:
++            try:
++                _winapi.cancel_read(request.handle, request._overlapped)
++            except WCIOCPError:
++                # An object that is already gone takes its reads with it.
++                pass
++
++    def _association_failed(self, handle, number, error):
++        """The error that an unsuccessful attachment to the port reports."""
++        if error == _winapi.ERROR_INVALID_HANDLE:
++            if _winapi.handle_is_valid(number):
++                # A live object the port will not take: a capability problem,
++                # not a bad argument.
++                return WCIOCPError(
++                    "object %r cannot report its reads through a completion "
++                    "port (%s)" % (handle, _winapi.describe(error)),
++                    kind="unsupported", handle=number)
++            return WCIOCPError("not a usable object handle: %r" % (handle,),
++                               kind="badarg", handle=number)
++        if error == _winapi.ERROR_INVALID_PARAMETER:
++            # The object will not carry a completion-port attachment: it was
++            # not opened for overlapping use, or it will not be re-pointed.
++            return WCIOCPError(
++                "object %r cannot report its reads through a completion port (%s)"
++                % (handle, _winapi.describe(error)),
++                kind="unsupported", handle=number)
++        return WCIOCPError(
++            "object %r could not be attached to the completion port (%s)"
++            % (handle, _winapi.describe(error)),
++            kind=_winapi.error_kind(error), handle=number)
+ 
+-    def _retire(self, request):
+-        """Hold on to a finished read so its control block stays where it is.
++    def _notification(self, ok, transferred, key, address, error):
++        """Turn one dequeued completion packet into an :class:`Event`.
+ 
+-        The system goes on writing into the control block and the buffer of a
+-        read until the read has been dealt with, so the layer keeps a hand on
+-        both instead of letting them go the moment the read shows up as done.
++        Returns ``None`` when the packet does not belong to a read this pool
++        holds, which is what keeps a notification from being handed out twice:
++        the control block is taken out of the pending table under the pool's
++        lock, so exactly one caller can ever form an event from it.
+         """
+         with self._mutex:
+-            self._retired.append(request)
+-            if len(self._retired) > _KEPT:
+-                del self._retired[:-_KEPT]
++            request = self._pending.pop(address, None)
++        if request is None:
++            return None
+ 
+-    def _harvest(self):
+-        """Move the reads that have finished into the ready list."""
++        if ok:
++            status = "completed"
++            failure = None
++        elif error == _winapi.ERROR_OPERATION_ABORTED:
++            status = "cancelled"
++            failure = error
++        else:
++            # The read ended without data -- end of file, a far end that went
++            # away -- which is a finished read as far as a caller is concerned.
++            status = "completed"
++            failure = error
++
++        request._state = "cancelled" if status == "cancelled" else "done"
++        self._retire(request)
++
++        # The port carries the key of the attachment the notification came
++        # from.  It is only overridden when the object was re-registered after
++        # this read was submitted: such a read keeps its submission key.
++        reported = key if key == request.key else request.key
++        event = Event(reported, request, transferred if ok else 0, status)
++        event.error = failure
++        return event
++
++    def _closing_handoff(self):
++        """One cancelled notification that :meth:`close` collected, if any."""
+         with self._mutex:
+-            outstanding = list(self._outstanding)
+-        for request in outstanding:
+-            kernel_event = request._kernel_event
+-            overlapped = request._overlapped
+-            if kernel_event is None or overlapped is None:
+-                continue
+-            outcome = _winapi.wait_for(kernel_event.handle, 0)
+-            if outcome != "signalled":
++            if self._handoff:
++                return self._handoff.pop(0)
++        return None
++
++    def _drain(self, port):
++        """Collect what a closing pool's cancelled reads leave on the port."""
++        deadline = time.monotonic() + _DRAIN_SECONDS
++        while True:
++            with self._mutex:
++                if not self._pending:
++                    return
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                break
++            # A read submitted while this pool was closing is cancelled too.
++            self._cancel_outstanding()
++            ok, transferred, key, address, error = _winapi.get_completion(
++                port, _milliseconds(min(remaining, _DRAIN_SLICE)))
++            if address:
++                event = self._notification(ok, transferred, key, address, error)
++                if event is not None:
++                    with self._mutex:
++                        self._handoff.append(event)
+                 continue
++            if not ok and error not in (_winapi.WAIT_TIMEOUT, _winapi.ERROR_SUCCESS):
++                # The port is no longer usable; nothing more will arrive.
++                break
++
++        # Whatever the system never reported back keeps its control block and
++        # its buffer for good: the kernel may still write into them.
++        with self._mutex:
++            for request in self._pending.values():
++                request._state = "cancelled"
++                self._abandoned.append(request)
++            self._pending.clear()
++
++    def _release_waiters(self, port):
++        """Wake the callers that are still inside the port, then let it go."""
++        deadline = time.monotonic() + _DRAIN_SECONDS
++        while True:
+             with self._mutex:
+-                try:
+-                    self._outstanding.remove(request)
+-                except ValueError:
+-                    continue
+-            request._state = "done"
+-            self._retire(request)
+-            self._deliver(request.handle, request,
+-                          _winapi.transferred_bytes(overlapped))
++                waiting = self._takers
++            if waiting <= 0:
++                break
++            if time.monotonic() >= deadline:
++                # Rather than pull the port out from under a caller that is
++                # still waiting on it, the handle is left behind.
++                return
++            _winapi.post_completion(port)
++            time.sleep(_DRAIN_SLICE)
++
++        _winapi.close_handle(port)
++
++    def _retire(self, request):
++        """Hold on to a read whose notification has just been collected.
+ 
+-    def _deliver_loop(self):
+-        """Collect finished reads for as long as the pool is open."""
+-        while not self._closing:
+-            self._harvest()
+-            with self._cond:
+-                self._cond.wait(_IDLE_SLICE)
++        The system writes into the control block and the buffer of a read until
++        the read is reported, so both are kept in place up to that point; the
++        most recent ones are kept a little longer, for the caller that is still
++        looking at the event.
++        """
++        with self._mutex:
++            self._retired.append(request)
++            if len(self._retired) > 4 * _RETIRED_KEPT:
++                del self._retired[:-_RETIRED_KEPT]
+ 
+ 
+ def _seconds(value):
+@@ -327,6 +485,15 @@ def _seconds(value):
+     return float(value)
+ 
+ 
++def _milliseconds(seconds):
++    """The wait a ``DWORD`` can carry for ``seconds``; ``None`` waits forever."""
++    if seconds is None:
++        return _winapi.INFINITE
++    if seconds <= 0:
++        return 0
++    return min(int(math.ceil(seconds * 1000.0)), _winapi.MAX_WAIT_MS)
++
++
+ def create_pool(threads=4):
+     """Create a completion :class:`Pool` served by ``threads`` workers."""
+     if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:

@@ -9,29 +9,41 @@ python -m venv ~/.workbuddy/binaries/python/envs/default
 
 （Windows 路径：`C:\Users\<user>\.workbuddy\binaries\python\envs\default\Scripts\python.exe`）
 
+> **口径优先级**：本目录脚本是**本地零成本预检**。判据冲突时一律以随包甲方脚本
+> `_reference/windows-harbor-qc/scripts/`（`inspect_delivery.py` / `run_qc.py` /
+> `validate_model_gate.py` / `validate_model_jobs.py`）的行为为准。
+
 ---
 
-## 1. `validate_package.py` — 题包校验
+## 1. `validate_package.py` — 题包校验（现行形态对齐版）
 
-按验收门禁做结构与身份一致性校验，输出 `PASS` / `FAIL` / `FLAG`。
+按甲方 `windows-harbor-qc` 的现行实测行为做结构与身份一致性校验，输出 `PASS` / `FAIL` / `FLAG`。
 
 ```bash
 python validate_package.py --package <题包根目录> --schema-version 1.3
 python validate_package.py --package <题包根目录> --json validate-report.json
+python validate_package.py --task-dir <单个题包目录>
 ```
 
 | 检查类别 | 内容 |
 |---|---|
-| 结构 | 标准 Harbor 五件套是否齐全 |
-| task.toml | `version` / `[metadata]` / `[agent]` / `[verifier]` / `[environment]` / 资源 / 12h 上限 |
+| 结构 | 五件套齐全 + `solution/` 具备 `solve.ps1\|solve.bat` 入口 |
+| task.toml | `version` / `task_id` / **`docker_image`（必须写，且与 Dockerfile `FROM` 逐字一致、pin digest、禁 latest）** / 12h 上限 |
 | 题面泄漏 | Golden Patch / Oracle / 隐藏测试 / F2P-P2P / Reward 关键词 |
 | 环境泄漏 | `environment/` 内是否混入 Solution 或答案 |
+| environment | **七件**（adapter.toml / Dockerfile / prepare.ps1 / validate_environment.ps1 / run.ps1 / restore.ps1 / cleanup.ps1）+ adapter.toml 可被 TOML 解析、六个扁平 key 均解析到真实文件 |
+| tests | **六件**（test.ps1 / run_tests.ps1 / aggregate_results.ps1 / **judge.toml** / **rubric.json** / **required_testcases.json**）、INVALID 区分、二值判分 |
+| 判分配置 | `judge.toml.source_sha256` == `rubric.json` **实字节** sha256；`rubric.json` 的 `test_ids` 覆盖全部 required testcase |
+| required_testcases | 顶层数组、5–27 条（>27 记 FLAG）、id 唯一、同时含 F2P 与 P2P |
+| 身份 | 用随包甲方 `inspect_delivery.py` 复算 `task_id` / `task_version` / `task_hash` / Harbor dirhash |
 | **Windows机制** | **★ Windows 专属机制门禁 F1–F6（委托 `check_windows_mechanism.py`）** |
-| tests | 验证入口、INVALID 区分能力、二值判分、旧 `judge.toml`/`rubric.json` 残留 |
-| spec | `swelive_spec.json` 的 F2P/P2P 与 `verification_evidence` |
-| 身份 | `harbor/` 与 `harbor-assets/` 的 task_id 一一对应、镜像引用一致 |
-| 伴随材料 | 批次级 7 文件 + 题级 6 项 |
-| 镜像 | 是否另存不可变 Digest |
+| jobs | `jobs/` 存在且**恰好 12 个 job**（Qwen×3 + Opus×3 + Oracle×3 + NOP×3）+ 必备文件 |
+
+> **已移除的历史形态检查**（现行 5 个生效包都不带，旧版会误报 FAIL）：
+> 把甲方必备件 `tests/judge.toml` / `tests/rubric.json` 判为"旧评分残留"；
+> 要求 `extras/` / `platform_import.json` / `swelive_spec.json` /
+> `extras/metadata/manifest.json` / 顶层 `_index/`；GLM/Kimi 目录缺失判 FAIL；
+> 要求 `[agent]` / `[verifier]` 段落。
 
 退出码：`0` 全过（可能含 FLAG）／`1` 存在 FAIL／`2` 参数错误。
 
@@ -58,11 +70,35 @@ python check_windows_mechanism.py --task-dir <题包目录> --allow-legacy-exemp
 | F3 | `exclusive_declaration.quote` 在 `instruction.md` 中**逐字出现** |
 | F4 | `mechanisms` ≥3 条；`instruction_quote` 题面逐字、`test_ref` 文件与行号有效、`f2p_case` 是 `required_testcases.json` 里的 F2P 用例 |
 | F5 | `non_windows_must_fail` 指向真实文件、证据逐字且含平台判定关键字 |
-| F6 | 包内**无**自我否认／通用化表述（「不主张 Windows…」「通用编码能力」「platform-agnostic」等）——**永不豁免** |
+| F6 | 包内**无**自我否认／通用化表述（「不主张 Windows…」「通用编码能力」「platform-agnostic」等）——**永不豁免**；判据与扫描器见 `self_denial_scan.py` |
 
 退出码：`0` 通过／`1` 存在 FAIL／`2` 参数错误。
 规则与可照抄的三层手法清单见 `references/12-windows-mechanism-gate.md`。
 
+
+---
+
+## 1.6 `self_denial_scan.py` — F6 自认句扫描（共享实现）★
+
+`check_windows_mechanism.py`（F6）与 `package_task_zip.py`（出包前扫描）**共用**这一份判据，
+避免"门禁绿、打包红"。
+
+```bash
+# 只查自认句（退出码 1 = 有真命中）
+python self_denial_scan.py <题包目录>
+# 连"被抑制"的条目一起看（用于核对是否误抑制）
+python self_denial_scan.py <题包目录> --include-suppressed
+```
+
+两条精度要求：
+
+1. **容忍夹字**：`通用编码` 与 `能力|题池|题` 之间允许 ≤8 个任意字符
+   （旧写法漏掉 `已按同一口径**明确归入通用编码能力**`）；
+2. **引用/否定防误报**：`对应甲方要求：…「否则归入通用编码题池」` 这类**转述条款**、
+   `**不归入**` 这类**反驳式表格行**会被抑制（可用 `--include-suppressed` 复核）。
+
+> 与多模型验证相关的补充：**`jobs/` 恰好 12 个**（Qwen×3 + Opus×3 + Oracle×3 + NOP×3）；
+> GLM/Kimi 自 2026-10-13 起可选，不占这 12 个名额、也不参与主判据。
 
 ---
 
@@ -113,8 +149,8 @@ python run_model_validation.py --score-only --out delivery-extras/tasks
 |---|---|---|---|---|
 | `qwen3.8-max` | Qwen3.8-Max-0902 | `qwen3.8-max-0902` | 3 | primary |
 | `opus-5` | Opus 5 | `claude-opus-5` | 3 | primary |
-| `glm-5.3` | GLM-5.3 | `glm-5.3` | 1 | auxiliary（**2026-10-13 起可选**） |
-| `kimi-k3` | Kimi K3 | `kimi-k3` | 1 | auxiliary |
+| `glm-5.3` | GLM-5.3 | `glm-5.3` | 可选（0 或 ≥1） | auxiliary（**2026-10-13 起可选**，不参与主判据） |
+| `kimi-k3` | Kimi K3 | `kimi-k3` | 可选（0 或 ≥1） | auxiliary（**2026-10-13 起可选**，不参与主判据） |
 
 协议均为 **Anthropic Messages**（`POST {base_url}/v1/messages`，header `x-api-key` + `anthropic-version: 2023-06-01`）。
 
@@ -213,7 +249,8 @@ python build_jobs.py --task-dir <题包> --summary <汇总 json> --dry-run
 
 ZIP 名与 ZIP 根目录名 = **`<task-id>-v<题目版本>-delivery`**，含 `instruction.md` / `task.toml` / `source.json` / `environment/**` /
 `tests/**`（含 `required_testcases.json`）/ **`solution/**`** / `jobs/**`；
-**只排除** `extras/`、`__pycache__/`、`.pytest_cache/`、`*.pyc`、`.DS_Store`。
+**排除** `extras/`、`environment/evidence/**`、`REFIT-*.md`、`verifier/WINDOWS_VALUE.md`、
+`solution/oracle.patch`、`__pycache__/`、`.pytest_cache/`、`*.pyc`、`.DS_Store`。
 
 > ⚠️ 甲方 `windows-harbor-qc` checklist 第 1 节明确要求 `solution/`（Golden 入口）、`source.json`、
 > `tests/required_testcases.json` **必须随题包交付**。**不要**再把 `solution/` 或 `source.json` 排除——
@@ -230,8 +267,12 @@ python package_task_zip.py --task-dir <题包> --out-dir <输出目录> --no-job
   文件名与内层根目录名均为 `<task-id>-v<版本>-delivery`，**与飞书交付附件名（去 `.zip`）逐字一致**，
   解压到 `harbor-windows/` 即落在同名目录下（详见 `SKILL.md` 的「飞书交付包 ↔ 本地目录严格对应」）
 - `--verify`：解包后逐文件比对 SHA256，并报告缺文件/哈希不符
-- **打包前自检**：缺 `source.json`、`solution/README.md`、`solution/solve.*`、`tests/required_testcases.json`
-  即 exit=2 拒发；ZIP 内混入 `extras/` 或 `*.pyc` 同样拒发
+- **打包前自检（任一命中即 exit=2 拒发）**：
+  1. 缺 `source.json`、`solution/README.md`、`solution/solve.*`、`tests/required_testcases.json`；
+  2. ZIP 内混入 `extras/`、`*.pyc` 或禁入名单条目；
+  3. **整个题包的自认句扫描命中**（与 `check_windows_mechanism.py` 的 F6 同口径，
+     打印 `文件:行号`；219 的命中来自 `REFIT-2026-10-13.md:68` 与
+     `verifier/WINDOWS_VALUE.md:106`）。
 
 ---
 

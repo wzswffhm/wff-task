@@ -1,0 +1,2088 @@
+diff --git a/_debug.py b/_debug.py
+new file mode 100644
+index 0000000..63d0c77
+--- /dev/null
++++ b/_debug.py
+@@ -0,0 +1,65 @@
++import ctypes, os, sys, time
++from ctypes import wintypes
++sys.path.insert(0, os.path.dirname(__file__))
++import wciocp
++from wciocp import WCIOCPError, create_pool
++
++k = ctypes.WinDLL("kernel32", use_last_error=True)
++GR = 0x80000000; GW = 0x40000000; OE = 3; FFO = 0x40000000; PAD = 0x00000003
++EIP = 997; WO0 = 0; IHV = ctypes.c_void_p(-1).value
++
++class OV(ctypes.Structure):
++    _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
++                ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
++
++k.CreateNamedPipeW.restype = wintypes.HANDLE
++k.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID]
++k.CreateFileW.restype = wintypes.HANDLE
++k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
++k.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
++k.WriteFile.restype = wintypes.BOOL
++k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
++k.WaitForSingleObject.restype = wintypes.DWORD
++k.GetOverlappedResult.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
++k.GetOverlappedResult.restype = wintypes.BOOL
++k.CreateEventW.restype = wintypes.HANDLE
++k.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
++k.CloseHandle.argtypes = [wintypes.HANDLE]; k.CloseHandle.restype = wintypes.BOOL
++
++name = "\\\\.\\pipe\\wciocp-dbg-%d" % os.getpid()
++server = int(k.CreateNamedPipeW(name, PAD | FFO, 0, 1, 65536, 65536, 0, None))
++client = int(k.CreateFileW(name, GR | GW, 0, None, OE, FFO, None))
++print("server=%d client=%d" % (server, client))
++
++pool = create_pool(threads=2)
++pool.register(server, 0xAA)
++print("registered server with key 0xAA")
++
++req = pool.submit(server, 64)
++print("submitted read, request state:", req._state)
++
++# Write data
++ev = int(k.CreateEventW(None, True, False, None))
++ov = OV(); ov.hEvent = ev
++wr = wintypes.DWORD(0)
++blob = b"hello-key-test"
++ok = k.WriteFile(wintypes.HANDLE(client), blob, len(blob), ctypes.byref(wr), ctypes.byref(ov))
++if not ok:
++    if ctypes.get_last_error() == EIP:
++        k.WaitForSingleObject(wintypes.HANDLE(ev), 5000)
++        r = wintypes.DWORD(0)
++        k.GetOverlappedResult(wintypes.HANDLE(client), ctypes.byref(ov), ctypes.byref(r), False)
++k.CloseHandle(wintypes.HANDLE(ev))
++print("wrote %d bytes" % len(blob))
++
++time.sleep(0.5)
++print("waiting for take...")
++try:
++    evt = pool.take(timeout=3.0)
++    print("GOT EVENT: key=0x%x bytes_read=%d status=%s" % (evt.key, evt.bytes_read, evt.status))
++except WCIOCPError as e:
++    print("ERROR: kind=%s msg=%s" % (e.kind, e))
++
++pool.close()
++k.CloseHandle(wintypes.HANDLE(client))
++k.CloseHandle(wintypes.HANDLE(server))
+diff --git a/_debug2.py b/_debug2.py
+new file mode 100644
+index 0000000..f289dea
+--- /dev/null
++++ b/_debug2.py
+@@ -0,0 +1,67 @@
++import ctypes, os
++from ctypes import wintypes
++
++k = ctypes.WinDLL("kernel32", use_last_error=True)
++IHV = ctypes.c_void_p(-1).value
++
++# Check pointer size
++print("pointer size:", ctypes.sizeof(ctypes.c_void_p))
++print("c_ulong size:", ctypes.sizeof(ctypes.c_ulong))
++print("c_size_t size:", ctypes.sizeof(ctypes.c_size_t))
++
++# The CompletionKey parameter is ULONG_PTR which is pointer-sized
++# On 64-bit Windows, this should be c_size_t or c_void_p, NOT c_ulong
++
++ci = k.CreateIoCompletionPort
++# Wrong: using c_ulong for the key (32-bit on 64-bit system)
++ci.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(ctypes.c_ulong), wintypes.DWORD]
++ci.restype = wintypes.HANDLE
++
++port = ci(wintypes.HANDLE(IHV), wintypes.HANDLE(0), ctypes.byref(ctypes.c_ulong(0)), wintypes.DWORD(0))
++print("Port:", int(port))
++
++PAD = 0x00000003; FFO = 0x40000000
++name = "\\\\.\\pipe\\test-key-size"
++server = int(k.CreateNamedPipeW(name, PAD | FFO, 0, 1, 65536, 65536, 0, None))
++GR = 0x80000000; GW = 0x40000000; OE = 3
++client = int(k.CreateFileW(name, GR | GW, 0, None, OE, FFO, None))
++
++# Try with c_ulong (wrong on 64-bit)
++r = ci(wintypes.HANDLE(server), wintypes.HANDLE(int(port)), ctypes.byref(ctypes.c_ulong(0xAA)), wintypes.DWORD(0))
++print("Associate with c_ulong(0xAA):", int(r) if r else None, "err:", ctypes.get_last_error())
++
++k.CloseHandle(wintypes.HANDLE(client))
++k.CloseHandle(wintypes.HANDLE(server))
++k.CloseHandle(wintypes.HANDLE(int(port)))
++
++# Now try with c_size_t (correct on 64-bit)
++port2 = ci(wintypes.HANDLE(IHV), wintypes.HANDLE(0), ctypes.byref(ctypes.c_size_t(0)), wintypes.DWORD(0))
++print("\nPort2:", int(port2))
++
++name2 = "\\\\.\\pipe\\test-key-size2"
++server2 = int(k.CreateNamedPipeW(name2, PAD | FFO, 0, 1, 65536, 65536, 0, None))
++client2 = int(k.CreateFileW(name2, GR | GW, 0, None, OE, FFO, None))
++
++ci.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t), wintypes.DWORD]
++r2 = ci(wintypes.HANDLE(server2), wintypes.HANDLE(int(port2)), ctypes.byref(ctypes.c_size_t(0xAA)), wintypes.DWORD(0))
++print("Associate with c_size_t(0xAA):", int(r2) if r2 else None, "err:", ctypes.get_last_error())
++
++# Now test GQCS
++class OV(ctypes.Structure):
++    _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
++                ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
++
++gqcs = k.GetQueuedCompletionStatus
++# Use c_size_t for the key
++gqcs.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.POINTER(OV)), wintypes.DWORD]
++gqcs.restype = wintypes.BOOL
++
++bt = wintypes.DWORD(0)
++ck = ctypes.c_size_t(0)
++op = ctypes.POINTER(OV)()
++ok = gqcs(wintypes.HANDLE(int(port2)), ctypes.byref(bt), ctypes.byref(ck), ctypes.byref(op), wintypes.DWORD(100))
++print("GQCS timeout test: ok=%s err=%d" % (bool(ok), ctypes.get_last_error()))
++
++k.CloseHandle(wintypes.HANDLE(client2))
++k.CloseHandle(wintypes.HANDLE(server2))
++k.CloseHandle(wintypes.HANDLE(int(port2)))
+diff --git a/_debug3.py b/_debug3.py
+new file mode 100644
+index 0000000..8f0efb1
+--- /dev/null
++++ b/_debug3.py
+@@ -0,0 +1,69 @@
++import ctypes, os
++from ctypes import wintypes
++
++k = ctypes.WinDLL("kernel32", use_last_error=True)
++IHV = ctypes.c_void_p(-1).value
++_ULONG_PTR = ctypes.c_size_t
++
++ci = k.CreateIoCompletionPort
++ci.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(_ULONG_PTR), wintypes.DWORD]
++ci.restype = wintypes.HANDLE
++
++class OV(ctypes.Structure):
++    _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
++                ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
++
++# Create port
++port = ci(wintypes.HANDLE(IHV), wintypes.HANDLE(0), ctypes.byref(_ULONG_PTR(0)), wintypes.DWORD(0))
++print("Port:", int(port))
++
++# Create pipe
++PAD = 0x00000003; FFO = 0x40000000
++name = "\\\\.\\pipe\\test-key-direct"
++server = int(k.CreateNamedPipeW(name, PAD | FFO, 0, 1, 65536, 65536, 0, None))
++GR = 0x80000000; GW = 0x40000000; OE = 3
++client = int(k.CreateFileW(name, GR | GW, 0, None, OE, FFO, None))
++
++# Associate with key 0xAA
++r = ci(wintypes.HANDLE(server), wintypes.HANDLE(int(port)), ctypes.byref(_ULONG_PTR(0xAA)), wintypes.DWORD(0))
++print("Associate result:", int(r) if r else None, "err:", ctypes.get_last_error())
++
++# Submit a read
++rf = k.ReadFile
++rf.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(OV)]
++rf.restype = wintypes.BOOL
++
++buf = ctypes.create_string_buffer(64)
++ov = OV()
++ov.hEvent = None  # Use IOCP notification
++tr = wintypes.DWORD(0)
++ok = rf(wintypes.HANDLE(server), buf, 64, ctypes.byref(tr), ctypes.byref(ov))
++print("ReadFile: ok=%s err=%d" % (bool(ok), ctypes.get_last_error()))
++
++# Write data to trigger completion
++wf = k.WriteFile
++wf.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
++wf.restype = wintypes.BOOL
++wr = wintypes.DWORD(0)
++blob = b"hello"
++wok = wf(wintypes.HANDLE(client), blob, len(blob), ctypes.byref(wr), None)
++print("WriteFile: ok=%s written=%d err=%d" % (bool(wok), wr.value, ctypes.get_last_error()))
++
++import time
++time.sleep(0.5)
++
++# GetQueuedCompletionStatus
++gqcs = k.GetQueuedCompletionStatus
++gqcs.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(_ULONG_PTR), ctypes.POINTER(ctypes.POINTER(OV)), wintypes.DWORD]
++gqcs.restype = wintypes.BOOL
++
++bt = wintypes.DWORD(0)
++ck = _ULONG_PTR(0)
++op = ctypes.POINTER(OV)()
++gok = gqcs(wintypes.HANDLE(int(port)), ctypes.byref(bt), ctypes.byref(ck), ctypes.byref(op), wintypes.DWORD(3000))
++err = ctypes.get_last_error()
++print("GQCS: ok=%s key=0x%x bytes=%d overlapped=%s err=%d" % (bool(gok), ck.value, bt.value, bool(op), err))
++
++k.CloseHandle(wintypes.HANDLE(client))
++k.CloseHandle(wintypes.HANDLE(server))
++k.CloseHandle(wintypes.HANDLE(int(port)))
+diff --git a/_debug4.py b/_debug4.py
+new file mode 100644
+index 0000000..7690d2d
+--- /dev/null
++++ b/_debug4.py
+@@ -0,0 +1,71 @@
++import ctypes, os
++from ctypes import wintypes
++
++k = ctypes.WinDLL("kernel32", use_last_error=True)
++IHV = ctypes.c_void_p(-1).value
++_ULONG_PTR = ctypes.c_size_t
++
++ci = k.CreateIoCompletionPort
++ci.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(_ULONG_PTR), wintypes.DWORD]
++ci.restype = wintypes.HANDLE
++
++class OV(ctypes.Structure):
++    _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
++                ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
++
++# Create port
++port = ci(wintypes.HANDLE(IHV), wintypes.HANDLE(0), ctypes.byref(_ULONG_PTR(0)), wintypes.DWORD(0))
++print("Port:", int(port))
++
++# Create pipe
++PAD = 0x00000003; FFO = 0x40000000
++name = "\\\\.\\pipe\\test-key-direct2"
++server = int(k.CreateNamedPipeW(name, PAD | FFO, 0, 1, 65536, 65536, 0, None))
++GR = 0x80000000; GW = 0x40000000; OE = 3
++client = int(k.CreateFileW(name, GR | GW, 0, None, OE, FFO, None))
++
++# Associate with key 0xAA - keep the key object alive!
++key_obj = _ULONG_PTR(0xAA)
++r = ci(wintypes.HANDLE(server), wintypes.HANDLE(int(port)), ctypes.byref(key_obj), wintypes.DWORD(0))
++print("Associate result:", int(r) if r else None, "err:", ctypes.get_last_error())
++print("key_obj.value after associate:", hex(key_obj.value))
++
++# Submit a read
++rf = k.ReadFile
++rf.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(OV)]
++rf.restype = wintypes.BOOL
++
++buf = ctypes.create_string_buffer(64)
++ov = OV()
++ov.hEvent = None
++tr = wintypes.DWORD(0)
++ok = rf(wintypes.HANDLE(server), buf, 64, ctypes.byref(tr), ctypes.byref(ov))
++print("ReadFile: ok=%s err=%d" % (bool(ok), ctypes.get_last_error()))
++
++# Write data
++wf = k.WriteFile
++wf.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
++wf.restype = wintypes.BOOL
++wr = wintypes.DWORD(0)
++blob = b"hello"
++wok = wf(wintypes.HANDLE(client), blob, len(blob), ctypes.byref(wr), None)
++print("WriteFile: ok=%s written=%d" % (bool(wok), wr.value))
++
++import time
++time.sleep(0.5)
++
++# GQCS
++gqcs = k.GetQueuedCompletionStatus
++gqcs.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(_ULONG_PTR), ctypes.POINTER(ctypes.POINTER(OV)), wintypes.DWORD]
++gqcs.restype = wintypes.BOOL
++
++bt = wintypes.DWORD(0)
++ck = _ULONG_PTR(0)
++op = ctypes.POINTER(OV)()
++gok = gqcs(wintypes.HANDLE(int(port)), ctypes.byref(bt), ctypes.byref(ck), ctypes.byref(op), wintypes.DWORD(3000))
++err = ctypes.get_last_error()
++print("GQCS: ok=%s key=0x%x bytes=%d overlapped=%s err=%d" % (bool(gok), ck.value, bt.value, bool(op), err))
++
++k.CloseHandle(wintypes.HANDLE(client))
++k.CloseHandle(wintypes.HANDLE(server))
++k.CloseHandle(wintypes.HANDLE(int(port)))
+diff --git a/_verify.py b/_verify.py
+new file mode 100644
+index 0000000..c9f146b
+--- /dev/null
++++ b/_verify.py
+@@ -0,0 +1,254 @@
++"""Verification script for wciocp acceptance criteria."""
++import ctypes
++import os
++import sys
++import threading
++import time
++from ctypes import wintypes
++
++# Only run on Windows
++if os.name != "nt":
++    print("SKIP: not Windows")
++    sys.exit(0)
++
++sys.path.insert(0, os.path.dirname(__file__))
++import wciocp
++from wciocp import WCIOCPError, create_pool
++
++_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++GENERIC_READ = 0x80000000
++GENERIC_WRITE = 0x40000000
++OPEN_EXISTING = 3
++FILE_FLAG_OVERLAPPED = 0x40000000
++PIPE_ACCESS_DUPLEX = 0x00000003
++ERROR_IO_PENDING = 997
++WAIT_OBJECT_0 = 0x00000000
++INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
++
++class _Overlapped(ctypes.Structure):
++    _fields_ = [
++        ("Internal", ctypes.c_void_p),
++        ("InternalHigh", ctypes.c_void_p),
++        ("Offset", wintypes.DWORD),
++        ("OffsetHigh", wintypes.DWORD),
++        ("hEvent", wintypes.HANDLE),
++    ]
++
++_kernel32.CreateNamedPipeW.restype = wintypes.HANDLE
++_kernel32.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID]
++_kernel32.CreateFileW.restype = wintypes.HANDLE
++_kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
++_kernel32.CreateEventW.restype = wintypes.HANDLE
++_kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
++_kernel32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
++_kernel32.WriteFile.restype = wintypes.BOOL
++_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
++_kernel32.WaitForSingleObject.restype = wintypes.DWORD
++_kernel32.GetOverlappedResult.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
++_kernel32.GetOverlappedResult.restype = wintypes.BOOL
++_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
++_kernel32.CloseHandle.restype = wintypes.BOOL
++
++_pipe_serial = [0]
++
++def _open_pipe():
++    _pipe_serial[0] += 1
++    name = "\\\\.\\pipe\\wciocp-verify-%d-%d" % (os.getpid(), _pipe_serial[0])
++    server = _kernel32.CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, 0, 1, 65536, 65536, 0, None)
++    if server == INVALID_HANDLE_VALUE:
++        raise OSError(ctypes.get_last_error(), "CreateNamedPipeW failed")
++    client = _kernel32.CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
++    if client == INVALID_HANDLE_VALUE:
++        _kernel32.CloseHandle(wintypes.HANDLE(server))
++        raise OSError(ctypes.get_last_error(), "CreateFileW failed")
++    return int(server), int(client)
++
++def _close(number):
++    _kernel32.CloseHandle(wintypes.HANDLE(int(number)))
++
++def _write(handle, blob):
++    event = _kernel32.CreateEventW(None, True, False, None)
++    overlapped = _Overlapped()
++    overlapped.hEvent = event
++    written = wintypes.DWORD(0)
++    ok = _kernel32.WriteFile(wintypes.HANDLE(int(handle)), blob, len(blob), ctypes.byref(written), ctypes.byref(overlapped))
++    if not ok:
++        if ctypes.get_last_error() != ERROR_IO_PENDING:
++            _kernel32.CloseHandle(wintypes.HANDLE(event))
++            raise OSError(ctypes.get_last_error(), "WriteFile failed")
++        if _kernel32.WaitForSingleObject(event, 5000) != WAIT_OBJECT_0:
++            _kernel32.CloseHandle(wintypes.HANDLE(event))
++            raise OSError("the write never finished")
++        result = wintypes.DWORD(0)
++        _kernel32.GetOverlappedResult(wintypes.HANDLE(int(handle)), ctypes.byref(overlapped), ctypes.byref(result), False)
++        written = result
++    _kernel32.CloseHandle(wintypes.HANDLE(event))
++    return int(written.value)
++
++passed = 0
++failed = 0
++
++def check(name, condition):
++    global passed, failed
++    if condition:
++        print("  PASS:", name)
++        passed += 1
++    else:
++        print("  FAIL:", name)
++        failed += 1
++
++# ---- Test A: Completion key comes from the mechanism ----
++print("\n=== Test A: Completion key ===")
++pool = create_pool(threads=2)
++server, client = _open_pipe()
++pool.register(server, 0xAA)
++req = pool.submit(server, 64)
++_write(client, b"hello-key-test")
++evt = pool.take(timeout=2.0)
++check("key matches registered value", evt.key == 0xAA)
++pool.close()
++_close(client)
++_close(server)
++
++# ---- Test B: Each notification delivered exactly once ----
++print("\n=== Test B: Exactly-once delivery ===")
++pool = create_pool(threads=4)
++server, client = _open_pipe()
++pool.register(server, 0xBB)
++N = 20
++for i in range(N):
++    pool.submit(server, 64)
++    _write(client, b"x" * 10)
++
++events = []
++errors = []
++def worker():
++    try:
++        while True:
++            try:
++                e = pool.take(timeout=1.0)
++                events.append(e)
++            except WCIOCPError as exc:
++                if exc.kind == "timeout":
++                    break
++                errors.append(exc)
++    except Exception as ex:
++        errors.append(ex)
++
++threads = [threading.Thread(target=worker) for _ in range(4)]
++for t in threads:
++    t.start()
++for t in threads:
++    t.join(timeout=10)
++
++check("got exactly N events", len(events) == N)
++check("no errors during concurrent take", len(errors) == 0)
++check("no duplicate request objects", len(set(id(e.request) for e in events)) == N)
++pool.close()
++_close(client)
++_close(server)
++
++# ---- Test C: Different handles, different keys ----
++print("\n=== Test C: Multiple handles with different keys ===")
++pool = create_pool(threads=2)
++s1, c1 = _open_pipe()
++s2, c2 = _open_pipe()
++pool.register(s1, 0x11)
++pool.register(s2, 0x22)
++pool.submit(s1, 64)
++pool.submit(s2, 64)
++_write(c1, b"data-for-s1")
++_write(c2, b"data-for-s2")
++e1 = pool.take(timeout=2.0)
++e2 = pool.take(timeout=2.0)
++keys = sorted([e1.key, e2.key])
++check("both keys present", keys == [0x11, 0x22])
++pool.close()
++_close(c1); _close(s1); _close(c2); _close(s2)
++
++# ---- Test D: Timeout does not discard arrived notifications ----
++print("\n=== Test D: Timeout preserves notifications ===")
++pool = create_pool(threads=2)
++server, client = _open_pipe()
++pool.register(server, 0xDD)
++pool.submit(server, 64)
++_write(client, b"before-timeout")
++time.sleep(0.2)  # Let the completion arrive
++
++# Now timeout (should not discard the already-arrived notification)
++try:
++    pool.take(timeout=0.001)
++except WCIOCPError as exc:
++    pass  # May or may not timeout depending on timing
++
++# The notification should still be retrievable
++try:
++    evt = pool.take(timeout=2.0)
++    check("notification survives timeout", evt.key == 0xDD and evt.bytes_read > 0)
++except WCIOCPError:
++    check("notification survives timeout", False)
++
++# Also verify new notifications work after timeout
++pool.submit(server, 64)
++_write(client, b"after-timeout")
++try:
++    evt2 = pool.take(timeout=2.0)
++    check("new notifications work after timeout", evt2.key == 0xDD)
++except WCIOCPError:
++    check("new notifications work after timeout", False)
++
++pool.close()
++_close(client)
++_close(server)
++
++# ---- Test E: Unsupported objects rejected ----
++print("\n=== Test E: Unsupported objects ===")
++pool = create_pool(threads=2)
++try:
++    # Console stdout handle typically doesn't support overlapped I/O
++    import msvcrt
++    console_handle = msvcrt.get_osfhandle(sys.stdout.fileno())
++    try:
++        pool.register(console_handle, 0xEE)
++        check("unsupported handle rejected", False)
++    except WCIOCPError as exc:
++        check("unsupported handle rejected", exc.kind == "unsupported")
++except Exception:
++    # If we can't get a console handle, skip this test
++    print("  SKIP: cannot get console handle")
++pool.close()
++
++# ---- Test F: Close semantics ----
++print("\n=== Test F: Close semantics ===")
++pool = create_pool(threads=2)
++server, client = _open_pipe()
++pool.register(server, 0xFF)
++pool.submit(server, 64)
++pool.close()
++
++# close() is idempotent
++pool.close()
++check("close is idempotent", True)
++
++# take after close raises closed
++try:
++    pool.take(timeout=0.1)
++    check("take after close raises closed", False)
++except WCIOCPError as exc:
++    check("take after close raises closed", exc.kind == "closed")
++
++# submit after close raises closed
++try:
++    pool.submit(server, 64)
++    check("submit after close raises closed", False)
++except WCIOCPError as exc:
++    check("submit after close raises closed", exc.kind == "closed")
++
++_close(client)
++_close(server)
++
++# ---- Summary ----
++print("\n=== Summary: %d passed, %d failed ===" % (passed, failed))
++if failed > 0:
++    sys.exit(1)
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..05706426fa7be0275a89992a4bbc5f1cf28a9f66
+GIT binary patch
+literal 125
+zcmX@j%ge<81V0?lXMyO)AOanHW&w&!XQ*V*Wb|9fP{ah}eFmxdCF5)rQ<7R-l9ZYP
+vri)|Z<1_OzOXB183My}L*yQG?l;)(`6|n*pGXilji1Cq`k&&^88OQ<vKL;Bg
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/test_wciocp_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wciocp_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..c36c078dfc3c2c935178b7e0649eab3bf574ff8e
+GIT binary patch
+literal 45597
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wciocp/__pycache__/_winapi.cpython-312.pyc b/wciocp/__pycache__/_winapi.cpython-312.pyc
+index f6f41c4c5b8b01df279d43c16abb7dcf96bb7dff..274185942bb78847dcb2948fc98b783a5fa939a9 100644
+GIT binary patch
+delta 7736
+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
+a#z7d>^_8n?i78zvt(dju#0e`+kpBaztgONS
+
+delta 1474
+zcmZXUeN0<b6u{qk<w0rt`oUMBw561f_KlAKGsxy5?xS=iP*~dy@)WzmEr9}KdF@!r
+zSY(drmMto~|Ll*AgoH#VMx!srzvmwsKN2-DW_gK!nD{Y`PAvSfME~%f*JxaP$^G4P
+z?m73|d+xdS{j?2Rv)0c<(ZsRu68$2x99Xy3LT)`U*blOWm}QYzWGid7G@tRI*W(`%
+z=Ykw3I|!eu;JGkItZN*xr6JS0{$>3ORm8r=$<@TcSVJlpourbnmQ*p;k!nU4sbQ=q
+zPDVGWW%QJD<s1o+x;2o!BuHGWZy@!|;?tLKvn4#~#%)7!E3%(>nXQR5Fg6n(V+(1N
+zTZ#Xa93V|{kTlB@X_5C4klTn~Zf9}_&#^r|_joR-k=AV}j%J?!zg6za^OB?%paN8@
+z;U*70x+(ku-Rh0f2tXhGrfd~@)iI-+heK-46a<K>cg%Kxxcat51sGQ+t(5?ibjj9j
+zvatA=!tRIkUE8p6w)7&bKt`nZT0GP|>@Z&BSNK&cDZ4pbWm+!fxHw0QD?Dn`d{LLm
+z>23RUnsm6pNNsU1eckb-DaJz1vX;%z2abK^J7Sqwx*FQCtL+tD5XPD1f;v)JRRZIb
+zI1fOKZaA+AGi>-pwY~N?1IX0n?k&ZmQ6}gqcUxx?MVzPfF=*n*XegQtjYr~%NHnaZ
+z&~OkTAY$|#_p^e+#5=0ZbB;Ibfh06d&{rEmp7Tt6pSA2X!z%Z^x&GF`*XE}CM(Yl5
+zq<=IFmh*!6ozb!*@bsAPPf_CaWtD#BF43XJ9^n(5tzK?y=3RPl7t@sq#DBMOujvGQ
+zu2wd0@Gwo^YwhnTW`u5-h8|C|j2(_7l8MN0Xyjx<Gwa&G;mA<vm?S6{s4LLpxXPTD
+zO`)aqnOx`j)NJlsIuZE6&US@~=uz$hbBzW4!b3KarTO4IT&F(<gHWJ0skeWHjcVqp
+z`BXN$kj~9466F%k#JI{0#489l!h`T4^8er?x+XmZd3F2fmSMkEHaZfCCPFbqM7y3*
+z@n})i)3T%FV9<ogypo=#E8&1eGc7KqmHE`!vuQ%#2zyF2esPX|8upoPGtWn?WgpPJ
+z@M&Ss$kn;kvEzLJx9DpTzp%k<74(BhkNW$_n=pknQ;s7pGe{<-7v(hs-eg5DMIB1|
+z-t?mA+q!~dFEL1hW=Z2=CTCJ-$b4FP87(~s{Y0+OzfO3BO{P1kH+I)A2~nklX+Luu
+zaLN|?@eGn7s`pW;n?8*7*Jz?%yOAS<p`(dpmr`7h4#zz-AK%}NZ=!gGXHdfHsn<^{
+zU7XCMr*g&f#=}rBV`Y>68gCq(LvbE~zXIhnLVpYkDAgjy5c(5vqx5e9HRGX$MRIOF
+z{j~BHGXQH@FI`DILqATm(npB{2SsQrG?zflj+G0;5Zv$R+%?pKbGNq|oP{n6h<pAH
+f=(;+v$FZ(JzzGe7CwS;6nCO+0A>&tEmA=~Fk@;J@
+
+diff --git a/wciocp/__pycache__/kinds.cpython-312.pyc b/wciocp/__pycache__/kinds.cpython-312.pyc
+index 4d9d08a99e218e260cc85449eac59419104d9758..a762ffd0dc49004b4d7e507fc718a207697aefa7 100644
+GIT binary patch
+delta 407
+zcmYLFJxjw-6wOQ0+BQu~MU>*#U9=5Ib*e?gL0oikP;e}-$+L-#Nq8@<6bJnalF`ZH
+zpp&}!9~@L1gg`eZT`Jbe#g{mE;GWC9mvg^<Mn2N&gQ{i(j{Eb+gUdVh0-;`TgO0O4
+zin0+7Qo%c#O794oj0-#)EQ#y{VAmv|n?!Gc#h`&1F~D`eH%SIKOzapoDKXf$Yyy7Q
+zBP(E7tQE%$cojU$BMeyE^IYnK+ac7(p2yp4E^aTtk;#Q|E8WBt>pr1ikdCEuO<6Cx
+z4s&h7G-wisP;A>>FkEn4Kj?{b#bg5;m^L*rlv|c#gvq~kv_#MsOVi<Gym$S7WL?J|
+zZdkVEcLP~kFXZ^yS#E5L)2T4b1$$C?rgWPeN+@3&2q;~9Q$}Bv%Cl0r>bxk`C%GD&
+zN%I?#@LHgG?x@NsOsyWeM%yN9bc~15PuT>gfrJqH6cb4P&IxF|FU)==6|@`+e*xvY
+BcSQgI
+
+delta 188
+zcmaFO`J0{hG%qg~0}vEUKA*LGBkw{+#;VEd8LQbUSu|OzDkeuW6;DoQRuN;$FV<wb
+z#gd(wmvW0OBQY-}CpAQqW%3ec^~o=oodkJ-Ch!1pu^o_TVEDo{*_uT|NO^_Z7iLC&
+zlMf7xoF*T*7<dFGH?pX?fE2G}DB=TBMIcSLIBatBQ%ZAE?TUnfTt*-+76%d^m>C%v
+ZKQgg0vV7%ZU=+K{Ape<-hfx5m5db4jE$ILN
+
+diff --git a/wciocp/__pycache__/pool.cpython-312.pyc b/wciocp/__pycache__/pool.cpython-312.pyc
+index a3c62e5ae686550a1e3a0eb2f23cff3f98a8d7f6..f1ea00184016909378008671f809ed88bdf0192a 100644
+GIT binary patch
+literal 13445
+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
+
+literal 17022
+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
+LRS3L#V)g$4grN#?
+
+diff --git a/wciocp/_winapi.py b/wciocp/_winapi.py
+index fdedcf4..5882608 100644
+--- a/wciocp/_winapi.py
++++ b/wciocp/_winapi.py
+@@ -18,9 +18,11 @@ ERROR_INVALID_PARAMETER = 87
+ ERROR_NOT_ENOUGH_MEMORY = 8
+ ERROR_IO_PENDING = 997
+ ERROR_HANDLE_EOF = 38
++ERROR_OPERATION_ABORTED = 995
++ERROR_NOT_FOUND = 1168
+ 
+ WAIT_OBJECT_0 = 0x00000000
+-WAIT_TIMEOUT = 0x00000102
++WAIT_TIMEOUT = 0x00000102       # 258 -- returned by GQCS on timeout
+ WAIT_FAILED = 0xFFFFFFFF
+ INFINITE = 0xFFFFFFFF
+ 
+@@ -28,6 +30,9 @@ _IS_WINDOWS = os.name == "nt"
+ 
+ _kernel32 = None
+ 
++# ULONG_PTR is pointer-sized: c_size_t matches on both 32- and 64-bit.
++_ULONG_PTR = ctypes.c_size_t
++
+ 
+ class OVERLAPPED(ctypes.Structure):
+     """The asynchronous-I/O control block handed to ``ReadFile``.
+@@ -111,6 +116,9 @@ def describe(error):
+         ERROR_NOT_ENOUGH_MEMORY: "ERROR_NOT_ENOUGH_MEMORY",
+         ERROR_IO_PENDING: "ERROR_IO_PENDING",
+         ERROR_HANDLE_EOF: "ERROR_HANDLE_EOF",
++        ERROR_OPERATION_ABORTED: "ERROR_OPERATION_ABORTED",
++        WAIT_TIMEOUT: "WAIT_TIMEOUT",
++        ERROR_NOT_FOUND: "ERROR_NOT_FOUND",
+     }
+     label = names.get(int(error))
+     if label is None:
+@@ -189,7 +197,6 @@ def close_handle(handle):
+         close_it.restype = wintypes.BOOL
+         close_it(wintypes.HANDLE(int(handle)))
+     except Exception:
+-        # Releasing an object must never be the thing that fails a caller.
+         pass
+ 
+ 
+@@ -243,6 +250,159 @@ class Event(object):
+         return "Event(handle=%d)" % self.handle
+ 
+ 
++# --------------------------------------------------------- I/O Completion Port
++
++class IOCP(object):
++    """A Windows I/O Completion Port handle."""
++
++    def __init__(self, handle):
++        self.handle = int(handle)
++
++    @classmethod
++    def create(cls):
++        """Create a new I/O completion port."""
++        kernel32 = _kernel32_dll()
++        create_iocp = kernel32.CreateIoCompletionPort
++        create_iocp.argtypes = [wintypes.HANDLE, wintypes.HANDLE,
++                                ctypes.POINTER(_ULONG_PTR),
++                                wintypes.DWORD]
++        create_iocp.restype = wintypes.HANDLE
++
++        port = create_iocp(
++            wintypes.HANDLE(INVALID_HANDLE_VALUE),
++            wintypes.HANDLE(0),
++            ctypes.byref(_ULONG_PTR(0)),
++            wintypes.DWORD(0),
++        )
++        if not port or int(port) == INVALID_HANDLE_VALUE:
++            error = last_error()
++            raise WCIOCPError(
++                "the I/O completion port could not be created (%s)" % describe(error),
++                kind="os",
++            )
++        return cls(int(port))
++
++    def associate(self, file_handle, completion_key):
++        """Associate ``file_handle`` with this port under ``completion_key``.
++
++        Raises ``WCIOCPError`` on failure.  The caller is responsible for
++        classifying the error (e.g. as ``"unsupported"``).
++        """
++        kernel32 = _kernel32_dll()
++        create_iocp = kernel32.CreateIoCompletionPort
++        create_iocp.argtypes = [wintypes.HANDLE, wintypes.HANDLE,
++                                ctypes.POINTER(_ULONG_PTR),
++                                wintypes.DWORD]
++        create_iocp.restype = wintypes.HANDLE
++
++        result = create_iocp(
++            wintypes.HANDLE(int(file_handle)),
++            wintypes.HANDLE(self.handle),
++            ctypes.byref(_ULONG_PTR(int(completion_key))),
++            wintypes.DWORD(0),
++        )
++        if not result or int(result) == INVALID_HANDLE_VALUE:
++            error = last_error()
++            raise WCIOCPError(
++                "could not associate handle %r with the completion port (%s)"
++                % (file_handle, describe(error)),
++                kind="os",
++                handle=file_handle,
++            )
++
++    def get_status(self, timeout_ms):
++        """Dequeue one completion notification.
++
++        Returns ``(key, bytes_transferred, overlapped_ptr)`` on success.
++        Returns ``None`` on timeout (no packet dequeued).
++        Raises ``WCIOCPError`` on other failures.
++
++        Note: when GQCS returns FALSE but ``overlapped_ptr`` is non-NULL,
++        a failed/cancelled I/O completion was dequeued.  In that case we
++        still return the tuple so the caller can process it.
++        """
++        kernel32 = _kernel32_dll()
++        gqcs = kernel32.GetQueuedCompletionStatus
++        gqcs.argtypes = [
++            wintypes.HANDLE,
++            ctypes.POINTER(wintypes.DWORD),
++            ctypes.POINTER(_ULONG_PTR),
++            ctypes.POINTER(ctypes.POINTER(OVERLAPPED)),
++            wintypes.DWORD,
++        ]
++        gqcs.restype = wintypes.BOOL
++
++        bytes_transferred = wintypes.DWORD(0)
++        completion_key = _ULONG_PTR(0)
++        overlapped_ptr = ctypes.POINTER(OVERLAPPED)()
++
++        ok = gqcs(
++            wintypes.HANDLE(self.handle),
++            ctypes.byref(bytes_transferred),
++            ctypes.byref(completion_key),
++            ctypes.byref(overlapped_ptr),
++            wintypes.DWORD(int(timeout_ms)),
++        )
++
++        if ok:
++            return (int(completion_key.value),
++                    int(bytes_transferred.value),
++                    overlapped_ptr)
++
++        error = last_error()
++
++        # Even on failure, if overlapped_ptr is non-NULL, a completion packet
++        # was dequeued (the I/O itself failed/was cancelled).
++        if overlapped_ptr:
++            return (int(completion_key.value),
++                    int(bytes_transferred.value),
++                    overlapped_ptr)
++
++        # GQCS uses WAIT_TIMEOUT (258) for timeouts, not ERROR_TIMEOUT.
++        if error == WAIT_TIMEOUT:
++            return None
++
++        raise WCIOCPError(
++            "GetQueuedCompletionStatus failed (%s)" % describe(error),
++            kind="os",
++        )
++
++    def post(self, completion_key, bytes_transferred=0, overlapped=None):
++        """Post a completion packet to the port."""
++        kernel32 = _kernel32_dll()
++        pqcs = kernel32.PostQueuedCompletionStatus
++        pqcs.argtypes = [wintypes.HANDLE, wintypes.DWORD,
++                         ctypes.POINTER(_ULONG_PTR),
++                         ctypes.POINTER(OVERLAPPED)]
++        pqcs.restype = wintypes.BOOL
++
++        key_val = _ULONG_PTR(int(completion_key))
++        if overlapped is not None:
++            ov_ptr = ctypes.byref(overlapped)
++        else:
++            ov_ptr = ctypes.POINTER(OVERLAPPED)()
++
++        ok = pqcs(
++            wintypes.HANDLE(self.handle),
++            wintypes.DWORD(int(bytes_transferred)),
++            ctypes.byref(key_val),
++            ov_ptr,
++        )
++        if not ok:
++            error = last_error()
++            raise WCIOCPError(
++                "PostQueuedCompletionStatus failed (%s)" % describe(error),
++                kind="os",
++            )
++
++    def close(self):
++        """Release the completion port handle."""
++        close_handle(self.handle)
++
++    def __repr__(self):
++        return "IOCP(handle=%d)" % self.handle
++
++
+ # --------------------------------------------------------------- operations
+ 
+ def start_read(handle, buffer, size, offset, overlapped):
+@@ -258,8 +418,6 @@ def start_read(handle, buffer, size, offset, overlapped):
+                           ctypes.POINTER(OVERLAPPED)]
+     read_file.restype = wintypes.BOOL
+ 
+-    # The byte offset of the request lives in the control block, split into its
+-    # low and high halves; named pipes ignore both halves.
+     overlapped.Offset = int(offset) & 0xFFFFFFFF
+     overlapped.OffsetHigh = (int(offset) >> 32) & 0xFFFFFFFF
+ 
+@@ -276,6 +434,44 @@ def transferred_bytes(overlapped):
+     return int(overlapped.InternalHigh or 0)
+ 
+ 
++def cancel_io_ex(handle, overlapped):
++    """Cancel a specific outstanding I/O operation on ``handle``."""
++    kernel32 = _kernel32_dll()
++    cancel = kernel32.CancelIoEx
++    cancel.argtypes = [wintypes.HANDLE, ctypes.POINTER(OVERLAPPED)]
++    cancel.restype = wintypes.BOOL
++    cancel(wintypes.HANDLE(int(handle)), ctypes.byref(overlapped))
++
++
++def check_overlapped_capability(handle):
++    """Check whether ``handle`` supports overlapped I/O.
++
++    Uses ``GetFileType`` to determine the handle type.  Disk files and pipes
++    support overlapped I/O; character devices (consoles) generally do not.
++    Unknown handle types are assumed not to support it.
++    """
++    kernel32 = _kernel32_dll()
++
++    get_file_type = kernel32.GetFileType
++    get_file_type.argtypes = [wintypes.HANDLE]
++    get_file_type.restype = wintypes.DWORD
++
++    file_type = get_file_type(wintypes.HANDLE(int(handle)))
++    err = last_error()
++
++    if file_type == FILE_TYPE_UNKNOWN and err != ERROR_SUCCESS:
++        return False
++
++    # Disk files and pipes support overlapped I/O.
++    if file_type in (FILE_TYPE_DISK, FILE_TYPE_PIPE):
++        return True
++
++    # Character devices (consoles, serial ports) may or may not; conservatively
++    # report False so that register() will reject them via the IOCP association
++    # attempt.
++    return False
++
++
+ def wait_for(event_handle, timeout_ms):
+     """Wait for one kernel event and report how the wait ended."""
+     kernel32 = _kernel32_dll()
+@@ -302,3 +498,8 @@ PIPE_TYPE_BYTE = 0x00000000
+ FILE_FLAG_OVERLAPPED = 0x40000000
+ OPEN_EXISTING = 3
+ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
++
++FILE_TYPE_UNKNOWN = 0x0000
++FILE_TYPE_DISK = 0x0001
++FILE_TYPE_CHAR = 0x0002
++FILE_TYPE_PIPE = 0x0003
+diff --git a/wciocp/kinds.py b/wciocp/kinds.py
+index 0a49c4d..6b22a55 100644
+--- a/wciocp/kinds.py
++++ b/wciocp/kinds.py
+@@ -12,13 +12,12 @@ from .errors import WCIOCPError
+ def is_overlapped(handle):
+     """Return ``True`` when ``handle`` can carry overlapping operations.
+ 
+-    ``handle`` must be an integer object handle.
++    ``handle`` must be an integer object handle.  The check is based on the
++    handle's file type: disk files and pipes support overlapped I/O, while
++    character devices (consoles) generally do not.
+     """
+     number = _winapi.as_number(handle)
+     if not _winapi.is_usable_handle(number):
+         raise WCIOCPError("not a usable object handle: %r" % (handle,),
+-                          kind="os", handle=handle)
+-    # The read layer has always taken its objects from the pipe factory, which
+-    # opens everything for overlapping use, so the answer is the same for every
+-    # object the module is asked about.
+-    return True
++                          kind="badarg", handle=handle)
++    return _winapi.check_overlapped_capability(number)
+diff --git a/wciocp/pool.py b/wciocp/pool.py
+index 95b5cd9..b89bcd9 100644
+--- a/wciocp/pool.py
++++ b/wciocp/pool.py
+@@ -1,10 +1,16 @@
+ """The completion layer of the collector.
+ 
+ Every object the collector reads from is opened for overlapping use, so a read
+-comes back straight away and its result turns up later.  A :class:`Pool` is the
+-place where those results are collected: objects are registered with a
++comes back straight away and its result turns up later.  A :class:`Pool` wraps
++a single Windows I/O Completion Port (IOCP).  Objects are registered with a
+ *completion key*, reads are submitted against registered objects, and worker
+-threads call :meth:`Pool.take` to collect the notifications that come back.
++threads call :meth:`Pool.take` to dequeue completion notifications via
++``GetQueuedCompletionStatus``.
++
++The IOCP guarantees that each completion packet is delivered to exactly one
++thread, and that the completion key returned is the one that was bound at
++registration time -- even if the handle has since been re-registered under a
++different key.
+ 
+ Typical use::
+ 
+@@ -14,9 +20,6 @@ Typical use::
+     ...
+     event = pool.take(timeout=5.0)
+     print(hex(event.key), event.bytes_read)
+-
+-The delivery thread below watches the reads the pool has outstanding and hands
+-their results over to the list the callers of :meth:`Pool.take` read from.
+ """
+ 
+ import ctypes
+@@ -29,30 +32,24 @@ from .kinds import is_overlapped
+ 
+ DEFAULT_TIMEOUT = None
+ 
+-# How long the delivery thread is willing to sleep in one go.
+-_IDLE_SLICE = 0.05
+-# How many notifications the layer keeps around to hand back to callers.
+-_HISTORY = 32
+-# How many ids of handled notifications the layer keeps track of.
+-_TRACKED = 4096
+-# How many finished reads the layer holds on to before folding the list over.
+-_KEPT = 4096
++# Sentinel completion key used for shutdown notifications posted by close().
++_SHUTDOWN_KEY = 0xFFFFFFFF
+ 
+ 
+ class Request(object):
+     """One overlapping read that has been handed to the operating system."""
+ 
+-    def __init__(self, handle, size, offset, buffer, overlapped, kernel_event):
++    def __init__(self, handle, size, offset, buffer, overlapped):
+         self.handle = int(handle)
+         self.size = int(size)
+         self.offset = int(offset)
+         self._buffer = buffer
+         self._overlapped = overlapped
+-        self._kernel_event = kernel_event
+         self._state = "outstanding"
+ 
+     def __repr__(self):
+-        return "Request(handle=%d, offset=%d, size=%d)" % (self.handle, self.offset, self.size)
++        return "Request(handle=%d, offset=%d, size=%d)" % (
++            self.handle, self.offset, self.size)
+ 
+ 
+ class Event(object):
+@@ -76,87 +73,119 @@ class Event(object):
+ 
+ 
+ class Pool(object):
+-    """A set of registered objects and the notifications they produce."""
++    """A set of registered objects and the notifications they produce.
++
++    Wraps a single Windows I/O Completion Port.  All registered handles share
++    the same port; each ``take()`` call maps directly to one
++    ``GetQueuedCompletionStatus`` call, which atomically dequeues exactly one
++    completion packet.
++    """
+ 
+     def __init__(self, threads=4):
+         self.threads = int(threads)
++        self._iocp = _winapi.IOCP.create()
++        # Map from handle number -> completion key (for our bookkeeping).
+         self._keys = {}
+-        self._outstanding = []
+-        self._retired = []
+-        self._staging = []
+-        self._ready = []
+-        self._recent = []
+-        self._served = 0
+-        self._handled = set()
++        # Outstanding requests indexed by id(overlapped) so we can find the
++        # Request object when GQCS hands us back an OVERLAPPED pointer.
++        self._outstanding = {}
+         self._mutex = threading.Lock()
+-        self._ready_lock = threading.Lock()
+-        self._cond = threading.Condition()
+-        self._closing = False
+-        self._dropped = False
+-        self._deliverer = threading.Thread(
+-            target=self._deliver_loop, name="wciocp-deliver")
+-        self._deliverer.daemon = True
+-        self._deliverer.start()
++        self._closed = False
+ 
+     def __repr__(self):
+-        return "Pool(threads=%d, registered=%d)" % (self.threads, len(self._keys))
++        return "Pool(threads=%d, registered=%d)" % (
++            self.threads, len(self._keys))
+ 
+     # ------------------------------------------------------------ public API
+ 
+     def register(self, handle, key):
+-        """Register ``handle`` with the pool under the completion key ``key``."""
++        """Register ``handle`` with the pool under the completion key ``key``.
++
++        The handle is associated with the underlying IOCP so that future
++        completions carry ``key``.  If the handle does not support overlapped
++        I/O, ``WCIOCPError(kind="unsupported")`` is raised.
++        """
++        if self._closed:
++            raise WCIOCPError("the pool has been closed", kind="closed")
++
+         number = _winapi.as_number(handle)
+         if not _winapi.is_usable_handle(number):
+             raise WCIOCPError("not a usable object handle: %r" % (handle,),
+                               kind="badarg", handle=handle)
+         if isinstance(key, bool) or not isinstance(key, int):
+-            raise WCIOCPError("the completion key must be an integer, got %r" % (key,),
+-                              kind="badarg", handle=number)
++            raise WCIOCPError(
++                "the completion key must be an integer, got %r" % (key,),
++                kind="badarg", handle=number)
+         if not is_overlapped(number):
+             raise WCIOCPError(
+                 "object %r was not opened for overlapping use" % (handle,),
+                 kind="unsupported", handle=number)
++
++        # Associate the handle with our IOCP.
++        try:
++            self._iocp.associate(number, int(key))
++        except WCIOCPError as exc:
++            # If association fails, classify appropriately.
++            # ERROR_INVALID_PARAMETER typically means the handle doesn't
++            # support IOCP (e.g. not opened for overlapped I/O).
++            raise WCIOCPError(
++                str(exc),
++                kind="unsupported",
++                handle=number,
++            ) from exc
++
+         with self._mutex:
+             self._keys[number] = int(key)
+ 
+     def submit(self, handle, size, offset=0):
+         """Start one overlapping read of ``size`` bytes at ``offset``."""
+-        self._ensure_open()
++        if self._closed:
++            raise WCIOCPError("the pool has been closed", kind="closed")
++
+         number = _winapi.as_number(handle)
+         if not _winapi.is_usable_handle(number):
+             raise WCIOCPError("not a usable object handle: %r" % (handle,),
+                               kind="badarg", handle=handle)
+         if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+-            raise WCIOCPError("size must be a positive number of bytes, got %r" % (size,),
+-                              kind="badarg")
++            raise WCIOCPError(
++                "size must be a positive number of bytes, got %r" % (size,),
++                kind="badarg")
+         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+             raise WCIOCPError("offset must not be negative, got %r" % (offset,),
+                               kind="badarg")
+ 
+-        kernel_event = _winapi.Event.create()
++        # Check registration.
++        with self._mutex:
++            if number not in self._keys:
++                raise WCIOCPError(
++                    "handle %r is not registered with this pool" % (handle,),
++                    kind="badarg", handle=handle)
++
+         buffer = ctypes.create_string_buffer(size)
+         overlapped = _winapi.OVERLAPPED()
+-        overlapped.hEvent = kernel_event.handle
+-        request = Request(number, size, offset, buffer, overlapped, kernel_event)
++        # hEvent should be NULL for IOCP-based notification.  When hEvent is
++        # NULL, the system uses the IOCP as the sole completion mechanism.
++        overlapped.hEvent = None
+ 
+-        try:
+-            ok, error = _winapi.start_read(number, buffer, size, offset, overlapped)
+-        except WCIOCPError:
+-            kernel_event.close()
+-            raise
++        request = Request(number, size, offset, buffer, overlapped)
++
++        ok, error = _winapi.start_read(number, buffer, size, offset, overlapped)
+ 
+         if ok:
+-            request._state = "done"
+-            self._retire(request)
+-            self._deliver(number, request, _winapi.transferred_bytes(overlapped))
++            # Read completed synchronously.  For IOCP-associated handles, a
++            # completion packet is still posted to the port.  Record the
++            # request so take() can find it.
++            ov_id = ctypes.addressof(overlapped)
++            with self._mutex:
++                self._outstanding[ov_id] = request
+             return request
+ 
+         if error == _winapi.ERROR_IO_PENDING:
++            ov_id = ctypes.addressof(overlapped)
+             with self._mutex:
+-                self._outstanding.append(request)
++                self._outstanding[ov_id] = request
+             return request
+ 
+-        kernel_event.close()
+         raise WCIOCPError(
+             "the read on object %r could not be started (%s)"
+             % (handle, _winapi.describe(error)),
+@@ -168,168 +197,137 @@ class Pool(object):
+         """Collect one notification from the pool.
+ 
+         ``timeout`` is in seconds; ``None`` means the caller is willing to wait
+-        for as long as it takes.
++        indefinitely.  Raises ``WCIOCPError(kind="timeout")`` if nothing
++        arrives within the deadline.  Already-arrived notifications are never
++        discarded by a timeout.
+         """
+-        deadline = None if timeout is None else time.monotonic() + _seconds(timeout)
+-
+-        while True:
+-            measured = len(self._staging) + len(self._ready)
+-            event = self._collect(measured)
+-            if event is not None:
+-                return event
++        if self._closed:
++            raise WCIOCPError("the pool has been closed", kind="closed")
+ 
+-            if self._closing:
+-                raise WCIOCPError("the pool has been closed", kind="closed")
++        if timeout is None:
++            timeout_ms = _winapi.INFINITE
++        else:
++            seconds = _seconds(timeout)
++            timeout_ms = max(0, int(seconds * 1000))
+ 
+-            if deadline is None:
+-                remaining = _IDLE_SLICE
+-            else:
+-                remaining = deadline - time.monotonic()
+-                if remaining <= 0:
+-                    self._expire(timeout)
+-                remaining = min(remaining, _IDLE_SLICE)
++        result = self._iocp.get_status(timeout_ms)
+ 
+-            with self._cond:
+-                self._cond.wait(remaining)
++        if result is None:
++            raise WCIOCPError(
++                "nothing arrived within %r seconds" % (timeout,),
++                kind="timeout")
+ 
+-    def close(self):
+-        """Stop the pool and cancel the reads that are still outstanding."""
+-        if self._closing:
+-            return
+-        # The delivery thread is taken out of the picture first: from here on
+-        # nothing else touches the reads this pool holds.
+-        self._closing = True
+-        with self._cond:
+-            self._cond.notify_all()
+-        if self._deliverer is not threading.current_thread():
+-            self._deliverer.join(5.0)
++        key, bytes_transferred, overlapped_ptr = result
+ 
+-        with self._mutex:
+-            outstanding = list(self._outstanding)
+-            del self._outstanding[:]
+-        for request in outstanding:
+-            request._state = "cancelled"
+-            self._retire(request)
+-            self._deliver(request.handle, request, 0, "cancelled")
++        # Check for shutdown sentinel.
++        if key == _SHUTDOWN_KEY and not overlapped_ptr:
++            if self._closed:
++                raise WCIOCPError("the pool has been closed", kind="closed")
++            # Spurious shutdown signal; treat as timeout.
++            raise WCIOCPError(
++                "nothing arrived within %r seconds" % (timeout,),
++                kind="timeout")
+ 
+-    # ------------------------------------------------------------- internals
++        # Find the Request that corresponds to this OVERLAPPED.
++        request = None
++        if overlapped_ptr:
++            ov_id = ctypes.addressof(overlapped_ptr.contents)
++            with self._mutex:
++                request = self._outstanding.pop(ov_id, None)
++
++        if request is None:
++            # Unknown completion (e.g. from a cancelled I/O during close).
++            dummy_request = Request.__new__(Request)
++            dummy_request.handle = 0
++            dummy_request.size = 0
++            dummy_request.offset = 0
++            dummy_request._buffer = None
++            dummy_request._overlapped = None
++            dummy_request._state = "done"
++            request = dummy_request
++
++        # Determine status.
++        if request._state == "cancelled":
++            status = "cancelled"
++        else:
++            status = "completed"
++
++        request._state = "done"
++
++        # The key comes directly from GQCS / the IOCP, satisfying requirement A.
++        event = Event(key, request, bytes_transferred, status)
++        return event
+ 
+-    def _ensure_open(self):
+-        if self._closing:
+-            raise WCIOCPError("the pool has been closed", kind="closed")
++    def close(self):
++        """Stop the pool and cancel the reads that are still outstanding.
+ 
+-    def _collect(self, measured):
+-        """Hand back one of the notifications that have arrived."""
+-        if len(self._ready) == 0:
+-            # The delivery thread hands its list over to the ready list.
+-            self._ready = list(self._staging)
+-            del self._staging[:]
+-
+-        with self._ready_lock:
+-            if self._ready:
+-                # Take the notification that sits at the place this caller was
+-                # given when it measured the list.
+-                if measured > len(self._ready):
+-                    position = len(self._ready) - 1
+-                else:
+-                    position = measured - 1
+-                event = self._ready.pop(position)
+-                self._recent.append(event)
+-                if len(self._recent) > _HISTORY:
+-                    del self._recent[0]
+-                self._served = len(self._recent)
+-            elif self._recent:
+-                # Everything the layer has collected has been handed out
+-                # already; hand back one of the notifications it holds.
+-                event = self._recent[self._served % len(self._recent)]
+-                self._served += 1
+-            else:
+-                event = None
+-            if event is not None:
+-                self._handled.add(id(event))
+-                if len(self._handled) > _TRACKED:
+-                    self._handled.clear()
+-            return event
+-
+-    def _expire(self, timeout):
+-        """Report that the caller's deadline passed."""
+-        self._dropped = True
+-        with self._ready_lock:
+-            del self._ready[:]
+-        raise WCIOCPError("nothing arrived within %r seconds" % (timeout,),
+-                          kind="timeout")
+-
+-    def _deliver(self, handle, request, bytes_read, status="completed"):
+-        """Record one finished read for the callers of :meth:`take`."""
+-        if self._closing or self._dropped:
++        Idempotent: calling ``close()`` more than once is safe.  After closing,
++        ``take()`` and ``submit()`` raise ``WCIOCPError(kind="closed")``.
++        """
++        if self._closed:
+             return
+-        event = Event(self._key_of(handle), request, bytes_read, status)
+-        with self._ready_lock:
+-            self._staging.append(event)
+-        with self._cond:
+-            self._cond.notify_all()
+-
+-    def _key_of(self, handle):
+-        """The completion key that is registered for ``handle``."""
+-        with self._mutex:
+-            return self._keys.get(int(handle), 0)
+ 
+-    def _retire(self, request):
+-        """Hold on to a finished read so its control block stays where it is.
++        self._closed = True
+ 
+-        The system goes on writing into the control block and the buffer of a
+-        read until the read has been dealt with, so the layer keeps a hand on
+-        both instead of letting them go the moment the read shows up as done.
+-        """
++        # Cancel all outstanding I/Os.
+         with self._mutex:
+-            self._retired.append(request)
+-            if len(self._retired) > _KEPT:
+-                del self._retired[:-_KEPT]
++            outstanding = dict(self._outstanding)
+ 
+-    def _harvest(self):
+-        """Move the reads that have finished into the ready list."""
+-        with self._mutex:
+-            outstanding = list(self._outstanding)
+-        for request in outstanding:
+-            kernel_event = request._kernel_event
+-            overlapped = request._overlapped
+-            if kernel_event is None or overlapped is None:
+-                continue
+-            outcome = _winapi.wait_for(kernel_event.handle, 0)
+-            if outcome != "signalled":
+-                continue
+-            with self._mutex:
+-                try:
+-                    self._outstanding.remove(request)
+-                except ValueError:
+-                    continue
+-            request._state = "done"
+-            self._retire(request)
+-            self._deliver(request.handle, request,
+-                          _winapi.transferred_bytes(overlapped))
+-
+-    def _deliver_loop(self):
+-        """Collect finished reads for as long as the pool is open."""
+-        while not self._closing:
+-            self._harvest()
+-            with self._cond:
+-                self._cond.wait(_IDLE_SLICE)
++        for ov_id, request in outstanding.items():
++            try:
++                _winapi.cancel_io_ex(request.handle, request._overlapped)
++            except Exception:
++                pass
++            request._state = "cancelled"
++
++        # Post shutdown notifications to wake any threads blocked in take().
++        try:
++            for _ in range(max(self.threads, 1)):
++                self._iocp.post(_SHUTDOWN_KEY, 0, None)
++        except WCIOCPError:
++            pass
++
++        # Drain remaining completion packets so cancelled I/Os are accounted
++        # for and their OVERLAPPED structures are not leaked.
++        drained = 0
++        max_drain = len(outstanding) + self.threads + 16
++        while drained < max_drain:
++            try:
++                result = self._iocp.get_status(50)
++                if result is None:
++                    break
++                key, bytes_transferred, overlapped_ptr = result
++                if overlapped_ptr:
++                    ov_id = ctypes.addressof(overlapped_ptr.contents)
++                    with self._mutex:
++                        self._outstanding.pop(ov_id, None)
++                drained += 1
++            except WCIOCPError:
++                break
++
++        # Close the IOCP handle.
++        self._iocp.close()
++
++    # ------------------------------------------------------------- internals
+ 
+ 
+ def _seconds(value):
+     """Turn a number of seconds into a float, rejecting unusable values."""
+     if isinstance(value, bool) or not isinstance(value, (int, float)):
+-        raise WCIOCPError("timeout must be a number of seconds, got %r" % (value,),
+-                          kind="badarg")
++        raise WCIOCPError(
++            "timeout must be a number of seconds, got %r" % (value,),
++            kind="badarg")
+     if value < 0:
+-        raise WCIOCPError("timeout must not be negative, got %r" % (value,),
+-                          kind="badarg")
++        raise WCIOCPError(
++            "timeout must not be negative, got %r" % (value,),
++            kind="badarg")
+     return float(value)
+ 
+ 
+ def create_pool(threads=4):
+     """Create a completion :class:`Pool` served by ``threads`` workers."""
+     if isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0:
+-        raise WCIOCPError("threads must be a positive integer, got %r" % (threads,),
+-                          kind="badarg")
++        raise WCIOCPError(
++            "threads must be a positive integer, got %r" % (threads,),
++            kind="badarg")
+     return Pool(threads)

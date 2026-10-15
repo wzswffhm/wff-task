@@ -33,6 +33,16 @@ F5  `non_windows_must_fail` 必须指向包内真实文件，`evidence` 逐字�
     且 evidence 含平台判定关键字（$IsWindows / Win32NT / OSVersion / DriveFormat /
     PipeTransmissionMode / GetFileInformationByHandle 等）。
 F6  包内**不得出现自我否认 Windows 价值的表述**（自认句会直接被甲方引为不合格证据）。
+      判据表与扫描器在 `scripts/self_denial_scan.py`，与 `package_task_zip.py` 的
+      出包前扫描共享同一份实现（两边结果必须一致）。
+      F6 修过两次精度问题（2026-10-14 复核）：
+        ① **词距盲区**：旧写法 `通用编码(能力|题池|题)` 要求关键词紧邻，漏掉了
+           `已按同一口径**明确归入通用编码能力**，不主张` 这种中间夹字的形态；
+           现行写法允许 `通用编码` 与 `能力|题池|题` 之间夹 ≤8 个任意字符。
+        ② **引文误报**：把 `对应甲方要求：…「否则归入通用编码题池」` 这类
+           **转述甲方条款**当成自认。现行写法加了「否定前缀 / 引用来源」两类
+           可复算的子串判据；被抑制的条目可用
+           `python self_denial_scan.py <目录> --include-suppressed` 逐条核对。
 
 用法
 ----
@@ -40,6 +50,9 @@ F6  包内**不得出现自我否认 Windows 价值的表述**（自认句会直
     python check_windows_mechanism.py --task-dir <题包目录> --extras <delivery-extras目录>
     python check_windows_mechanism.py --package <平铺题包根目录> --json report.json
     python check_windows_mechanism.py --task-dir <题包目录> --allow-legacy-exempt
+
+    # 只查 F6 的自认句（含被抑制条目的核对视图）
+    python self_denial_scan.py <题包目录> --include-suppressed
 
 退出码
 ------
@@ -62,13 +75,21 @@ import os
 import re
 import sys
 
+# F6 的扫描实现与「出包前扫描」共享同一份判据（scripts/self_denial_scan.py），
+# 避免出现"门禁绿、打包红"的自相矛盾。脚本按文件路径并列存放，直接就地导入。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from self_denial_scan import (  # noqa: E402  (必须在 sys.path 调整之后)
+    EXEMPT_FILE,
+    SELF_DENIAL_PATTERNS,
+    scan_self_denial,
+)
+
 # ---------------------------------------------------------------- 常量
 
 GATE_FILE_CANDIDATES = [
     os.path.join("metadata", "windows_mechanism.json"),
     "windows_mechanism.json",
 ]
-EXEMPT_FILE = "WINDOWS_MECHANISM_EXEMPT.md"
 
 # 排他声明：把其他操作系统排除出验收范围（加强 Windows 属性，不是免责）
 EXCLUSIVE_HINTS = (
@@ -101,26 +122,11 @@ PLATFORM_KEYWORDS = (
     "NTFS",
 )
 
-# 自我否认 / 通用化表述：命中即 FAIL（永不豁免）
-SELF_DENIAL_PATTERNS = [
-    (re.compile(r"不主张[^\n]{0,12}Windows"), "自我否认：『不主张 Windows…』"),
-    (re.compile(r"不(依赖|涉及|要求)[^\n]{0,8}Windows[^\n]{0,8}(专属|特有|机制)"), "自我否认：不依赖 Windows 专属机制"),
-    (re.compile(r"通用编码(能力|题池|题)"), "自我归类：『通用编码能力/题池』"),
-    (re.compile(r"platform[\s-]?agnostic", re.I), "自我归类：platform-agnostic"),
-    (re.compile(r"cross[\s-]?platform\s+(task|problem|implementation)", re.I), "自我归类：cross-platform task"),
-    (re.compile(r"(no|not|never)\s+(claim|claiming|rely on|relying on|depend on|depending on)\s+Windows", re.I),
-     "自我否认：no/not … Windows"),
-    (re.compile(r"Windows\s+(relevance|value)[^\n]{0,12}(low|none|absent)", re.I), "自我否认：Windows relevance low/none"),
-    (re.compile(r"not\s+a\s+Windows[\s-]specific", re.I), "自我否认：not a Windows-specific"),
-    (re.compile(r"按通用[^\n]{0,8}(归类|交付|计分)"), "自我归类：按通用…归类"),
-    (re.compile(r"windows_target[^\n]{0,40}(执行平台|不作为)"), "自我降格：windows_target 仅为执行平台"),
-]
-
-SCAN_SUFFIXES = {".md", ".toml", ".json", ".ps1", ".bat", ".txt"}
-SCAN_SKIP_DIRS = {"environment/workspace", "jobs", ".git", "__pycache__", "node_modules"}
-# 豁免标记是包内元数据声明（其措辞必然含"通用编码"字样），不参与 F6 扫描；
-# 但它**不得随交付 ZIP 外发**，故豁免生效时追加一条 FLAG 提醒。
-SCAN_SKIP_FILES = {EXEMPT_FILE}
+# 自我否认 / 通用化表述的判据表与扫描器已迁到 self_denial_scan.py（本模块 re-export）。
+# 旧的 `通用编码(能力|题池|题)` 写法有词距盲区：漏掉
+# `已按同一口径**明确归入通用编码能力**，不主张`（关键词之间夹了 Markdown 粗体与语气副词）。
+# 现行写法允许 `通用编码` 与 `能力|题池|题` 之间夹 ≤8 个任意字符，并加了
+# 「否定前缀 / 引用来源」两类上下文防误报判定。
 
 TEST_REF_RE = re.compile(r"^(?P<path>[^#]+)(?:#L(?P<start>\d+)(?:-L?(?P<end>\d+))?)?$")
 
@@ -222,31 +228,16 @@ def required_cases(task_dir):
     return out
 
 
-def scan_self_denial(task_dir):
-    """扫描题包自述类文件中的自我否认表述。返回 [(相对路径, 行号, 片段, 说明)]。"""
-    hits = []
-    for root, dirs, files in os.walk(task_dir):
-        rel_root = os.path.relpath(root, task_dir).replace("\\", "/")
-        if rel_root == ".":
-            rel_root = ""
-        dirs[:] = [d for d in dirs
-                   if not any((rel_root + "/" + d).lstrip("/").startswith(s) for s in SCAN_SKIP_DIRS)]
-        for name in files:
-            rel = (rel_root + "/" + name).lstrip("/")
-            if any(rel.startswith(s) for s in SCAN_SKIP_DIRS):
-                continue
-            if name in SCAN_SKIP_FILES:
-                continue
-            if os.path.splitext(name)[1].lower() not in SCAN_SUFFIXES:
-                continue
-            txt = read_text(os.path.join(root, name))
-            if not txt:
-                continue
-            for lineno, line in enumerate(txt.splitlines(), 1):
-                for pat, why in SELF_DENIAL_PATTERNS:
-                    if pat.search(line):
-                        hits.append((rel, lineno, line.strip()[:160], why))
-    return hits
+def scan_denial_hits(task_dir):
+    """F6 扫描：返回真命中（未被子串判据抑制）的自我否认表述。
+
+    实现委托 `self_denial_scan.scan_self_denial`，与 `package_task_zip.py` 的出包前
+    扫描逐字共享同一份判据表 —— 两边结果必须一致，否则会出现"门禁绿、打包红"。
+
+    返回 [(相对路径, 行号, 片段, 说明)]，保持历史调用方的元组形态。
+    """
+    hits = scan_self_denial(task_dir)
+    return [(h["file"], h["line"], h["text"], h["why"]) for h in hits]
 
 
 # ---------------------------------------------------------------- 门禁
@@ -401,7 +392,7 @@ def check_task(task_dir, extras_dir=None, allow_legacy_exempt=False):
                     res.note("非 Windows 必然失败锚点: %s → %s" % (f, ev[:60]))
 
     # ---- F6 自认句（永不豁免）
-    hits = scan_self_denial(task_dir)
+    hits = scan_denial_hits(task_dir)
     if hits:
         detail = "; ".join("%s:%d %s" % (h[0], h[1], h[3]) for h in hits[:6])
         res.error("包内出现自我否认 / 通用化 Windows 价值的表述（%d 处）：%s" % (len(hits), detail))
