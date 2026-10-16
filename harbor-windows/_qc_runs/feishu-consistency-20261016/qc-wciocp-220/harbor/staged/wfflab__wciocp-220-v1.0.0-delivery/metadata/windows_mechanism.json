@@ -1,0 +1,46 @@
+{
+  "schema_version": "windows-mechanism-gate-v1",
+  "task_id": "wfflab__wciocp-220",
+
+  "counterfactual": {
+    "question": "把目标 OS 换成 Linux/macOS，主要实现、错误根因和 Evaluator 是否基本不变？",
+    "answer": "否",
+    "reason": "主要实现只能由 Windows 的完成端口接口构成：句柄要用 CreateIoCompletionPort(handle, port, key, 0) 绑定到端口并同时登记**完成键**；重叠操作结束由内核把 (完成键, OVERLAPPED*, 字节数) 作为一个完成包入队；等待线程用 GetQueuedCompletionStatus 从端口**原子地取出**一个包，空队列等待以 WAIT_TIMEOUT(258) 结束。这些语义在 Linux/macOS 上没有对等物：epoll/kqueue 只报告就绪而不承载『完成包 + 完成键』；io_uring 的完成队列（CQE + user_data）是另一套模型；用进程内队列加条件变量模拟，『一个完成通知恰好被一个线程取到、且带回登记时的键』这条内核级保证必然丢失——缺陷实现正是因此重复消费、丢包，并在换键后给出错误答案。错误根因也只在 Windows 上成立：只有完成包由内核队列承载时，完成键才会随包回传，模块自己按句柄记账则在句柄被重新登记后改写已到达通知的键。Evaluator 必须在真实 Windows Runtime 上触发：它要自己建可完成对象、自己登记不同的完成键、自己用多个线程并发取包，并以『每个请求恰好回来一次、且带回登记时的键』为终态判据。"
+  },
+
+  "exclusive_declaration": {
+    "quote": "本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。"
+  },
+
+  "mechanisms": [
+    {
+      "name": "完成键随完成包由内核回传，且后来的登记不得改写已到达的通知（CreateIoCompletionPort 的完成键 + GetQueuedCompletionStatus）",
+      "instruction_quote": "- 同一个句柄被重新登记换键之后，**已经到达端口的通知**仍必须报**旧键**（不得被后来的登记改写）。",
+      "test_ref": "verifier/tests/test_wciocp_semantics.py#L184-L201",
+      "f2p_case": "f2p-reregistered-key-does-not-rewrite-past-completions"
+    },
+    {
+      "name": "完成包的内核级唯一消费（端口队列的原子出队 vs 进程内列表）",
+      "instruction_quote": "- 在多个线程并发 `take()` 的情况下，每个完成通知必须**恰好**被某一个线程取到：不得重复交付，也不得丢失。",
+      "test_ref": "verifier/tests/test_wciocp_semantics.py#L212-L228",
+      "f2p_case": "f2p-each-completion-is-delivered-once"
+    },
+    {
+      "name": "空队列等待的 WAIT_TIMEOUT 语义（超时不得破坏端口）",
+      "instruction_quote": "- 超时也不得让端口失效：之后到达的通知必须照常可以被取到。",
+      "test_ref": "verifier/tests/test_wciocp_semantics.py#L252-L267",
+      "f2p_case": "f2p-timeout-does-not-drop-queued-completions"
+    },
+    {
+      "name": "对象是否可承载完成通知的能力判定（FILE_FLAG_OVERLAPPED 的文件模式）",
+      "instruction_quote": "- 对不支持后台完成通知的对象，`register()` 必须抛出 `WCIOCPError`，且 `err.kind == \"unsupported\"`；不得静默接受。",
+      "test_ref": "verifier/tests/test_wciocp_semantics.py#L298-L304",
+      "f2p_case": "f2p-non-overlapped-handle-is-unsupported"
+    }
+  ],
+
+  "non_windows_must_fail": {
+    "file": "environment/validate_environment.ps1",
+    "evidence": "Fail 'the host platform is not Windows (Win32NT), so the wciocp contract cannot be graded here'"
+  }
+}

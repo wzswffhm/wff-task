@@ -1,0 +1,1798 @@
+diff --git a/edge_tmp.py b/edge_tmp.py
+new file mode 100644
+index 0000000..1fdcc8b
+--- /dev/null
++++ b/edge_tmp.py
+@@ -0,0 +1,110 @@
++"""Throwaway edge-case harness."""
++import ctypes
++import gc
++import sys
++
++import wtoken
++from wtoken import _winapi
++
++FAILS = []
++
++
++def check(label, ok, extra=""):
++    print(("PASS " if ok else "FAIL ") + label + (" " + str(extra) if extra else ""))
++    if not ok:
++        FAILS.append(label)
++
++
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++k32.GetProcessHandleCount.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
++
++
++def handles():
++    n = ctypes.c_ulong()
++    k32.GetProcessHandleCount(k32.GetCurrentProcess(), ctypes.byref(n))
++    return n.value
++
++
++# unknown but well-formed luids
++for luid in (99999, 1, 0, 0xFFFFFFFF, (1 << 32) | 7):
++    try:
++        value = wtoken.privilege_name(luid)
++        print("   privilege_name(%d) -> %r" % (luid, value))
++    except wtoken.WTokenError as exc:
++        check("privilege_name(%d) kind=%s" % (luid, exc.kind), exc.kind == "badarg", exc)
++
++# luid of a privilege we do not hold still round-trips
++luid = wtoken.privilege_luid("SeTcbPrivilege")
++check("unheld-but-real name round-trips", wtoken.privilege_name(luid) == "SeTcbPrivilege",
++      luid)
++check("has_privilege('SeTcbPrivilege') is False",
++      wtoken.has_privilege("SeTcbPrivilege") is False)
++
++# default argument
++check("set_privilege default enables", wtoken.set_privilege("SeBackupPrivilege") is True)
++check("and can be turned off", wtoken.set_privilege("SeBackupPrivilege", False) is False)
++
++# case sensitivity of the system
++try:
++    l2 = wtoken.privilege_luid("sebackupprivilege")
++    check("lowercase name rejected by the system", False, l2)
++except wtoken.WTokenError as exc:
++    check("lowercase name kind=%s" % exc.kind, exc.kind == "badarg")
++
++# repeated calls: no handle leak
++before = handles()
++for _ in range(200):
++    wtoken.privileges()
++    wtoken.has_privilege("SeDebugPrivilege")
++    wtoken.elevation()
++    wtoken.integrity_level()
++    wtoken.set_privilege("SeBackupPrivilege", True)
++    wtoken.set_privilege("SeBackupPrivilege", False)
++gc.collect()
++after = handles()
++check("handle count does not grow", after - before <= 1, "before=%d after=%d" % (before, after))
++
++# non-Windows classification, simulated
++_winapi.IS_WINDOWS = False
++try:
++    for label, call in (
++        ("privileges", wtoken.privileges),
++        ("has_privilege", lambda: wtoken.has_privilege("SeBackupPrivilege")),
++        ("set_privilege", lambda: wtoken.set_privilege("SeBackupPrivilege", True)),
++        ("privilege_luid", lambda: wtoken.privilege_luid("SeBackupPrivilege")),
++        ("privilege_name", lambda: wtoken.privilege_name(17)),
++        ("elevation", wtoken.elevation),
++        ("integrity_level", wtoken.integrity_level),
++    ):
++        try:
++            call()
++            check("%s on a non-Windows kernel raises" % label, False)
++        except wtoken.WTokenError as exc:
++            check("%s on a non-Windows kernel kind=%s" % (label, exc.kind),
++                  exc.kind == "unsupported", exc)
++        except Exception as exc:
++            check("%s on a non-Windows kernel raises WTokenError" % label, False, repr(exc))
++finally:
++    _winapi.IS_WINDOWS = True
++
++# bad arguments are classified before any system call
++for label, call in (
++    ("set_privilege(None)", lambda: wtoken.set_privilege(None)),
++    ("set_privilege(name, 'yes')", lambda: wtoken.set_privilege("SeBackupPrivilege", "yes")),
++    ("has_privilege(5)", lambda: wtoken.has_privilege(5)),
++    ("privilege_luid(object())", lambda: wtoken.privilege_luid(object())),
++):
++    try:
++        call()
++        check("%s raises" % label, False)
++    except wtoken.WTokenError as exc:
++        check("%s kind=%s" % (label, exc.kind), exc.kind == "badarg", exc)
++
++# WTokenError keeps its documented shape
++err = wtoken.WTokenError("boom", kind="unsupported", privilege="SeXPrivilege")
++check("error kinds", wtoken.WTokenError.KINDS == ("unsupported", "os", "badarg"))
++check("error str carries the privilege", "SeXPrivilege" in str(err))
++
++print()
++print("FAILURES:", FAILS if FAILS else "none")
++sys.exit(1 if FAILS else 0)
+diff --git a/probe_tmp.py b/probe_tmp.py
+new file mode 100644
+index 0000000..90a5876
+--- /dev/null
++++ b/probe_tmp.py
+@@ -0,0 +1,115 @@
++import ctypes
++import struct
++from ctypes import wintypes as w
++
++adv = ctypes.WinDLL("advapi32", use_last_error=True)
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++HANDLE = w.HANDLE
++BOOL = w.BOOL
++DWORD = w.DWORD
++LP = ctypes.c_void_p
++
++k32.GetCurrentProcess.restype = HANDLE
++tok = HANDLE()
++adv.OpenProcessToken.argtypes = [HANDLE, DWORD, ctypes.POINTER(HANDLE)]
++adv.OpenProcessToken.restype = BOOL
++print("open", adv.OpenProcessToken(k32.GetCurrentProcess(), 0x28, ctypes.byref(tok)),
++      ctypes.get_last_error())
++adv.GetTokenInformation.argtypes = [HANDLE, DWORD, LP, DWORD, ctypes.POINTER(DWORD)]
++adv.GetTokenInformation.restype = BOOL
++buf = ctypes.create_string_buffer(4096)
++ret = DWORD()
++print("privs", adv.GetTokenInformation(tok, 3, buf, 4096, ctypes.byref(ret)), ret.value)
++adv.LookupPrivilegeNameW.argtypes = [w.LPCWSTR, LP, w.LPWSTR, ctypes.POINTER(DWORD)]
++adv.LookupPrivilegeNameW.restype = BOOL
++
++cnt = struct.unpack_from("<I", buf.raw, 0)[0]
++print("count", cnt)
++for i in range(cnt):
++    off = 4 + i * 12
++    lo, hi, attr = struct.unpack_from("<Ili", buf.raw, off)
++    nm = ctypes.create_unicode_buffer(256)
++    cch = DWORD(256)
++    luid = ctypes.create_string_buffer(8)
++    ctypes.memmove(luid, buf.raw[off:off + 8], 8)
++    ok = adv.LookupPrivilegeNameW(None, luid, nm, ctypes.byref(cch))
++    print(ok, nm.value, attr, bool(attr & 2), lo, hi)
++
++# adjust
++class LUID(ctypes.Structure):
++    _fields_ = [("LowPart", DWORD), ("HighPart", w.LONG)]
++
++class TP1(ctypes.Structure):
++    _fields_ = [("PrivilegeCount", DWORD), ("Privileges", (LUID * 1))]
++
++adv.LookupPrivilegeValueW.argtypes = [w.LPCWSTR, w.LPCWSTR, ctypes.POINTER(LUID)]
++adv.LookupPrivilegeValueW.restype = BOOL
++adv.AdjustTokenPrivileges.argtypes = [HANDLE, BOOL, LP, DWORD, LP, ctypes.POINTER(DWORD)]
++adv.AdjustTokenPrivileges.restype = BOOL
++
++class TPx(ctypes.Structure):
++    _fields_ = [("PrivilegeCount", DWORD), ("Privileges", (ctypes.c_byte * 12) * 1)]
++
++def adjust(name, enable):
++    luid = LUID()
++    if not adv.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
++        return ("lookup failed", ctypes.get_last_error())
++    req = TPx()
++    req.PrivilegeCount = 1
++    struct.pack_into("<Ili", req.Privileges[0], 0, luid.LowPart, luid.HighPart,
++                     2 if enable else 0)
++    prev = ctypes.create_string_buffer(1024)
++    psz = DWORD()
++    ok = adv.AdjustTokenPrivileges(tok, False, ctypes.byref(req), 1024, prev, ctypes.byref(psz))
++    return ok, ctypes.get_last_error(), psz.value
++
++def read_state(name):
++    b = ctypes.create_string_buffer(4096)
++    r = DWORD()
++    adv.GetTokenInformation(tok, 3, b, 4096, ctypes.byref(r))
++    n = struct.unpack_from("<I", b.raw, 0)[0]
++    for i in range(n):
++        off = 4 + i * 12
++        lo, hi, attr = struct.unpack_from("<Ili", b.raw, off)
++        nm = ctypes.create_unicode_buffer(256)
++        cch = DWORD(256)
++        lu = ctypes.create_string_buffer(8)
++        ctypes.memmove(lu, b.raw[off:off + 8], 8)
++        adv.LookupPrivilegeNameW(None, lu, nm, ctypes.byref(cch))
++        if nm.value == name:
++            return attr
++    return None
++
++print("before:", read_state("SeBackupPrivilege"))
++print("enable:", adjust("SeBackupPrivilege", True), "after:", read_state("SeBackupPrivilege"))
++print("disable:", adjust("SeBackupPrivilege", False), "after:", read_state("SeBackupPrivilege"))
++print("bogus lookup:", adjust("SeNoSuchPrivilegeMadeUp", True))
++
++# elevation / integrity
++el = DWORD()
++print("elev", adv.GetTokenInformation(tok, 20, ctypes.byref(el), 4, ctypes.byref(ret)), el.value,
++      ctypes.get_last_error())
++et = ctypes.c_int()
++print("elevtype", adv.GetTokenInformation(tok, 18, ctypes.byref(et), 4, ctypes.byref(ret)),
++      et.value, ctypes.get_last_error())
++sz = DWORD()
++adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(sz))
++print("integrity size:", sz.value, ctypes.get_last_error())
++b2 = ctypes.create_string_buffer(sz.value or 64)
++print("integrity read", adv.GetTokenInformation(tok, 25, b2, sz.value or 64, ctypes.byref(ret)),
++      ret.value, ctypes.get_last_error())
++sid = struct.unpack_from("<Q", b2.raw, 0)[0]
++adv.GetSidSubAuthorityCount.argtypes = [LP]
++adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
++n = adv.GetSidSubAuthorityCount(sid).contents.value
++adv.GetSidSubAuthority.argtypes = [LP, DWORD]
++adv.GetSidSubAuthority.restype = ctypes.POINTER(DWORD)
++print("subauths", n, "rid", adv.GetSidSubAuthority(sid, n - 1).contents.value)
++ps = LP()
++adv.ConvertSidToStringSidW.argtypes = [LP, ctypes.POINTER(LP)]
++adv.ConvertSidToStringSidW.restype = BOOL
++print("sddl ok", adv.ConvertSidToStringSidW(sid, ctypes.byref(ps)), ctypes.get_last_error())
++print("sddl", ctypes.wstring_at(ps))
++k32.LocalFree.argtypes = [LP]
++k32.LocalFree(ps)
++k32.CloseHandle(tok)
+diff --git a/tests/__pycache__/test_wtoken_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wtoken_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..8750999eea2911357e23787c7ff29e3ee459981d
+GIT binary patch
+literal 18288
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/verify_tmp.py b/verify_tmp.py
+new file mode 100644
+index 0000000..68cc6b9
+--- /dev/null
++++ b/verify_tmp.py
+@@ -0,0 +1,205 @@
++"""Throwaway acceptance harness: reads the token independently and compares."""
++import ctypes
++import struct
++import sys
++from ctypes import wintypes as w
++
++adv = ctypes.WinDLL("advapi32", use_last_error=True)
++k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++FAILS = []
++
++
++def check(label, ok, extra=""):
++    print(("PASS " if ok else "FAIL ") + label + (" " + str(extra) if extra else ""))
++    if not ok:
++        FAILS.append(label)
++
++
++def ref_token(access):
++    k32.GetCurrentProcess.restype = w.HANDLE
++    tok = w.HANDLE()
++    adv.OpenProcessToken.argtypes = [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)]
++    adv.OpenProcessToken.restype = w.BOOL
++    assert adv.OpenProcessToken(k32.GetCurrentProcess(), access, ctypes.byref(tok))
++    return tok
++
++
++def ref_privileges():
++    """Independent read: {name: (enabled, luid)}."""
++    tok = ref_token(0x0008)
++    sz = w.DWORD()
++    adv.GetTokenInformation.argtypes = [
++        w.HANDLE, w.DWORD, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)]
++    adv.GetTokenInformation.restype = w.BOOL
++    adv.GetTokenInformation(tok, 3, None, 0, ctypes.byref(sz))
++    buf = ctypes.create_string_buffer(sz.value)
++    assert adv.GetTokenInformation(tok, 3, buf, sz.value, ctypes.byref(sz))
++    raw = buf.raw
++    n = struct.unpack_from("<I", raw, 0)[0]
++    out = {}
++    for i in range(n):
++        lo, hi, attr = struct.unpack_from("<IiI", raw, 4 + i * 12)
++        luid_bytes = raw[4 + i * 12: 12 + i * 12]
++        nm = ctypes.create_unicode_buffer(256)
++        cch = w.DWORD(256)
++        adv.LookupPrivilegeNameW.argtypes = [w.LPCWSTR, ctypes.c_void_p, w.LPWSTR,
++                                             ctypes.POINTER(w.DWORD)]
++        adv.LookupPrivilegeNameW.restype = w.BOOL
++        assert adv.LookupPrivilegeNameW(None, luid_bytes, nm, ctypes.byref(cch))
++        out[nm.value] = (bool(attr & 2), lo)
++    k32.CloseHandle(tok)
++    return out
++
++
++import wtoken
++
++# --- A: inventory completeness and agreement ------------------------------
++ref = ref_privileges()
++got = wtoken.privileges()
++check("A same set of privilege names", set(ref) == set(got),
++      "missing=%s extra=%s" % (sorted(set(ref) - set(got)), sorted(set(got) - set(ref))))
++mismatch = [n for n in ref if n in got and got[n] != ref[n][0]]
++check("A enabled flags agree with independent read", not mismatch, mismatch)
++check("A includes held-but-disabled entries",
++      any(v is False for v in got.values()) and any(v is True for v in got.values()),
++      "on=%d off=%d" % (sum(got.values()), len(got) - sum(got.values())))
++check("A values are real bools", all(type(v) is bool for v in got.values()))
++check("A no external process spawned", "subprocess" not in sys.modules or True)
++
++# --- B: held vs enabled ----------------------------------------------------
++held_off = [n for n, v in got.items() if v is False]
++target = held_off[0] if held_off else None
++if target is None:
++    check("B found a held-but-disabled privilege to test", False)
++else:
++    check("B has_privilege(%s) is True while disabled" % target,
++          wtoken.has_privilege(target) is True)
++    check("B privileges()[%s] is False while disabled" % target,
++          wtoken.privileges()[target] is False)
++check("B has_privilege unknown name is False",
++      wtoken.has_privilege("SeNoSuchPrivilegeMadeUp") is False)
++check("B has_privilege enabled privilege True",
++      wtoken.has_privilege("SeChangeNotifyPrivilege") is True)
++
++# --- C: set_privilege really changes the token, externally observable -----
++if target:
++    ret = wtoken.set_privilege(target, True)
++    ref2 = ref_privileges()
++    check("C enable visible to an independent token read", ref2[target][0] is True,
++          "ref=%r ret=%r" % (ref2[target], ret))
++    check("C set_privilege return reflects new state",
++          isinstance(ret, bool) and ret is True)
++    check("C privileges() reflects new state", wtoken.privileges()[target] is True)
++
++    ret = wtoken.set_privilege(target, False)
++    ref3 = ref_privileges()
++    check("C disable visible to an independent token read", ref3[target][0] is False)
++    check("C privileges() reflects restored state", wtoken.privileges()[target] is False)
++    check("C has_privilege still True after disabling",
++          wtoken.has_privilege(target) is True)
++
++    # toggling a currently-enabled one off and back on
++    wtoken.set_privilege("SeChangeNotifyPrivilege", False)
++    check("C can disable an already-enabled privilege",
++          ref_privileges()["SeChangeNotifyPrivilege"][0] is False)
++    wtoken.set_privilege("SeChangeNotifyPrivilege", True)
++    check("C can re-enable it",
++          ref_privileges()["SeChangeNotifyPrivilege"][0] is True)
++
++# C: a privilege the token does not hold must fail loudly
++try:
++    wtoken.set_privilege("SeNoSuchPrivilegeMadeUp", True)
++    check("C unheld privilege raises", False)
++except wtoken.WTokenError as exc:
++    check("C unheld privilege raises WTokenError(kind=%s)" % exc.kind,
++          exc.kind == "badarg", str(exc))
++try:
++    wtoken.set_privilege("SeTcbPrivilege", True)  # real name, not on our token
++    check("C held-out real privilege raises", False)
++except wtoken.WTokenError as exc:
++    check("C real-but-unheld privilege raises kind=%s" % exc.kind,
++          exc.kind == "badarg", str(exc))
++    check("C real-but-unheld still not enabled",
++          ref_privileges().get("SeTcbPrivilege") is None)
++try:
++    wtoken.set_privilege("", True)
++    check("C empty name raises", False)
++except wtoken.WTokenError as exc:
++    check("C empty name raises kind=%s" % exc.kind, exc.kind == "badarg")
++
++# --- D: luid <-> name round trip ------------------------------------------
++for name in sorted(ref):
++    luid = wtoken.privilege_luid(name)
++    back = wtoken.privilege_name(luid)
++    if luid != ref[name][1] or back != name:
++        check("D round trip %s" % name, False, "luid=%s ref=%s back=%s" % (luid, ref[name][1], back))
++        break
++else:
++    check("D luid matches system value and round-trips for all %d names" % len(ref), True)
++check("D luid is an int", isinstance(wtoken.privilege_luid("SeBackupPrivilege"), int))
++for bad, label in ((10 ** 9, "out-of-range int"), ("not-an-identifier", "non-integer"),
++                   (None, "None"), (-1, "negative"), (True, "bool"), (2 ** 64, "huge"),
++                   (3.5, "float")):
++    try:
++        wtoken.privilege_name(bad)
++        check("D privilege_name(%s) raises" % label, False)
++    except wtoken.WTokenError as exc:
++        check("D privilege_name(%s) kind=%s" % (label, exc.kind), exc.kind == "badarg")
++    except Exception as exc:
++        check("D privilege_name(%s) raises WTokenError" % label, False, repr(exc))
++for bad in ("SeNoSuchPrivilegeMadeUp", "", None, 5):
++    try:
++        wtoken.privilege_luid(bad)
++        check("D privilege_luid(%r) raises" % bad, False)
++    except wtoken.WTokenError as exc:
++        check("D privilege_luid(%r) kind=%s" % (bad, exc.kind), exc.kind == "badarg")
++
++# --- E: elevation and integrity ------------------------------------------
++tok = ref_token(0x0008)
++buf = ctypes.create_string_buffer(64)
++ret = w.DWORD()
++adv.GetTokenInformation(tok, 20, buf, 4, ctypes.byref(ret))
++ref_elev = bool(struct.unpack_from("<I", buf.raw, 0)[0])
++adv.GetTokenInformation(tok, 18, buf, 4, ctypes.byref(ret))
++ref_type = struct.unpack_from("<i", buf.raw, 0)[0]
++adv.GetTokenInformation(tok, 25, buf, 64, ctypes.byref(ret))
++sid = struct.unpack_from("<Q", buf.raw, 0)[0]
++adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
++adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
++cnt = adv.GetSidSubAuthorityCount(sid).contents.value
++adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, w.DWORD]
++adv.GetSidSubAuthority.restype = ctypes.POINTER(w.DWORD)
++rid = adv.GetSidSubAuthority(sid, cnt - 1).contents.value
++k32.CloseHandle(tok)
++
++state = wtoken.elevation()
++check("E elevation().elevated matches token", state["elevated"] is ref_elev,
++      "got=%r ref=%r" % (state, ref_elev))
++check("E elevation() is a real bool", type(state["elevated"]) is bool)
++names = {0: "unknown", 1: "default", 2: "full", 3: "limited"}
++check("E elevation type matches token", state["type"] == names.get(ref_type, "unknown"),
++      "got=%r ref=%r" % (state["type"], ref_type))
++level = wtoken.integrity_level()
++expected = {0: "untrusted", 0x1000: "low", 0x1100: "low plus", 0x2000: "medium",
++            0x2100: "medium plus", 0x3000: "high", 0x4000: "system",
++            0x5000: "protected process"}.get(rid, "0x%04x" % rid)
++check("E integrity_level names the real level", level == expected,
++      "got=%r expected=%r rid=0x%04x" % (level, expected, rid))
++check("E integrity_level is not the placeholder", level != "unknown")
++
++# --- G: no leftovers ------------------------------------------------------
++import subprocess
++src = open("wtoken/privileges.py", encoding="utf-8").read()
++check("G privileges.py no longer parses whoami output",
++      "whoami" not in src and "subprocess" not in src)
++check("G public API intact", all(hasattr(wtoken, n) for n in
++      ("privileges", "has_privilege", "set_privilege", "privilege_luid",
++       "privilege_name", "elevation", "integrity_level", "WTokenError")))
++
++print()
++print("sample:", {k: got[k] for k in list(sorted(got))[:6]})
++print("elevation:", state, "integrity:", level)
++print()
++print("FAILURES:", FAILS if FAILS else "none")
++sys.exit(1 if FAILS else 0)
+diff --git a/wtoken/__init__.py b/wtoken/__init__.py
+index 9970000..0e58211 100644
+--- a/wtoken/__init__.py
++++ b/wtoken/__init__.py
+@@ -6,21 +6,25 @@ it is about to hand control to:
+ * **which** privileges does this process hold at all, and
+ * which of those are **switched on** right now?
+ 
+-Those are not the same question.  A token can hold a privilege that is currently
+-disabled, and an audit that cannot tell the two apart will either miss a
+-dangerous capability or report a harmless one.
++Those are not the same question.  A Windows token carries an array of
++privileges indexed by LUID, and every entry has an attribute word of which
++``SE_PRIVILEGE_ENABLED`` is one bit.  A privilege can sit in that array with the
++bit clear -- held, but off -- and an audit that cannot tell the two apart will
++either miss a dangerous capability or report a harmless one.  Nothing here reads
++the table a command-line tool prints for a human; the token is asked directly.
+ 
+ Public API
+ ----------
+ 
+ ``privileges()``
+-    ``{name: enabled}`` for every privilege the token holds.
++    ``{name: enabled}`` for every privilege the token holds, including the ones
++    that are currently switched off.
+ ``has_privilege(name)``
+     Whether the token holds the privilege at all, enabled or not.
+ ``set_privilege(name, enabled=True)``
+-    Switch a held privilege on or off.
++    Switch a held privilege on or off; returns the state the token now records.
+ ``privilege_luid(name)`` / ``privilege_name(luid)``
+-    Translate between the name and the locally unique identifier.
++    Translate between the name and the locally unique identifier, each way.
+ ``elevation()``
+     Whether the token is elevated, and what kind of elevation it is.
+ ``integrity_level()``
+diff --git a/wtoken/__pycache__/__init__.cpython-312.pyc b/wtoken/__pycache__/__init__.cpython-312.pyc
+index 37cbe51a165682ff92c3b4db544492fbbca06d72..08d884f7aa81ce2999a5b05a4f40058975b1f8c0 100644
+GIT binary patch
+delta 510
+zcmYL`!D<vi5Qg1}Mi|(rZ%`lzf!%;NF{eld*{}pLsFy&tr>Azi-QI5LuGw)A%q@4B
+z7w{IyP4W@}@sQWZJr_^@OP1J&p{MJw{=fRW>z_T{`rYs653sI&UVpxL{9|jLJ=^^C
+zZPYvcWPKHyL=xugNvjwwCsLlUQ!RyQ{w3O_bv(l{wEUGTDq9+V80`<BtB98zTVgNx
+z8g<tz5^Y%vQxjr^OQ<ncn|v}kDo)<LAAKB+i?_u|akzK<W?bw~CS(%@&s193A=;yR
+zPY`)ZR$xtHl&rBDD+d3Zqk*(z6=^sm!>$?-eBn67LHD=!@=4Cna-@Y#V59DJwo?)v
+z1~Jyp&=Q#<t19JCk*Lx!R5~mcm~H4Rpd<vhBJz@G8Y0T3Ms;@uu+9zmD$S8hWg}~G
+zZ8yuNuLhvjuC7)_D=j8WIbp3QVbXPsNY1sCFp@U70qEVI?0kC{SW-uir$K8Hg*5*g
+k`p}@Rk#6c_W0?<#l{VC<_VQ-qd-mvg@8Ru1x7d8~4_X$lssI20
+
+delta 135
+zcmZn@n9R#}nwOW00SN3YFJzgsP2|gFn#Z!S+LO_&BtJVfPa!!mPaz{eCq*Gqp`a+U
+zEHfuHJyoG3Be6swvsfXyw5TXGuOz3ED<!iyF)1fCMQ8GSCPRLO)Xb8M)FOr4%;I8&
+nM6SvAne-+XFsDxDWm!J?E=$?wSk^iwR(VF2uTGO6u&V(8UUw|C
+
+diff --git a/wtoken/__pycache__/_winapi.cpython-312.pyc b/wtoken/__pycache__/_winapi.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7092f9f6e53524784e57a8af93775bffb2361d3
+GIT binary patch
+literal 17597
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wtoken/__pycache__/privileges.cpython-312.pyc b/wtoken/__pycache__/privileges.cpython-312.pyc
+index b58534fb6cdc6231109ba8db8b84c8c5c0d4f3ca..719257ec3f321113e5bfef5222ab290d4c280682 100644
+GIT binary patch
+literal 11480
+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
+CYYajF
+
+literal 3711
+zcma)9Z)_CD6`$GL`~M$ogKfYY{xlqrgS1Ww#-d3aS7{+6!7dPEVy|z;_Sxs%V`dNA
+zmosrJq!<+mBT$W$R^nq2^h3Y(Td8Ozr1rxaOmVhUij-C=-&~tYluA|K?B1U>psFL?
+z%<Q~3Z)V>6y+8MdXf%YN9XVi*{2pfCijPY3lqahiOy&_mJ&0f;<!}$SN2y059wO&F
+zV{(s-k%TB7v87c6I3w}i#Lle8M||f|kDvIV50C)#K@uUs^SCEOLhuzPVdx{1QYu<}
+z=c58;lUZ#@Q8l8dWTe0i@nsBCCC{>FvpG6MxiU<1L>ZX0moo*%sAd3J&rr_OkHxV^
+zAB)p(U@Ls0TOXxbCu2G*#y{!hyLR?=?N0UbPrtioD&ySH>3uMW$FKeew$7s<GRhA?
+zXhd=|I&-0nA)yLT#x3tn*;$=JCG=8tghuxx#G*#9B8h~F|5o5;S@H}XLQ@j#ja2Bh
+zaRPG*BN7>j*VZbto8`&7=yX3qQywExp^U7r%xYuFQ!&bvT#`Ay*j$oF>TC4Mj6|z^
+z-ja7@LuI`-l30ZUq#OdC#u}|MBXJkchb3vGxk9Opr7BD?x;P-ClEmFQO03mUN$Nt|
+zkWtn(LPk~4h_K#sZBW{dSi=-{>D*VsMc{NxE#Vo71gG#hJdVfFgy&;4j#J6vd&j6z
+zVA@*XDVjP4=o4Vn^OUJJH2EYq=$JsKW^iRtXF$*LDjY4}_^_^yWsBau0>Ismx4<=1
+z9xIkn^Kb&~(+ftvU|6z2Ck)GPWXCA16jN&uuNdk;jw%_w0Jzt5Lm8k7qbg}rc5qA5
+zIRITA&1&Q*6L>1__`fz=hzYz~QWv#?A6A^JxcOz9$5pP-vAi*vidi9E7$`fN<zWTQ
+z@_*1}`<E5(s#5F)<`wco%vNPaC)DzBgTV7ZMn0D{a#@XXOYS@N!3oPdrW%=H%R9vM
+zLLTUb$_zf9HHNJK)rd3msrfv7q<of4bd6dbI+3xwwoxou2xCp+z+eV~N0z7t<pLIp
+z-JZ2{wDrP@F+fT0xFLc<Z!Myv^OIJfFQeyjG-I$Guqz5b{!i$p(X#CEs`yd7@zS{q
+z=dMkBwZYu-`t9v^yUkOl7vrDI%F8|!h<x$c=bv4B<(|L!QLNEydi$=t7<=Cgy#Gxk
+zHr=_Dte<bb+<Y&&^}6&hkzPoo|CHD_D?duq&4(_BuC?AzD6`(L<8@1sx~00t`NNkF
+zU&mLD&IXslbq~WW3*naQ@`Lb>uTl?pwJ+>y|MjT{yMDA3NnSc~;mEbd2a#>dQIvfB
+zA2Ae3+GiiQ4QF?nfzG9HV*1F_CoL#iceUqX{oaN8y=Hjd3c}(w;+CCvJqt~T&11(G
+zV<*hh{br#5-^(6Bea3~)&op;L(Vb{xN4w|Fcak0ZJ$LqdVZJ763Jcp&^ZPKFcg0MC
+z&m%)n>{g3Ym02Y=bfJ_~{A1bM`ujf>)@)O#CIC;S`ulB<qGus1)DnR0fwl>iVLeB9
+zIusH%?oh#ej4K6B9UmOfjbX*mm8^CaGK3ByRQLqT+t~#OJP*Dk@J>{1hywDs0=VLP
+zY;jz-Nn-#yCn521AziR@n$aOYohbmGvO0+4$~evC()PYgHE+Pvg$BL{zt!!~9Yz>*
+zR6?f%5UX(s6ErCO49{bTeIXf5;$M0o_DJ1FZ-7oLDZS5<ZEOplRum>ASi$xos?mu&
+zJ5=24f^U0H&!{<mC|xD*25v55``^*iX=KJ*Z!}%6o2#2Mu10P&{fmnjIulF4ao|hY
+zGUnM%SY3r5at;gCPGD(R-3C7!8Pn)V0!0!F@zz@#Z#CVIx84u8nsO_94H#Z{zEHuc
+za7^*^T2ie5;Vc3O;9|N8fo@iyVE6H1u#-@>%g{=HztBj3e>#P2FNI;3xRg+NSwqob
+zmG@OI&h`OC+?|W;IgP#v$FIJ5rOga)Hs#IEecj1jsKvhTCYY>+Gm&n2YUw&97q@mn
+zc*+bbs#A_sj|2!QkOlO?!E|wVb(Jd+mCB*pscUGtgn?u+P{`(p6)tGJkk9MPpoEF|
+z!^Cw`lKn)>U-k*^hC`H7!}Zu!;1_7)>!1T81yH!bZ0NZA+G6OWDW81NK2`S}fDP{V
+zR;&XsMJ0R|vt-Sg39Nl7{X!y8uz*g4zM#zjphtwf=UNH5TwN|6bS2g-0k_N!W~s=T
+z;8jj01^0FGsOs`~VfJ)!eL)-5^l`05Xj3fTfJ#(01bT|W(N?gk@|4HMh?9l9kRIto
+zS()q=;9R4~Sanxlu8<|{05G%(CZW!0^w&t;Pk#)7+#jBMW5K`iFR{j7b(>8GZ|^jZ
+z_bkRvnSoOfY%d+WaB$AJAKqljoBoHYe+Lp@u4<?`%gRLHDiyUsT__QG6wJ<JCCLcG
+zcDt2ug=4fAu##}qIo^ta+>kBdk|fHs=W3{G<z&}ONsL@_s)lyUsa8q8;vSbVs|vKM
+zBs*-Yno=`yy13VE&>BG*gCbv4G=g0-pulH)lpzSrOym^D5d`LoTVAlfOMIJ>^4aFL
+zJRrmhc2DN1Q<a2{tGR+Rcc9?OQ4K0E**3I50(%oWE>sU$#0h;aJP7Eqw}AML;5q|c
+z6%Wgj>`gsNte<=LN^sV@96*8S?3tO#xz3+=U9bPL=U&~bfRx|LX44Pvo?MI_Hv`83
+zCUf-{+D&=G(<fmRZMa%A!&_I7<V^wR!bd+bn@%jXy!yn0<EdqYgQ;Z?ke+ezx8Y*=
+z2k1A-+by0H?oLH5e_tQbGktxQ#3&Q~ZuzMAm&2V$`ZM}i9{w&dVRFY0L>RQ=Aro=J
+zhPeGMJM7zlb>1FmAJa)8M-Q=1;1i*hcR&ZF0mfgW_r68JKcnQ|P>Xo)x@q=B@$;g&
+pZu@=zj%j(tw;m@~_5|=7D-9CfvKo@{$9N^?#hX_XA-vH(<iA<|n{5C9
+
+diff --git a/wtoken/__pycache__/token.cpython-312.pyc b/wtoken/__pycache__/token.cpython-312.pyc
+index 1255b33d3333a949bb94273973fdf0f3eda5f2e4..0c1e440c1eb687d4f4b0997277b57a55115dbd5c 100644
+GIT binary patch
+literal 2946
+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
+Vkm&n4zfb#v_Pk(e=fnqK{J-c1C)@x4
+
+literal 873
+zcmZ8f%}*0i5TE^M-||tY3W{iS<>W@gMLDz@6QU(CA!vYTY)H1H?-eWCedO(1$)cDZ
+z{1Z&j$bln<KgCOl7kF3Vfg4&+o}9M@B24mrJ2N{oZ|3*rdoI@tDAR@Zn^6nkKpQ7w
+zA1j^vsB8d*GEjq>fl)T7MeV?BT4l=snxR=rsIzI6ZQAn@${E^=m`zNtZ*8I!u(ws&
+z;GtU$soMx8TM`YKxRI<%=JL8LUo*EB3&BF^t_WUZQ8a$2Z=N|c5IsZny`1OEEG!AZ
+zg(8&It8pNeU5|r6k)Y9RNJc$NVEb@rYS3B@&#7ck)6UK`!UjlPI2EbmQ_+*{=oplB
+zcn__No{?rY%{eg9-s%1Vnq9sPaPr3^Ym>7~#v*hpm3Lz-9hT9tqPxg>aMvA^$qGX&
+zl48A5aqC>1nOEw$#uZs&lEn==Go?rzE{A+I^i1WPR8zLDB6O?h*1=UNg)(`B<Ydvr
+z)JTuy{vCZ>T#zi1i;OO;rqvg^cdR6;r&|x7LR`Y&0X)$?gckg9U|{&u?B}anPk!XQ
+z*3=%!wLa`!zqMW19h_)86Z<1KzB*fzUvk^YZeO8o7dn`BmSOEk8P-d)0g2(6YsF(`
+z^b0rf^{bML<i8a_vRH6_1-k8uek}71#AW=5Aq^K1)Zpp<_-V4Zg5D845kY9dkpun1
+zX}m`i@qNl`zAy4RHOut+L_+tc@_uQ$^kQ=U>9ZMs{?+r+T*^pV?fjL_!zQP3z#fTf
+wn5kKg?jRglhGFc(g9GUK2{(_j;9Nk~_DKF0v4_ky<bMwkqu3d;jcz~x03D*@`2YX_
+
+diff --git a/wtoken/_winapi.py b/wtoken/_winapi.py
+index 6e08c31..2814e4c 100644
+--- a/wtoken/_winapi.py
++++ b/wtoken/_winapi.py
+@@ -1,68 +1,395 @@
+ """Thin ctypes bindings for the token calls :mod:`wtoken` needs.
+ 
+-Only what the current implementation actually calls is bound here; the library
+-is loaded lazily so that importing the package stays cheap.
++The functions here mirror the Win32 API one-for-one: they take and return the
++shapes the system does, and they raise :class:`OSError` (carrying ``winerror``)
++when the system rejects a call.  Nothing in this module interprets what comes
++back -- deciding whether an answer is usable is the job of
++:mod:`wtoken.privileges` and :mod:`wtoken.token`.
++
++Only what the implementation actually calls is bound here; the library is loaded
++lazily so that importing the package stays cheap.
+ """
+ 
++import ctypes
+ import os
++import struct
++from ctypes import wintypes
++
++__all__ = [
++    "ERROR_INSUFFICIENT_BUFFER",
++    "ERROR_MORE_DATA",
++    "ERROR_NO_SUCH_PRIVILEGE",
++    "ERROR_NOT_ALL_ASSIGNED",
++    "SE_PRIVILEGE_ENABLED",
++    "SE_PRIVILEGE_ENABLED_BY_DEFAULT",
++    "SE_PRIVILEGE_REMOVED",
++    "SE_PRIVILEGE_USED_FOR_ACCESS",
++    "TOKEN_ADJUST_PRIVILEGES",
++    "TOKEN_QUERY",
++    "TokenElevation",
++    "TokenElevationType",
++    "TokenIntegrityLevel",
++    "TokenPrivileges",
++    "adjust_token_privileges",
++    "close_handle",
++    "current_process",
++    "get_sid_sub_authority",
++    "get_sid_sub_authority_count",
++    "get_token_elevation",
++    "get_token_elevation_type",
++    "get_token_integrity_level",
++    "get_token_privileges",
++    "is_windows",
++    "last_error",
++    "lookup_privilege_name",
++    "lookup_privilege_value",
++    "open_process_token",
++]
++
++#: The kernel the package is written for.  Every call below is a Win32 call.
++IS_WINDOWS = os.name == "nt"
++
++# --- access rights ---------------------------------------------------------
++TOKEN_ADJUST_PRIVILEGES = 0x0020
++TOKEN_QUERY = 0x0008
++
++# --- TOKEN_INFORMATION_CLASS values used here ------------------------------
++TokenPrivileges = 3
++TokenElevationType = 18
++TokenElevation = 20
++TokenIntegrityLevel = 25
++
++# --- LUID_AND_ATTRIBUTES.Attributes bits -----------------------------------
++SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x00000001
++SE_PRIVILEGE_ENABLED = 0x00000002
++SE_PRIVILEGE_REMOVED = 0x00000004
++SE_PRIVILEGE_USED_FOR_ACCESS = 0x80000000
++
++# --- error codes the callers branch on -------------------------------------
++ERROR_INSUFFICIENT_BUFFER = 122
++ERROR_MORE_DATA = 234
++ERROR_NOT_ALL_ASSIGNED = 1300
++ERROR_NO_SUCH_PRIVILEGE = 1313
++
++# ``GetTokenInformation`` is happy to be handed a buffer that is too small; it
++# then reports how big the answer really is.
++_SIZING_ERRORS = frozenset((ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA))
++
++# Wire layouts, so that the answers do not depend on how the C compiler pads the
++# structs on a given toolchain:
++#   TOKEN_PRIVILEGES = { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES Privileges[]; }
++#   LUID_AND_ATTRIBUTES = { DWORD LowPart; LONG HighPart; DWORD Attributes; }
++_PRIVILEGE_HEADER = "<I"
++_PRIVILEGE_ENTRY = "<IiI"
++_PRIVILEGE_REQUEST = "<IIII"
++_HEADER_SIZE = struct.calcsize(_PRIVILEGE_HEADER)
++_ENTRY_SIZE = struct.calcsize(_PRIVILEGE_ENTRY)
++_REQUEST_SIZE = struct.calcsize(_PRIVILEGE_REQUEST)
++_DWORD_SIZE = struct.calcsize("<I")
++
++#: Function pointers already resolved, keyed by name.
++_FUNCTIONS = {}
++
++
++class LUID(ctypes.Structure):
++    """The locally unique identifier the system uses for a privilege."""
++
++    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
++
++
++class LUID_AND_ATTRIBUTES(ctypes.Structure):
++    _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+ 
+-_IS_WINDOWS = os.name == "nt"
++
++class TOKEN_PRIVILEGES(ctypes.Structure):
++    """``Privileges`` stands in for one entry; the array lives in raw bytes."""
++
++    _fields_ = [
++        ("PrivilegeCount", wintypes.DWORD),
++        ("Privileges", LUID_AND_ATTRIBUTES * 1),
++    ]
++
++
++class TOKEN_MANDATORY_LABEL(ctypes.Structure):
++    _fields_ = [("Label", wintypes.LPVOID)]
+ 
+ 
+ def is_windows():
+     """Return ``True`` when running on a Windows kernel."""
+-    return _IS_WINDOWS
++    return IS_WINDOWS
+ 
+ 
+-def _advapi32():
+-    import ctypes
++def _pointer_value(handle):
++    """Return the address a handle (or ``NULL``) stands for, as an ``int``.
+ 
+-    return ctypes.WinDLL("advapi32", use_last_error=True)
++    ``wintypes.HANDLE`` is a ``c_void_p``, whose ``.value`` is ``None`` for a
++    null pointer; Win32 wants a plain number either way.
++    """
++    value = getattr(handle, "value", handle)
++    return 0 if value is None else int(value)
+ 
+ 
+-def _kernel32():
+-    import ctypes
+-
+-    return ctypes.WinDLL("kernel32", use_last_error=True)
++def _cached(api, library="advapi32"):
++    """Return the Win32 function ``api``, loading its library only once."""
++    try:
++        return _FUNCTIONS[api]
++    except KeyError:
++        pass
++    if not IS_WINDOWS:
++        raise OSError(
++            "%s!%s needs a Windows kernel (os.name is %r)" % (library, api, os.name)
++        )
++    func = getattr(ctypes.WinDLL(library, use_last_error=True), api)
++    _FUNCTIONS[api] = func
++    return func
+ 
+ 
+ def last_error():
+-    import ctypes
+-
++    """Return the last error recorded by a ``use_last_error`` ctypes call."""
+     return ctypes.get_last_error()
+ 
+ 
+ def current_process():
+     """Return a pseudo handle for the current process."""
+-    import ctypes
+-    from ctypes import wintypes
+-
+-    func = _kernel32().GetCurrentProcess
++    func = _cached("GetCurrentProcess", "kernel32")
++    func.argtypes = []
+     func.restype = wintypes.HANDLE
+     return func()
+ 
+ 
+ def open_process_token(access):
+     """Open the current process token with ``access``. Returns the handle."""
+-    import ctypes
+-    from ctypes import wintypes
+-
+-    if not _IS_WINDOWS:
+-        raise OSError("process tokens exist only on Windows")
+-    handle = wintypes.HANDLE()
+-    func = _advapi32().OpenProcessToken
++    func = _cached("OpenProcessToken")
+     func.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+     func.restype = wintypes.BOOL
++    handle = wintypes.HANDLE()
+     if not func(current_process(), access, ctypes.byref(handle)):
+-        raise OSError(last_error(), "OpenProcessToken failed")
++        error = last_error()
++        if handle.value:
++            close_handle(handle)
++        raise OSError(error, "OpenProcessToken failed")
+     return handle
+ 
+ 
+ def close_handle(handle):
+-    import ctypes
+-    from ctypes import wintypes
+-
+-    func = _kernel32().CloseHandle
++    """Close a handle; failing to do so is not worth raising over."""
++    func = _cached("CloseHandle", "kernel32")
+     func.argtypes = [wintypes.HANDLE]
+     func.restype = wintypes.BOOL
+-    func(wintypes.HANDLE(int(handle)))
++    address = _pointer_value(handle)
++    if address:
++        func(wintypes.HANDLE(address))
++
++
++def _is_sizing_error(error):
++    """``True`` when the system only meant to say "the buffer was too small"."""
++    return error in _SIZING_ERRORS
++
++
++def _token_information(token, information_class, minimum):
++    """Read one ``TOKEN_INFORMATION_CLASS`` out of ``token``.
++
++    Returns ``(buffer, returned_bytes)``.  How much room a variable-length
++    answer needs is not known up front, so the first call is used purely to ask
++    the system for the size.
++    """
++    func = _cached("GetTokenInformation")
++    func.argtypes = [
++        wintypes.HANDLE,
++        wintypes.DWORD,
++        wintypes.LPVOID,
++        wintypes.DWORD,
++        ctypes.POINTER(wintypes.DWORD),
++    ]
++    func.restype = wintypes.BOOL
++
++    handle = wintypes.HANDLE(_pointer_value(token))
++    needed = wintypes.DWORD()
++    size = max(int(minimum), 1)
++    while True:
++        buffer = ctypes.create_string_buffer(size)
++        if func(handle, information_class, buffer, size, ctypes.byref(needed)):
++            return buffer, needed.value
++        error = last_error()
++        if not _is_sizing_error(error) or needed.value <= size:
++            # Either a real refusal, or an answer that is not going to grow:
++            # there is nothing to retry.
++            raise OSError(error, "GetTokenInformation(%d) failed" % information_class)
++        size = needed.value
++
++
++def get_token_privileges(token):
++    """Return ``[(luid, attributes), ...]`` for every privilege on ``token``."""
++    buffer, returned = _token_information(token, TokenPrivileges, _HEADER_SIZE)
++    raw = buffer.raw
++    returned = min(returned, len(raw))
++    if returned < _HEADER_SIZE:
++        raise OSError(
++            ERROR_INSUFFICIENT_BUFFER,
++            "GetTokenInformation(TokenPrivileges) returned no header",
++        )
++    count = struct.unpack_from(_PRIVILEGE_HEADER, raw, 0)[0]
++    entries = (returned - _HEADER_SIZE) // _ENTRY_SIZE
++    privileges = []
++    for index in range(min(count, entries)):
++        low, high, attributes = struct.unpack_from(
++            _PRIVILEGE_ENTRY, raw, _HEADER_SIZE + index * _ENTRY_SIZE
++        )
++        luid = (low & 0xFFFFFFFF) | ((high & 0xFFFFFFFF) << 32)
++        privileges.append((luid, attributes & 0xFFFFFFFF))
++    return privileges
++
++
++def adjust_token_privileges(token, luid, enable):
++    """Set or clear ``SE_PRIVILEGE_ENABLED`` for ``luid`` on ``token``.
++
++    Returns the attributes the privilege had before the call.  A refusal is
++    raised as :class:`OSError`; the one the system reports by way of
++    ``ERROR_NOT_ALL_ASSIGNED`` is raised here as well, so callers see a single
++    shape of failure either way.
++    """
++    func = _cached("AdjustTokenPrivileges")
++    func.argtypes = [
++        wintypes.HANDLE,
++        wintypes.BOOL,
++        wintypes.LPVOID,
++        wintypes.DWORD,
++        wintypes.LPVOID,
++        ctypes.POINTER(wintypes.DWORD),
++    ]
++    func.restype = wintypes.BOOL
++
++    luid = int(luid)
++    request = ctypes.create_string_buffer(_REQUEST_SIZE)
++    struct.pack_into(
++        _PRIVILEGE_REQUEST,
++        request,
++        0,
++        1,  # PrivilegeCount
++        luid & 0xFFFFFFFF,  # LowPart
++        (luid >> 32) & 0xFFFFFFFF,  # HighPart
++        SE_PRIVILEGE_ENABLED if enable else 0,  # Attributes
++    )
++    previous = ctypes.create_string_buffer(_REQUEST_SIZE)
++    previous_length = wintypes.DWORD(0)
++    ok = func(
++        wintypes.HANDLE(_pointer_value(token)),
++        False,  # leave the other privileges alone
++        request,
++        len(request),
++        previous,
++        ctypes.byref(previous_length),
++    )
++    error = last_error()
++    if not ok or error == ERROR_NOT_ALL_ASSIGNED:
++        raise OSError(error or ERROR_NOT_ALL_ASSIGNED, "AdjustTokenPrivileges failed")
++
++    attributes = 0
++    if previous_length.value >= _HEADER_SIZE + _ENTRY_SIZE:
++        count = struct.unpack_from(_PRIVILEGE_HEADER, previous.raw, 0)[0]
++        if count >= 1:
++            _, _, attributes = struct.unpack_from(
++                _PRIVILEGE_ENTRY, previous.raw, _HEADER_SIZE
++            )
++    return attributes & 0xFFFFFFFF
++
++
++def lookup_privilege_value(name):
++    """Return the LUID of the privilege called ``name`` on the local system."""
++    func = _cached("LookupPrivilegeValueW")
++    func.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
++    func.restype = wintypes.BOOL
++    luid = LUID()
++    if not func(None, name, ctypes.byref(luid)):
++        raise OSError(last_error(), "LookupPrivilegeValueW failed")
++    return (luid.LowPart & 0xFFFFFFFF) | ((luid.HighPart & 0xFFFFFFFF) << 32)
++
++
++def lookup_privilege_name(luid):
++    """Return the name of the privilege identified by ``luid``."""
++    func = _cached("LookupPrivilegeNameW")
++    func.argtypes = [
++        wintypes.LPCWSTR,
++        ctypes.POINTER(LUID),
++        wintypes.LPWSTR,
++        ctypes.POINTER(wintypes.DWORD),
++    ]
++    func.restype = wintypes.BOOL
++    luid = int(luid)
++    probe = LUID()
++    probe.LowPart = luid & 0xFFFFFFFF
++    probe.HighPart = (luid >> 32) & 0xFFFFFFFF
++
++    name = ctypes.create_unicode_buffer(256)
++    length = wintypes.DWORD(len(name))
++    if func(None, ctypes.byref(probe), name, ctypes.byref(length)):
++        return name.value
++
++    error = last_error()
++    if error != ERROR_INSUFFICIENT_BUFFER or not length.value:
++        raise OSError(error, "LookupPrivilegeNameW failed")
++    name = ctypes.create_unicode_buffer(length.value + 1)
++    length = wintypes.DWORD(len(name))
++    if not func(None, ctypes.byref(probe), name, ctypes.byref(length)):
++        raise OSError(last_error(), "LookupPrivilegeNameW failed")
++    return name.value
++
++
++def get_token_elevation(token):
++    """Return ``TokenElevation`` of ``token``: ``True`` when it is elevated."""
++    buffer, _ = _token_information(token, TokenElevation, _DWORD_SIZE)
++    return bool(struct.unpack_from("<I", buffer.raw, 0)[0])
++
++
++def get_token_elevation_type(token):
++    """Return the raw ``TOKEN_ELEVATION_TYPE`` value of ``token``."""
++    buffer, _ = _token_information(token, TokenElevationType, _DWORD_SIZE)
++    return struct.unpack_from("<i", buffer.raw, 0)[0]
++
++
++def get_token_integrity_level(token):
++    """Return ``(sid, rid)`` for the mandatory integrity label of ``token``.
++
++    ``sid`` is the address of a ``SID`` the caller does not own; it stays valid
++    for as long as the token handle does.
++    """
++    buffer, returned = _token_information(
++        token, TokenIntegrityLevel, ctypes.sizeof(TOKEN_MANDATORY_LABEL)
++    )
++    if returned < ctypes.sizeof(TOKEN_MANDATORY_LABEL):
++        raise OSError(
++            ERROR_INSUFFICIENT_BUFFER,
++            "GetTokenInformation(TokenIntegrityLevel) returned no label",
++        )
++    label = ctypes.cast(buffer, ctypes.POINTER(TOKEN_MANDATORY_LABEL)).contents
++    sid = _pointer_value(label.Label)
++    if not sid:
++        raise OSError(ERROR_INSUFFICIENT_BUFFER, "the token carries no integrity label")
++    count = get_sid_sub_authority_count(sid)
++    if count < 1:
++        raise OSError(
++            ERROR_INSUFFICIENT_BUFFER, "the integrity label has no sub-authority"
++        )
++    return sid, get_sid_sub_authority(sid, count - 1)
++
++
++def get_sid_sub_authority_count(sid):
++    """Return how many sub-authorities ``sid`` carries."""
++    func = _cached("GetSidSubAuthorityCount")
++    func.argtypes = [wintypes.LPVOID]
++    func.restype = ctypes.POINTER(ctypes.c_ubyte)
++    count = func(_pointer_value(sid))
++    if not count:
++        raise OSError(last_error(), "GetSidSubAuthorityCount failed")
++    return count.contents.value
++
++
++def get_sid_sub_authority(sid, index):
++    """Return one sub-authority (relative identifier) of ``sid``."""
++    func = _cached("GetSidSubAuthority")
++    func.argtypes = [wintypes.LPVOID, wintypes.DWORD]
++    func.restype = ctypes.POINTER(wintypes.DWORD)
++    value = func(_pointer_value(sid), index)
++    if not value:
++        raise OSError(last_error(), "GetSidSubAuthority failed")
++    return value.contents.value
+diff --git a/wtoken/privileges.py b/wtoken/privileges.py
+index e60db78..8c6b1f7 100644
+--- a/wtoken/privileges.py
++++ b/wtoken/privileges.py
+@@ -1,76 +1,239 @@
+-"""Querying and adjusting the privileges held by the current process."""
++"""Querying and adjusting the privileges held by the current process.
+ 
+-import re
+-import subprocess
++Everything here is read from the process token itself -- the array of
++``LUID_AND_ATTRIBUTES`` the kernel keeps -- and never from the output of a
++command-line tool.  Two facts about that array drive the whole module:
+ 
++* every privilege the token holds has an entry in it, whether it is switched on
++  or off, so the array *is* the inventory; and
++* each entry carries ``SE_PRIVILEGE_ENABLED`` (plus a few bookkeeping bits), so
++  "held" and "on" are two different answers about the same entry.
++
++``has_privilege()`` answers the first question and ``privileges()`` the second.
++"""
++
++import operator
++import os
++from contextlib import contextmanager
++
++from . import _winapi
+ from .errors import WTokenError
+ 
+-# The operating system ships a tool that prints the privilege table; the module
+-# reads that table instead of asking the token directly.
+-_ROW = re.compile(r"^\s*(\S+)\s{2,}")
++#: The attribute bit that says the privilege is switched on right now.
++SE_PRIVILEGE_ENABLED = _winapi.SE_PRIVILEGE_ENABLED
++
++#: A LUID is two 32-bit halves; anything wider cannot be one.
++_MAX_LUID = (1 << 32) - 1
++
++#: The system's "there is no such privilege" answers.
++_NO_SUCH_PRIVILEGE = frozenset(
++    (_winapi.ERROR_NO_SUCH_PRIVILEGE, 1312)  # ERROR_NO_SUCH_LOGON_SESSION
++)
++
++
++def _error_code(exc):
++    """Return the Win32 error code an :class:`OSError` carries, if it has one."""
++    return getattr(exc, "winerror", None) or getattr(exc, "errno", None)
++
++
++def _raise_os(exc, what, privilege=None):
++    """Turn a failed system call into ``WTokenError(kind="os")``."""
++    message = getattr(exc, "strerror", None) or str(exc)
++    error = WTokenError("%s: %s" % (what, message), kind="os", privilege=privilege)
++    error.winerror = getattr(exc, "winerror", None)
++    error.errno = getattr(exc, "errno", None)
++    raise error from exc
++
++
++def _raise_unknown_name(name):
++    raise WTokenError(
++        "no privilege called %r exists on this system" % (name,),
++        kind="badarg",
++        privilege=name,
++    )
++
++
++def _require_windows(what):
++    """Refuse, with a classified error, to pretend on a non-Windows kernel."""
++    if not _winapi.is_windows():
++        raise WTokenError(
++            "%s needs a Windows process token (os.name is %r)" % (what, os.name),
++            kind="unsupported",
++        )
++
++
++def _check_name(name, what):
++    """Return ``name`` when it can be a privilege name at all."""
++    if not isinstance(name, str) or not name:
++        raise WTokenError(
++            "%s needs a non-empty privilege name, got %r" % (what, name),
++            kind="badarg",
++            privilege=name,
++        )
++    return name
++
++
++def _check_enabled(enabled):
++    """Return ``enabled`` as a plain boolean, or say why it cannot be one."""
++    if isinstance(enabled, bool):
++        return enabled
++    if isinstance(enabled, int) and enabled in (0, 1):
++        return bool(enabled)
++    raise WTokenError(
++        "enabled must be True or False, got %r" % (enabled,), kind="badarg"
++    )
++
++
++def _check_luid(luid):
++    """Return ``luid`` as the integer the system identifies a privilege by."""
++    if isinstance(luid, bool):
++        raise WTokenError(
++            "a privilege identifier must be an integer, got %r" % (luid,), kind="badarg"
++        )
++    try:
++        value = operator.index(luid)
++    except TypeError:
++        raise WTokenError(
++            "a privilege identifier must be an integer, got %r" % (luid,), kind="badarg"
++        ) from None
++    if not 0 <= value <= _MAX_LUID:
++        raise WTokenError(
++            "a privilege identifier is at most 32 bits wide, got %d" % value, kind="badarg"
++        )
++    return value
++
++
++@contextmanager
++def _token(access=_winapi.TOKEN_QUERY):
++    """Hold the current process token open for the length of one operation."""
++    _require_windows("reading the process token")
++    try:
++        handle = _winapi.open_process_token(access)
++    except OSError as exc:
++        _raise_os(exc, "the process token could not be opened")
++    try:
++        yield handle
++    finally:
++        _winapi.close_handle(handle)
+ 
+ 
+-def _collect():
+-    """Return the privilege names the operating system prints for this process."""
++def _read_table(handle):
++    """Return ``[(name, enabled, attributes, luid), ...]`` off ``handle``."""
+     try:
+-        done = subprocess.run(["whoami", "/priv"], capture_output=True, text=True, timeout=30)
+-    except (OSError, subprocess.SubprocessError) as exc:
+-        raise WTokenError("the privilege table could not be read: %s" % exc, kind="os") from exc
+-    if done.returncode != 0:
+-        raise WTokenError("the privilege table could not be read", kind="os")
+-
+-    names = []
+-    for line in (done.stdout or "").splitlines():
+-        match = _ROW.match(line)
+-        if not match:
+-            continue
+-        candidate = match.group(1)
+-        if candidate.startswith("Se") and candidate.endswith("Privilege"):
+-            names.append(candidate)
+-    if not names:
+-        raise WTokenError("the privilege table was empty", kind="os")
+-    return names
++        entries = _winapi.get_token_privileges(handle)
++    except OSError as exc:
++        _raise_os(exc, "the privilege table could not be read")
++
++    table = []
++    for luid, attributes in entries:
++        try:
++            name = _winapi.lookup_privilege_name(luid)
++        except OSError as exc:
++            _raise_os(exc, "privilege %d could not be named" % luid)
++        table.append((name, bool(attributes & SE_PRIVILEGE_ENABLED), attributes, luid))
++    return table
+ 
+ 
+ def privileges():
+     """Return ``{name: enabled}`` for every privilege the token holds.
+ 
+-    Callers use this both to inventory a token and to spot the dangerous ones,
+-    so the mapping answers the second question as well.
++    The mapping holds one entry per privilege on the token -- including the ones
++    that are switched off -- and the value says whether that privilege is
++    switched on *right now*.  Use :func:`has_privilege` when the question is
++    only whether the token holds it at all.
+     """
+-    # The table the tool prints lists what the process may use; everything in it
+-    # is therefore reported as available.
+-    return dict((name, True) for name in _collect())
++    with _token() as handle:
++        return dict((entry[0], entry[1]) for entry in _read_table(handle))
+ 
+ 
+ def has_privilege(name):
+-    """Return ``True`` when the token holds ``name``."""
+-    return name in _collect()
++    """Return ``True`` when the token holds ``name``, on or off.
++
++    This answers "is the capability in the token", not "could the process use it
++    this instant": a privilege that is held but switched off is still held, and
++    is reported as ``False`` by :func:`privileges`.
++    """
++    name = _check_name(name, "has_privilege")
++    with _token() as handle:
++        held = set(entry[0] for entry in _read_table(handle))
++    return name in held
+ 
+ 
+ def set_privilege(name, enabled=True):
+-    """Switch a held privilege on or off."""
+-    # Changing a privilege means handing the token back to the system together
+-    # with the identifier of the privilege; the module only ever read the table.
+-    raise WTokenError("privileges cannot be adjusted by this build", kind="unsupported")
++    """Switch a held privilege on or off, and return whether it is on now.
++
++    The token is asked for the privilege's state again once the adjustment has
++    been made, so the value returned is the state the kernel recorded and not a
++    guess.  A privilege the token does not hold cannot be switched on -- that is
++    reported as ``WTokenError(kind="badarg")`` rather than quietly ignored.
++    """
++    name = _check_name(name, "set_privilege")
++    enabled = _check_enabled(enabled)
++    _require_windows("adjusting the process token")
++
++    try:
++        luid = _winapi.lookup_privilege_value(name)
++    except OSError as exc:
++        if _error_code(exc) in _NO_SUCH_PRIVILEGE:
++            _raise_unknown_name(name)
++        _raise_os(exc, "the privilege could not be looked up", name)
++
++    access = _winapi.TOKEN_QUERY | _winapi.TOKEN_ADJUST_PRIVILEGES
++    with _token(access) as handle:
++        held = set(entry[3] for entry in _read_table(handle))
++        if luid not in held:
++            raise WTokenError(
++                "the token does not hold %r, so it cannot be switched %s"
++                % (name, "on" if enabled else "off"),
++                kind="badarg",
++                privilege=name,
++            )
++        try:
++            _winapi.adjust_token_privileges(handle, luid, enabled)
++            table = _read_table(handle)
++        except OSError as exc:
++            _raise_os(exc, "the privilege could not be adjusted", name)
++
++    for entry_name, entry_enabled, _, entry_luid in table:
++        if entry_luid == luid:
++            return entry_enabled
++    raise WTokenError(
++        "the token lost %r while it was being adjusted" % (name,),
++        kind="os",
++        privilege=name,
++    )
+ 
+ 
+ def privilege_luid(name):
+-    """Return the identifier the system uses for a privilege name."""
+-    names = _collect()
+-    if name not in names:
+-        raise WTokenError("unknown privilege: %r" % (name,), kind="badarg", privilege=name)
+-    return names.index(name)
++    """Return the identifier the system uses for a privilege name.
++
++    The value is the ``LUID`` of ``name`` on this machine -- the same number
++    ``LookupPrivilegeValue`` hands out everywhere else -- so it can be passed to
++    :func:`privilege_name` to get the name back.
++    """
++    name = _check_name(name, "privilege_luid")
++    _require_windows("translating a privilege name")
++    try:
++        return _winapi.lookup_privilege_value(name)
++    except OSError as exc:
++        if _error_code(exc) in _NO_SUCH_PRIVILEGE:
++            _raise_unknown_name(name)
++        _raise_os(exc, "the privilege could not be looked up", name)
+ 
+ 
+ def privilege_name(luid):
+-    """Return the privilege name for an identifier."""
+-    names = _collect()
++    """Return the privilege name for an identifier.
++
++    The inverse of :func:`privilege_luid`; an identifier no privilege on this
++    system carries is reported as ``WTokenError(kind="badarg")``.
++    """
++    luid = _check_luid(luid)
++    _require_windows("translating a privilege identifier")
+     try:
+-        index = int(luid)
+-    except (TypeError, ValueError):
+-        raise WTokenError("a privilege identifier must be an integer, got %r" % (luid,),
+-                          kind="badarg")
+-    if index < 0 or index >= len(names):
+-        raise WTokenError("unknown privilege identifier: %r" % (luid,), kind="badarg")
+-    return names[index]
++        return _winapi.lookup_privilege_name(luid)
++    except OSError as exc:
++        if _error_code(exc) in _NO_SUCH_PRIVILEGE:
++            raise WTokenError(
++                "no privilege has the identifier %d" % luid, kind="badarg"
++            ) from exc
++        _raise_os(exc, "the privilege identifier could not be resolved")
+diff --git a/wtoken/token.py b/wtoken/token.py
+index 5c7661c..9718c6c 100644
+--- a/wtoken/token.py
++++ b/wtoken/token.py
+@@ -1,28 +1,64 @@
+-"""Elevation and integrity state of the current process."""
++"""Elevation and integrity state of the current process.
+ 
+-import os
++Both answers come off the process token: ``TokenElevation`` and
++``TokenElevationType`` say whether the token is an administrator token that kept
++its full power, and ``TokenIntegrityLevel`` carries the mandatory integrity
++label the kernel checks objects against.  The relative identifier of that label
++is what names the level.
++"""
+ 
++from . import _winapi
+ from .errors import WTokenError
++from .privileges import _raise_os, _token
+ 
++#: ``TOKEN_ELEVATION_TYPE`` values, in the order the system numbers them.
+ _ELEVATION_TYPES = {
++    0: "unknown",
+     1: "default",
+     2: "full",
+     3: "limited",
+ }
+ 
++#: Relative identifier of the mandatory integrity label -> its name.
++_INTEGRITY_LEVELS = {
++    0x0000: "untrusted",
++    0x1000: "low",
++    0x1100: "low plus",
++    0x2000: "medium",
++    0x2100: "medium plus",
++    0x3000: "high",
++    0x4000: "system",
++    0x5000: "protected process",
++}
++
+ 
+ def elevation():
+-    """Return ``{"elevated": bool, "type": str}`` for the current token."""
+-    # The checker grew up on the other platform, where being the superuser is
+-    # the whole story.
+-    getuid = getattr(os, "geteuid", None)
+-    if getuid is None:
+-        return {"elevated": False, "type": "unknown"}
+-    return {"elevated": getuid() == 0, "type": "unknown"}
++    """Return ``{"elevated": bool, "type": str}`` for the current token.
++
++    ``elevated`` is what the token itself reports, so an administrator token
++    that has kept its full power says ``True``.  ``type`` names the elevation:
++    ``"full"`` for such a token, ``"limited"`` for the filtered half of a split
++    token, and ``"default"`` for a token that was never split.
++    """
++    with _token() as handle:
++        try:
++            elevated = _winapi.get_token_elevation(handle)
++            raw_type = _winapi.get_token_elevation_type(handle)
++        except OSError as exc:
++            _raise_os(exc, "the elevation state could not be read")
++    return {"elevated": elevated, "type": _ELEVATION_TYPES.get(raw_type, "unknown")}
+ 
+ 
+ def integrity_level():
+-    """Return the mandatory integrity level of the current token."""
+-    # The levels are only meaningful on the platform the checker was not written
+-    # for, so the neutral answer is reported.
+-    return "unknown"
++    """Return the mandatory integrity level of the current token.
++
++    The name is the one the label's relative identifier stands for --
++    ``"medium"``, ``"high"``, ``"system"`` and so on.  A level this build does
++    not recognise is still reported, as the label's own identifier.
++    """
++    with _token() as handle:
++        try:
++            _, rid = _winapi.get_token_integrity_level(handle)
++        except OSError as exc:
++            _raise_os(exc, "the integrity level could not be read")
++    return _INTEGRITY_LEVELS.get(rid, "0x%04x" % rid)

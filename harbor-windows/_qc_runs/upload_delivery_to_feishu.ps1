@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Task,      # 215 / 216 / 219 / 220
     [Parameter(Mandatory = $true)][string]$RecordId,
@@ -37,6 +37,7 @@ $Spec = @{
     '216' = @{ build = 'wvas-build';    zip = 'wfflab__wvas-216-v1.0.0-delivery.zip' }
     '219' = @{ build = 'wcancel-build'; zip = 'wfflab__wcancel-219-v1.0.0-delivery.zip' }
     '220' = @{ build = 'wciocp-build';  zip = 'wfflab__wciocp-220-v1.0.0-delivery.zip' }
+    '218' = @{ build = 'wspawn-build';  zip = 'wfflab__wspawn-218-v1.0.0-delivery.zip' }
 }[$Task]
 if (-not $Spec) { throw "未知 task: $Task" }
 

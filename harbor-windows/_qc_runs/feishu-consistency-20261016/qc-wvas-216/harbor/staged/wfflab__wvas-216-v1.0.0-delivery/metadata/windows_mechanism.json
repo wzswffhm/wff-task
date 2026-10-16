@@ -1,0 +1,70 @@
+{
+  "schema_version": "windows-mechanism-gate-v1",
+  "task_id": "wfflab__wvas-216",
+
+  "counterfactual": {
+    "question": "把目标 OS 换成 Linux/macOS，主要实现、错误根因和 Evaluator 是否基本不变？",
+    "answer": "否",
+    "reason": "主要实现只能由 Windows 虚拟内存 API 构成：区间枚举必须调用 kernel32!VirtualQueryEx 并读取 MEMORY_BASIC_INFORMATION 的 BaseAddress / RegionSize / State / Type / Protect；一个区间背后是哪个文件只能由 psapi!GetMappedFileNameW 给出，而它返回的是 \\Device\\HarddiskVolumeN\\... 形式的 NT 设备路径，要变成调用方真的能打开的路径，必须再用 kernel32!QueryDosDeviceW 建立驱动器到设备的映射并做最长前缀替换。这些入口在 Linux/macOS 上没有对等物：/proc/<pid>/maps 把地址、长度、权限与路径一次性摆好，macOS 要 mach_vm_region 加 proc_regionfilename，两者的字段宽度、错误分类、路径形式和『已保留但未提交』的表达都不同，把同一份验收标准搬过去，实现与评测点会整体重写。错误根因同样只在 Windows 语义下成立：公开仓库 psutil 的缺陷史记录的正是 Windows 侧把 64 位地址与区间长度截断到 32 位（gh-863、gh-3019）、映射路径缓冲区不足（gh-2934）以及设备路径未翻译（gh-2494），这几类现象在 /proc 或 mach 接口上不会出现。Evaluator 更必须在真实 Windows 上运行：它自己拉起目标进程，用 VirtualQueryEx 独立遍历该进程、用 GetMappedFileNameW 独立命名、用 QueryDosDeviceW 独立翻译，再把候选结果与自己在同一时刻的测量逐个比对；换到别的操作系统，这些判据一条都无法复算。环境层的就绪探针同样要求 VirtualQueryEx、GetMappedFileNameW、QueryDosDeviceW 在本机真的能应答，而隐藏用例在 os.name 不是 nt 时整体跳过，因此任何非 Windows 控制轮都会记为 INVALID 而不是通过。"
+  },
+
+  "exclusive_declaration": {
+    "quote": "本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。"
+  },
+
+  "mechanisms": [
+    {
+      "name": "区间起始地址的完整宽度（VirtualQueryEx / MEMORY_BASIC_INFORMATION.BaseAddress 按 64 位指针读取）",
+      "instruction_quote": "`base` | 区间起始地址，必须是**完整地址宽度**下的真值（64 位进程上的地址不得被截断到 32 位）",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L290-L305",
+      "f2p_case": "f2p-region-addresses-are-64-bit"
+    },
+    {
+      "name": "区间长度的完整宽度（RegionSize 为 64 位；超过 4 GiB 的保留区不得被 32 位取整）",
+      "instruction_quote": "`size` | 区间长度，同样不得截断：超过 4 GiB 的区间必须报出真实长度",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L307-L318",
+      "f2p_case": "f2p-region-sizes-are-64-bit"
+    },
+    {
+      "name": "MEM_RESERVE 区间的可见性（VirtualQueryEx 的 State 字段区分 MEM_COMMIT 与 MEM_RESERVE）",
+      "instruction_quote": "`include_reserved=True` 时必须**同时**报出已提交区间和已保留区间；`include_reserved=False` 时只报已提交区间。",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L320-L331",
+      "f2p_case": "f2p-reserved-regions-are-reported"
+    },
+    {
+      "name": "文件背衬区间的命名（psapi!GetMappedFileNameW 返回映射文件的 NT 设备路径）",
+      "instruction_quote": "文件映射区间的 `path` 必须等于该文件真实的磁盘路径。",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L333-L346",
+      "f2p_case": "f2p-file-mapping-path-is-a-dos-path"
+    },
+    {
+      "name": "设备路径到盘符的翻译（kernel32!QueryDosDeviceW 建立设备到驱动器的映射并做最长前缀替换，\\Device\\Mup\\ 映射为 UNC）",
+      "instruction_quote": "1. `path` 必须是调用方**可以直接打开**的形式：DOS 盘符路径（`C:\\...`）或 UNC 路径（`\\\\server\\share\\...`）。任何 `\\Device\\...`、`\\??\\...`、`\\\\?\\...` 形式的前缀都算不合格。",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L348-L358",
+      "f2p_case": "f2p-device-paths-are-translated"
+    },
+    {
+      "name": "匿名映射与命名映射的区别（GetMappedFileNameW 对无文件背衬的区间返回 0，契约要求报 None 而不是空字符串）",
+      "instruction_quote": "3. 没有文件背衬的区间（匿名映射、私有内存、保留内存），`path` 必须是 `None`，不得是空字符串或占位文本。",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L360-L370",
+      "f2p_case": "f2p-anonymous-mapping-has-no-path"
+    },
+    {
+      "name": "进程打开失败的分类（OpenProcess 的 ERROR_INVALID_PARAMETER=87 -> no-such-process、ERROR_ACCESS_DENIED=5 -> access-denied）",
+      "instruction_quote": "| 进程不存在 | `no-such-process` |",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L372-L379",
+      "f2p_case": "f2p-missing-process-is-classified"
+    },
+    {
+      "name": "已加载映像清单（psapi!EnumProcessModulesEx 加 GetModuleFileNameExW 给出每个映像可打开的文件路径；同一映像只出现一次，且不依赖区间的映射名能否还原成盘符路径）",
+      "instruction_quote": "`modules(pid)` 返回已加载的映像，按 `base` 升序；每个映像只出现一次，同一个文件路径不得重复出现，`path` 是映像文件真实的磁盘路径。",
+      "test_ref": "verifier/tests/test_wvas_semantics.py#L381-L389",
+      "f2p_case": "f2p-modules-are-deduplicated"
+    }
+  ],
+
+  "non_windows_must_fail": {
+    "file": "environment/validate_environment.ps1",
+    "evidence": "Fail 'the host platform is not Windows (Win32NT), so the wvas contract cannot be graded here'"
+  }
+}

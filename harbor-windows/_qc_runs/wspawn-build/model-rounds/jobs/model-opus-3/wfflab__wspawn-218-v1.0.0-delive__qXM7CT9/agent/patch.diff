@@ -1,0 +1,1120 @@
+diff --git a/check3.py b/check3.py
+new file mode 100644
+index 0000000..37f0c84
+--- /dev/null
++++ b/check3.py
+@@ -0,0 +1,93 @@
++"""Identity-based verification of the handover (run from the system temp dir)."""
++import os
++import subprocess
++import sys
++import tempfile
++
++sys.path.insert(0, os.environ["WSPAWN_REPO"])
++
++import msvcrt
++import _winapi as w
++
++from wspawn import (WSpawnError, handle_kind, inheritable_handles,
++                    is_inheritable, set_inheritable, spawn)
++
++PROBE = os.path.join(tempfile.gettempdir(), "wspawn_probe2.py")
++PY = sys.executable
++
++
++def run(args, inherit, **kw):
++    helper = spawn([PY, PROBE] + [str(a) for a in args], inherit=inherit,
++                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
++    out, err = helper.communicate(timeout=60)
++    return helper.returncode, out.decode(errors="replace"), err.decode(errors="replace")
++
++
++# Keep strong references so nothing gets closed behind our back.
++KEEP = []
++
++
++def leaky_file(tag):
++    f = open(os.path.join(tempfile.mkdtemp(), tag + ".txt"), "w+b")
++    f.write(("content-of-" + tag).encode())
++    f.flush()
++    KEEP.append(f)
++    h = msvcrt.get_osfhandle(f.fileno())
++    set_inheritable(h, True)
++    return h, os.path.basename(f.name)
++
++
++noise = [leaky_file("noise%d" % i) for i in range(3)]
++noise_handles = [h for h, _ in noise]
++noise_names = [n for _, n in noise]
++nr, nw = w.CreatePipe(0, 0)
++set_inheritable(nr, True)
++set_inheritable(nw, True)
++KEEP.append((nr, nw))
++
++print("noise file handles:", noise_handles, noise_names)
++print("noise pipe handles:", nr, nw)
++listed = inheritable_handles()
++print("inheritable_handles() covers the noise:",
++      all(h in listed for h in noise_handles + [nr, nw]),
++      "(total listed: %d)" % len(listed))
++
++print()
++print("=== A: empty inherit -> none of the caller's objects reach the child ===")
++rc, out, err = run(["ident"] + noise_handles + [nr, nw], inherit=[])
++print("rc", rc)
++print(out.strip())
++print("err", err.strip()[:300])
++
++print()
++print("=== A/B/D: hand over exactly one file; noise must stay out ===")
++target, target_name = leaky_file("handed-over")
++print("handed over:", target, target_name)
++rc, out, err = run(["ident", target] + noise_handles + [nr, nw], inherit=[target])
++print("rc", rc)
++print(out.strip())
++print("err", err.strip()[:300])
++
++print()
++print("=== B: the handed-over object is really usable in the child ===")
++rc, out, err = run(["readfile", target], inherit=[target])
++print("rc", rc, "|", out.strip(), "|", err.strip()[:300])
++
++print()
++print("=== B: handed-over pipe round trip ===")
++pr, pw = w.CreatePipe(0, 0)
++rc, out, err = run(["writepipe", pw, "payload-123"], inherit=[pw])
++print("rc", rc, "err", err.strip()[:200])
++fd = msvcrt.open_osfhandle(pr, os.O_RDONLY)
++print("parent read back:", os.read(fd, 100))
++
++print()
++print("=== A: full child-side census with one pipe handed over ===")
++pr2, pw2 = w.CreatePipe(0, 0)
++rc, out, err = run(["census"], inherit=[pw2])
++body = out.strip().removeprefix("CHILD-CENSUS:")
++entries = [e for e in body.split(",") if e]
++print("handed over:", pw2)
++print("census:", entries)
++bad = [e for e in entries if any(nm in e for nm in noise_names + [target_name])]
++print("caller files visible in child:", bad or "none")
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..05706426fa7be0275a89992a4bbc5f1cf28a9f66
+GIT binary patch
+literal 125
+zcmX@j%ge<81V0?lXMyO)AOanHW&w&!XQ*V*Wb|9fP{ah}eFmxdCF5)rQ<7R-l9ZYP
+vri)|Z<1_OzOXB183My}L*yQG?l;)(`6|n*pGXilji1Cq`k&&^88OQ<vKL;Bg
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/test_wspawn_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wspawn_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4d11406676538ad9b289938853a2adb662bc4ae
+GIT binary patch
+literal 18492
+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
+I3>(;g10hSe9{>OV
+
+literal 0
+HcmV?d00001
+
+diff --git a/wspawn/__pycache__/_winapi.cpython-312.pyc b/wspawn/__pycache__/_winapi.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4cfe035e59f44933c6551b20875fd3e6b260b4e
+GIT binary patch
+literal 7340
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/wspawn/__pycache__/inherit.cpython-312.pyc b/wspawn/__pycache__/inherit.cpython-312.pyc
+index efdbd14e8abb7a61e14f4a23b976662aa1453f4c..a2b4d4f0559adb18d0275333a4f9d7bfe57ba5d7 100644
+GIT binary patch
+literal 4986
+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
+SC-3c&g%|H9o)l7!;Qs=1lGxM$
+
+literal 2105
+zcmah~T})g>6rQ=WKX;d9ksm1~MMhELM!JpBklKiGHG<ekjSv+=vfSM}>@F<#t~0aU
+zg3u7sH$&n>6G*Cwi9XQKCO#PBV|n($ZNN0%;8XRX@rA&HP5a`Rd-tx3Dd|aOa^~;M
+zne%;T&M(c)Q3UdL>esn{0tnq#17Eb7ax@6a1~SnUGO?)@@f0?R87OKCWQt&92Ct#1
+zfEh7E*YH%(48tg7>d=Q5wM2C3?NKYwctILgmeJXwkrQ;*=2YexwKH=pD}}4)Z6Rsi
+zuuK@*v;ebtRxB|tk`I&{V-GO&3G6g|I$km=)_a`WJgeq>34%hP9nC<ufg(uOSC`Rt
+zO&>>nNc!(W5?<`dto9<}tr*F$KV#x$bVK__Gqqb}yLMs?SI`wQi7Ge|7+dO9-WC~M
+zD1+x2Mh%M=EXi_=573+~sT0Z=ronUIbYQ+<nTdcyV1pBxSS&Hue<%8hQ7n5pSH8g3
+zkY`mWhv}m;?_QXeOvnr~rz=7|e7fL;Gg(@6qG>~<t@1*Kao!C3b!g%Z=vL8zMuJm#
+zzoqS~!7sn4>fI0bW6xe+sy4lFh%hYt5kI}tS?wOJe)QR1e6p%f9uPJCNGKC)(Pp$x
+z&ys9CP%s&S=7tx6XB$rp?urIMS9@HUs|VMgL1<a~FTl&#2gMIBMvDaCQ7*Uwko2q&
+z+2oI<dZR1L#6PQGx}|N`Ze1p8nn_m3RZ_t+?(de*_?ipz(`^P$vRQ{exb*&q2A`)h
+zGag(sGt>a$a>Ej{j2juC1+X}qFBDB$;&zq^!NdRs-V14$fZjluf|aAfPCA+`ZfaZ+
+zkE^GSaTV%B#6^_1fbO&iCet<Cm2D@GvF)N0zBKOA$fb@$gycM;tf-7m1YBcIm|5zC
+z>4ZF<ID}ov3Iz=X;W4$p)$i10;&bR$(VxwyHbcA3y{p3qS}=GK@9WWfdiPzudvoyn
+z*SEso4gIFS`f$IgP0?ut@5fJn-M5*&@$y#353_smp*yct_2I{jlmiR(JzYQd@5NJh
+zL{<ObvEtoD;2niq*L%;R+mX}|`Kc=vCp+;rP<Loo>O9#w9|Zkay4U%*1t(A7BW~oQ
+zR3C&ZbL#B>q=Ai%U&V1QYER^%b^;eQmy6m}t<vyqEM54R$uhTqITO6hfH##qQ=>YM
+z3W8?KoHI)n7mqP2>5_pfGLI#~9zEJ%P~%AMI7fK9T2ess4(JlZ<pb|j6Q`gPDrI~M
+zIPrpLBpC08Mb*S5=#I02D7;(RufKDzqyKJ4|F@TSJCeIC=c@X-r}05yJpx!Of7W|m
+zLEDj3EBUc26(c*bAgEcGuZu!Kxp<_&+CVup4!`5lPAz)uGUJQ2`T@T#R1gSTEzw|L
+zNP2P@qftfu38+7A&4HxN&U-b;uSbxcc8OU+l_6G~9e^}-Yt({mmLan_E7=?hR7Kqb
+zb<DL_!;BUdN=3E+=ozwLTXf#CD}ovsyDXFLzMF`jQO|;g-1KwW8!|gx`~CTIu-pet
+zsEmg1JceTN)luF9qXeEv=uSADHtlRW?V%rn3Se{L;jO+&FR2xTt||9U_q2DX{-*bq
+vxA^n0Ma5dY1RWrR@$YE(K8pN>dJjVZDD_8i9bd$UogqAekJ>^w?wa`*#_{U{
+
+diff --git a/wspawn/__pycache__/kinds.cpython-312.pyc b/wspawn/__pycache__/kinds.cpython-312.pyc
+index f2826244e7971ee7fd7e1aed07cd08ce1bd6332b..adf05d8c43651a56a619ce25f241fe3ff7376acc 100644
+GIT binary patch
+literal 1927
+zcmah~O-vg{6rNqLy|x!@NJ9guDWmWcEJaq;R#6i*2?$J}%?|}y1VS>)?tmB8yY9>w
+zV`M56^?<5MJtk6BDe8%aNbQkht5oWt7hI4`Rz#{=^^hAX9IEuvnZ=7uP}Gq<^WMB~
+z-p{-@Z-1??4+A#-cvPBS_XF@JXS^X+h=aEoaUbYl66k_1nnFgL6a`NEOkYNtlw4Xe
+z{h7dIfYJWX!K7RW#O381eWpr?F>7clHEavovyi3{v}fj#Mu|(OZ9-v2Ex@#D>5$sc
+zV1hI<vj~&KbAefo3yz%18<v_i7^#epX4Slv#Ms7+4X0F+vT~Ujgf$NKMvxIc_CL7J
+zqPP#}v8)I-D)fp#Il>+Dl1Ek7jS5L3RQ7gx{6+BCw^2EHPY8h;E!^r$qbPXxgj(d;
+zmtc&oBB^)tVE*;fxF}d=5v)i>sRq}48n@6502T_t6S(uQ#Dz}aVz0op)I|H{X-qW+
+zEb8G=pev)GptJ+(RvE{406e-P(t7V~QPd^f@7*V^D~j_GPgY$mh3z*~d5>E0)#N5n
+z1Ye8ah&3Lb@o?3(=vxv9uU^^9OKm=j;yqFKuZW+Cc_9y$d=nrq#Ou^fcHtw4=CB2)
+zr!UMJCb}>^eTmaqBYRA1wnc1L1Z~WPIcveP^A^J<!ePk9*m3bgTF4@(*%?IOEVeTY
+zeiP9Frg@AB*Z~N8p_W#$s!@cYjus6KL4!csG7GLQjIuVSNQWwcD%0fJhWRw&J~CZ>
+zM?1G|ovDMWrlBl*Sq8lXXOO1m2&yP0t~Qd>(p=N@^qr4yaXdy)HHm%72Lkg3P1`xj
+z)EL&BXP6{hHOpN`ZyRbSA3jE(<_yeY9XBl9&J#z;StOS|iXbjJ(gNFe0=x&9$O*F7
+zj`#z=vmCQ*%EHSLb;k4>hubPlbQM15X>}x?4@cseaOBE8ICACg;|-X#HGuhhb;1VW
+zjf6XZ`Ga@rjtr(|O?8eq^4(FltvK==qAH~r^Qv|H%oWRa!mdXt*U=C+nc^vQ8U}`L
+zB~xP)!^zZ0^7h@aq!X#`^bd`GSj!I&4WE$r4fc+>URB(V`*Dby3><Yd$A^|QN77gd
+zF>ft|hr;U!zBu1^b&4WFXOKRXC%hw0anDF1TX2+0RD1(NcEmj!Vl})94kIAa{2;Jh
+z-?loir<^G(ttF*(M`_!OwCvWsyLoNvqwzzZ5S<YAfe>PIIN%=?_JYxJFjfl29(=MB
+z>|iSDUMnlHlEV0HrQ@+&?(Qjd_iSD4DJeax{kyXAWxgEkEJZtilRI~#P5-m87i%xa
+z5~WyTeQ_std9AP&Ol}UbX;(S>&*2-)*55$lPPBDBB<mk+N;_@W*2q`IFN#0D^UIZ=
+zuB=JVA}vqfy1Z5Q-d<yKxv{;}*#5Bp+oAQ|?Z(6pi-&$OdgJ&0oBMt-G${PL@8`N+
+z5Z*7pZ|Vc!2?+Jad{08Xk^XbOpU?Rjb0;2TU!0U~YpIk|DV>0u{Yu%$hLuLxphu;}
+zZ}>ZKz-EBk*yIG?&)9m-MAz{}#`3QX;ca~1CkVn*ko*fYJp*m*cMxb5ns65r{Reia
+B-6jA4
+
+delta 602
+zcmYjOO=uHA6n-=NlTBi_2AZM~?4rFa_AC@ipoa>*6rrV>6^xtCHr6D&Wp<aC7^wt7
+zPtp>hhzK6^An94~=uPn89(r-mqX+R4j0f@Ln<R)2=FR)w%=f)F^B&E-*3FN(Tn5m7
+ztbDrjj2@b2tRkW#VBi2Fj5bJ<I+OrY9)hE^Ra-l}xwfCZwz227{8i2azD*>5Y8vhe
+zuF(^8N05f--)R>H)A&B=5~kL%5YI=cDHE91h3E7IWqKEmQv<1j)+24>B1Ck803sEm
+zr7_x}3n)O~KM69GpvTH!O6idn+*QiZB6hk{>R(bympk*fU7s~Ps~LxpRrM^_w|4!=
+zt9g9Uss)iH^s38TUbBf%>$^VtF6;GQs^>QZ4MLl89kI|SDk2s8bw6nNwki~q5$VnL
+zo;Us)k=b$^@g(N*K}b!Hseat7dOVap_TOrY`=>FGqTvm64`8S&nnS+iXAide=N{`r
+z9Srjz-@EtKJo|1ZDPH-onK-vjOgAxHJUdnR{VNB#xu=~Zd*LS#q~gW*b4hV6xqAJ?
+zEGI^JsL1r6P?qmy7vPn(qAKgya;j2c!TNTkB6LrVGaNU{WkYXZgdX?|I$<m~0~R;D
+b5-%W>lMLk@)FtFItbT*}k)9z1K8wk}3=)w%
+
+diff --git a/wspawn/__pycache__/proc.cpython-312.pyc b/wspawn/__pycache__/proc.cpython-312.pyc
+index c4b87317f013f3a85ba150d98f8816c220918188..a4902b7f19a63d7bce380262b410596f7585a270 100644
+GIT binary patch
+literal 9433
+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
+
+delta 1872
+zcmZ8hU2GIp6ux)<XLq|lWxM_1r^`>NQ)8(VLq$?ptRR}KNDaa!WLb8mu(;h_?@V2~
+zZrO(PL87R2i11)yH743r6B9M@O&eZJjB#r<z}OdKOeFeH+CCt@c+PBFiYL3@+?;#v
+zch5b4w+{cd(f@s2ori$@75nkr-^#eZiN?p<+qyV%i0I-N(IrEi;?aPRgrv)3Bq8ex
+zprU(pb&Mv|VNUaw4vb$v(0m(>;<qWFMjh{q{e@I9_Y`A!dk5dx)dA|O#2^W(lLV*J
+z1g~?zBj~a&0FQ{b!3`3iJj`o~J;ooUr|lbjS{^2oG_HyE$AT8pct<de?0_Q{@&zNu
+zy!O0sSn>h6x!v9;wsV&Q_9gMMrh>*1im8mn>d+yM`QgLDXvhIXqb!Ju278~>MC<M2
+zQYYXkwb`DKPClu?md3LhNg<!jx+Ig-B{A`Z%f}mGSz715)X<NxeA+P0PCO8?_sg2g
+zc&y^GaWyv8GT2}ymx50doL$S+f?Q4i<61SxU9%owl-yK&Z+S0yZzvmQl#RbAtqj%7
+zy+v`9WHOf;G?GcjlS~fg^`Wf2!?XTq2u&Ig&}D{flcaXgje~?*1bnmE3@}D+3A+{q
+zL2O<0aboL&0<fr1F<Lt%eet>HI;Dbb`FhtQg%e2T@@z1b&6q|q#m>CKIzhY1{=xU1
+zSA-Q-(c;&{o~S!g!DN?7ADIFj$`pnaq@Qdh7Cyuk%dJdY4shEDi;PeUiCod8GA)6>
+zI{&FKg$V^I(~F!=M(71vq(yR`KS7FAljE!v_DXv)xw8h#Skb{D(|$eBVkZNU%4XPM
+zTL99_4#1KS0sh_aU)%}sETK@hWpXk=fZAHME7KLH-=$Y6C2xcTGE6?>i?o&r>hPJI
+zrEw0|*~K0PqP1n`sC&;CIpc-%1=d??TNAglshplQ%+9^pd^(jidplh_H0weNOyHm7
+z?kK5-yC-)~?7Gr_EqwLF<nDh=^!Z{#BP~5-PX)H^-xF;!HHmElEqfFJ_Zh~MX#kGr
+zSSmYYU~@8P4KL~+0a*3XE(DuAkAVi;);w#!6YMyt)44!+1}~lsch3g8t4jCXIbXw-
+zQq{X<flv|l{ms>uzHiN$mS?KZpZM9IsGdq!mGr;!Jnr6e-TyGOi+mY~HS^PaC>G|Y
+z!y>HHqJ5_^%>6{{Z#Fb{i`MeQ!IZ8<c|_7_nJe>ULFe8RMr4)TFNSlH{eir$A`Z|D
+zDa#+xH|dCCLB48IR?5;!i9A?fP*fX6R12T)iiM-Xm9n~W?*j#<LV<}R>IHR8fk~y8
+z`>hnSqW1CDKKrX^d*z@eIBGhZhdvn4O-D2>J(F`J_~eHy_iHf5+TkL%_Trl2whF^|
+zJ05fBbfGp#9PtRwI7fc2-_2AliEVfeJ5}>A%uX$PJ-B)tVNV6nk<<CXK`16iUM?v|
+zdZ`FqX)=sUE!kKO(N%HhAvlXuo5f%Y-7#MU7$r*{64-Q2pY?AYJv8T!PBhN?wb4WK
+z9uir9GZeX5-vqxqb+TU?JvblS$%{R6!Im4r=u8kyXM)|I90YhxT#|^d<ysq@_G(o@
+zySpS3-#V<E9{beRa0RQR=bnl4>HSEIl4+{Ow)4}T#@J?ldb0>?O>lcT9*@J@H-TL(
+zh)=-EkszjdX1XzQr2Oe~M%r@2bU(K4t6YZrgU?a+x<k_F-Ou`f2m9N^Rse4(y+xk>
+lov6Q(&>y6ANvfyOw~s9m_$+j&G_=s9P@OJC!nDKX`wz|LtnvT=
+
+diff --git a/wspawn/_winapi.py b/wspawn/_winapi.py
+index 273b792..521da15 100644
+--- a/wspawn/_winapi.py
++++ b/wspawn/_winapi.py
+@@ -1,7 +1,10 @@
+ """Thin ctypes bindings for the Win32 calls that :mod:`wspawn` needs.
+ 
+-Only what the current implementation actually calls is bound here; the DLL is
+-loaded lazily so that importing the package stays cheap.
++The module talks about *object handles* (``HANDLE`` values), not file
++descriptors: handle values are what Windows preserves across process creation
++and what ``SetHandleInformation``/``GetHandleInformation`` operate on.
++
++The DLL is loaded lazily so that importing the package stays cheap.
+ """
+ 
+ import os
+@@ -12,28 +15,136 @@ FILE_TYPE_CHAR = 0x0002
+ FILE_TYPE_PIPE = 0x0003
+ FILE_TYPE_REMOTE = 0x8000
+ 
++HANDLE_FLAG_INHERIT = 0x0001
++HANDLE_FLAG_PROTECT_FROM_CLOSE = 0x0002
++
++ERROR_SUCCESS = 0
++ERROR_INVALID_FUNCTION = 1
++ERROR_ACCESS_DENIED = 5
++ERROR_INVALID_HANDLE = 6
++ERROR_NOT_SUPPORTED = 50
++ERROR_INVALID_PARAMETER = 87
++ERROR_CALL_NOT_IMPLEMENTED = 120
++
++#: Failures that mean "this object/argument can never do what was asked".
++_UNSUPPORTED = frozenset((
++    ERROR_INVALID_FUNCTION,
++    ERROR_NOT_SUPPORTED,
++    ERROR_INVALID_PARAMETER,
++    ERROR_CALL_NOT_IMPLEMENTED,
++))
++
+ _IS_WINDOWS = os.name == "nt"
+ 
++_cache = {}
++
+ 
+ def is_windows():
+     """Return ``True`` when running on a Windows kernel."""
+     return _IS_WINDOWS
+ 
+ 
+-def _kernel32():
++def error_kind(code):
++    """Map a Win32 error code onto a :class:`~wspawn.errors.WSpawnError` kind."""
++    return "unsupported" if int(code) in _UNSUPPORTED else "os"
++
++
++def error_text(code):
++    """Return a readable message for a Win32 error code."""
+     import ctypes
+ 
+-    return ctypes.WinDLL("kernel32", use_last_error=True)
++    try:
++        text = ctypes.FormatError(int(code)).strip()
++    except Exception:  # pragma: no cover - FormatError is best effort
++        text = ""
++    return "%s (WinError %d)" % (text or "Win32 call failed", int(code))
+ 
+ 
+-def file_type(handle):
+-    """Return the ``GetFileType`` value for an object handle."""
++def _api():
++    """Return the bound kernel32 entry points, loading them on first use."""
++    if _cache:
++        return _cache
+     if not _IS_WINDOWS:
+-        raise OSError("GetFileType is only available on Windows")
++        raise OSError("the Win32 handle API is only available on Windows")
++
+     import ctypes
+     from ctypes import wintypes
+ 
+-    func = _kernel32().GetFileType
+-    func.argtypes = [wintypes.HANDLE]
+-    func.restype = wintypes.DWORD
+-    return int(func(wintypes.HANDLE(int(handle))))
++    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++    k32.GetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
++    k32.GetHandleInformation.restype = wintypes.BOOL
++    k32.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
++    k32.SetHandleInformation.restype = wintypes.BOOL
++    k32.GetFileType.argtypes = [wintypes.HANDLE]
++    k32.GetFileType.restype = wintypes.DWORD
++    k32.GetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
++    k32.GetConsoleMode.restype = wintypes.BOOL
++    k32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
++    k32.GetProcessHandleCount.restype = wintypes.BOOL
++    k32.GetCurrentProcess.argtypes = []
++    k32.GetCurrentProcess.restype = wintypes.HANDLE
++    k32.SetLastError.argtypes = [wintypes.DWORD]
++    k32.SetLastError.restype = None
++
++    _cache["k32"] = k32
++    _cache["ctypes"] = ctypes
++    _cache["wintypes"] = wintypes
++    return _cache
++
++
++def _handle(value):
++    api = _api()
++    return api["wintypes"].HANDLE(int(value))
++
++
++def last_error():
++    import ctypes
++
++    return ctypes.get_last_error()
++
++
++def handle_flags(handle):
++    """Return the ``GetHandleInformation`` flags, or raise :class:`OSError`."""
++    api = _api()
++    flags = api["wintypes"].DWORD(0)
++    api["ctypes"].set_last_error(0)
++    if not api["k32"].GetHandleInformation(_handle(handle), api["ctypes"].byref(flags)):
++        code = last_error() or ERROR_INVALID_HANDLE
++        raise OSError(0, error_text(code), None, code)
++    return int(flags.value)
++
++
++def set_handle_flags(handle, mask, flags):
++    """Call ``SetHandleInformation``, raising :class:`OSError` on failure."""
++    api = _api()
++    api["ctypes"].set_last_error(0)
++    if not api["k32"].SetHandleInformation(_handle(handle), int(mask), int(flags)):
++        code = last_error() or ERROR_INVALID_PARAMETER
++        raise OSError(0, error_text(code), None, code)
++
++
++def file_type(handle):
++    """Return the ``GetFileType`` value for an object handle (0 on failure)."""
++    api = _api()
++    api["ctypes"].set_last_error(0)
++    api["k32"].SetLastError(0)
++    return int(api["k32"].GetFileType(_handle(handle)))
++
++
++def is_console(handle):
++    """Return ``True`` when ``GetConsoleMode`` accepts the handle."""
++    api = _api()
++    mode = api["wintypes"].DWORD(0)
++    api["ctypes"].set_last_error(0)
++    return bool(api["k32"].GetConsoleMode(_handle(handle), api["ctypes"].byref(mode)))
++
++
++def process_handle_count():
++    """Return how many handles this process holds, or ``None`` if unknown."""
++    api = _api()
++    count = api["wintypes"].DWORD(0)
++    if not api["k32"].GetProcessHandleCount(
++            api["k32"].GetCurrentProcess(), api["ctypes"].byref(count)):
++        return None
++    return int(count.value)
+diff --git a/wspawn/inherit.py b/wspawn/inherit.py
+index eb1617b..ddd89e6 100644
+--- a/wspawn/inherit.py
++++ b/wspawn/inherit.py
+@@ -1,41 +1,108 @@
+-"""Inheritance flags for the objects the host hands to its helpers."""
++"""Inheritance flags for the objects the host hands to its helpers.
+ 
+-import os
++On Windows the unit of handover is the *object handle*, and whether a handle
++crosses a process boundary is a property of the handle itself, stored in the
++kernel and readable from outside with ``GetHandleInformation``.  The standard
++library's descriptor-level helpers talk about CRT file descriptors instead, so
++they cannot be used here: a descriptor's flag is invisible to the system
++interfaces the acceptance criteria check against.
++"""
+ 
++from . import _winapi
+ from .errors import WSpawnError
+ 
++#: Handle values are machine words; reject anything that cannot be one.
++_MAX_HANDLE = (1 << 64) - 1
++
+ 
+ def _as_number(handle):
+-    try:
+-        return int(handle)
+-    except (TypeError, ValueError):
+-        raise WSpawnError("handle must be an integer, got %r" % (handle,), kind="badarg")
++    """Validate ``handle`` and return it as a plain integer."""
++    if isinstance(handle, bool) or not isinstance(handle, int):
++        # ``bool`` is an ``int`` subclass but is never a handle value.
++        try:
++            handle = handle.__index__()
++        except (AttributeError, TypeError, ValueError):
++            raise WSpawnError(
++                "handle must be an integer, got %r" % (handle,), kind="badarg") from None
++    number = int(handle)
++    if number < 0 or number > _MAX_HANDLE:
++        raise WSpawnError(
++            "not a usable object handle: %r" % (handle,), kind="badarg", handle=handle)
++    return number
++
++
++def _require_windows(handle=None):
++    if not _winapi.is_windows():
++        raise WSpawnError(
++            "handle inheritance control requires Windows",
++            kind="unsupported", handle=handle)
+ 
+ 
+ def set_inheritable(handle, enabled=True):
+-    """Mark ``handle`` as transferable to child processes, or stop it being so."""
++    """Mark ``handle`` as transferable to child processes, or stop it being so.
++
++    The change is made with ``SetHandleInformation`` so that it is a property of
++    the kernel object and can be read back independently with
++    ``GetHandleInformation``.
++    """
+     number = _as_number(handle)
++    _require_windows(handle)
++    flags = _winapi.HANDLE_FLAG_INHERIT if enabled else 0
+     try:
+-        os.set_inheritable(number, bool(enabled))
++        _winapi.set_handle_flags(number, _winapi.HANDLE_FLAG_INHERIT, flags)
+     except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os", handle=handle) from exc
+-    except (TypeError, ValueError) as exc:
+-        raise WSpawnError(str(exc), kind="badarg", handle=handle) from exc
++        raise _translate(exc, handle) from exc
+ 
+ 
+ def is_inheritable(handle):
+     """Return ``True`` when ``handle`` is currently transferable."""
+     number = _as_number(handle)
++    _require_windows(handle)
+     try:
+-        return bool(os.get_inheritable(number))
++        flags = _winapi.handle_flags(number)
+     except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++        raise _translate(exc, handle) from exc
++    return bool(flags & _winapi.HANDLE_FLAG_INHERIT)
++
++
++def _translate(exc, handle):
++    """Turn an :class:`OSError` from a Win32 call into a ``WSpawnError``."""
++    code = exc.winerror if getattr(exc, "winerror", None) else exc.errno
++    kind = _winapi.error_kind(code or 0)
++    return WSpawnError(str(exc), kind=kind, handle=handle)
+ 
+ 
+ def inheritable_handles():
+     """Return every object in this process that is currently transferable.
+ 
+-    The host tracks the objects it opens itself, so the module reports what the
+-    current implementation knows about.
++    Windows hands out handle values from a per-process table in multiples of
++    four, so the table can be walked directly: every value that
++    ``GetHandleInformation`` accepts names a live object, and the inherit flag
++    says whether a child would receive it.  The walk stops once every handle the
++    process is known to hold has been seen.
+     """
+-    return []
++    if not _winapi.is_windows():
++        return []
++
++    found = []
++    seen = 0
++    total = _winapi.process_handle_count()
++    # The table is sparse, so allow plenty of slack past the reported count
++    # before giving up, and keep a hard ceiling for pathological processes.
++    limit = 1 << 16 if total is None else max(1 << 12, total * 64)
++    limit = min(limit, 1 << 20)
++
++    value = 4
++    while value <= limit:
++        try:
++            flags = _winapi.handle_flags(value)
++        except OSError:
++            value += 4
++            continue
++        seen += 1
++        if flags & _winapi.HANDLE_FLAG_INHERIT:
++            found.append(value)
++        if total is not None and seen >= total:
++            break
++        value += 4
++    return found
+diff --git a/wspawn/kinds.py b/wspawn/kinds.py
+index 8ac6fb3..f280381 100644
+--- a/wspawn/kinds.py
++++ b/wspawn/kinds.py
+@@ -1,16 +1,37 @@
+ """Classification of the objects the host may hand to its helpers."""
+ 
++from . import _winapi
+ from .errors import WSpawnError
++from .inherit import _as_number
+ 
+ 
+ def handle_kind(handle):
+-    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``."""
++    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``.
++
++    The object type comes from ``GetFileType``.  A character device is only
++    reported as a console when ``GetConsoleMode`` accepts it, because devices
++    such as ``NUL`` are also character devices without being consoles.
++    """
++    number = _as_number(handle)
++    if not _winapi.is_windows():
++        raise WSpawnError(
++            "object classification requires Windows", kind="unsupported", handle=handle)
++
++    # Reject handles that do not name a live object before asking for a type:
++    # GetFileType cannot tell "unknown type" from "bad handle" on its own.
+     try:
+-        number = int(handle)
+-    except (TypeError, ValueError):
+-        raise WSpawnError("handle must be an integer, got %r" % (handle,), kind="badarg")
+-    if number <= 0:
+-        raise WSpawnError("not a usable object handle: %r" % (handle,), kind="os", handle=handle)
+-    # The classification was only ever wanted for a log line that never made it
+-    # into production, so the module reports the neutral value for everything.
++        _winapi.handle_flags(number)
++    except OSError as exc:
++        code = exc.winerror if getattr(exc, "winerror", None) else exc.errno
++        raise WSpawnError(
++            "not a usable object handle: %r" % (handle,),
++            kind=_winapi.error_kind(code or 0), handle=handle) from exc
++
++    kind = _winapi.file_type(number) & ~_winapi.FILE_TYPE_REMOTE
++    if kind == _winapi.FILE_TYPE_DISK:
++        return "file"
++    if kind == _winapi.FILE_TYPE_PIPE:
++        return "pipe"
++    if kind == _winapi.FILE_TYPE_CHAR:
++        return "console" if _winapi.is_console(number) else "unknown"
+     return "unknown"
+diff --git a/wspawn/proc.py b/wspawn/proc.py
+index b300be0..6e25272 100644
+--- a/wspawn/proc.py
++++ b/wspawn/proc.py
+@@ -1,9 +1,23 @@
+-"""Starting helper processes with a handover of the caller's objects."""
++"""Starting helper processes with a handover of the caller's objects.
++
++Windows decides what a child may reach at process-creation time.  Simply
++enabling inheritance (``bInheritHandles=TRUE``) hands over *every* inheritable
++handle in the parent, which is exactly what the sandbox must not do, and
++disabling it hands over nothing.  The middle setting is
++``PROC_THREAD_ATTRIBUTE_HANDLE_LIST``: the child receives the listed handles and
++nothing else, and each listed handle keeps the same numeric value it had in the
++parent.
++"""
+ 
+ import os
+ import subprocess
+ 
++from . import _winapi
+ from .errors import WSpawnError
++from .inherit import _as_number, _translate
++from .kinds import handle_kind
++
++_STD_STREAMS = ("stdin", "stdout", "stderr")
+ 
+ 
+ class SpawnedProcess(object):
+@@ -14,6 +28,10 @@ class SpawnedProcess(object):
+         self.inherit = tuple(inherit)
+         self.pid = popen.pid
+         self.returncode = None
++        # Present when the caller asked for a pipe on that stream.
++        self.stdin = popen.stdin
++        self.stdout = popen.stdout
++        self.stderr = popen.stderr
+ 
+     def wait(self, timeout=None):
+         self.returncode = self._popen.wait(timeout=timeout)
+@@ -23,9 +41,17 @@ class SpawnedProcess(object):
+         self.returncode = self._popen.poll()
+         return self.returncode
+ 
++    def communicate(self, input=None, timeout=None):
++        out = self._popen.communicate(input=input, timeout=timeout)
++        self.returncode = self._popen.returncode
++        return out
++
+     def terminate(self):
+         self._popen.terminate()
+ 
++    def kill(self):
++        self._popen.kill()
++
+ 
+ def _normalise_argv(argv):
+     if isinstance(argv, (str, bytes)):
+@@ -45,29 +71,135 @@ def _normalise_handles(inherit):
+     if isinstance(inherit, int):
+         raise WSpawnError("inherit must be a sequence of handles, not a single handle", kind="badarg")
+     try:
+-        return tuple(int(item) for item in inherit)
+-    except (TypeError, ValueError) as exc:
+-        raise WSpawnError("inherit must contain integer handles: %s" % exc, kind="badarg") from exc
+-
+-
+-def spawn(argv, inherit=(), stdin=None, stdout=None, stderr=None):
++        items = list(inherit)
++    except TypeError as exc:
++        raise WSpawnError("inherit must be a sequence of handles: %s" % exc, kind="badarg") from exc
++
++    handles = []
++    for item in items:
++        if isinstance(item, bool) or not isinstance(item, int):
++            raise WSpawnError(
++                "inherit must contain integer handles, got %r" % (item,), kind="badarg")
++        number = _as_number(item)
++        if number == 0:
++            raise WSpawnError("not a usable object handle: 0", kind="badarg", handle=item)
++        if number not in handles:
++            handles.append(number)
++    return tuple(handles)
++
++
++def _check_transferable(handles):
++    """Reject handles that cannot be handed over before touching any flags."""
++    for handle in handles:
++        try:
++            _winapi.handle_flags(handle)
++        except OSError as exc:
++            raise _translate(exc, handle) from exc
++        # Console handles with their low two bits set are not real kernel
++        # objects; CreateProcess rejects them in a handle list.
++        if handle & 0x3 == 0x3 and handle_kind(handle) in ("console", "unknown"):
++            raise WSpawnError(
++                "console pseudo handles cannot be handed over explicitly",
++                kind="unsupported", handle=handle)
++
++
++def _make_inheritable(handles):
++    """Turn the inherit flag on, returning the handles that had to be changed."""
++    changed = []
++    try:
++        for handle in handles:
++            try:
++                flags = _winapi.handle_flags(handle)
++            except OSError as exc:
++                raise _translate(exc, handle) from exc
++            if flags & _winapi.HANDLE_FLAG_INHERIT:
++                continue
++            try:
++                _winapi.set_handle_flags(
++                    handle, _winapi.HANDLE_FLAG_INHERIT, _winapi.HANDLE_FLAG_INHERIT)
++            except OSError as exc:
++                raise _translate(exc, handle) from exc
++            changed.append(handle)
++    except BaseException:
++        _restore(changed)
++        raise
++    return changed
++
++
++def _restore(handles):
++    """Put the inherit flag back for handles :func:`_make_inheritable` changed."""
++    for handle in handles:
++        try:
++            _winapi.set_handle_flags(handle, _winapi.HANDLE_FLAG_INHERIT, 0)
++        except OSError:
++            pass
++
++
++def _startupinfo(handles, startupinfo):
++    """Return a STARTUPINFO carrying the explicit handle list."""
++    info = startupinfo
++    if info is None:
++        info = subprocess.STARTUPINFO()
++    elif not isinstance(info, subprocess.STARTUPINFO):
++        raise WSpawnError(
++            "startupinfo must be a subprocess.STARTUPINFO, got %r" % (startupinfo,),
++            kind="badarg")
++
++    attributes = dict(info.lpAttributeList or {})
++    listed = list(attributes.get("handle_list") or [])
++    for handle in handles:
++        if handle not in listed:
++            listed.append(handle)
++    attributes["handle_list"] = listed
++    info.lpAttributeList = attributes
++    return info
++
++
++def spawn(argv, inherit=(), stdin=None, stdout=None, stderr=None, **kwargs):
+     """Start a helper process, handing it the objects named in ``inherit``.
+ 
++    The helper can reach the objects in ``inherit`` plus whichever standard
++    streams the caller passes explicitly, and nothing else: other inheritable
++    objects in this process stay out of reach.  Each handed-over object keeps
++    its numeric handle value inside the helper.
++
+     Returns a :class:`SpawnedProcess`.
+     """
+     command = _normalise_argv(argv)
+     handles = _normalise_handles(inherit)
+ 
+-    kwargs = {
+-        # The helper is expected to need the objects it is handed, so close_fds
+-        # stays off; otherwise the log pipe is gone before the helper starts.
+-        "close_fds": False,
+-        "stdin": stdin,
+-        "stdout": stdout,
+-        "stderr": stderr,
+-    }
++    for name in _STD_STREAMS:
++        kwargs.pop(name, None)
++    startupinfo = kwargs.pop("startupinfo", None)
++
++    if not _winapi.is_windows():
++        raise WSpawnError(
++            "an explicit handle handover requires Windows", kind="unsupported")
++
++    _check_transferable(handles)
++    info = _startupinfo(handles, startupinfo)
++    changed = _make_inheritable(handles)
+     try:
+-        popen = subprocess.Popen(command, **kwargs)
++        popen = subprocess.Popen(
++            command,
++            # close_fds keeps Popen from widening inheritance on its own: the
++            # handle list is the only thing that crosses the boundary, and the
++            # standard streams Popen is told about are added to it.
++            close_fds=True,
++            stdin=stdin,
++            stdout=stdout,
++            stderr=stderr,
++            startupinfo=info,
++            **kwargs
++        )
+     except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os") from exc
++        code = getattr(exc, "winerror", None)
++        kind = _winapi.error_kind(code) if code else "os"
++        raise WSpawnError(str(exc), kind=kind) from exc
++    except (TypeError, ValueError) as exc:
++        raise WSpawnError(str(exc), kind="badarg") from exc
++    finally:
++        # Leave the caller's own flags exactly as they were; only the ones this
++        # call switched on are switched back off.
++        _restore(changed)
+     return SpawnedProcess(popen, handles)

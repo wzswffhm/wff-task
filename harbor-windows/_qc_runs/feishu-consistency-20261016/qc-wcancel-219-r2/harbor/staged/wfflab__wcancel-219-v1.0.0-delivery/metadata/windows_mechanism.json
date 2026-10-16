@@ -1,0 +1,52 @@
+{
+  "schema_version": "windows-mechanism-gate-v1",
+  "task_id": "wfflab__wcancel-219",
+
+  "counterfactual": {
+    "question": "把目标 OS 换成 Linux/macOS，主要实现、错误根因和 Evaluator 是否基本不变？",
+    "answer": "否",
+    "reason": "主要实现只能由 Win32 重叠 I/O 的取消接口构成：一个挂起请求由它自己的 OVERLAPPED 结构标识，停止它必须调用 CancelIoEx(handle, OVERLAPPED*)——这个入口可以跨线程调用；请求的终态只能由 GetOverlappedResult 读回，被取消是 ERROR_OPERATION_ABORTED(995)，而请求已经不在挂起状态是 ERROR_NOT_FOUND(1168)。这些语义在 Linux/macOS 上没有对等物：POSIX 的 aio_cancel 只作用于 aio_read/aio_write 族请求，终态用 AIO_CANCELED/AIO_NOTCANCELED/AIO_ALLDONE 表达，而且对普通文件描述符通常直接返回 AIO_NOTCANCELED；io_uring 的取消（IORING_OP_ASYNC_CANCEL）是另外一套模型；用线程加信号或标志位的模拟做不到『精确到某一个请求、并且能区分已取消与已完成』。错误根因同样只在 Windows 上成立：缺陷实现之所以一次取消掉同一批请求，正是因为它退回到 CancelIo——CancelIo 只作用于调用线程在该句柄上发出的请求，从别的线程调用时它照样返回成功但什么也没取消。Evaluator 必须在真实 Windows Runtime 上触发，因为它要自己用 CreateNamedPipeW/CreateFileW(FILE_FLAG_OVERLAPPED) 建可取消对象、自己发起挂起 ReadFile、自己从第二个线程调取消、并以 GetOverlappedResult 的原始错误码为终态；换到别的操作系统，这些判据一条都无法复算。"
+  },
+
+  "exclusive_declaration": {
+    "quote": "本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。"
+  },
+
+  "mechanisms": [
+    {
+      "name": "按请求精确取消（CancelIoEx + OVERLAPPED*）",
+      "instruction_quote": "- `cancel(request)` 必须**只**停止 `request` 指向的那一个挂起请求。",
+      "test_ref": "verifier/tests/test_wcancel_semantics.py#L135-L150",
+      "f2p_case": "f2p-cancel-affects-only-the-target-request"
+    },
+    {
+      "name": "取消可跨线程发起（CancelIoEx 与 CancelIo 的关键差异）",
+      "instruction_quote": "- 从**任意线程**调用 `cancel(request)` 都必须真的停止那个请求；不得出现「返回成功但请求仍在挂起」的情况。",
+      "test_ref": "verifier/tests/test_wcancel_semantics.py#L151-L175",
+      "f2p_case": "f2p-cancel-works-from-another-thread"
+    },
+    {
+      "name": "被取消请求的终态判定（GetOverlappedResult → ERROR_OPERATION_ABORTED）",
+      "instruction_quote": "- `wait(request)` 对收到取消的请求必须产出 `status == \"cancelled\"`，`bytes_read` 反映实际完成的字节数。",
+      "test_ref": "verifier/tests/test_wcancel_semantics.py#L195-L205",
+      "f2p_case": "f2p-cancelled-request-reports-cancelled-status"
+    },
+    {
+      "name": "已完成请求不得谎报取消（ERROR_NOT_FOUND）",
+      "instruction_quote": "- 对**已经完成**的请求调用 `cancel(request)` 必须返回 `False`；对同一个请求重复调用取消，第二次也必须返回 `False`。",
+      "test_ref": "verifier/tests/test_wcancel_semantics.py#L206-L215",
+      "f2p_case": "f2p-completed-request-cannot-be-cancelled"
+    },
+    {
+      "name": "对象是否支持重叠 I/O 的能力判定（FILE_FLAG_OVERLAPPED 的文件模式）",
+      "instruction_quote": "- 对不支持重叠读取的对象，`submit()` 必须抛出 `WCancelError`，且 `err.kind == \"unsupported\"`；不得静默退化成同步读取。",
+      "test_ref": "verifier/tests/test_wcancel_semantics.py#L228-L236",
+      "f2p_case": "f2p-non-overlapped-handle-is-unsupported"
+    }
+  ],
+
+  "non_windows_must_fail": {
+    "file": "environment/validate_environment.ps1",
+    "evidence": "Fail 'the host platform is not Windows (Win32NT), so the wcancel contract cannot be graded here'"
+  }
+}

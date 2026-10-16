@@ -1,0 +1,1621 @@
+diff --git a/check_struct.py b/check_struct.py
+new file mode 100644
+index 0000000..b1fa6bf
+--- /dev/null
++++ b/check_struct.py
+@@ -0,0 +1,58 @@
++import ctypes
++from ctypes import wintypes
++
++class STARTUPINFO(ctypes.Structure):
++    _fields_ = [
++        ('cb', wintypes.DWORD),
++        ('lpReserved', wintypes.LPWSTR),
++        ('lpDesktop', wintypes.LPWSTR),
++        ('lpTitle', wintypes.LPWSTR),
++        ('dwX', wintypes.DWORD),
++        ('dwY', wintypes.DWORD),
++        ('dwXSize', wintypes.DWORD),
++        ('dwYSize', wintypes.DWORD),
++        ('dwXCountChars', wintypes.DWORD),
++        ('dwYCountChars', wintypes.DWORD),
++        ('dwFillAttribute', wintypes.DWORD),
++        ('dwFlags', wintypes.DWORD),
++        ('wShowWindow', wintypes.WORD),
++        ('cbReserved2', wintypes.WORD),
++        ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
++        ('hStdInput', wintypes.HANDLE),
++        ('hStdOutput', wintypes.HANDLE),
++        ('hStdError', wintypes.HANDLE),
++    ]
++
++class STARTUPINFOEX(ctypes.Structure):
++    _fields_ = [
++        ('cb', wintypes.DWORD),
++        ('lpReserved', wintypes.LPWSTR),
++        ('lpDesktop', wintypes.LPWSTR),
++        ('lpTitle', wintypes.LPWSTR),
++        ('dwX', wintypes.DWORD),
++        ('dwY', wintypes.DWORD),
++        ('dwXSize', wintypes.DWORD),
++        ('dwYSize', wintypes.DWORD),
++        ('dwXCountChars', wintypes.DWORD),
++        ('dwYCountChars', wintypes.DWORD),
++        ('dwFillAttribute', wintypes.DWORD),
++        ('dwFlags', wintypes.DWORD),
++        ('wShowWindow', wintypes.WORD),
++        ('cbReserved2', wintypes.WORD),
++        ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
++        ('hStdInput', wintypes.HANDLE),
++        ('hStdOutput', wintypes.HANDLE),
++        ('hStdError', wintypes.HANDLE),
++        ('lpAttributeList', ctypes.c_void_p),
++    ]
++
++print('STARTUPINFO size:', ctypes.sizeof(STARTUPINFO))
++print('STARTUPINFOEX size:', ctypes.sizeof(STARTUPINFOEX))
++print('Expected STARTUPINFOEX on x64: 112')
++
++# Check field offsets
++si = STARTUPINFO()
++sie = STARTUPINFOEX()
++print('STARTUPINFO.cb offset:', type(si).cb.offset)
++print('STARTUPINFOEX.cb offset:', type(sie).cb.offset)
++print('STARTUPINFOEX.lpAttributeList offset:', type(sie).lpAttributeList.offset)
+diff --git a/test_create.py b/test_create.py
+new file mode 100644
+index 0000000..63219f7
+--- /dev/null
++++ b/test_create.py
+@@ -0,0 +1,66 @@
++import ctypes
++from ctypes import wintypes
++import subprocess
++
++kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++# Simple test without attribute list first
++class STARTUPINFO(ctypes.Structure):
++    _fields_ = [
++        ('cb', wintypes.DWORD),
++        ('lpReserved', wintypes.LPWSTR),
++        ('lpDesktop', wintypes.LPWSTR),
++        ('lpTitle', wintypes.LPWSTR),
++        ('dwX', wintypes.DWORD),
++        ('dwY', wintypes.DWORD),
++        ('dwXSize', wintypes.DWORD),
++        ('dwYSize', wintypes.DWORD),
++        ('dwXCountChars', wintypes.DWORD),
++        ('dwYCountChars', wintypes.DWORD),
++        ('dwFillAttribute', wintypes.DWORD),
++        ('dwFlags', wintypes.DWORD),
++        ('wShowWindow', wintypes.WORD),
++        ('cbReserved2', wintypes.WORD),
++        ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
++        ('hStdInput', wintypes.HANDLE),
++        ('hStdOutput', wintypes.HANDLE),
++        ('hStdError', wintypes.HANDLE),
++    ]
++
++class PROCESS_INFORMATION(ctypes.Structure):
++    _fields_ = [
++        ('hProcess', wintypes.HANDLE),
++        ('hThread', wintypes.HANDLE),
++        ('dwProcessId', wintypes.DWORD),
++        ('dwThreadId', wintypes.DWORD),
++    ]
++
++si = STARTUPINFO()
++si.cb = ctypes.sizeof(STARTUPINFO)
++
++pi = PROCESS_INFORMATION()
++
++cmd = subprocess.list2cmdline(['python', '-c', 'print("hello")'])
++cmd_buf = ctypes.create_unicode_buffer(cmd)
++
++success = kernel32.CreateProcessW(
++    None,
++    cmd_buf,
++    None,
++    None,
++    False,  # bInheritHandles
++    0,      # dwCreationFlags
++    None,
++    None,
++    ctypes.byref(si),
++    ctypes.byref(pi)
++)
++
++if success:
++    print('Success! PID:', pi.dwProcessId)
++    kernel32.WaitForSingleObject(pi.hProcess, 5000)
++    kernel32.CloseHandle(pi.hProcess)
++    kernel32.CloseHandle(pi.hThread)
++else:
++    err = ctypes.get_last_error()
++    print('Failed with error:', err)
+diff --git a/test_create_ex.py b/test_create_ex.py
+new file mode 100644
+index 0000000..c5888ec
+--- /dev/null
++++ b/test_create_ex.py
+@@ -0,0 +1,110 @@
++import ctypes
++from ctypes import wintypes
++import subprocess
++
++kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++EXTENDED_STARTUPINFO_PRESENT = 0x00080000
++PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
++STARTF_USESTDHANDLES = 0x00000100
++STD_INPUT_HANDLE = -10 & 0xFFFFFFFF
++STD_OUTPUT_HANDLE = -11 & 0xFFFFFFFF
++STD_ERROR_HANDLE = -12 & 0xFFFFFFFF
++
++class STARTUPINFOEX(ctypes.Structure):
++    _fields_ = [
++        ('cb', wintypes.DWORD),
++        ('lpReserved', wintypes.LPWSTR),
++        ('lpDesktop', wintypes.LPWSTR),
++        ('lpTitle', wintypes.LPWSTR),
++        ('dwX', wintypes.DWORD),
++        ('dwY', wintypes.DWORD),
++        ('dwXSize', wintypes.DWORD),
++        ('dwYSize', wintypes.DWORD),
++        ('dwXCountChars', wintypes.DWORD),
++        ('dwYCountChars', wintypes.DWORD),
++        ('dwFillAttribute', wintypes.DWORD),
++        ('dwFlags', wintypes.DWORD),
++        ('wShowWindow', wintypes.WORD),
++        ('cbReserved2', wintypes.WORD),
++        ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
++        ('hStdInput', wintypes.HANDLE),
++        ('hStdOutput', wintypes.HANDLE),
++        ('hStdError', wintypes.HANDLE),
++        ('lpAttributeList', ctypes.c_void_p),
++    ]
++
++class PROCESS_INFORMATION(ctypes.Structure):
++    _fields_ = [
++        ('hProcess', wintypes.HANDLE),
++        ('hThread', wintypes.HANDLE),
++        ('dwProcessId', wintypes.DWORD),
++        ('dwThreadId', wintypes.DWORD),
++    ]
++
++# Get standard handles
++stdin_h = kernel32.GetStdHandle(STD_INPUT_HANDLE)
++stdout_h = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
++stderr_h = kernel32.GetStdHandle(STD_ERROR_HANDLE)
++
++print('stdin:', stdin_h, 'stdout:', stdout_h, 'stderr:', stderr_h)
++
++# Initialize attribute list
++attr_list_size = ctypes.c_size_t(0)
++kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_list_size))
++print('attr_list_size:', attr_list_size.value)
++
++attr_list = ctypes.create_string_buffer(attr_list_size.value)
++success = kernel32.InitializeProcThreadAttributeList(attr_list, 1, 0, ctypes.byref(attr_list_size))
++print('InitializeProcThreadAttributeList success:', success)
++if not success:
++    print('Error:', ctypes.get_last_error())
++
++# Create handle array with std handles
++handles = [int(stdin_h), int(stdout_h), int(stderr_h)]
++handle_array = (wintypes.HANDLE * len(handles))(*handles)
++
++success = kernel32.UpdateProcThreadAttribute(
++    attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
++    handle_array, ctypes.sizeof(handle_array), None, None
++)
++print('UpdateProcThreadAttribute success:', success)
++if not success:
++    print('Error:', ctypes.get_last_error())
++
++si = STARTUPINFOEX()
++si.cb = ctypes.sizeof(STARTUPINFOEX)
++si.lpAttributeList = ctypes.cast(attr_list, ctypes.c_void_p)
++si.dwFlags = STARTF_USESTDHANDLES
++si.hStdInput = stdin_h
++si.hStdOutput = stdout_h
++si.hStdError = stderr_h
++
++pi = PROCESS_INFORMATION()
++
++cmd = subprocess.list2cmdline(['python', '-c', 'print("hello from ex")'])
++cmd_buf = ctypes.create_unicode_buffer(cmd)
++
++success = kernel32.CreateProcessW(
++    None,
++    cmd_buf,
++    None,
++    None,
++    True,  # bInheritHandles must be True
++    EXTENDED_STARTUPINFO_PRESENT,
++    None,
++    None,
++    ctypes.byref(si),
++    ctypes.byref(pi)
++)
++
++if success:
++    print('Success! PID:', pi.dwProcessId)
++    kernel32.WaitForSingleObject(pi.hProcess, 5000)
++    kernel32.CloseHandle(pi.hProcess)
++    kernel32.CloseHandle(pi.hThread)
++else:
++    err = ctypes.get_last_error()
++    print('Failed with error:', err)
++
++kernel32.DeleteProcThreadAttributeList(attr_list)
+diff --git a/test_debug.py b/test_debug.py
+new file mode 100644
+index 0000000..f5d9ed0
+--- /dev/null
++++ b/test_debug.py
+@@ -0,0 +1,30 @@
++import sys
++sys.path.insert(0, '/testbed')
++
++from wspawn._winapi import get_handle_information, HANDLE_FLAG_INHERIT, _open_nul_write
++import ctypes
++from ctypes import wintypes
++
++kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++# Open NUL for writing
++nul_h = _open_nul_write()
++print('NUL handle:', nul_h)
++
++# Check if it's inheritable
++flags = get_handle_information(nul_h)
++print('Flags:', hex(flags))
++print('Is inheritable:', bool(flags & HANDLE_FLAG_INHERIT))
++
++# Try to make it inheritable
++success = kernel32.SetHandleInformation(wintypes.HANDLE(nul_h), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
++print('SetHandleInformation success:', success)
++if not success:
++    print('Error:', ctypes.get_last_error())
++
++# Check again
++flags = get_handle_information(nul_h)
++print('Flags after set:', hex(flags))
++print('Is inheritable after set:', bool(flags & HANDLE_FLAG_INHERIT))
++
++kernel32.CloseHandle(wintypes.HANDLE(nul_h))
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..05706426fa7be0275a89992a4bbc5f1cf28a9f66
+GIT binary patch
+literal 125
+zcmX@j%ge<81V0?lXMyO)AOanHW&w&!XQ*V*Wb|9fP{ah}eFmxdCF5)rQ<7R-l9ZYP
+vri)|Z<1_OzOXB183My}L*yQG?l;)(`6|n*pGXilji1Cq`k&&^88OQ<vKL;Bg
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/test_wspawn_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wspawn_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4d11406676538ad9b289938853a2adb662bc4ae
+GIT binary patch
+literal 18492
+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
+I3>(;g10hSe9{>OV
+
+literal 0
+HcmV?d00001
+
+diff --git a/wspawn/__pycache__/_winapi.cpython-312.pyc b/wspawn/__pycache__/_winapi.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..92f11d7d81040cef03d131d3e645ad28e163c3eb
+GIT binary patch
+literal 14437
+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
+MaR)rr>n4-?Z;^0m$^ZZW
+
+literal 0
+HcmV?d00001
+
+diff --git a/wspawn/__pycache__/inherit.cpython-312.pyc b/wspawn/__pycache__/inherit.cpython-312.pyc
+index efdbd14e8abb7a61e14f4a23b976662aa1453f4c..e4d1c773c74967ec829dab7d209d86b94fbbbd9c 100644
+GIT binary patch
+literal 4502
+zcmcJTUu+b|8Ng@u-~I8~cleBbwz0jK1ULguYXVZCpx9vk$0V@@!KFH{Z`QuG&%3AD
+zJ&fsHN>QYuCY7lA2TM@NQt|*I4}GLnrNrhXYNhsEObA<7eF%Nv%{6{Npi2E__xA2^
+zO+!?5q@A0Y{q~!G-}jqu?vK^gK?LbfZ~l4gSQw$NSj9_RvGDjUC|pGZ4I+XGm&Svb
+z@I**+6Z{~L5fR@<g951{())N&BtED~98!I^ik}bqi67bmBmjAk1R<}Q;^LtTZyeQA
+zD%C7SPpa}rS{XIv5rfKBN|lY_F*RwKPB~?mmYh;_0#!rSpf#nYGb%MZAF&?#9%0Di
+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
+
+literal 2105
+zcmah~T})g>6rQ=WKX;d9ksm1~MMhELM!JpBklKiGHG<ekjSv+=vfSM}>@F<#t~0aU
+zg3u7sH$&n>6G*Cwi9XQKCO#PBV|n($ZNN0%;8XRX@rA&HP5a`Rd-tx3Dd|aOa^~;M
+zne%;T&M(c)Q3UdL>esn{0tnq#17Eb7ax@6a1~SnUGO?)@@f0?R87OKCWQt&92Ct#1
+zfEh7E*YH%(48tg7>d=Q5wM2C3?NKYwctILgmeJXwkrQ;*=2YexwKH=pD}}4)Z6Rsi
+zuuK@*v;ebtRxB|tk`I&{V-GO&3G6g|I$km=)_a`WJgeq>34%hP9nC<ufg(uOSC`Rt
+zO&>>nNc!(W5?<`dto9<}tr*F$KV#x$bVK__Gqqb}yLMs?SI`wQi7Ge|7+dO9-WC~M
+zD1+x2Mh%M=EXi_=573+~sT0Z=ronUIbYQ+<nTdcyV1pBxSS&Hue<%8hQ7n5pSH8g3
+zkY`mWhv}m;?_QXeOvnr~rz=7|e7fL;Gg(@6qG>~<t@1*Kao!C3b!g%Z=vL8zMuJm#
+zzoqS~!7sn4>fI0bW6xe+sy4lFh%hYt5kI}tS?wOJe)QR1e6p%f9uPJCNGKC)(Pp$x
+z&ys9CP%s&S=7tx6XB$rp?urIMS9@HUs|VMgL1<a~FTl&#2gMIBMvDaCQ7*Uwko2q&
+z+2oI<dZR1L#6PQGx}|N`Ze1p8nn_m3RZ_t+?(de*_?ipz(`^P$vRQ{exb*&q2A`)h
+zGag(sGt>a$a>Ej{j2juC1+X}qFBDB$;&zq^!NdRs-V14$fZjluf|aAfPCA+`ZfaZ+
+zkE^GSaTV%B#6^_1fbO&iCet<Cm2D@GvF)N0zBKOA$fb@$gycM;tf-7m1YBcIm|5zC
+z>4ZF<ID}ov3Iz=X;W4$p)$i10;&bR$(VxwyHbcA3y{p3qS}=GK@9WWfdiPzudvoyn
+z*SEso4gIFS`f$IgP0?ut@5fJn-M5*&@$y#353_smp*yct_2I{jlmiR(JzYQd@5NJh
+zL{<ObvEtoD;2niq*L%;R+mX}|`Kc=vCp+;rP<Loo>O9#w9|Zkay4U%*1t(A7BW~oQ
+zR3C&ZbL#B>q=Ai%U&V1QYER^%b^;eQmy6m}t<vyqEM54R$uhTqITO6hfH##qQ=>YM
+z3W8?KoHI)n7mqP2>5_pfGLI#~9zEJ%P~%AMI7fK9T2ess4(JlZ<pb|j6Q`gPDrI~M
+zIPrpLBpC08Mb*S5=#I02D7;(RufKDzqyKJ4|F@TSJCeIC=c@X-r}05yJpx!Of7W|m
+zLEDj3EBUc26(c*bAgEcGuZu!Kxp<_&+CVup4!`5lPAz)uGUJQ2`T@T#R1gSTEzw|L
+zNP2P@qftfu38+7A&4HxN&U-b;uSbxcc8OU+l_6G~9e^}-Yt({mmLan_E7=?hR7Kqb
+zb<DL_!;BUdN=3E+=ozwLTXf#CD}ovsyDXFLzMF`jQO|;g-1KwW8!|gx`~CTIu-pet
+zsEmg1JceTN)luF9qXeEv=uSADHtlRW?V%rn3Se{L;jO+&FR2xTt||9U_q2DX{-*bq
+vxA^n0Ma5dY1RWrR@$YE(K8pN>dJjVZDD_8i9bd$UogqAekJ>^w?wa`*#_{U{
+
+diff --git a/wspawn/__pycache__/kinds.cpython-312.pyc b/wspawn/__pycache__/kinds.cpython-312.pyc
+index f2826244e7971ee7fd7e1aed07cd08ce1bd6332b..20eb8947d83c9f3d9a508e3a682eb38175cfe7bb 100644
+GIT binary patch
+literal 1968
+zcma)7O>7fK6rSC+z3ccVi9?+@C1heyYD)<!RP;bAsw531Kto7qLM&8g?On&4*t^#5
+z7~{z9PgJRhQ>0b`2`X`GD>(EBr#AG0)I(PgsbK|bCFp^hML1M&>6=||>XaTjl4sw{
+zy!YmN-+OQTODNQaVEp#suS?(Z2tB3?cd$)iD-ObCB%u_N7>O+~DMsQXPk}9RDULys
+z_Y0KrRN16&<-M_jXc$UP$%;hLRIKGN$;(*FEXi47*m7Po2ri0MoEKFI6AdeHke3T3
+zSvU4Sr8iDKWnfM+R$y+XBv#aMUDxz1-E)Tz1P*>%f57f#<VR%tw1#dp<vLSiB+oJg
+zp?4Ap%^8xnhOV;Tuo7ECH+?s#7Z|Gy5gZAjC7Td;<$NW6IRSnWk|6mDz9L^|i$a|%
+z`s<!zTiwe50v6TS8nb=3ujZ?9whdEl2ien<J3#g}<<4rvM%erR5LP355ph$3h{r{k
+zWA{OX3~Gsyabvv6-Dp~@G8J@zn@1G}yhL4Fusm7kNz7f>c&SYaxU5`Yj39$*{1PDi
+z_oxdsK?>TDw71+G+R1B;UuFL}C4H`!8t*bCg<JDL^`$_a|Aen><4tyn*C3_SGAZjS
+zURa3dl!6>zSQw&mNhxj1Sxq%G`v_|~JuIuss#Z}!cYhm(VNa)2Jg2CVRxyTf*^mwV
+zflQ8q$1~NEOv_P{iL4hD6&6srgziEWi*~sd<ioa)VSIGr<aqkb{M2~*{fU_qIB_6}
+zhmT+f+AAtk6I0_j@s^`vBW_}8^)q&CWEv+9I!bORIFZeZx|jt>0PMVym4_%KXs<${
+zikn)=S1$Z$^2Fq+xk;ROGfAn?AQIii=Q3hj*weJAP!d`?4d=i_QO}D7MQTQEP%o;c
+z4l62=7r~dPFP4k4N(_hCm44dH1sNC1(A*griz;}qRfq7RMzH0}h!Pk<Q+t+yeVtb2
+z%5D{oM96}e0bA#haCyc_R;NvC`5f04s}h}dYtm!+X$7QdYOL_iM6|9c>#b`_uq9L=
+zv-CZgd`cgYmGI6$Emkuu4|Q*OXre5>$+5*ZsY|w79E4{1X}#DllhrmW7RrvS)2`Gz
+zC~l7`7QsFZ7m6iCr;myrpi_`eA*#ZknsGevi!u=j(Je1vQ#Fe-h@SN8^hvUOYPpz!
+z?f-JX=7`0~7qWU7Gz~vYw9M`CqIc}@IU*Y*BTMHh27O1*QRa>PrK%NhI8EEBh=Uou
+z$%sLheTEuQ&YNN$cJ5l6{p$6LzJ`E=@EWta@+cg;oilrn-aTu6ENz5kQ;?tV{x2(^
+zSJw8ee)_vGdtaDsczFK_=0RugmACJA#xIUGI#4jYw&z};f3qvL8ERiUaxXNnL)_i)
+zp<R7&Niec@`qDd(B7N(F=APr`>3K7g--sw?P}ywn`Rn-zgF?}-SIj{C8Dan*pjnTa
+zy%Xlt*^ThLDa<!Gy8ZHb6m@hzLtcRKq<ha5<NEO*Jomc~-RmB`)%9cScI@J@&Gzmq
+z2QJkgMhDFJ!CO6d2REXp&AF7>k$M>EyOzDa_iFyTGq(meA|pQ;X7KpSMu0kdVeA8n
+zRs$o4&^jlK_Mr7cc=R>yPLF?Vn7cDD!jC1mpA%kKB)yRIw4`OzX{Qi;kUUK{oYJ6V
+ye~-3cM*09umhf&-lgb78i2epF>0g)81rvnBFb~l9W90u6^>6uxnV3EZ`+oyC*9IK`
+
+delta 384
+zcmdnMzm$#dG%qg~0}#A+JfAg_X(FG5f)tQ9ogsxGiXnwDg(-(Imnn*gks*b-g&~T$
+zl0}nsqMy^mX$st|KxNE8{JD=|;z7m9EsPR^Y&8sP*jIxDfuM=8l4J5(MmH8s&MLdf
+ztC;L2yRjHDy=0hN$)Xs1iz&ZYlc|UesO}b9Mq*w{PU<c8(!A`v{PH|amRro3c_p_v
+zLn;eWU5kqHi*9j+CFYbu*hL`Yfm%7iTJuVClTwR{nSh+h*I9L(1b_^Xp~cZaqJiN9
+z3o~mJ;~hbf31O3^JJ>$3F>vrr5NxWx%O|-r?ShosiI59X30L?MFK{FR<#<GYeBqtE
+zicK}`S24)=CT<mmB?^u#%zi*8vB$@!<R{0+-(pJzIjI=zjv|nKD;YimNrobRAaRSs
+qCO1E&G$+-rNEFCr1ma?lnh(s3jEpxKT%R(?e`e!i6fF_~3IYI``({4?
+
+diff --git a/wspawn/__pycache__/proc.cpython-312.pyc b/wspawn/__pycache__/proc.cpython-312.pyc
+index c4b87317f013f3a85ba150d98f8816c220918188..1c3976dcb2e30227fd2c843df9f62909a80beecb 100644
+GIT binary patch
+literal 12152
+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
+
+delta 741
+zcmZ9K&ubGw6vyYy{+x|T(@>IP?JupC4H)#G_~Rf8wJoBtSP|WWQZrj^O_MsC5`S!L
+zkeqrDbq@9*=)r>+JxKq89t6RIU_t8Ii>P?8hgx&+;K7-O_TXdryzlUS?3=gy=i-;n
+z*t=-dLc)GJ?<ZHy2eJ0ES#f%VC~^@6iu2&YhQ}_Z3RUyUl<KO0Fd9Nst0Ag;T3wMH
+z5OQ^D)R1dXQ_!RqB{gu#O>9SAzx@WVjlaTwA;DiLKOo5;s&8OBKd)7QEPT`kFmx?+
+zm;r`;eBOEvY3@YkQaP>Jc!Rp2e9`X@{7iiRNeTfDlt88Uv05<*DsAOX%FO>P(8gf`
+z1;#VD2Nko_vKbD{K(AvyLfVG=5Zh59rO0Ne6x~z-sY6p!<)vE3O&yTCm}(Vrhm@g=
+zZYUQ}8EpO5b-o%u!Ly0}*+E+kNiJXXy-VZN4>i9;Ckml1Tydtf;XTG!zv#wx3S@1Q
+zW#r+2Kxp|hm#0}V=lP;?q&V#rLgV!4amI>_sWNM~guJP3v9#23aCS)Iu*8vB!O+MR
+zr>4dVG&HUX<~={uua(Ex6`#o!u)PAl{Qf;##^SP0^QXtk1?C7X$MJ6qR8hl1EnV|;
+zDYmORv=Zxinp%q4)uA;DB|DZ|lgo*A@%)M!F}*st7Ux>#)WMXfdy;ejEdp`&D2rCg
+z=~WhcHKA>lb&F^=n-w?c5~{h1qeAhyOdn<rU&(YH8xUu?eP7PHrU1YvH2f8j&#3h~
+f>Tc)>=(&HcfrML66KGv;H^u+jNVY+mB}BzP&eo<?
+
+diff --git a/wspawn/_winapi.py b/wspawn/_winapi.py
+index 273b792..ff6cee6 100644
+--- a/wspawn/_winapi.py
++++ b/wspawn/_winapi.py
+@@ -5,6 +5,7 @@ loaded lazily so that importing the package stays cheap.
+ """
+ 
+ import os
++import sys
+ 
+ FILE_TYPE_UNKNOWN = 0x0000
+ FILE_TYPE_DISK = 0x0001
+@@ -12,6 +13,28 @@ FILE_TYPE_CHAR = 0x0002
+ FILE_TYPE_PIPE = 0x0003
+ FILE_TYPE_REMOTE = 0x8000
+ 
++HANDLE_FLAG_INHERIT = 0x00000001
++HANDLE_FLAG_PROTECT_FROM_CLOSE = 0x00000002
++
++# Process creation flags
++EXTENDED_STARTUPINFO_PRESENT = 0x00080000
++
++# ProcThreadAttribute constants
++PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
++
++# STARTF_USESTDHANDLES
++STARTF_USESTDHANDLES = 0x00000100
++
++# Standard handle IDs
++STD_INPUT_HANDLE = -10
++STD_OUTPUT_HANDLE = -11
++STD_ERROR_HANDLE = -12
++
++# Wait constants
++WAIT_OBJECT_0 = 0x00000000
++WAIT_TIMEOUT = 0x00000102
++INFINITE = 0xFFFFFFFF
++
+ _IS_WINDOWS = os.name == "nt"
+ 
+ 
+@@ -36,4 +59,325 @@ def file_type(handle):
+     func = _kernel32().GetFileType
+     func.argtypes = [wintypes.HANDLE]
+     func.restype = wintypes.DWORD
+-    return int(func(wintypes.HANDLE(int(handle))))
++    result = func(wintypes.HANDLE(int(handle)))
++    # GetFileType returns FILE_TYPE_UNKNOWN (0) on error, but also for some valid handles
++    # Check GetLastError to distinguish
++    err = ctypes.get_last_error()
++    if result == FILE_TYPE_UNKNOWN and err != 0:
++        raise OSError(err, "GetFileType failed")
++    return int(result)
++
++
++def get_handle_information(handle):
++    """Return the flags for a handle via GetHandleInformation.
++    
++    Returns the flags as an integer. Raises OSError on failure.
++    """
++    if not _IS_WINDOWS:
++        raise OSError("GetHandleInformation is only available on Windows")
++    import ctypes
++    from ctypes import wintypes
++
++    kernel32 = _kernel32()
++    flags = wintypes.DWORD()
++    success = kernel32.GetHandleInformation(wintypes.HANDLE(int(handle)), ctypes.byref(flags))
++    if not success:
++        err = ctypes.get_last_error()
++        raise OSError(err, "GetHandleInformation failed")
++    return int(flags.value)
++
++
++def set_handle_information(handle, mask, flags):
++    """Set handle flags via SetHandleInformation.
++    
++    mask: which flags to modify
++    flags: new values for those flags
++    Raises OSError on failure.
++    """
++    if not _IS_WINDOWS:
++        raise OSError("SetHandleInformation is only available on Windows")
++    import ctypes
++    from ctypes import wintypes
++
++    kernel32 = _kernel32()
++    success = kernel32.SetHandleInformation(
++        wintypes.HANDLE(int(handle)),
++        wintypes.DWORD(mask),
++        wintypes.DWORD(flags)
++    )
++    if not success:
++        err = ctypes.get_last_error()
++        raise OSError(err, "SetHandleInformation failed")
++
++
++def get_std_handle(which):
++    """Get a standard handle (STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE)."""
++    if not _IS_WINDOWS:
++        raise OSError("GetStdHandle is only available on Windows")
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = _kernel32()
++    kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
++    kernel32.GetStdHandle.restype = wintypes.HANDLE
++    
++    # Convert negative constants to DWORD
++    if which < 0:
++        which = which & 0xFFFFFFFF
++    
++    handle = kernel32.GetStdHandle(wintypes.DWORD(which))
++    return int(handle)
++
++
++def close_handle(handle):
++    """Close a Windows handle."""
++    if not _IS_WINDOWS:
++        return
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = _kernel32()
++    kernel32.CloseHandle(wintypes.HANDLE(int(handle)))
++
++
++def wait_for_single_object(handle, timeout_ms):
++    """Wait for a single object. Returns WAIT_OBJECT_0 or WAIT_TIMEOUT."""
++    if not _IS_WINDOWS:
++        raise OSError("WaitForSingleObject is only available on Windows")
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = _kernel32()
++    result = kernel32.WaitForSingleObject(
++        wintypes.HANDLE(int(handle)),
++        wintypes.DWORD(timeout_ms)
++    )
++    return int(result)
++
++
++def get_exit_code_process(process_handle):
++    """Get the exit code of a process."""
++    if not _IS_WINDOWS:
++        raise OSError("GetExitCodeProcess is only available on Windows")
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = _kernel32()
++    exit_code = wintypes.DWORD()
++    success = kernel32.GetExitCodeProcess(
++        wintypes.HANDLE(int(process_handle)),
++        ctypes.byref(exit_code)
++    )
++    if not success:
++        err = ctypes.get_last_error()
++        raise OSError(err, "GetExitCodeProcess failed")
++    return int(exit_code.value)
++
++
++def terminate_process(process_handle, exit_code=1):
++    """Terminate a process."""
++    if not _IS_WINDOWS:
++        raise OSError("TerminateProcess is only available on Windows")
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = _kernel32()
++    success = kernel32.TerminateProcess(
++        wintypes.HANDLE(int(process_handle)),
++        wintypes.UINT(exit_code)
++    )
++    if not success:
++        err = ctypes.get_last_error()
++        raise OSError(err, "TerminateProcess failed")
++
++
++def create_process_with_handle_list(command_line, handle_list, stdin=None, stdout=None, stderr=None):
++    """Create a process with an explicit handle inheritance list.
++    
++    Uses STARTUPINFOEX with PROC_THREAD_ATTRIBUTE_HANDLE_LIST to ensure
++    only the specified handles are inherited by the child process.
++    
++    handle_list: sequence of integer handles to inherit (in addition to std handles)
++    stdin, stdout, stderr: optional integer handles for standard streams.
++                           If None, uses parent's standard handles.
++    
++    Returns (process_handle, thread_handle, pid).
++    """
++    if not _IS_WINDOWS:
++        raise OSError("create_process_with_handle_list is only available on Windows")
++    
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = _kernel32()
++    
++    # Define STARTUPINFO structure first
++    class STARTUPINFO(ctypes.Structure):
++        _fields_ = [
++            ("cb", wintypes.DWORD),
++            ("lpReserved", wintypes.LPWSTR),
++            ("lpDesktop", wintypes.LPWSTR),
++            ("lpTitle", wintypes.LPWSTR),
++            ("dwX", wintypes.DWORD),
++            ("dwY", wintypes.DWORD),
++            ("dwXSize", wintypes.DWORD),
++            ("dwYSize", wintypes.DWORD),
++            ("dwXCountChars", wintypes.DWORD),
++            ("dwYCountChars", wintypes.DWORD),
++            ("dwFillAttribute", wintypes.DWORD),
++            ("dwFlags", wintypes.DWORD),
++            ("wShowWindow", wintypes.WORD),
++            ("cbReserved2", wintypes.WORD),
++            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
++            ("hStdInput", wintypes.HANDLE),
++            ("hStdOutput", wintypes.HANDLE),
++            ("hStdError", wintypes.HANDLE),
++        ]
++    
++    # STARTUPINFOEX extends STARTUPINFO with lpAttributeList
++    class STARTUPINFOEX(ctypes.Structure):
++        _fields_ = [
++            # Include all STARTUPINFO fields
++            ("cb", wintypes.DWORD),
++            ("lpReserved", wintypes.LPWSTR),
++            ("lpDesktop", wintypes.LPWSTR),
++            ("lpTitle", wintypes.LPWSTR),
++            ("dwX", wintypes.DWORD),
++            ("dwY", wintypes.DWORD),
++            ("dwXSize", wintypes.DWORD),
++            ("dwYSize", wintypes.DWORD),
++            ("dwXCountChars", wintypes.DWORD),
++            ("dwYCountChars", wintypes.DWORD),
++            ("dwFillAttribute", wintypes.DWORD),
++            ("dwFlags", wintypes.DWORD),
++            ("wShowWindow", wintypes.WORD),
++            ("cbReserved2", wintypes.WORD),
++            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
++            ("hStdInput", wintypes.HANDLE),
++            ("hStdOutput", wintypes.HANDLE),
++            ("hStdError", wintypes.HANDLE),
++            # Extended field
++            ("lpAttributeList", ctypes.c_void_p),
++        ]
++    
++    class PROCESS_INFORMATION(ctypes.Structure):
++        _fields_ = [
++            ("hProcess", wintypes.HANDLE),
++            ("hThread", wintypes.HANDLE),
++            ("dwProcessId", wintypes.DWORD),
++            ("dwThreadId", wintypes.DWORD),
++        ]
++    
++    # Determine which handles to include in the inheritance list
++    # We need to include std handles explicitly since we're using STARTF_USESTDHANDLES
++    all_handles = []
++    
++    # Get actual handle values for std streams
++    actual_stdin = stdin if stdin is not None else get_std_handle(STD_INPUT_HANDLE)
++    actual_stdout = stdout if stdout is not None else get_std_handle(STD_OUTPUT_HANDLE)
++    actual_stderr = stderr if stderr is not None else get_std_handle(STD_ERROR_HANDLE)
++    
++    all_handles.append(actual_stdin)
++    all_handles.append(actual_stdout)
++    all_handles.append(actual_stderr)
++    
++    for h in handle_list:
++        all_handles.append(int(h))
++    
++    # Remove duplicates while preserving order
++    seen = set()
++    unique_handles = []
++    for h in all_handles:
++        if h not in seen:
++            seen.add(h)
++            unique_handles.append(h)
++    
++    # Initialize attribute list size
++    attr_list_size = ctypes.c_size_t(0)
++    
++    # First call to get required size
++    success = kernel32.InitializeProcThreadAttributeList(
++        None, 1, 0, ctypes.byref(attr_list_size)
++    )
++    # This call is expected to fail with ERROR_INSUFFICIENT_BUFFER
++    
++    if attr_list_size.value == 0:
++        raise OSError("Failed to get attribute list size")
++    
++    # Allocate buffer
++    attr_list = ctypes.create_string_buffer(attr_list_size.value)
++    
++    # Initialize the attribute list
++    success = kernel32.InitializeProcThreadAttributeList(
++        attr_list, 1, 0, ctypes.byref(attr_list_size)
++    )
++    if not success:
++        err = ctypes.get_last_error()
++        raise OSError(err, "InitializeProcThreadAttributeList failed")
++    
++    try:
++        # Create HANDLE array for the handle list
++        handle_array = (wintypes.HANDLE * len(unique_handles))(*unique_handles)
++        
++        # Update the attribute list with the handle list
++        success = kernel32.UpdateProcThreadAttribute(
++            attr_list,
++            0,
++            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
++            handle_array,
++            ctypes.sizeof(handle_array),
++            None,
++            None
++        )
++        if not success:
++            err = ctypes.get_last_error()
++            raise OSError(err, "UpdateProcThreadAttribute failed")
++        
++        # Setup STARTUPINFOEX
++        si = STARTUPINFOEX()
++        si.cb = ctypes.sizeof(STARTUPINFOEX)
++        si.lpAttributeList = ctypes.cast(attr_list, ctypes.c_void_p)
++        
++        # Always set standard handles explicitly
++        si.dwFlags = STARTF_USESTDHANDLES
++        si.hStdInput = wintypes.HANDLE(actual_stdin)
++        si.hStdOutput = wintypes.HANDLE(actual_stdout)
++        si.hStdError = wintypes.HANDLE(actual_stderr)
++        
++        pi = PROCESS_INFORMATION()
++        
++        # Convert command line to wide string buffer
++        if isinstance(command_line, bytes):
++            cmd_str = command_line.decode('utf-8')
++        elif isinstance(command_line, str):
++            cmd_str = command_line
++        else:
++            cmd_str = str(command_line)
++        
++        # Create mutable buffer for command line (CreateProcessW may modify it)
++        cmd_buf = ctypes.create_unicode_buffer(cmd_str)
++        
++        # Create the process
++        # bInheritHandles must be TRUE when using PROC_THREAD_ATTRIBUTE_HANDLE_LIST
++        success = kernel32.CreateProcessW(
++            None,               # lpApplicationName
++            cmd_buf,            # lpCommandLine
++            None,               # lpProcessAttributes
++            None,               # lpThreadAttributes
++            True,               # bInheritHandles - MUST be True for handle list to work
++            EXTENDED_STARTUPINFO_PRESENT,  # dwCreationFlags
++            None,               # lpEnvironment
++            None,               # lpCurrentDirectory
++            ctypes.byref(si),   # lpStartupInfo
++            ctypes.byref(pi)    # lpProcessInformation
++        )
++        
++        if not success:
++            err = ctypes.get_last_error()
++            raise OSError(err, "CreateProcessW failed")
++        
++        return (int(pi.hProcess), int(pi.hThread), int(pi.dwProcessId))
++    
++    finally:
++        # Clean up attribute list
++        kernel32.DeleteProcThreadAttributeList(attr_list)
+diff --git a/wspawn/inherit.py b/wspawn/inherit.py
+index eb1617b..c7b494f 100644
+--- a/wspawn/inherit.py
++++ b/wspawn/inherit.py
+@@ -13,29 +13,92 @@ def _as_number(handle):
+ 
+ 
+ def set_inheritable(handle, enabled=True):
+-    """Mark ``handle`` as transferable to child processes, or stop it being so."""
++    """Mark ``handle`` as transferable to child processes, or stop it being so.
++    
++    On Windows, uses SetHandleInformation to modify the HANDLE_FLAG_INHERIT flag.
++    This works for all handle types (files, pipes, events, etc.), not just file descriptors.
++    """
+     number = _as_number(handle)
+-    try:
+-        os.set_inheritable(number, bool(enabled))
+-    except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os", handle=handle) from exc
+-    except (TypeError, ValueError) as exc:
+-        raise WSpawnError(str(exc), kind="badarg", handle=handle) from exc
++    
++    if os.name == "nt":
++        from ._winapi import set_handle_information, HANDLE_FLAG_INHERIT
++        try:
++            flags = HANDLE_FLAG_INHERIT if enabled else 0
++            set_handle_information(number, HANDLE_FLAG_INHERIT, flags)
++        except OSError as exc:
++            # Check if this is an unsupported operation
++            # ERROR_INVALID_HANDLE (6) means the handle is invalid
++            # Some handle types don't support inheritance modification
++            winerror = getattr(exc, 'winerror', None) or exc.errno
++            if winerror == 6:  # ERROR_INVALID_HANDLE
++                raise WSpawnError("invalid handle", kind="badarg", handle=handle) from exc
++            # For other errors, check if it's a type that doesn't support this
++            # We'll treat most OS errors as "os" kind unless we know better
++            raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++    else:
++        # Non-Windows fallback using os.set_inheritable (POSIX)
++        try:
++            os.set_inheritable(number, bool(enabled))
++        except OSError as exc:
++            raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++        except (TypeError, ValueError) as exc:
++            raise WSpawnError(str(exc), kind="badarg", handle=handle) from exc
+ 
+ 
+ def is_inheritable(handle):
+-    """Return ``True`` when ``handle`` is currently transferable."""
++    """Return ``True`` when ``handle`` is currently transferable.
++    
++    On Windows, uses GetHandleInformation to check the HANDLE_FLAG_INHERIT flag.
++    """
+     number = _as_number(handle)
+-    try:
+-        return bool(os.get_inheritable(number))
+-    except OSError as exc:
+-        raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++    
++    if os.name == "nt":
++        from ._winapi import get_handle_information, HANDLE_FLAG_INHERIT
++        try:
++            flags = get_handle_information(number)
++            return bool(flags & HANDLE_FLAG_INHERIT)
++        except OSError as exc:
++            winerror = getattr(exc, 'winerror', None) or exc.errno
++            if winerror == 6:  # ERROR_INVALID_HANDLE
++                raise WSpawnError("invalid handle", kind="badarg", handle=handle) from exc
++            raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++    else:
++        try:
++            return bool(os.get_inheritable(number))
++        except OSError as exc:
++            raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++
++
++# Track handles that have been marked inheritable by this module
++_tracked_inheritable = set()
++
++
++def _track_handle(handle):
++    """Track a handle as potentially inheritable."""
++    _tracked_inheritable.add(int(handle))
++
++
++def _untrack_handle(handle):
++    """Stop tracking a handle."""
++    _tracked_inheritable.discard(int(handle))
+ 
+ 
+ def inheritable_handles():
+     """Return every object in this process that is currently transferable.
+-
+-    The host tracks the objects it opens itself, so the module reports what the
+-    current implementation knows about.
++    
++    Returns handles that have been marked inheritable via set_inheritable().
++    Note: This only tracks handles modified through this module; handles
++    marked inheritable through other means may not be reported.
+     """
+-    return []
++    # Verify which tracked handles are still actually inheritable
++    result = []
++    for h in list(_tracked_inheritable):
++        try:
++            if is_inheritable(h):
++                result.append(h)
++            else:
++                _untrack_handle(h)
++        except WSpawnError:
++            # Handle is no longer valid
++            _untrack_handle(h)
++    return tuple(result)
+diff --git a/wspawn/kinds.py b/wspawn/kinds.py
+index 8ac6fb3..b3ced30 100644
+--- a/wspawn/kinds.py
++++ b/wspawn/kinds.py
+@@ -1,16 +1,53 @@
+ """Classification of the objects the host may hand to its helpers."""
+ 
++import os
++
+ from .errors import WSpawnError
+ 
+ 
+ def handle_kind(handle):
+-    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``."""
++    """Return ``"file"``, ``"pipe"``, ``"console"`` or ``"unknown"``.
++    
++    On Windows, uses GetFileType to determine the type of a handle:
++    - FILE_TYPE_DISK (1) -> "file"
++    - FILE_TYPE_PIPE (3) -> "pipe"  
++    - FILE_TYPE_CHAR (2) -> "console" (character device, typically console)
++    - FILE_TYPE_UNKNOWN (0) or other -> "unknown"
++    
++    Raises WSpawnError for invalid handles or non-integer arguments.
++    """
+     try:
+         number = int(handle)
+     except (TypeError, ValueError):
+         raise WSpawnError("handle must be an integer, got %r" % (handle,), kind="badarg")
+-    if number <= 0:
+-        raise WSpawnError("not a usable object handle: %r" % (handle,), kind="os", handle=handle)
+-    # The classification was only ever wanted for a log line that never made it
+-    # into production, so the module reports the neutral value for everything.
+-    return "unknown"
++    
++    if number < 0:
++        raise WSpawnError("not a usable object handle: %r" % (handle,), kind="badarg", handle=handle)
++    
++    if os.name == "nt":
++        from ._winapi import file_type, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_CHAR
++        
++        try:
++            ft = file_type(number)
++        except OSError as exc:
++            # Invalid handle or other error
++            winerror = getattr(exc, 'winerror', None) or exc.errno
++            if winerror == 6:  # ERROR_INVALID_HANDLE
++                raise WSpawnError("invalid handle", kind="badarg", handle=handle) from exc
++            raise WSpawnError(str(exc), kind="os", handle=handle) from exc
++        
++        if ft == FILE_TYPE_DISK:
++            return "file"
++        elif ft == FILE_TYPE_PIPE:
++            return "pipe"
++        elif ft == FILE_TYPE_CHAR:
++            return "console"
++        else:
++            # FILE_TYPE_UNKNOWN or FILE_TYPE_REMOTE
++            return "unknown"
++    else:
++        # Non-Windows: we can't reliably determine handle type
++        # Just validate it's a plausible handle value
++        if number <= 0:
++            raise WSpawnError("not a usable object handle: %r" % (handle,), kind="badarg", handle=handle)
++        return "unknown"
+diff --git a/wspawn/proc.py b/wspawn/proc.py
+index b300be0..c2a52cd 100644
+--- a/wspawn/proc.py
++++ b/wspawn/proc.py
+@@ -2,6 +2,7 @@
+ 
+ import os
+ import subprocess
++import sys
+ 
+ from .errors import WSpawnError
+ 
+@@ -50,22 +51,260 @@ def _normalise_handles(inherit):
+         raise WSpawnError("inherit must contain integer handles: %s" % exc, kind="badarg") from exc
+ 
+ 
++# Special sentinel values used by subprocess module
++_SUBPROCESS_DEVNULL = getattr(subprocess, 'DEVNULL', -3)
++_SUBPROCESS_PIPE = getattr(subprocess, 'PIPE', -1)
++
++
++def _get_handle_value(stream):
++    """Get the integer handle value for a stream.
++    
++    stream can be:
++    - None: returns None (use default std handle)
++    - An integer >= 0: returns that integer (assumed to be a valid handle)
++    - A file-like object with fileno(): returns the fd if >= 0
++    - subprocess.DEVNULL: returns special marker
++    - subprocess.PIPE: returns special marker
++    
++    Returns integer handle, None, or special marker.
++    """
++    if stream is None:
++        return None
++    
++    # Check for subprocess special values
++    if stream is _SUBPROCESS_DEVNULL or (isinstance(stream, int) and stream == _SUBPROCESS_DEVNULL):
++        return _SUBPROCESS_DEVNULL
++    if stream is _SUBPROCESS_PIPE or (isinstance(stream, int) and stream == _SUBPROCESS_PIPE):
++        return _SUBPROCESS_PIPE
++    
++    if isinstance(stream, int):
++        if stream >= 0:
++            return stream
++        # Negative integers other than special values are invalid
++        return None
++    
++    if hasattr(stream, 'fileno'):
++        try:
++            fd = stream.fileno()
++            if fd >= 0:
++                return fd
++        except Exception:
++            pass
++    
++    return None
++
++
+ def spawn(argv, inherit=(), stdin=None, stdout=None, stderr=None):
+     """Start a helper process, handing it the objects named in ``inherit``.
+ 
++    On Windows, uses PROC_THREAD_ATTRIBUTE_HANDLE_LIST to ensure only the
++    specified handles are inherited by the child process. The handles in
++    ``inherit`` plus any explicitly specified standard streams will be
++    available in the child with the same numeric values.
++    
+     Returns a :class:`SpawnedProcess`.
+     """
+     command = _normalise_argv(argv)
+     handles = _normalise_handles(inherit)
+ 
++    if os.name == "nt":
++        return _spawn_windows(command, handles, stdin, stdout, stderr)
++    else:
++        return _spawn_posix(command, handles, stdin, stdout, stderr)
++
++
++def _spawn_windows(command, handles, stdin, stdout, stderr):
++    """Windows-specific spawn using precise handle inheritance."""
++    from ._winapi import create_process_with_handle_list, get_std_handle
++    from ._winapi import STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
++    
++    # Get handle values for standard streams
++    stdin_val = _get_handle_value(stdin)
++    stdout_val = _get_handle_value(stdout)
++    stderr_val = _get_handle_value(stderr)
++    
++    # Handle subprocess.DEVNULL by opening NUL device
++    if stdin_val == _SUBPROCESS_DEVNULL:
++        stdin_handle = _open_nul_read()
++    elif stdin_val is None:
++        stdin_handle = None  # Will use parent's stdin
++    else:
++        stdin_handle = stdin_val
++    
++    if stdout_val == _SUBPROCESS_DEVNULL:
++        stdout_handle = _open_nul_write()
++    elif stdout_val is None:
++        stdout_handle = None  # Will use parent's stdout
++    else:
++        stdout_handle = stdout_val
++    
++    if stderr_val == _SUBPROCESS_DEVNULL:
++        stderr_handle = _open_nul_write()
++    elif stderr_val is None:
++        stderr_handle = None  # Will use parent's stderr
++    else:
++        stderr_handle = stderr_val
++    
++    # Build command line string
++    cmd_line = subprocess.list2cmdline(command)
++    
++    try:
++        proc_handle, thread_handle, pid = create_process_with_handle_list(
++            cmd_line,
++            handles,
++            stdin=stdin_handle,
++            stdout=stdout_handle,
++            stderr=stderr_handle
++        )
++    except OSError as exc:
++        raise WSpawnError(str(exc), kind="os") from exc
++    finally:
++        # Close NUL handles we opened (they've been inherited by child)
++        # Actually, we should NOT close them here because the child needs them
++        # But since they're inherited, closing in parent is fine
++        if stdin_val == _SUBPROCESS_DEVNULL and stdin_handle is not None:
++            try:
++                from ._winapi import close_handle
++                close_handle(stdin_handle)
++            except Exception:
++                pass
++        if stdout_val == _SUBPROCESS_DEVNULL and stdout_handle is not None:
++            try:
++                from ._winapi import close_handle
++                close_handle(stdout_handle)
++            except Exception:
++                pass
++        if stderr_val == _SUBPROCESS_DEVNULL and stderr_handle is not None:
++            try:
++                from ._winapi import close_handle
++                close_handle(stderr_handle)
++            except Exception:
++                pass
++    
++    # Create a wrapper that mimics Popen interface
++    class _WindowsProcessWrapper:
++        def __init__(self, proc_handle, thread_handle, pid):
++            self._proc_handle = proc_handle
++            self._thread_handle = thread_handle
++            self.pid = pid
++            self.returncode = None
++        
++        def wait(self, timeout=None):
++            from ._winapi import wait_for_single_object, get_exit_code_process
++            from ._winapi import WAIT_OBJECT_0, WAIT_TIMEOUT, INFINITE
++            
++            if timeout is None:
++                wait_ms = INFINITE
++            else:
++                wait_ms = int(timeout * 1000)
++            
++            result = wait_for_single_object(self._proc_handle, wait_ms)
++            
++            if result == WAIT_OBJECT_0:
++                self.returncode = get_exit_code_process(self._proc_handle)
++            elif result == WAIT_TIMEOUT:
++                raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
++            else:
++                raise OSError("WaitForSingleObject failed with result %d" % result)
++            
++            return self.returncode
++        
++        def poll(self):
++            from ._winapi import wait_for_single_object, get_exit_code_process
++            from ._winapi import WAIT_OBJECT_0
++            
++            result = wait_for_single_object(self._proc_handle, 0)
++            
++            if result == WAIT_OBJECT_0:
++                self.returncode = get_exit_code_process(self._proc_handle)
++            
++            return self.returncode
++        
++        def terminate(self):
++            from ._winapi import terminate_process
++            terminate_process(self._proc_handle, 1)
++        
++        def __del__(self):
++            try:
++                from ._winapi import close_handle
++                if hasattr(self, '_proc_handle') and self._proc_handle:
++                    close_handle(self._proc_handle)
++                    self._proc_handle = None
++                if hasattr(self, '_thread_handle') and self._thread_handle:
++                    close_handle(self._thread_handle)
++                    self._thread_handle = None
++            except Exception:
++                pass
++    
++    wrapper = _WindowsProcessWrapper(proc_handle, thread_handle, pid)
++    return SpawnedProcess(wrapper, handles)
++
++
++def _open_nul_read():
++    """Open NUL device for reading. Returns a Windows handle."""
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    
++    GENERIC_READ = 0x80000000
++    FILE_SHARE_READ = 0x00000001
++    OPEN_EXISTING = 3
++    
++    handle = kernel32.CreateFileW(
++        "NUL",
++        GENERIC_READ,
++        FILE_SHARE_READ,
++        None,
++        OPEN_EXISTING,
++        0,
++        None
++    )
++    
++    if handle == -1 or handle == 0xFFFFFFFF:
++        err = ctypes.get_last_error()
++        raise OSError(err, "Failed to open NUL for reading")
++    
++    return int(handle)
++
++
++def _open_nul_write():
++    """Open NUL device for writing. Returns a Windows handle."""
++    import ctypes
++    from ctypes import wintypes
++    
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    
++    GENERIC_WRITE = 0x40000000
++    FILE_SHARE_WRITE = 0x00000002
++    OPEN_EXISTING = 3
++    
++    handle = kernel32.CreateFileW(
++        "NUL",
++        GENERIC_WRITE,
++        FILE_SHARE_WRITE,
++        None,
++        OPEN_EXISTING,
++        0,
++        None
++    )
++    
++    if handle == -1 or handle == 0xFFFFFFFF:
++        err = ctypes.get_last_error()
++        raise OSError(err, "Failed to open NUL for writing")
++    
++    return int(handle)
++
++
++def _spawn_posix(command, handles, stdin, stdout, stderr):
++    """POSIX fallback spawn (not used on Windows, kept for completeness)."""
+     kwargs = {
+-        # The helper is expected to need the objects it is handed, so close_fds
+-        # stays off; otherwise the log pipe is gone before the helper starts.
+-        "close_fds": False,
++        "close_fds": True,
+         "stdin": stdin,
+         "stdout": stdout,
+         "stderr": stderr,
+     }
++    
+     try:
+         popen = subprocess.Popen(command, **kwargs)
+     except OSError as exc:

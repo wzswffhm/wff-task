@@ -437,10 +437,16 @@ class WindowsCodingModelAgent(BaseAgent):
                     blocks = (got["doc"] or {}).get("content") or []
                     texts = "".join(b.get("text") or "" for b in blocks if b.get("type") == "text")
                     tuses = [b for b in blocks if b.get("type") == "tool_use"]
-                    empty = (not tuses) and (not texts.strip()) and not (
-                        (got["doc"] or {}).get("usage") or {}).get("output_tokens")
+                    # 4router.net 偶发返回一句占位文本而不是真正的回复，且
+                    # usage.output_tokens 非零（实测 85），所以原来的空响应判定
+                    # （要求 output_tokens 为空）不成立，agent 会把占位文本当成
+                    # 模型的正式作答而不再重试。这里把它一并视为需要重试的空响应。
+                    stub = "上游模型未返回任何内容" in texts
+                    empty = stub or ((not tuses) and (not texts.strip()) and not (
+                        (got["doc"] or {}).get("usage") or {}).get("output_tokens"))
                     if empty and attempt < 6:
-                        log({"step": step, "kind": "upstream_empty_retry", "attempt": attempt})
+                        log({"step": step, "kind": "upstream_empty_retry", "attempt": attempt,
+                             "stub": stub})
                         await asyncio.sleep(min(3 * attempt, 20))
                         continue
                     break

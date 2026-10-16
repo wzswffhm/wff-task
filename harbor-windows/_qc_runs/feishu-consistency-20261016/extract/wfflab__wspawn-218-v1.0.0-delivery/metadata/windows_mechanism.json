@@ -1,0 +1,52 @@
+{
+  "schema_version": "windows-mechanism-gate-v1",
+  "task_id": "wfflab__wspawn-218",
+
+  "counterfactual": {
+    "question": "把目标 OS 换成 Linux/macOS，主要实现、错误根因和 Evaluator 是否基本不变？",
+    "answer": "否",
+    "reason": "主要实现只能由 Win32 进程创建接口构成：把子进程可用的对象限定在一份清单内，必须先构造扩展 STARTUPINFO，用 InitializeProcThreadAttributeList 建属性列表、UpdateProcThreadAttribute 写入 PROC_THREAD_ATTRIBUTE_HANDLE_LIST，再用带 EXTENDED_STARTUPINFO_PRESENT 的 CreateProcessW 启动；对象的可继承位只能由 SetHandleInformation 与 GetHandleInformation 读写，对象类别只能由 GetFileType 读出。这些入口在 Linux/macOS 上没有对等物：POSIX 的默认行为是不继承任何描述符、需要逐个子进程 opt-in，方向与本任务相反，不存在『默认全部继承、必须显式收窄』这一语义，也没有以对象句柄清单为参数的进程创建接口。错误根因同样只在 Windows 语义下成立：缺陷实现之所以把父进程的全部可继承对象泄漏给子进程，正因为 Windows 在 bInheritHandles=TRUE 时把每一个带继承标志的句柄都交出去；这在 POSIX 上根本不会发生。Evaluator 必须在真实 Windows Runtime 上触发，因为它要自己 CreatePipe、用 GetHandleInformation 独立读可继承位、通过候选的 spawn 启动一个真实子进程、再让该子进程带内回报它到底能用哪个句柄；换到别的操作系统，这些判据一条都无法复算。"
+  },
+
+  "exclusive_declaration": {
+    "quote": "本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。"
+  },
+
+  "mechanisms": [
+    {
+      "name": "进程创建时的句柄清单（STARTUPINFOEX + PROC_THREAD_ATTRIBUTE_HANDLE_LIST + CreateProcessW）",
+      "instruction_quote": "`spawn(argv, inherit=[...])` 必须让子进程**只能**访问 `inherit` 里列出的那些对象，加上调用方显式指定的标准流。",
+      "test_ref": "verifier/tests/test_wspawn_semantics.py#L256-L265",
+      "f2p_case": "f2p-unlisted-handle-does-not-cross-the-boundary"
+    },
+    {
+      "name": "对象可继承位的读写（SetHandleInformation / GetHandleInformation + HANDLE_FLAG_INHERIT）",
+      "instruction_quote": "`set_inheritable(handle, True/False)` 必须真的改变该对象的可继承状态，且改变结果可以用系统接口从外部独立读到。",
+      "test_ref": "verifier/tests/test_wspawn_semantics.py#L350-L365",
+      "f2p_case": "f2p-set-inheritable-changes-the-observed-flag"
+    },
+    {
+      "name": "对象类别查询（GetFileType）",
+      "instruction_quote": "`handle_kind(handle)` 必须区分至少这几类：文件、管道、控制台、以及无法识别的对象。",
+      "test_ref": "verifier/tests/test_wspawn_semantics.py#L383-L396",
+      "f2p_case": "f2p-handle-kind-classifies-pipe-and-file"
+    },
+    {
+      "name": "空清单也不得泄漏（默认不交任何对象）",
+      "instruction_quote": "不传 `inherit`（或传空序列）时，子进程除标准流外不应拿到任何调用方对象。",
+      "test_ref": "verifier/tests/test_wspawn_semantics.py#L266-L288",
+      "f2p_case": "f2p-empty-inherit-leaks-nothing"
+    },
+    {
+      "name": "清位后即使启用继承也不得跨进程（可继承位的语义）",
+      "instruction_quote": "调用方进程里**其它**处于可继承状态的对象，不得出现在子进程中。",
+      "test_ref": "verifier/tests/test_wspawn_semantics.py#L318-L348",
+      "f2p_case": "f2p-cleared-inherit-flag-keeps-the-object-at-home"
+    }
+  ],
+
+  "non_windows_must_fail": {
+    "file": "environment/validate_environment.ps1",
+    "evidence": "Fail 'the host platform is not Windows (Win32NT), so the wspawn contract cannot be graded here'"
+  }
+}

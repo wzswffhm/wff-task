@@ -1,0 +1,20 @@
+{
+  "alias": "qwen",
+  "model": "qwen3.8-max-0902",
+  "label": "qwen",
+  "protocol": "anthropic",
+  "base_url": "https://llm-cz4pcezs463b102x.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+  "auth": "x-api-key",
+  "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wciocp-build\\harbor_agent\\wciocp_model_agent.py",
+  "runner_sha256": "e4d99f48a1e179e4f891bb1442c2ad47bebf3b702746f62b70cb11ca764738f2",
+  "steps": 37,
+  "submitted": true,
+  "submit_summary": "## 修改总结\n\n### 根本原因\n原实现使用一个 delivery thread 轮询 per-request 内核事件来模拟完成端口，存在多个严重缺陷：\n1. **完成键在交付时查表**（`_key_of`），导致换键后旧通知报新键\n2. **`_collect()` 并发逻辑有 bug**：多线程可能取到同一位置的事件，且 `_recent` 列表会重复分发已交付的事件\n3. **`_expire()` 清空 `_ready` 并设 `_dropped=True`**，导致超时后所有通知丢失、端口永久失效\n4. **`is_overlapped()` 总返回 True**，不检查句柄是否真正支持重叠 I/O\n5. **关闭语义不完整**\n\n### 修复方案：改用真正的 Windows I/O Completion Port\n\n#### `wciocp/_winapi.py`\n- 新增 `create_completion_port()` — 创建 IOCP (`CreateIoCompletionPort`)\n- 新增 `associate_handle()` — 将句柄关联到 IOCP 并绑定完成键\n- 新增 `get_completion_status()` — 从 IOCP 取一个完成包 (`GetQueuedCompletionStatus`)\n- 新增 `post_completion_status()` — 手动投递完成包（用于同步完成的读取）\n- 新增 `cancel_io()` — 取消句柄上的 outstanding I/O\n- 新增 `handle_is_overlapped()` — 通过 `NtQueryInformationFile(FileModeInformation)` 安全地检查句柄是否以 `FILE_FLAG_OVERLAPPED` 打开（不消耗 IOCP 关联）\n- 新增 `get_overlapped_result()` 辅助函数\n- 修复了 `_ntdll` 变量名与函数名冲突的问题（改为 `_ntdll_handle` / `_ntdll_dll()`）\n\n#### `wciocp/pool.py` — 完全重写\n- **Pool 持有一个真正的 IOCP 句柄**，不再需要 delivery thread\n- **`register()`**：先调 `is_overlapped()` 预检，再调 `associate_handle()` 将句柄绑定到 IOCP 和完成键。不支持的句柄抛 `unsupported`\n- **`submit()`**：发起 `ReadFile` 重叠读取。同步完成时通过 `PostQueuedCompletionStatus` 投递，异步完成由系统自动通过 IOCP 通知。OVERLAPPED 地址作为 Request 的唯一标识\n- **`take()`**：直接调用 `GetQueuedCompletionStatus`，天然保证每个通知恰好被一个线程取到。返回的 key 由系统保存，不受后续 re-register 影响。超时仅当无包可取时抛 `timeout`，不清空任何状态\n- **`close()`**：幂等；cancel 所有 active handles 的 I/O；drain 剩余完成包；关闭 IOCP 句柄。之后 `take()`/`submit()` 抛 `closed`\n\n#### `wciocp/kinds.py`\n- `is_overlapped()` 改为调用 `_winapi.handle_is_overlapped()`，通过 NT 内核查询文件模式标志来判断，不会消耗句柄的 IOCP 关联\n\n### 验收标准覆盖\n- **A**: 完成键由 IOCP 系统在 `CreateIoCompletionPort` 时绑定，`GetQueuedCompletionStatus` 原样返回\n- **B**: `GetQueuedCompletionStatus` 保证每个完成包恰好交付一次；多线程并发 `take()` 各自取到不同的包\n- **C**: 不同句柄关联不同的完成键，IOCP 保证不串\n- **D**: 超时时仅返回 None，不清空队列、不设 dropped 标志\n- **E**: `is_overlapped()` 真正检查文件模式标志；`associate_handle()` 对非 overlapped 句柄抛 `unsupported`\n- **F**: `close()` 幂等；关闭后 `take()`/`submit()` 抛 `closed`；outstanding reads 被 cancel\n- **G**: 公开 API 名称与签名不变；14 个冒烟测试全部通过",
+  "input_tokens": 1560,
+  "output_tokens": 35044,
+  "elapsed_sec": 533.47,
+  "last_stop_reason": "tool_use",
+  "workspace": "C:\\testbed",
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wciocp-build\\model-rounds\\jobs\\model-qwen-1\\wfflab__wciocp-220-v1.0.0-delive__kCSJDgd\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-15T14:30:28.778936+00:00"
+}
