@@ -7,14 +7,14 @@
   "auth": "x-api-key",
   "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\harbor_agent\\wcancel_model_agent.py",
   "runner_sha256": "dce19869ec369664173244db7c91a31a0237595201a61c3d93e7cdc8a957ab56",
-  "steps": 40,
-  "submitted": false,
-  "submit_summary": null,
+  "steps": 26,
+  "submitted": true,
+  "submit_summary": "## 根因\n\n`_winapi.cancel()` 封装的是 `CancelIo`，其 Windows 语义是「中止**调用线程**在该句柄上发起的**全部** I/O」。这一个调用同时造成了现象 1（取消一个停一片）和现象 2（换线程取消静默失效：取消线程自己没有发起过 I/O，`CancelIo` 返回成功但什么都没停）。其余现象来自 `proc.py` 的状态机和 `kinds.py` 里写死的 `return True`。\n\n## 改动\n\n**`wcancel/_winapi.py`**\n- 新增 `cancel_request(handle, overlapped)`，走 `CancelIoEx` 并传入该请求自己的 `OVERLAPPED`：按请求点名、不影响同句柄其它请求、任意线程有效。返回 `(ok, error)`，`ERROR_NOT_FOUND` 表示当时已不在挂起。\n- `cancel(handle)` 改为 `CancelIoEx(handle, NULL)`（批量形式，不再受调用线程限制），仅供 `cancel_all` 语义参考。\n- `wait_for_read()` 新增 `\"cancelled\"` 结局：`ERROR_OPERATION_ABORTED` 不再混入 `\"error\"` 分支。\n- `file_mode()` 改用 `ntdll!NtQueryInformationFile(FileModeInformation)`；原先调用的 `GetFileInformationByHandleEx` 并没有这个信息类。新增 `supports_overlapped()`，按 `FILE_SYNCHRONOUS_IO_ALERT/NONALERT` 判定。\n- 各调用前 `set_last_error(0)`，避免读到残留错误码；补齐 `ERROR_HANDLE_EOF`/`ERROR_BROKEN_PIPE` 等。\n\n**`wcancel/kinds.py`**\n- `is_overlapped()` 不再无条件返回 `True`，改为实际查询句柄打开模式。\n- 句柄不可用时的 `kind` 由 `\"os\"` 改为 `\"badarg\"`。\n\n**`wcancel/proc.py`**\n- `cancel()` 只对目标请求发 `CancelIoEx`；先用 `GetOverlappedResult` 查实际状态：已完成则落为 `completed` 并返回 `False`，已中止则落为 `cancelled` 并返回 `False`（标准 D：不谎报）。重复取消第二次返回 `False`。\n- `cancel_all()` 逐个请求点名取消，只动本模块提交的请求，返回真实停止数量。\n- `wait()` 对收到取消的请求产出 `status == \"cancelled\"` 与实际 `bytes_read`，不再报成 `kind=\"os\"`（标准 C）。超时只抛 `timeout`，不把请求置为终态，之后仍可取消。\n- `submit()` 在不支持重叠读取的对象上抛 `WCancelError(kind=\"unsupported\")`，不再退化成同步读取（标准 E）。\n- 加入每请求 `RLock` + 等待者计数：请求在到达终态且无人等待前不关闭事件、不从注册表摘除，避免内核仍可能写入的控制块/缓冲区被提前释放。\n- `Completion` 新增 `data`（默认 `b\"\"`，构造签名向后兼容），`Request.data` 可读取已交付字节。\n\n公开 API 名称与签名未变。\n\n## 验证\n\n真实 Windows（Server 2022 / Python 3.12）上逐条验过并清理了临时脚本：\n- A/B：6 个重叠读取取消第 4 个，恰好 1 个 `cancelled`、5 个 `completed` 且字节与写入内容一致；跨线程取消生效，包括「另一线程已阻塞在 `wait()` 中」的竞态。\n- C/D：`cancelled` 独立终态；已完成请求取消返回 `False`，重复取消返回 `False`。\n- E：同步打开的管道与磁盘文件 `submit()` 抛 `kind=\"unsupported\"`。\n- F：`timeout` / `badarg` 分类正确。\n- G：`tests/test_wcancel_basic.py` 10 项全通过。\n\n注：`.pyc` 被仓库跟踪，我已 `git checkout` 还原，补丁只含源码改动。",
   "input_tokens": 1,
-  "output_tokens": 46943,
-  "elapsed_sec": 1310.27,
+  "output_tokens": 23128,
+  "elapsed_sec": 2347.66,
   "last_stop_reason": "tool_use",
   "workspace": "C:\\testbed",
-  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\model-rounds\\jobs\\model-opus-1\\wfflab__wcancel-219-v1.0.0-deliv__ozi3c67\\agent\\trajectory.jsonl",
-  "completed_at_utc": "2026-10-14T13:32:27.320453+00:00"
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\model-rounds\\jobs\\model-opus-1\\wfflab__wcancel-219-v1.0.0-deliv__eYnDTmu\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-15T14:01:01.469683+00:00"
 }

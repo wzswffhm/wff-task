@@ -8,13 +8,13 @@
   "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\harbor_agent\\wcancel_model_agent.py",
   "runner_sha256": "dce19869ec369664173244db7c91a31a0237595201a61c3d93e7cdc8a957ab56",
   "steps": 35,
-  "submitted": true,
-  "submit_summary": "## 根因\n\n三处缺陷，全部在实现代码里：\n\n1. **`_winapi.cancel()` 用的是 `CancelIo(handle)`。** 这个调用的语义恰好是两个 bug 的来源：它放弃**调用线程**在该对象上的**全部**未完成 I/O —— 既太粗（连带打掉同批的兄弟请求，现象 1），又太窄（忽略其它线程发起的请求，所以换线程取消就静默失效，现象 2）。\n2. **请求没有「被取消」这个终态。** `wait()` 把 `ERROR_OPERATION_ABORTED` 当普通 I/O 失败，经 `error_kind()` 归到 `kind=\"os\"` 抛出（现象 3）；`cancel()` 则无条件 `return True`（现象 4）。\n3. **`is_overlapped()` 直接 `return True`**，于是同步句柄也被收下，`ReadFile` 退化成同步读（现象 5）。\n\n## 改动\n\n- **`_winapi.py`**：改绑 `CancelIoEx(handle, overlapped)` —— 用控制块点名单个请求，与发起线程无关；新增 `cancel_request()` 返回 `(ok, error)` 让上层区分 `ERROR_NOT_FOUND`（已完成）与真失败。新增 `overlapped_capable()`，读 `FILE_MODE_INFORMATION.Mode` 的 `FILE_SYNCHRONOUS_IO_*` 位判定能力。`read_status()` 加可选阻塞参数，`wait_for_read()` 把 abort 作为独立出口上报。\n- **`proc.py`**：`Request` 有了显式状态机（`new`/`pending`/`cancelling`/`done`），终态结果缓存，`_lock` 保护 `_pending` 与状态字段（只在不阻塞的调用上持锁，等待时不持锁）。`cancel()` 只在本次调用真的发出取消时返回 `True`；`cancel_all()` 逐个点名并返回实际停掉的数量；`wait()` 把 abort 映射为 `status=\"cancelled\"` 并带上已到字节数。\n- **`kinds.py`**：`is_overlapped()` 改为问对象本身；不可用句柄的 `kind` 由 `os` 改为 `badarg`。\n\n## 一处需要你知道的发现\n\n原代码查询模式字用的是 `GetFileInformationByHandleEx(..., 16, ...)`，但 **16 在 `FILE_INFO_BY_HANDLE_CLASS` 里是 `FileStorageInfo`**，`FileModeInformation` 属于 `NtQueryInformationFile` 的那个枚举。这个查询在管道上一直是失败的。我最初沿用了它，结果同步管道被判成「可重叠」，`submit()` 卡死在同步 `ReadFile` 里（有两个我自己的调试进程挂住，已 `taskkill`）。改用 `ntdll.NtQueryInformationFile` 后能力判定才正确；查询失败时按「无依据」保守判为不支持。\n\n## 验证（真实 Windows 内核）\n\n`tests/test_wcancel_basic.py` 10 项全过。另用临时脚本（已删除，工作区只剩三个源文件的改动）逐条核对：五个分片取消中间一个，另外四个各自交出 `b'shard-0N'`；跨线程取消返回 `True`、重复取消和已完成请求取消均 `False`；五线程并发取消同一请求恰好一个 `True`；取消时已阻塞在 `wait()` 里的线程拿到 `status='cancelled'`；重叠磁盘文件正常读出，非重叠文件与同步管道 `submit()` 抛 `kind=\"unsupported\"`；`timeout`/`badarg` 分类正确。\n\n`docs/NOTES.md` 未动——它自述为 superseded 草稿，且任务指明以验收标准为准。",
+  "submitted": false,
+  "submit_summary": null,
   "input_tokens": 1,
-  "output_tokens": 35548,
-  "elapsed_sec": 1558.16,
-  "last_stop_reason": "tool_use",
+  "output_tokens": 27136,
+  "elapsed_sec": 1402.02,
+  "last_stop_reason": "end_turn",
   "workspace": "C:\\testbed",
-  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\model-rounds\\jobs\\model-opus-2\\wfflab__wcancel-219-v1.0.0-deliv__VMV8Uyr\\agent\\trajectory.jsonl",
-  "completed_at_utc": "2026-10-14T13:59:15.595205+00:00"
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\model-rounds\\jobs\\model-opus-2\\wfflab__wcancel-219-v1.0.0-deliv__mYtfxm9\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-15T14:24:48.186121+00:00"
 }

@@ -28,8 +28,6 @@ class ModelGateTests(unittest.TestCase):
             "models": {
                 "qwen": [run(f"q{i}", score) for i, score in enumerate(qwen_scores)],
                 "opus": [run(f"o{i}", score) for i, score in enumerate(opus_scores)],
-                "glm": [run("g0", 0)],
-                "kimi": [run("k0", 0)],
             },
         }
 
@@ -75,11 +73,12 @@ class ModelGateTests(unittest.TestCase):
         result = evaluate(self.evidence((1, 1, 0), (1, 0, 0)))
         self.assertFalse(result["pass"])
 
-    def test_qwen_opus_zero_tie_fails_when_another_model_is_nonzero(self):
+    def test_qwen_opus_zero_tie_still_fails_without_other_models(self):
+        # 放宽 GLM/Kimi 后仍必须拒绝 Qwen/Opus 的零分平局。
         evidence = self.evidence((0, 0, 0), (0, 0, 0))
-        evidence["models"]["glm"][0]["score"] = 1
         result = evaluate(evidence)
         self.assertFalse(result["pass"])
+        self.assertTrue(result["stats"]["distinction"]["score_tie"])
 
     def test_qwen_opus_full_score_is_rejected(self):
         result = evaluate(self.evidence((1, 1, 1), (1, 1, 1)))
@@ -103,20 +102,18 @@ class ModelGateTests(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertTrue(result["stats"]["distinction"]["qwen_opus_full_score"])
 
-    def test_all_models_full_score_is_rejected_and_reported(self):
+    def test_primary_models_full_score_is_rejected_and_reported(self):
+        # 放宽后只剩 Qwen/Opus，全满分与 qwen_opus_full_score 等价。
         evidence = self.evidence((1, 1, 1), (1, 1, 1))
-        evidence["models"]["glm"][0]["score"] = 1
-        evidence["models"]["kimi"][0]["score"] = 1
         result = evaluate(evidence)
         self.assertFalse(result["pass"])
-        self.assertTrue(result["stats"]["distinction"]["all_models_full_score"])
+        self.assertTrue(result["stats"]["distinction"]["qwen_opus_full_score"])
 
-    def test_glm_and_kimi_require_exactly_one_run(self):
+    def test_glm_and_kimi_are_no_longer_required(self):
+        # 甲方 2026-10-15 放宽：缺 GLM/Kimi 不再导致门禁失败。
         evidence = self.evidence()
-        evidence["models"]["glm"].append(run("g1", 0))
-        evidence["models"]["kimi"] = []
         result = evaluate(evidence)
-        self.assertFalse(result["pass"])
+        self.assertTrue(result["pass"], result["errors"])
 
     def test_invalid_run_cannot_be_counted_as_zero(self):
         evidence = self.evidence()

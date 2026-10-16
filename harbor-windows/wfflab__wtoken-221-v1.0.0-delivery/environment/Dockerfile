@@ -22,7 +22,15 @@
 # Windows 11 hosts. ltsc2025 (build 26100) would exceed the buyer host build and
 # could not start there at all, so the "prefer 2025" guidance yields to the hard
 # requirement that the buyer can actually run the image.
-FROM mcr.microsoft.com/windows/server:ltsc2022@sha256:7b9f4ac228cf21b6a4f8795e23329442183bd708e3ee55f7b67798481c94f591
+#
+# 这里按 tag 引用而不是按 digest：本批交付镜像是在离线条件下用 docker load /
+# 分层组装导入 L1 的，导入镜像的 RepoDigests 为空；一旦 pin digest，docker build
+# 会强制联网向 mcr.microsoft.com 解析该 digest，而该站点的响应极慢且会超时，
+# 构建将直接失败。远端身份改由 task.toml 的成品镜像 +
+# quality-review.json 的 image_delivery.resolved_image_digest 记录（见
+# image-delivery-gate.md 第 2 节：Dockerfile 不 pin digest 不单独返修，
+# 记录本次解析得到的 digest 才是运行证据要求）。
+FROM mcr.microsoft.com/windows/server:ltsc2022
 
 SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 

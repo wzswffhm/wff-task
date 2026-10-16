@@ -1,4 +1,4 @@
-"""Validate direct Harbor jobs: 8 model trajectories plus 3 Oracle and 3 NOP."""
+"""Validate direct Harbor jobs: 6 model trajectories plus 3 Oracle and 3 NOP."""
 from __future__ import annotations
 
 import json
@@ -112,8 +112,8 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
             errors.append(f"jobs/ is missing Harbor parent job file: {relative}")
     job_dirs = sorted(path for path in jobs_root.iterdir() if path.is_dir() and (path / "result.json").is_file())
 
-    if len(job_dirs) != 14:
-        errors.append(f"jobs/ must contain exactly 14 Harbor job directories, got {len(job_dirs)}")
+    if len(job_dirs) != 12:
+        errors.append(f"jobs/ must contain exactly 12 Harbor job directories, got {len(job_dirs)}")
     for job in job_dirs:
         label = job.name
         for relative in COMMON_FILES:
@@ -196,7 +196,7 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
                 "validity": status, "score": score,
                 "cases": [{"id": key, "status": value} for key, value in sorted(cases.items())],
             }
-            models[model].append(run)
+            models.setdefault(model, []).append(run)
             details.append({"job_dir": label, "kind": "model", "model": model,
                             "actual_model": actual_model_name, "score": score})
         else:
@@ -206,6 +206,13 @@ def validate_jobs(jobs_root: Path, task_root: Path, identity: dict[str, Any]) ->
         if secret:
             errors.append(f"{label} contains a possible credential in {secret}")
 
+    unknown = sorted(set(models) - set(REQUIRED_COUNTS))
+    if unknown:
+        errors.append(
+            "jobs/ contains models outside the accepted set "
+            f"{sorted(REQUIRED_COUNTS)}: {unknown} "
+            "(the buyer relaxed GLM/Kimi on 2026-10-15; do not deliver them)"
+        )
     for model, count in REQUIRED_COUNTS.items():
         if len(models[model]) != count:
             errors.append(f"jobs/ contains {len(models[model])} {model} model jobs; exactly {count} required")

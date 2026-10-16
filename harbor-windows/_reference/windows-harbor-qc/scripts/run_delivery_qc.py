@@ -1,4 +1,4 @@
-"""Run complete delivery QC: layout, eight model jobs, and real Oracle/NOP."""
+"""Run complete delivery QC: layout, six model jobs, and real Oracle/NOP."""
 from __future__ import annotations
 
 import argparse
@@ -187,7 +187,7 @@ def markdown(payload: dict[str, Any]) -> str:
               "- `harbor/`：真实 Oracle/NOP 报告、命令、job 和 CLI 日志",
               "- `delivery-layout.json`：目录与 task_id/version/hash 绑定",
               "- `model-gate.json`：四模型次数、分数和区分度",
-              "- `model-jobs.json`：14 个 Harbor jobs（8 个模型、3 个 Oracle、3 个 NOP）交叉校验",
+              "- `model-jobs.json`：12 个 Harbor jobs（6 个模型、3 个 Oracle、3 个 NOP）交叉校验",
               "- 人工证据：WIP 94 项、D01-D20、逐项证据链、Hack 事件和独立复算文件", ""]
     return "\n".join(lines)
 

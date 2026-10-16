@@ -10,7 +10,7 @@
 # the Python embed distribution, a pinned MinGit archive and the wheelhouse the
 # test runner needs. The base image is addressed by immutable digest.
 
-FROM mcr.microsoft.com/windows/servercore:ltsc2022@sha256:76cf422c98ca437b308374d0498280541fa42ac7061bb44015a6c8b70cf4db6a
+FROM mcr.microsoft.com/windows/server:ltsc2022
 
 SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 

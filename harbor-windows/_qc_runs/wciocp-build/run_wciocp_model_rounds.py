@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """run_wciocp_model_rounds.py —— 用自定义 Harbor agent 跑 wfflab__wciocp-220 的模型轮次。
 
-轮次固定为 Qwen x3 与 Opus x3（甲方口径：只跑这两个模型；GLM/Kimi 不参与判分）。
+轮次固定为 Qwen x3 与 Opus x3，共 6 个模型 job
+（甲方 2026-10-15 放宽 GLM/Kimi；区分度只看 Qwen 与 Opus：Opus 总分必须严格大于 Qwen）。
 每轮一个 Harbor 原生 job，写到题包**外**的 jobs-dir，避免 task checksum 被 jobs 污染。
 
 端点来源：仓库根 models.local.json 的 active 条目（qwen3.8-max、opus-5）。
@@ -53,6 +54,12 @@ def endpoints() -> dict:
                    "auth": o["auth"],
                    "key": o["api_key"], "max_tokens": int(os.environ.get("wciocp_OPUS_MAX_TOKENS", o["max_tokens"])),
                    "timeout": 1800, "extra_body": None}
+    # 甲方已放宽 GLM/Kimi（2026-10-15 口径）；交付只包含 Qwen x3 与 Opus x3。
+    for _alias, _key in (("glm", "glm-5.3"), ("kimi", "kimi-k3")):
+        _e = by_key[_key]
+        out[_alias] = {"base_url": _e["base_url"], "model": _e["model"], "auth": _e["auth"],
+                       "key": _e["api_key"], "max_tokens": int(_e["max_tokens"]),
+                       "timeout": 900, "extra_body": None}
     return out
 
 

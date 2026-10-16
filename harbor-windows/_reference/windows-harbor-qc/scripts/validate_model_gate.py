@@ -17,7 +17,7 @@ ALIASES = {
     "glm": "glm", "glm-5.3": "glm",
     "kimi": "kimi", "kimi-k3": "kimi",
 }
-REQUIRED_COUNTS = {"qwen": 3, "opus": 3, "glm": 1, "kimi": 1}
+REQUIRED_COUNTS = {"qwen": 3, "opus": 3}  # 甲方 2026-10-15 放宽：不再要求 GLM/Kimi
 
 
 def load(path: Path) -> dict[str, Any]:

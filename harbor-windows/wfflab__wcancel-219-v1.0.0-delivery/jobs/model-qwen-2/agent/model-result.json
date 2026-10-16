@@ -7,14 +7,14 @@
   "auth": "x-api-key",
   "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\harbor_agent\\wcancel_model_agent.py",
   "runner_sha256": "dce19869ec369664173244db7c91a31a0237595201a61c3d93e7cdc8a957ab56",
-  "steps": 30,
+  "steps": 22,
   "submitted": true,
-  "submit_summary": "## 修改总结\n\n修复了 `wcancel` 包中异步读取取消机制的多个缺陷，使其满足所有验收标准。\n\n### 修改的文件\n\n#### 1. `wcancel/_winapi.py` — Win32 API 绑定层\n- **新增 `CancelIoEx` 绑定** (`cancel_io_ex` 函数)：使用 `CancelIoEx(handle, overlapped)` 代替原来的 `CancelIo(handle)`，实现精确到单个 OVERLAPPED 请求的取消，且跨线程有效。当请求已完成时返回 `False`（`ERROR_NOT_FOUND`），而非抛异常。\n- **新增 `ntdll` 加载器** (`_ntdll_dll`)：用于调用 `NtQueryInformationFile`。\n- **新增 `IO_STATUS_BLOCK` 结构体**：`NtQueryInformationFile` 所需的参数。\n- **重写 `file_mode` 函数**：改用 `ntdll.NtQueryInformationFile(FileModeInformation)` 代替 `kernel32.GetFileInformationByHandleEx`，因为后者对命名管道等对象类型会失败（error 24），而 NT API 对所有句柄类型统一有效。\n- **新增同步 I/O 标志常量**：`FILE_SYNCHRONOUS_IO_ALERT` (0x10) 和 `FILE_SYNCHRONOUS_IO_NONALERT` (0x20)。\n- **修改 `wait_for_read`**：新增 `\"cancelled\"` 返回值，当 `GetOverlappedResult` 返回 `ERROR_OPERATION_ABORTED` 时识别为取消而非错误。\n\n#### 2. `wcancel/kinds.py` — 句柄分类\n- **重写 `is_overlapped`**：不再无条件返回 `True`。通过 `file_mode()` 查询句柄的模式字，检查是否设置了同步 I/O 标志。如果设置了 `FILE_SYNCHRONOUS_IO_ALERT` 或 `FILE_SYNCHRONOUS_IO_NONALERT`，说明句柄未以 `FILE_FLAG_OVERLAPPED` 打开，返回 `False`。无法查询模式时保守返回 `True`。\n- **修正错误分类**：不可用句柄改为 `kind=\"badarg\"` 而非 `\"os\"`。\n\n#### 3. `wcancel/proc.py` — 核心读取层\n- **`cancel(request)` 精确取消**：使用 `cancel_io_ex` 只取消指定的 OVERLAPPED 请求，不影响同一句柄上的其他请求。只在请求确实挂起时返回 `True`；对已完成或已取消的请求返回 `False`。\n- **`cancel_all(handle)` 逐个取消**：对每个待处理请求单独调用 `cancel_io_ex`，而非使用 `CancelIo` 批量取消。返回实际被取消的请求数量。\n- **`wait()` 区分取消与失败**：`ERROR_OPERATION_ABORTED` 产生 `Completion(status=\"cancelled\")` 而非抛出 `WCancelError(kind=\"os\")`。\n- **`submit()` 能力检查**：在发起读取前调用 `is_overlapped()`，不支持时抛出 `WCancelError(kind=\"unsupported\")`，不再静默退化为同步读取。\n- **线程安全**：为 `_pending` 字典添加 `threading.Lock`，为每个 `Request` 添加独立的 `_lock`，确保多线程下的状态一致性。\n- **竞态条件处理**：`cancel` 和 `cancel_all` 中仔细处理了\"检查状态\"与\"发出取消\"之间的窗口期，通过二次检查确保不会误报。\n\n### 验收标准对应\n- **A. 精确取消** ✅ — 使用 `CancelIoEx` 针对单个 OVERLAPPED\n- **B. 跨线程取消** ✅ — `CancelIoEx` 不依赖调用线程\n- **C. 独立终态** ✅ — `status=\"cancelled\"` 区别于 I/O 错误\n- **D. 不谎报取消** ✅ — 已完成/已取消的请求返回 `False`\n- **E. 能力判定** ✅ — `submit` 对非 overlapped 句柄抛 `unsupported`\n- **F. 错误分类** ✅ — 正确使用 `badarg`/`os`/`timeout`/`unsupported`\n- **G. 无回归** ✅ — 全部 10 个冒烟测试通过",
-  "input_tokens": 695,
-  "output_tokens": 22077,
-  "elapsed_sec": 439.68,
+  "submit_summary": "修复了 wcancel 包的六个验收标准问题：\n\n1. **精确取消 (A)**：将 `cancel(request)` 底层从 `CancelIo`（取消同线程所有I/O）改为 `CancelIoEx`（只取消指定 overlapped 的请求），确保同一句柄上其他请求不受影响。\n\n2. **跨线程取消 (B)**：`CancelIoEx` 可从任意线程取消指定请求，解决了原 `CancelIo` 只能取消调用线程 I/O 的问题。\n\n3. **被取消请求独立终态 (C)**：`wait()` 现在识别 `ERROR_OPERATION_ABORTED` 并返回 `Completion(status=\"cancelled\")`，不再将其作为普通 I/O 错误抛出。\n\n4. **不得谎报取消 (D)**：`cancel()` 先检查请求状态，对已完成/已取消的请求返回 `False`，仅在请求确实挂起且成功发出取消时返回 `True`。\n\n5. **能力判定 (E)**：`submit()` 新增 `check_overlapped()` 探测，对不支持重叠 I/O 的句柄抛出 `WCancelError(kind=\"unsupported\")`；`is_overlapped()` 也改为实际检测。\n\n6. **错误分类 (F)**：所有错误路径均正确分类为 unsupported/badarg/os/timeout。\n\n修改文件：wcancel/_winapi.py（新增 cancel_ex、check_overlapped）、wcancel/proc.py（重写 cancel/cancel_all/wait/submit 逻辑）、wcancel/kinds.py（is_overlapped 实际检测）。所有冒烟测试通过。",
+  "input_tokens": 597,
+  "output_tokens": 9495,
+  "elapsed_sec": 150.57,
   "last_stop_reason": "tool_use",
   "workspace": "C:\\testbed",
-  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\model-rounds\\jobs\\model-qwen-2\\wfflab__wcancel-219-v1.0.0-deliv__hk2iUtr\\agent\\trajectory.jsonl",
-  "completed_at_utc": "2026-10-14T13:05:24.540509+00:00"
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wcancel-build\\model-rounds\\jobs\\model-qwen-2\\wfflab__wcancel-219-v1.0.0-deliv__RmngL4R\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-15T13:16:53.991012+00:00"
 }

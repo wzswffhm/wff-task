@@ -16,10 +16,9 @@ from image_delivery_review import IMAGE_CHECKS, image_review_template
 from review_fixtures import passing_windows_image, passing_tools, passing_nested_virtualization
 
 
+# 甲方 2026-10-15 放宽：交付只含 Qwen 与 Opus。
 MODELS = (("qwen3.8-max-0902", "QWEN", "qwen", (0, 0, 0)),
-          ("claude-opus-5", "OPUS", "opus", (1, 1, 0)),
-          ("glm-5.3", "GLM", "glm", (0,)),
-          ("kimi-k3", "KIMI", "kimi", (0,)))
+          ("claude-opus-5", "OPUS", "opus", (1, 1, 0)))
 REQUIRED_CASES = (
     ("f2p-core", "F2P"),
     ("f2p-edge-1", "F2P"),
@@ -140,7 +139,7 @@ class DeliveryAndJobsTests(unittest.TestCase):
         return {"task_id": "demo", "task_version": "1.0.0", "task_hash": task_hash(root),
                 "harbor_task_checksum": checksum}
 
-    def test_direct_layout_and_fourteen_jobs_pass(self):
+    def test_direct_layout_and_twelve_jobs_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "delivery"
             root.mkdir()
