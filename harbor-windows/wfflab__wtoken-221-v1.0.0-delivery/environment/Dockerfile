@@ -15,13 +15,11 @@
 # policy requires a complete, untrimmed Windows system (>= Server 2019, 2025
 # preferred) and explicitly forbids both trimmed families.
 #
-# ltsc2022 carries os.version 10.0.20348, which is exactly the buyer host build.
-# It is also the only complete image that satisfies both constraints at once: a
-# build-equal image runs under process isolation on the buyer's 20348 hosts, and
-# because 20348 <= every Windows 11 build it also runs under Hyper-V isolation on
-# Windows 11 hosts. ltsc2025 (build 26100) would exceed the buyer host build and
-# could not start there at all, so the "prefer 2025" guidance yields to the hard
-# requirement that the buyer can actually run the image.
+# ltsc2022 carries os.version 10.0.20348, which is exactly the buyer host build,
+# so a build-equal image runs under process isolation on the buyer's 20348 hosts.
+# ltsc2025 (build 26100) would exceed the buyer host build and could not start
+# there at all, so the "prefer 2025" guidance yields to the hard requirement that
+# the buyer can actually run the image.
 #
 # 这里按 tag 引用而不是按 digest：本批交付镜像是在离线条件下用 docker load /
 # 分层组装导入 L1 的，导入镜像的 RepoDigests 为空；一旦 pin digest，docker build
