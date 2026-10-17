@@ -1,0 +1,879 @@
+diff --git a/wsparse/_winapi.py b/wsparse/_winapi.py
+index d16a526..cc287f5 100644
+--- a/wsparse/_winapi.py
++++ b/wsparse/_winapi.py
+@@ -1,24 +1,545 @@
+ """Thin ctypes bindings for the Win32 calls that :mod:`wsparse` needs.
+ 
+-Only the calls the current implementation actually uses are bound here. The
+-module is written so that importing it on a non-Windows platform stays cheap:
+-the DLL is loaded lazily, on first use.
++Only the calls the implementation actually uses are bound here.  The module is
++written so that importing it on a non-Windows platform stays cheap: the DLL is
++loaded lazily, on first use.
++
++The sparse-file semantics the rest of the package relies on come from:
++
++``FSCTL_SET_SPARSE``
++    marks a file as sparse, so that extending it leaves holes behind instead
++    of allocating (and zero-filling) clusters;
++``SetEndOfFile``
++    moves the logical end of file without writing anything;
++``FILE_STANDARD_INFO.AllocationSize`` / ``GetCompressedFileSizeW``
++    report the number of bytes a file really occupies on disk;
++``FSCTL_QUERY_ALLOCATED_RANGES``
++    reports which byte ranges of a file are backed by allocated clusters.
+ """
+ 
+ import os
+ 
+-# FILE_ATTRIBUTE_SPARSE_FILE
++from .errors import WSParseError
++
++#: FILE_ATTRIBUTE_SPARSE_FILE
+ SPARSE_ATTRIBUTE = 0x00000200
++#: FILE_ATTRIBUTE_DIRECTORY
++DIRECTORY_ATTRIBUTE = 0x00000010
++
++#: Cluster size assumed when the volume cannot be queried (NTFS default).
++DEFAULT_CLUSTER = 4096
+ 
+ _IS_WINDOWS = os.name == "nt"
+ 
++# --- Win32 constants -------------------------------------------------------
++
++GENERIC_READ = 0x80000000
++GENERIC_WRITE = 0x40000000
++FILE_READ_ATTRIBUTES = 0x0080
++
++FILE_SHARE_READ = 0x00000001
++FILE_SHARE_WRITE = 0x00000002
++FILE_SHARE_DELETE = 0x00000004
++SHARE_ALL = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
++
++OPEN_EXISTING = 3
++OPEN_ALWAYS = 4
++
++FILE_BEGIN = 0
++FILE_ATTRIBUTE_NORMAL = 0x00000080
++FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
++
++INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
++INVALID_FILE_SIZE = 0xFFFFFFFF
++
++FSCTL_SET_SPARSE = 0x000900C4
++FSCTL_SET_ZERO_DATA = 0x000980C8
++FSCTL_QUERY_ALLOCATED_RANGES = 0x000940CF
++
++#: ``FileStandardInfo`` for ``GetFileInformationByHandleEx``.
++FILE_STANDARD_INFO_CLASS = 1
++
++ERROR_SUCCESS = 0
++ERROR_INVALID_FUNCTION = 1
++ERROR_FILE_NOT_FOUND = 2
++ERROR_PATH_NOT_FOUND = 3
++ERROR_ACCESS_DENIED = 5
++ERROR_NOT_SUPPORTED = 50
++ERROR_CALL_NOT_IMPLEMENTED = 120
++ERROR_MORE_DATA = 234
++
++#: Win32 errors that mean "this object or this volume will never support the
++#: operation", as opposed to a transient or environmental failure.  A device
++#: control the file system does not implement surfaces as
++#: ``ERROR_INVALID_FUNCTION``; network redirectors and non-NTFS volumes use
++#: ``ERROR_NOT_SUPPORTED`` or ``ERROR_CALL_NOT_IMPLEMENTED`` instead.
++UNSUPPORTED_ERRORS = frozenset(
++    (ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_CALL_NOT_IMPLEMENTED)
++)
++
++#: Errors that only say "the path is not there", never "it cannot work".
++MISSING_ERRORS = frozenset((ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND))
++
++_cache = {}
++
+ 
+ def is_windows():
+     """Return ``True`` when running on a Windows kernel."""
+     return _IS_WINDOWS
+ 
+ 
++# --- lazy binding ----------------------------------------------------------
++
++
++def _bind():
++    import ctypes
++    from ctypes import wintypes
++
++    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
++
++    class FILE_ALLOCATED_RANGE_BUFFER(ctypes.Structure):
++        _fields_ = [
++            ("FileOffset", ctypes.c_longlong),
++            ("Length", ctypes.c_longlong),
++        ]
++
++    class FILE_ZERO_DATA_INFORMATION(ctypes.Structure):
++        _fields_ = [
++            ("FileOffset", ctypes.c_longlong),
++            ("BeyondFinalZero", ctypes.c_longlong),
++        ]
++
++    class FILE_STANDARD_INFO(ctypes.Structure):
++        _fields_ = [
++            ("AllocationSize", ctypes.c_longlong),
++            ("EndOfFile", ctypes.c_longlong),
++            ("NumberOfLinks", wintypes.DWORD),
++            ("DeletePending", ctypes.c_ubyte),
++            ("Directory", ctypes.c_ubyte),
++        ]
++
++    k32.CreateFileW.argtypes = [
++        wintypes.LPCWSTR,
++        wintypes.DWORD,
++        wintypes.DWORD,
++        ctypes.c_void_p,
++        wintypes.DWORD,
++        wintypes.DWORD,
++        wintypes.HANDLE,
++    ]
++    k32.CreateFileW.restype = wintypes.HANDLE
++
++    k32.CloseHandle.argtypes = [wintypes.HANDLE]
++    k32.CloseHandle.restype = wintypes.BOOL
++
++    k32.DeviceIoControl.argtypes = [
++        wintypes.HANDLE,
++        wintypes.DWORD,
++        ctypes.c_void_p,
++        wintypes.DWORD,
++        ctypes.c_void_p,
++        wintypes.DWORD,
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.c_void_p,
++    ]
++    k32.DeviceIoControl.restype = wintypes.BOOL
++
++    k32.GetFileSizeEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong)]
++    k32.GetFileSizeEx.restype = wintypes.BOOL
++
++    k32.SetFilePointerEx.argtypes = [
++        wintypes.HANDLE,
++        ctypes.c_longlong,
++        ctypes.POINTER(ctypes.c_longlong),
++        wintypes.DWORD,
++    ]
++    k32.SetFilePointerEx.restype = wintypes.BOOL
++
++    k32.SetEndOfFile.argtypes = [wintypes.HANDLE]
++    k32.SetEndOfFile.restype = wintypes.BOOL
++
++    k32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
++    k32.GetFileAttributesW.restype = wintypes.DWORD
++
++    k32.GetCompressedFileSizeW.argtypes = [
++        wintypes.LPCWSTR,
++        ctypes.POINTER(wintypes.DWORD),
++    ]
++    k32.GetCompressedFileSizeW.restype = wintypes.DWORD
++
++    k32.GetFileInformationByHandleEx.argtypes = [
++        wintypes.HANDLE,
++        wintypes.DWORD,
++        ctypes.c_void_p,
++        wintypes.DWORD,
++    ]
++    k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
++
++    k32.GetDiskFreeSpaceW.argtypes = [
++        wintypes.LPCWSTR,
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.POINTER(wintypes.DWORD),
++    ]
++    k32.GetDiskFreeSpaceW.restype = wintypes.BOOL
++
++    k32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
++    k32.FlushFileBuffers.restype = wintypes.BOOL
++
++    return {
++        "k32": k32,
++        "range_buffer": FILE_ALLOCATED_RANGE_BUFFER,
++        "zero_data": FILE_ZERO_DATA_INFORMATION,
++        "standard_info": FILE_STANDARD_INFO,
++        "invalid_handle": ctypes.c_void_p(-1).value,
++    }
++
++
++def _win():
++    """Return the lazily bound Win32 helpers."""
++    if not _IS_WINDOWS:
++        raise WSParseError(
++            "the Win32 sparse-file interface is only available on Windows",
++            kind="unsupported",
++        )
++    api = _cache.get("api")
++    if api is None:
++        api = _bind()
++        _cache["api"] = api
++    return api
++
++
+ def _kernel32():
++    """Backwards-compatible accessor for the ``kernel32`` DLL object."""
++    return _win()["k32"]
++
++
++# --- error mapping ---------------------------------------------------------
++
++
++def classify(code):
++    """Map a Win32 error code onto a :class:`WSParseError` ``kind``."""
++    if code in UNSUPPORTED_ERRORS:
++        return "unsupported"
++    return "os"
++
++
++def win_error(operation, path=None, code=None, kind=None):
++    """Build a :class:`WSParseError` out of a Win32 error code."""
++    import ctypes
++
++    if code is None:
++        code = ctypes.get_last_error()
++    try:
++        text = ctypes.FormatError(code).strip()
++    except Exception:  # pragma: no cover - FormatError is defensive only
++        text = ""
++    message = "%s failed (WinError %d)" % (operation, code)
++    if text:
++        message = "%s: %s" % (message, text)
++    error = WSParseError(message, kind=kind or classify(code), path=path)
++    error.winerror = code
++    return error
++
++
++# --- path level helpers ----------------------------------------------------
++
++
++def check_target(path, must_exist=True):
++    """Validate that ``path`` can carry sparse-file semantics at all.
++
++    A directory -- and anything else that is not a regular file -- can never
++    be sparse, so the sparse interfaces classify it as ``"unsupported"``
++    instead of failing somewhere deep inside a device control call.  A missing
++    path is an ordinary operating-system failure.
++    """
++    if os.path.isdir(path):
++        raise WSParseError(
++            "sparse-file operations are not supported on directories",
++            kind="unsupported",
++            path=path,
++        )
++    if os.path.exists(path):
++        if not os.path.isfile(path):
++            raise WSParseError(
++                "sparse-file operations are only supported on regular files",
++                kind="unsupported",
++                path=path,
++            )
++    elif must_exist:
++        raise WSParseError("no such file", kind="os", path=path)
++
++
++def cluster_size(path):
++    """Return the allocation unit of the volume ``path`` lives on."""
++    import ctypes
++    from ctypes import wintypes
++
++    if not _IS_WINDOWS:
++        return DEFAULT_CLUSTER
++    root = os.path.splitdrive(os.path.abspath(path))[0]
++    if root:
++        root += os.sep
++    cached = _cache.setdefault("clusters", {})
++    if root in cached:
++        return cached[root]
++    sectors = wintypes.DWORD(0)
++    sector_bytes = wintypes.DWORD(0)
++    free = wintypes.DWORD(0)
++    total = wintypes.DWORD(0)
++    size = DEFAULT_CLUSTER
++    try:
++        api = _win()
++        ok = api["k32"].GetDiskFreeSpaceW(
++            root or None,
++            ctypes.byref(sectors),
++            ctypes.byref(sector_bytes),
++            ctypes.byref(free),
++            ctypes.byref(total),
++        )
++        if ok:
++            candidate = sectors.value * sector_bytes.value
++            if candidate > 0:
++                size = candidate
++    except WSParseError:  # pragma: no cover - non-Windows guard
++        size = DEFAULT_CLUSTER
++    cached[root] = size
++    return size
++
++
++def get_file_attributes(path):
++    """Return the Win32 file attributes of ``path``."""
++    import ctypes
++
++    api = _win()
++    attributes = api["k32"].GetFileAttributesW(path)
++    if attributes == INVALID_FILE_ATTRIBUTES:
++        code = ctypes.get_last_error()
++        kind = "os" if code in MISSING_ERRORS else None
++        raise win_error("GetFileAttributesW", path, code, kind=kind)
++    return attributes
++
++
++def get_compressed_size(path):
++    """Return the on-disk size ``GetCompressedFileSizeW`` reports for ``path``."""
++    import ctypes
++    from ctypes import wintypes
++
++    api = _win()
++    ctypes.set_last_error(ERROR_SUCCESS)
++    high = wintypes.DWORD(0)
++    low = api["k32"].GetCompressedFileSizeW(path, ctypes.byref(high))
++    code = ctypes.get_last_error()
++    if low == INVALID_FILE_SIZE and code != ERROR_SUCCESS:
++        kind = "os" if code in MISSING_ERRORS else None
++        raise win_error("GetCompressedFileSizeW", path, code, kind=kind)
++    return (high.value << 32) | low
++
++
++def get_allocated_size(path):
++    """Return the number of bytes ``path`` really occupies on disk.
++
++    The query goes through a handle so that the answer accounts for writes that
++    are still sitting in the cache: ``GetCompressedFileSizeW`` reads the
++    directory entry, which the file system only refreshes once the stream's
++    metadata has been pushed out.  Flushing first keeps the number consistent
++    with what another observer sees on the volume.
++    """
++    handle = None
++    try:
++        handle = open_handle(path, write=True)
++        flush(handle)
++    except WSParseError as exc:
++        if getattr(exc, "winerror", None) in MISSING_ERRORS:
++            raise
++        # No write access (a read-only sink, or someone holding it): a plain
++        # read handle still reports the allocation, just without the flush.
++        if handle is not None:
++            close_handle(handle)
++            handle = None
++        try:
++            handle = open_handle(path, access=FILE_READ_ATTRIBUTES)
++        except WSParseError as inner:
++            if getattr(inner, "winerror", None) in MISSING_ERRORS:
++                raise
++            return get_compressed_size(path)
++    try:
++        return get_allocation_from_handle(handle, path)
++    finally:
++        close_handle(handle)
++
++
++# --- handle level helpers --------------------------------------------------
++
++
++def open_handle(path, access=None, create=False, write=False):
++    """Open ``path`` and return a raw Win32 handle.
++
++    ``create`` opens the file, creating it when it does not exist yet;
++    otherwise the file has to exist already.
++    """
+     import ctypes
+ 
+-    return ctypes.WinDLL("kernel32", use_last_error=True)
++    api = _win()
++    if access is None:
++        access = GENERIC_READ | GENERIC_WRITE if write else GENERIC_READ
++    disposition = OPEN_ALWAYS if create else OPEN_EXISTING
++    handle = api["k32"].CreateFileW(
++        path,
++        access,
++        SHARE_ALL,
++        None,
++        disposition,
++        FILE_ATTRIBUTE_NORMAL,
++        None,
++    )
++    if handle is None or handle == api["invalid_handle"]:
++        code = ctypes.get_last_error()
++        kind = "os" if code in MISSING_ERRORS else None
++        raise win_error("CreateFileW", path, code, kind=kind)
++    return handle
++
++
++def close_handle(handle):
++    """Close a handle returned by :func:`open_handle`."""
++    try:
++        _win()["k32"].CloseHandle(handle)
++    except Exception:  # pragma: no cover - closing must never mask an error
++        pass
++
++
++def flush(handle):
++    """Push the file system's state for ``handle`` out to the volume."""
++    try:
++        _win()["k32"].FlushFileBuffers(handle)
++    except Exception:  # pragma: no cover - best effort only
++        pass
++
++
++def get_file_size(handle, path=None):
++    """Return the logical length of the file behind ``handle``."""
++    import ctypes
++
++    api = _win()
++    size = ctypes.c_longlong(0)
++    if not api["k32"].GetFileSizeEx(handle, ctypes.byref(size)):
++        raise win_error("GetFileSizeEx", path, ctypes.get_last_error())
++    return size.value
++
++
++def get_allocation_from_handle(handle, path=None):
++    """Return ``FILE_STANDARD_INFO.AllocationSize`` for ``handle``."""
++    import ctypes
++
++    api = _win()
++    info = api["standard_info"]()
++    ok = api["k32"].GetFileInformationByHandleEx(
++        handle,
++        FILE_STANDARD_INFO_CLASS,
++        ctypes.byref(info),
++        ctypes.sizeof(info),
++    )
++    if not ok:
++        raise win_error("GetFileInformationByHandleEx", path, ctypes.get_last_error())
++    return info.AllocationSize
++
++
++def set_sparse(handle, enabled=True, path=None):
++    """Issue ``FSCTL_SET_SPARSE`` on ``handle``."""
++    import ctypes
++    from ctypes import wintypes
++
++    api = _win()
++    flag = ctypes.c_ubyte(1 if enabled else 0)
++    returned = wintypes.DWORD(0)
++    ok = api["k32"].DeviceIoControl(
++        handle,
++        FSCTL_SET_SPARSE,
++        ctypes.byref(flag),
++        ctypes.sizeof(flag),
++        None,
++        0,
++        ctypes.byref(returned),
++        None,
++    )
++    if not ok:
++        raise win_error("FSCTL_SET_SPARSE", path, ctypes.get_last_error())
++
++
++def set_end_of_file(handle, size, path=None):
++    """Move the logical end of file of ``handle`` to ``size`` bytes."""
++    import ctypes
++
++    api = _win()
++    if not api["k32"].SetFilePointerEx(handle, size, None, FILE_BEGIN):
++        raise win_error("SetFilePointerEx", path, ctypes.get_last_error())
++    if not api["k32"].SetEndOfFile(handle):
++        raise win_error("SetEndOfFile", path, ctypes.get_last_error())
++
++
++def zero_data(handle, offset, end, path=None):
++    """Punch a hole into ``handle`` with ``FSCTL_SET_ZERO_DATA``."""
++    import ctypes
++    from ctypes import wintypes
++
++    api = _win()
++    request = api["zero_data"](offset, end)
++    returned = wintypes.DWORD(0)
++    ok = api["k32"].DeviceIoControl(
++        handle,
++        FSCTL_SET_ZERO_DATA,
++        ctypes.byref(request),
++        ctypes.sizeof(request),
++        None,
++        0,
++        ctypes.byref(returned),
++        None,
++    )
++    if not ok:
++        raise win_error("FSCTL_SET_ZERO_DATA", path, ctypes.get_last_error())
++
++
++def query_allocated_ranges(handle, size, path=None):
++    """Return the raw ``(offset, length)`` ranges NTFS reports for ``handle``."""
++    import ctypes
++    from ctypes import wintypes
++
++    api = _win()
++    if size <= 0:
++        return []
++
++    entry_type = api["range_buffer"]
++    entry_size = ctypes.sizeof(entry_type)
++    out_type = entry_type * 128
++
++    found = []
++    start = 0
++    while start < size:
++        request = entry_type(start, size - start)
++        out = out_type()
++        returned = wintypes.DWORD(0)
++        ok = api["k32"].DeviceIoControl(
++            handle,
++            FSCTL_QUERY_ALLOCATED_RANGES,
++            ctypes.byref(request),
++            entry_size,
++            ctypes.byref(out),
++            ctypes.sizeof(out),
++            ctypes.byref(returned),
++            None,
++        )
++        code = ERROR_SUCCESS if ok else ctypes.get_last_error()
++        if not ok and code != ERROR_MORE_DATA:
++            raise win_error("FSCTL_QUERY_ALLOCATED_RANGES", path, code)
++        count = returned.value // entry_size
++        for index in range(count):
++            found.append((out[index].FileOffset, out[index].Length))
++        if ok or count == 0:
++            break
++        # ERROR_MORE_DATA: resume right behind the last range we were handed.
++        resume = found[-1][0] + found[-1][1]
++        if resume <= start:
++            break
++        start = resume
++    return found
+diff --git a/wsparse/alloc.py b/wsparse/alloc.py
+index 48598d9..0c754e1 100644
+--- a/wsparse/alloc.py
++++ b/wsparse/alloc.py
+@@ -1,13 +1,17 @@
+-"""Pre-allocation of sink files."""
++"""Pre-allocation of sink files.
++
++On NTFS a sink is reserved by marking the file sparse and then moving its end
++of file: the logical length becomes ``size`` immediately while the untouched
++region stays a hole and costs no clusters.  The writer overwrites the hole as
++payload arrives, so only the bytes that were really written end up occupying
++disk.  Nothing is ever zero-filled by hand.
++"""
+ 
+ import os
+ 
++from . import _winapi
+ from .errors import WSParseError
+ 
+-#: Size of one reservation block.  The tail of a sink is written out in whole
+-#: blocks so that the writer never has to grow the file while it streams.
+-_BLOCK = 1 << 20
+-
+ 
+ def _check_size(size):
+     if isinstance(size, bool) or not isinstance(size, int):
+@@ -16,46 +20,48 @@ def _check_size(size):
+         raise WSParseError("size must not be negative, got %r" % (size,), kind="badarg")
+ 
+ 
+-def _open_for_update(path):
+-    try:
+-        return open(path, "r+b")
+-    except FileNotFoundError:
+-        try:
+-            return open(path, "w+b")
+-        except OSError as exc:
+-            raise WSParseError(str(exc), kind="os", path=path) from exc
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-
+-
+ def preallocate(path, size):
+-    """Grow ``path`` to ``size`` bytes and reserve the space for it.
++    """Reserve ``size`` bytes for the sink at ``path``.
++
++    The file is created when it does not exist yet, is marked as a sparse file,
++    and its logical length is extended to ``size``.  The reserved tail is a
++    hole: it reads back as zero bytes and occupies no clusters until the writer
++    actually puts payload there.
+ 
+-    The sink is created when it does not exist yet.  Existing content is
+-    preserved; the file is only ever extended, never shrunk.  The call is
+-    idempotent -- calling it again with the same ``size`` leaves the file
+-    untouched.
++    Existing content is preserved; the file is only ever extended, never
++    shrunk.  The call is idempotent -- calling it again with the same ``size``
++    leaves both the length and the on-disk layout alone.
+ 
+     Returns the resulting file length in bytes.
++
++    Raises :class:`WSParseError` with ``kind == "unsupported"`` when the target
++    object or its volume cannot hold a sparse file, ``kind == "badarg"`` for an
++    unusable ``size``, and ``kind == "os"`` for other operating-system
++    failures.
+     """
+     _check_size(size)
+     path = os.fspath(path)
+-    handle = _open_for_update(path)
++    _winapi.check_target(path, must_exist=False)
++
++    handle = _winapi.open_handle(path, create=True, write=True)
+     try:
+-        handle.seek(0, os.SEEK_END)
+-        remaining = size - handle.tell()
+-        if remaining > 0:
+-            # Reserve the tail by writing it out.  The collector's writer fills
+-            # these bytes in later, so the intermediate content does not matter.
+-            block = b"\x00" * _BLOCK
+-            while remaining > 0:
+-                take = _BLOCK if remaining > _BLOCK else remaining
+-                handle.write(block[:take])
+-                remaining -= take
+-        handle.flush()
+-        os.fsync(handle.fileno())
+-        return handle.tell()
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
++        # Marking the file sparse first is what makes the extension below free:
++        # on a sparse file ``SetEndOfFile`` records the new length without
++        # allocating -- let alone zeroing -- the clusters behind it.
++        _winapi.set_sparse(handle, True, path)
++        current = _winapi.get_file_size(handle, path)
++        if size > current:
++            _winapi.set_end_of_file(handle, size, path)
++            # Re-assert the hole over the region we just exposed.  An existing
++            # dense tail may have left allocated clusters inside it, and this
++            # keeps a repeated call from inheriting them.
++            try:
++                _winapi.zero_data(handle, current, size, path)
++            except WSParseError as exc:
++                if exc.kind != "os":
++                    raise
++            current = _winapi.get_file_size(handle, path)
++        _winapi.flush(handle)
++        return current
+     finally:
+-        handle.close()
++        _winapi.close_handle(handle)
+diff --git a/wsparse/flags.py b/wsparse/flags.py
+index c819d68..5ad6cfb 100644
+--- a/wsparse/flags.py
++++ b/wsparse/flags.py
+@@ -2,41 +2,63 @@
+ 
+ import os
+ 
++from . import _winapi
+ from ._winapi import SPARSE_ATTRIBUTE, is_windows
+ from .errors import WSParseError
+ 
+ 
+ def sparse_state(path):
+-    """Return ``True`` when ``path`` currently carries the sparse attribute."""
++    """Return ``True`` when ``path`` currently carries the sparse attribute.
++
++    Raises :class:`WSParseError` with ``kind == "unsupported"`` when ``path``
++    is not an object that can carry the attribute at all (a directory, for
++    instance), and ``kind == "os"`` when it cannot be inspected.
++    """
+     path = os.fspath(path)
+-    try:
+-        info = os.stat(path)
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-    attributes = getattr(info, "st_file_attributes", 0)
++    _winapi.check_target(path)
++    attributes = _winapi.get_file_attributes(path)
+     return bool(attributes & SPARSE_ATTRIBUTE)
+ 
+ 
+ def sparse_flag(path, enabled=True):
+     """Turn the sparse attribute of ``path`` on or off.
+ 
+-    ``enabled`` defaults to ``True``.  Returns the state the file ends up in.
++    ``enabled`` defaults to ``True``.  Returns the state the file ends up in,
++    read back from the file system rather than assumed.
++
++    Setting the attribute is not retroactive: NTFS applies it to the clusters
++    that are allocated *after* the call, so a file that has already been
++    extended densely keeps its clusters -- and therefore its disk usage --
++    until the dense regions are explicitly turned back into holes.  This call
++    never claims otherwise; it only reports whether the attribute is set.
++
++    Raises :class:`WSParseError` with ``kind == "unsupported"`` when the object
++    or its volume does not support sparse files, and ``kind == "os"`` when the
++    path is missing or the operation is rejected by the operating system.
+     """
+     path = os.fspath(path)
+-    if not os.path.exists(path):
+-        raise WSParseError("no such file: %s" % path, kind="os", path=path)
++    _winapi.check_target(path)
+     if not is_windows():
+         raise WSParseError(
+             "the sparse attribute is a Windows file-system concept",
+             kind="unsupported",
+             path=path,
+         )
+-    if not enabled:
++
++    handle = _winapi.open_handle(path, write=True)
++    try:
++        _winapi.set_sparse(handle, bool(enabled), path)
++        _winapi.flush(handle)
++        attributes = _winapi.get_file_attributes(path)
++        state = bool(attributes & SPARSE_ATTRIBUTE)
++    finally:
++        _winapi.close_handle(handle)
++
++    if state != bool(enabled):
+         raise WSParseError(
+-            "clearing the sparse attribute is not implemented yet",
++            "the file system did not %s the sparse attribute"
++            % ("set" if enabled else "clear"),
+             kind="unsupported",
+             path=path,
+         )
+-    # The attribute is maintained by the file system while the file is being
+-    # written, so there is nothing left to do here but report where we stand.
+-    return sparse_state(path)
++    return state
+diff --git a/wsparse/ranges.py b/wsparse/ranges.py
+index 5452117..92841f2 100644
+--- a/wsparse/ranges.py
++++ b/wsparse/ranges.py
+@@ -2,22 +2,68 @@
+ 
+ import os
+ 
++from . import _winapi
+ from .errors import WSParseError
+ 
+ 
++def _normalise(raw, size):
++    """Clip, sort, and coalesce the ranges NTFS handed back."""
++    clipped = []
++    for offset, length in raw:
++        if length <= 0:
++            continue
++        start = offset if offset > 0 else 0
++        end = offset + length
++        if end > size:
++            end = size
++        if end <= start:
++            continue
++        clipped.append((start, end))
++
++    clipped.sort()
++    merged = []
++    for start, end in clipped:
++        if merged and start <= merged[-1][1]:
++            if end > merged[-1][1]:
++                merged[-1][1] = end
++        else:
++            merged.append([start, end])
++    return [(start, end - start) for start, end in merged]
++
++
+ def allocated_ranges(path):
+     """Return ``[(offset, length), ...]`` of the byte ranges backed by clusters.
+ 
+     The transfer layer uses this to decide which parts of a sink still have to
+-    be fetched: a range that is already allocated is on disk, everything else
+-    is a hole that still needs data.  The list is ordered by ``offset`` and the
+-    ranges never overlap.  Every range lies inside the file's logical length.
++    be fetched: an allocated range is already on disk, everything else is a
++    hole that still needs data.  The list is ordered by ``offset``, the ranges
++    never overlap, and every range lies inside the file's logical length.
++
++    A file that is nothing but holes reports an empty list.  A file that is not
++    sparse reports a single range covering its whole length.
++
++    Raises :class:`WSParseError` with ``kind == "unsupported"`` when ``path``
++    cannot carry sparse-file semantics, and ``kind == "os"`` for other
++    operating-system failures.
+     """
+     path = os.fspath(path)
++    if not os.path.exists(path):
++        raise WSParseError("no such file", kind="os", path=path)
++    _winapi.check_target(path)
++
++    handle = _winapi.open_handle(path)
+     try:
+-        size = os.path.getsize(path)
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-    if size == 0:
+-        return []
+-    return [(0, size)]
++        size = _winapi.get_file_size(handle, path)
++        if size <= 0:
++            return []
++        attributes = _winapi.get_file_attributes(path)
++        if not attributes & _winapi.SPARSE_ATTRIBUTE:
++            # A dense file has every cluster of its length allocated.  NTFS
++            # answers the query for it too, but reporting the whole length
++            # directly keeps the answer exact for files whose data stream is
++            # resident in the MFT record.
++            return [(0, size)]
++        raw = _winapi.query_allocated_ranges(handle, size, path)
++        return _normalise(raw, size)
++    finally:
++        _winapi.close_handle(handle)
+diff --git a/wsparse/usage.py b/wsparse/usage.py
+index 4c0f135..8994e2d 100644
+--- a/wsparse/usage.py
++++ b/wsparse/usage.py
+@@ -2,20 +2,35 @@
+ 
+ import os
+ 
++from . import _winapi
+ from .errors import WSParseError
+ 
+ 
+ def disk_usage(path):
+-    """Return the number of bytes ``path`` occupies on disk.
++    """Return the number of bytes ``path`` really occupies on disk.
+ 
+-    This is what the quota tracker subtracts from the volume budget, so it has
+-    to describe the space the sink actually holds, not the number of bytes a
+-    reader would see.  The value is rounded up to a whole cluster by the file
+-    system.
++    This is what the quota tracker subtracts from the volume budget, so it
++    describes the space the sink actually holds -- the clusters NTFS has
++    allocated for it -- and not the number of bytes a reader would see.  For a
++    sparse sink that is mostly holes the value is a small fraction of the
++    logical length; for a dense sink it is the logical length rounded up to a
++    whole cluster.
++
++    Raises :class:`WSParseError` with ``kind == "os"`` when ``path`` cannot be
++    inspected, and ``kind == "unsupported"`` when it is not a regular file.
+     """
+     path = os.fspath(path)
+-    try:
+-        info = os.stat(path)
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-    return info.st_size
++    if not os.path.exists(path):
++        raise WSParseError("no such file", kind="os", path=path)
++    _winapi.check_target(path)
++
++    allocated = _winapi.get_allocated_size(path)
++
++    # ``GetCompressedFileSizeW`` already reports cluster-granular numbers, but
++    # a resident (very small) data stream can come back below one cluster.
++    # Round up so the quota tracker never undercounts a sink that holds data.
++    if allocated > 0:
++        cluster = _winapi.cluster_size(path)
++        if cluster > 0:
++            allocated = -(-allocated // cluster) * cluster
++    return int(allocated)

@@ -1,0 +1,115 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "data": [
+      [
+        "wfflab__wciocp-220-v1.0.0-delivery.zip",
+        "1/3",
+        null,
+        [
+          {
+            "id": "ou_f4e4bc01ed9be1ef4cbaedcdf8f19d45",
+            "name": "wff"
+          }
+        ],
+        [
+          "返修待质检"
+        ],
+        null,
+        [
+          {
+            "file_token": "J73bba2GJoiFGrxVE5fcOP9ynqc",
+            "name": "score_summary.png",
+            "size": 74865
+          }
+        ],
+        null,
+        "Windows/异步 I/O 与内核同步（I/O 完成端口：完成键随完成包由内核回传、端口队列的原子交付保证一个通知只被一个线程取到、跨句柄键区分、空队列 WAIT_TIMEOUT、重叠模式能力判定）/Python/缺陷修复",
+        "3/3",
+        [
+          {
+            "file_token": "GQ2cbIazfovdVDx8r45ctJnYnRf",
+            "name": "wfflab__wciocp-220-v1.0.0-delivery.zip",
+            "size": 54576334
+          }
+        ],
+        "# wciocp：完成事件的分派与回收不正确\n\n`wciocp` 是我们采集器的**完成通知层**。同一台机器上会同时开着很多句柄（分片管道、目标文件、辅助进程的输出），它们的后台读取统一登记到**一个完成端口**上；若干个工作线程各自从端口取走「某个句柄的某次读取已经结束」的通知，再按登记时约定的**完成键**把结果分派回它所属的作业。\n\n一个完成通知只应该被**一个**线程取走，而且它带回来的键必须是当初登记的那个——否则同一个分片会被两个线程各处理一次，或者结果被记到别的作业名下。\n\n## 目标平台（范围声明）\n\n本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。\n\n`wciocp` 的验收建立在真实 Windows 完成端口的语义上：「一个完成通知恰好被交付一次、并带回登记时的完成键」必须在机制层面**真的成立**；评测器会自己持有对象、自己登记不同的完成键、自己用多个线程并发取走通知，并以它实际取到的键与次数为准，**不采信** `wciocp` 自己的说法。\n\n跨平台兼容（POSIX 的 `epoll`/`kqueue`、`io_uring` 的完成队列之类）不在验收范围内，也不构成替代实现。\n\n## 现象（仓库 issue #220）\n\n1. **一个通知被领走两次**：两个工作线程同时取包时，同一个完成通知会被两个线程各取到一次，分片被重复处理、计数翻倍；工作线程再多一些，则反过来出现丢包——有的通知谁都拿不到。\n2. **键对不上**：取回来的通知带着**别的作业**的完成键，或者同一个句柄换过一次键之后，早先那批请求结束时报的是新键。\n3. **超时一次就再也拿不到**：`take(timeout=...)` 一旦超时，先前**已经到达**的通知就再也取不出来了，调用方只能看到端口一直空着。\n4. **不支持时不报错**：在不支持后台完成通知的对象上，登记照做不误，等到取包时才以一种含糊的失败收场。\n5. **关闭之后还在收包**：端口关闭了，残留的通知仍会被取出来，新的读取也照样能提交。\n\n## 任务\n\n修复 `wciocp` 包，使其满足下列验收标准。`docs/NOTES.md` 是早期草稿，与 Windows 的实际语义已经不一致，请以本说明的验收标准为准。\n\n## 验收标准\n\n### A. 完成键必须由完成机制本身带回\n\n- `take()` 返回的 `Event.key` 必须等于该请求所属句柄在 `register(handle, key)` 时登记的键。\n- 同一个句柄被重新登记换键之后，**已经到达端口的通知**仍必须报**旧键**（不得被后来的登记改写）。\n\n### B. 一个完成通知恰好交付一次\n\n- 在多个线程并发 `take()` 的情况下，每个完成通知必须**恰好**被某一个线程取到：不得重复交付，也不得丢失。\n- 由本模块提交的每一次完成读取，最终都必须能被取到一次。\n\n### C. 同一端口上不同句柄各自带键\n\n- 一个池上可以登记多个句柄；取到的每一个通知的键都必须对应它自己的句柄，不得互相串。\n\n### D. 超时不得丢弃已到达的通知\n\n- `take(timeout)` 在期限内没有新通知时抛 `WCIOCPError(kind=\"timeout\")`。\n- 超时**不得**影响端口中已经到达的通知：随后的 `take()` 必须仍能取到它们。\n- 超时也不得让端口失效：之后到达的通知必须照常可以被取到。\n\n### E. 能力判定\n\n- 对不支持后台完成通知的对象，`register()` 必须抛出 `WCIOCPError`，且 `err.kind == \"unsupported\"`；不得静默接受。\n\n### F. 关闭与错误分类\n\n- `close()` 必须幂等；关闭之后 `take()` 与 `submit()` 必须抛 `WCIOCPError(kind=\"closed\")`。\n- 关闭时该池上尚未结束的读取必须被取消，其完成以 `status == \"cancelled\"` 交出。\n- 参数或句柄不可用时抛 `WCIOCPError(kind=\"badarg\")`；底层调用失败抛 `WCIOCPError(kind=\"os\")`。\n- 不得出现静默成功，也不得只抛出无分类的 `OSError`。\n\n### G. 不得回归\n\n- 可见冒烟测试 `tests/test_wciocp_basic.py` 必须继续通过。\n- 公开 API 的名称与签名保持不变（`create_pool` / `register` / `submit` / `take` / `close` / `Event` / `Request` / `WCIOCPError`）。\n\n## 提交\n\n直接修改 `wciocp/` 下的源码即可，无需改测试文件。\n",
+        null,
+        null,
+        null,
+        "【2026-10-16 本轮质检】\n1. 测试把候选模块和隐藏测试一起放进同一个 pytest 进程执行，当前配置没有把候选的权限和评分端分开。这样候选在验证时可以影响同一解释器里的测试和判分。请让候选在受限进程运行，由独立可信端检查结果和写分，并补读写测试/评分目录被拒绝的反例。没有证据表明这批模型已经实际利用了这个漏洞。\n证据：tests/run_tests.ps1；environment/Dockerfile；task.toml\n\n2. 评分脚本会把基础设施故障当成普通失败。本轮用原状态映射代码和原聚合器做探针，验证依赖缺失导致一个测试都没收集到时，仍输出 VALID/0。请把这类故障保留为 INVALID、正式分数为空；只有完整有效执行后的功能失败才能记0。探针不是完整Docker实测，也不表示现有模型的0分都已证实是环境错误。\n证据：fault-probes/；tests/run_tests.ps1；tests/aggregate_results.ps1\n\n3. 部分测试没有真正验到题面要求：只检查 close 后拒绝新调用；close 前没有 pending read，未覆盖题面F的取消挂起读取和 cancelled 终态。；重复close路径没有挂起读取，不能补足题面F取消终态的覆盖。；场景是空队列timeout后再提交新读，没有验证超时期间已入队完成项不会被丢弃。 请补真实行为/终态断言，保留独立系统观测作为预期，再复验标准解、NOP、错误实现与等价实现。\n证据：tests/test_wciocp_semantics.py；deep-audit.json\n\n4. 本次附件里没有找到作者写测试之前的具体用例设计，以及可核验的造测可见会话，因此94项里的“先设计用例”和“没有看分数循环改测试”还不能判通过。请补原始可见消息/工具记录、时间顺序和预处理说明；不需要交隐藏思考或私密无关会话，也不能事后补写成旧记录。\n证据：inventory.json；author-evidence-audit.json\n\n5. 本轮真实Windows容器跑完三轮Oracle和三轮NOP后，第三轮NOP的 p2p-keys-distinguish-handles-on-one-port 失败：两次take没有交出第二个句柄的完成项，预期键0x22，实际为None。这个用例目前标为P2P，不能宣称基线三轮P2P稳定全过。请核对重复完成项的目标缺陷与用例分组，按真实功能修正/澄清后复验，不能删掉用例来凑通过。\n证据：local-controls/runs.json；local-controls/jobs/wfflab__wciocp-220-nop-3/；tests/test_wciocp_semantics.py:178\n\n本轮结论：需要返修（已确认缺陷）。状态保持不变。目录和原始主模型分差已检查；GLM/Kimi免跑，不因缺evidence/metadata、source.json或未pin digest驳回。",
+        [
+          {
+            "file_token": "DdqdbdLS1oyLPHx62Gbc1QaYnic",
+            "name": "oracle_nop_controls.png",
+            "size": 102420
+          }
+        ]
+      ]
+    ],
+    "field_id_list": [
+      "fldffCZZex",
+      "fld4L6XW9p",
+      "fld56Xs70o",
+      "flda4emMz7",
+      "fldd6UxkAs",
+      "fldFRWpFE1",
+      "fldg4yePGJ",
+      "fldIsqG5qU",
+      "fldiuFJbFr",
+      "fldlid4pGC",
+      "fldnki9xts",
+      "fldOv2xWDV",
+      "fldTBdxeDe",
+      "fldU9Zv4o6",
+      "fldvkmPVpM",
+      "fldWk8Ld9p",
+      "fldZI4BCU2"
+    ],
+    "field_type_list": [
+      "text",
+      "text",
+      "attachment",
+      "user",
+      "select",
+      "button",
+      "attachment",
+      "datetime",
+      "text",
+      "text",
+      "attachment",
+      "text",
+      "number",
+      "text",
+      "text",
+      "text",
+      "attachment"
+    ],
+    "fields": [
+      "文本",
+      "Qwen分数",
+      "质检通过截图",
+      "标注员",
+      "状态",
+      "提交/返修完成",
+      "分数截图",
+      "领取日期",
+      "题目方向",
+      "opus分数",
+      "作业压缩包",
+      "提示词",
+      "甲方ID",
+      "glm分数",
+      "Kimi分数",
+      "返修原因",
+      "oracle/nop截图"
+    ],
+    "has_more": false,
+    "record_id_list": [
+      "reczz28NUOrl6Foj"
+    ],
+    "rev": 4129,
+    "timezone": "Asia/Shanghai"
+  }
+}

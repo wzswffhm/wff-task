@@ -1,0 +1,278 @@
+diff --git a/wvas/_winapi.py b/wvas/_winapi.py
+index 82faf2f..a7e0888 100644
+--- a/wvas/_winapi.py
++++ b/wvas/_winapi.py
+@@ -1,13 +1,22 @@
+-"""ctypes bindings for the Win32 calls the auditor uses."""
++"""ctypes bindings for the Win32 calls the auditor uses.
++
++The module is importable everywhere so that the pure helpers of :mod:`wvas`
++(``protection_name`` / ``type_name``) keep working off-Windows. When the
++platform cannot provide the APIs, :data:`AVAILABLE` is ``False`` and the
++callers turn that into a ``WVasError`` of kind ``unsupported``.
++"""
+ 
+ import ctypes
+-import ctypes.wintypes as wt
++import sys
+ 
+-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+-psapi = ctypes.WinDLL("psapi", use_last_error=True)
++try:
++    import ctypes.wintypes as wt
++except (ImportError, ValueError):  # pragma: no cover - non Windows
++    wt = None
+ 
+ # ---- access rights ---------------------------------------------------------
+ PROCESS_QUERY_INFORMATION = 0x0400
++PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ PROCESS_VM_READ = 0x0010
+ 
+ # ---- region state ----------------------------------------------------------
+@@ -31,42 +40,208 @@ PAGE_EXECUTE_READWRITE = 0x40
+ PAGE_EXECUTE_WRITECOPY = 0x80
+ PAGE_GUARD = 0x100
+ 
+-
+-class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+-    """MEMORY_BASIC_INFORMATION, as declared by the platform SDK."""
+-
+-    _fields_ = [
+-        ("BaseAddress", ctypes.c_void_p),
+-        ("AllocationBase", ctypes.c_void_p),
+-        ("AllocationProtect", wt.DWORD),
+-        ("RegionSize", ctypes.c_size_t),
+-        ("State", wt.DWORD),
+-        ("Protect", wt.DWORD),
+-        ("Type", wt.DWORD),
++# ---- module enumeration ----------------------------------------------------
++LIST_MODULES_DEFAULT = 0x00
++LIST_MODULES_32BIT = 0x01
++LIST_MODULES_64BIT = 0x02
++LIST_MODULES_ALL = 0x03
++
++# ---- error codes -----------------------------------------------------------
++ERROR_FILE_NOT_FOUND = 2
++ERROR_ACCESS_DENIED = 5
++ERROR_INVALID_HANDLE = 6
++ERROR_INVALID_PARAMETER = 87
++ERROR_INSUFFICIENT_BUFFER = 122
++ERROR_PARTIAL_COPY = 299
++ERROR_FILE_INVALID = 1006
++
++STILL_ACTIVE = 259
++
++AVAILABLE = sys.platform == "win32" and wt is not None
++
++
++if AVAILABLE:
++
++    class MEMORY_BASIC_INFORMATION(ctypes.Structure):
++        """MEMORY_BASIC_INFORMATION, as declared by the platform SDK.
++
++        ``BaseAddress`` / ``AllocationBase`` are pointer sized and
++        ``RegionSize`` is ``SIZE_T``, so the structure describes the full
++        address width of the target on both 32 and 64 bit builds.
++        """
++
++        _fields_ = [
++            ("BaseAddress", ctypes.c_void_p),
++            ("AllocationBase", ctypes.c_void_p),
++            ("AllocationProtect", wt.DWORD),
++            ("__alignment1", wt.DWORD),
++            ("RegionSize", ctypes.c_size_t),
++            ("State", wt.DWORD),
++            ("Protect", wt.DWORD),
++            ("Type", wt.DWORD),
++            ("__alignment2", wt.DWORD),
++        ]
++
++    class SYSTEM_INFO(ctypes.Structure):
++        _fields_ = [
++            ("wProcessorArchitecture", wt.WORD),
++            ("wReserved", wt.WORD),
++            ("dwPageSize", wt.DWORD),
++            ("lpMinimumApplicationAddress", ctypes.c_void_p),
++            ("lpMaximumApplicationAddress", ctypes.c_void_p),
++            ("dwActiveProcessorMask", ctypes.c_void_p),
++            ("dwNumberOfProcessors", wt.DWORD),
++            ("dwProcessorType", wt.DWORD),
++            ("dwAllocationGranularity", wt.DWORD),
++            ("wProcessorLevel", wt.WORD),
++            ("wProcessorRevision", wt.WORD),
++        ]
++
++    class MODULEINFO(ctypes.Structure):
++        _fields_ = [
++            ("lpBaseOfDll", ctypes.c_void_p),
++            ("SizeOfImage", wt.DWORD),
++            ("EntryPoint", ctypes.c_void_p),
++        ]
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    try:
++        psapi = ctypes.WinDLL("psapi", use_last_error=True)
++    except OSError:  # pragma: no cover - psapi is always present
++        psapi = kernel32
++
++    OpenProcess = kernel32.OpenProcess
++    OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
++    OpenProcess.restype = wt.HANDLE
++
++    CloseHandle = kernel32.CloseHandle
++    CloseHandle.argtypes = [wt.HANDLE]
++    CloseHandle.restype = wt.BOOL
++
++    GetExitCodeProcess = kernel32.GetExitCodeProcess
++    GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
++    GetExitCodeProcess.restype = wt.BOOL
++
++    VirtualQueryEx = kernel32.VirtualQueryEx
++    VirtualQueryEx.argtypes = [
++        wt.HANDLE,
++        ctypes.c_void_p,
++        ctypes.POINTER(MEMORY_BASIC_INFORMATION),
++        ctypes.c_size_t,
+     ]
+-
+-
+-OpenProcess = kernel32.OpenProcess
+-OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+-OpenProcess.restype = wt.HANDLE
+-
+-CloseHandle = kernel32.CloseHandle
+-CloseHandle.argtypes = [wt.HANDLE]
+-CloseHandle.restype = wt.BOOL
+-
+-VirtualQueryEx = kernel32.VirtualQueryEx
+-VirtualQueryEx.argtypes = [
+-    wt.HANDLE,
+-    ctypes.c_void_p,
+-    ctypes.POINTER(MEMORY_BASIC_INFORMATION),
+-    ctypes.c_size_t,
+-]
+-VirtualQueryEx.restype = ctypes.c_size_t
+-
+-GetMappedFileNameW = psapi.GetMappedFileNameW
+-GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
+-GetMappedFileNameW.restype = wt.DWORD
+-
+-
+-def last_error():
+-    return ctypes.get_last_error()
++    VirtualQueryEx.restype = ctypes.c_size_t
++
++    GetNativeSystemInfo = kernel32.GetNativeSystemInfo
++    GetNativeSystemInfo.argtypes = [ctypes.POINTER(SYSTEM_INFO)]
++    GetNativeSystemInfo.restype = None
++
++    GetSystemInfo = kernel32.GetSystemInfo
++    GetSystemInfo.argtypes = [ctypes.POINTER(SYSTEM_INFO)]
++    GetSystemInfo.restype = None
++
++    QueryDosDeviceW = kernel32.QueryDosDeviceW
++    QueryDosDeviceW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
++    QueryDosDeviceW.restype = wt.DWORD
++
++    GetLogicalDriveStringsW = kernel32.GetLogicalDriveStringsW
++    GetLogicalDriveStringsW.argtypes = [wt.DWORD, wt.LPWSTR]
++    GetLogicalDriveStringsW.restype = wt.DWORD
++
++    GetMappedFileNameW = psapi.GetMappedFileNameW
++    GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
++    GetMappedFileNameW.restype = wt.DWORD
++
++    GetModuleFileNameExW = psapi.GetModuleFileNameExW
++    GetModuleFileNameExW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
++    GetModuleFileNameExW.restype = wt.DWORD
++
++    GetModuleInformation = psapi.GetModuleInformation
++    GetModuleInformation.argtypes = [
++        wt.HANDLE,
++        ctypes.c_void_p,
++        ctypes.POINTER(MODULEINFO),
++        wt.DWORD,
++    ]
++    GetModuleInformation.restype = wt.BOOL
++
++    try:
++        EnumProcessModulesEx = psapi.EnumProcessModulesEx
++        EnumProcessModulesEx.argtypes = [
++            wt.HANDLE,
++            ctypes.POINTER(ctypes.c_void_p),
++            wt.DWORD,
++            ctypes.POINTER(wt.DWORD),
++            wt.DWORD,
++        ]
++        EnumProcessModulesEx.restype = wt.BOOL
++    except AttributeError:  # pragma: no cover - very old platforms
++        EnumProcessModulesEx = None
++
++    def last_error():
++        return ctypes.get_last_error()
++
++    def set_last_error(value=0):
++        ctypes.set_last_error(value)
++
++else:  # pragma: no cover - non Windows
++
++    MEMORY_BASIC_INFORMATION = None
++    SYSTEM_INFO = None
++    MODULEINFO = None
++    kernel32 = None
++    psapi = None
++    OpenProcess = None
++    CloseHandle = None
++    GetExitCodeProcess = None
++    VirtualQueryEx = None
++    GetNativeSystemInfo = None
++    GetSystemInfo = None
++    QueryDosDeviceW = None
++    GetLogicalDriveStringsW = None
++    GetMappedFileNameW = None
++    GetModuleFileNameExW = None
++    GetModuleInformation = None
++    EnumProcessModulesEx = None
++
++    def last_error():
++        return 0
++
++    def set_last_error(value=0):
++        return None
++
++
++_POINTER_BITS = ctypes.sizeof(ctypes.c_void_p) * 8
++
++#: Upper bound used when nothing better can be learnt from the system.
++DEFAULT_MAX_ADDRESS = 0x7FFFFFFFFFFF if _POINTER_BITS == 64 else 0xFFFFFFFF
++
++
++def max_application_address():
++    """Highest address the auditor has to probe, inclusive."""
++    if not AVAILABLE:
++        return DEFAULT_MAX_ADDRESS
++    info = SYSTEM_INFO()
++    try:
++        GetNativeSystemInfo(ctypes.byref(info))
++    except Exception:  # pragma: no cover - defensive
++        try:
++            GetSystemInfo(ctypes.byref(info))
++        except Exception:
++            return DEFAULT_MAX_ADDRESS
++    highest = info.lpMaximumApplicationAddress or 0
++    if _POINTER_BITS == 64 and highest < DEFAULT_MAX_ADDRESS:
++        # A 64 bit auditor can be asked about a 64 bit target even when the
++        # reported maximum belongs to a narrower view of the address space.
++        highest = DEFAULT_MAX_ADDRESS
++    return highest or DEFAULT_MAX_ADDRESS
++
++
++def page_size():
++    if not AVAILABLE:
++        return 0x1000
++    info = SYSTEM_INFO()
++    try:
++        GetSystemInfo(ctypes.byref(info))
++    except Exception:  # pragma: no cover - defensive
++        return 0x1000
++    return info.dwPageSize or 0x1000

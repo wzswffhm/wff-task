@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(r"C:\Users\Administrator\Desktop\wff-task")
-PKG = ROOT / "harbor-windows" / "wfflab__wvas-216-v1.0.0-delivery"
+PKG = ROOT / "harbor-windows" / "wfflab__wvas-216-v1.0.1-delivery"
 BUILD = ROOT / "harbor-windows" / "_qc_runs" / "wvas-build"
 CONTROL_JOBS = BUILD / "controls" / "jobs"
 MODEL_JOBS = BUILD / "model-rounds" / "jobs"

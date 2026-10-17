@@ -116,6 +116,17 @@ DENY = ("format ", "rd /s", "rmdir /s", "del /f /s", "shutdown", "diskpart", "bc
 MAX_OBS = 24000
 MAX_WRITE = 400000
 
+# 中转端点(4router.net)在上游失败时返回 HTTP 200 + 一条纯文本告警：既不是空
+# content，也没有 tool_use。历史上这条文本被当成模型正常收工，于是 Opus 只走
+# 5 步就 end_turn，基础设施故障被记成模型 VALID/0。出现即按瞬时故障重试，
+# 重试耗尽后抛错，让该 job 直接失败(INVALID)而不是记一个假 0 分。
+RELAY_ERROR_MARKERS = (
+    "上游模型未返回任何内容",
+    "触发了安全策略",
+    "上游限流",
+    "请重试或简化输入后再试",
+)
+
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -452,12 +463,26 @@ class WindowsCodingModelAgent(BaseAgent):
                     blocks = (got["doc"] or {}).get("content") or []
                     texts = "".join(b.get("text") or "" for b in blocks if b.get("type") == "text")
                     tuses = [b for b in blocks if b.get("type") == "tool_use"]
-                    empty = (not tuses) and (not texts.strip()) and not (
-                        (got["doc"] or {}).get("usage") or {}).get("output_tokens")
-                    if empty and attempt < 6:
-                        log({"step": step, "kind": "upstream_empty_retry", "attempt": attempt})
-                        await asyncio.sleep(min(3 * attempt, 20))
-                        continue
+                    relay_error = (not tuses) and any(
+                        marker in texts for marker in RELAY_ERROR_MARKERS)
+                    # 中转有时返回 output_tokens=1 的"空回复"（stop_reason 为 null），
+                    # 用 not output_tokens 判不出来，必须按极小输出量兜底。实测 215 的
+                    # Opus#1 就是这样在第 15 步被截断、还被记成 VALID/0。
+                    tiny = (not tuses) and int(
+                        (got["doc"] or {}).get("usage", {}).get("output_tokens") or 0) < 10
+                    empty = relay_error or tiny or (
+                        (not tuses) and (not texts.strip()) and not (
+                            (got["doc"] or {}).get("usage") or {}).get("output_tokens"))
+                    if empty:
+                        if attempt < 6:
+                            log({"step": step, "kind": "upstream_empty_retry",
+                                 "attempt": attempt, "relay_error": relay_error,
+                                 "text": texts[:200]})
+                            await asyncio.sleep(min(3 * attempt, 20))
+                            continue
+                        raise RuntimeError(
+                            "upstream_empty_after_6_attempts: %s"
+                            % (texts[:200].strip() or "<empty>"))
                     break
                 if got is None:
                     raise RuntimeError("transport_error: %s" % last_err)

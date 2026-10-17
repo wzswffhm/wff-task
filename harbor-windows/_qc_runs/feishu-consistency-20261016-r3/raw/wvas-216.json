@@ -1,0 +1,115 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "data": [
+      [
+        "wfflab__wvas-216-v1.0.0-delivery.zip",
+        "2/3",
+        null,
+        [
+          {
+            "id": "ou_f4e4bc01ed9be1ef4cbaedcdf8f19d45",
+            "name": "wff"
+          }
+        ],
+        [
+          "返修待质检"
+        ],
+        null,
+        [
+          {
+            "file_token": "RFSHbI2mSoA5Cexqv9ickhAVnRf",
+            "name": "score_summary.png",
+            "size": 74258
+          }
+        ],
+        null,
+        "Windows/系统与内存管理（Windows 虚拟地址空间审计：VirtualQueryEx 完整 64 位地址宽度与 MEM_RESERVE 可见性、GetMappedFileNameW + QueryDosDeviceW 还原 DOS/UNC 路径）/Python/缺陷修复",
+        "3/3",
+        [
+          {
+            "file_token": "RWLzbe64voPantxxB0kcEUBMnph",
+            "name": "wfflab__wvas-216-v1.0.0-delivery.zip",
+            "size": 54420063
+          }
+        ],
+        "# wvas：进程虚拟地址空间审计实现有缺陷\n\n`wvas` 是采集端用来**审计本机进程虚拟地址空间**的只读包。给它一个进程 ID，\n它要报出这个进程当前占用了哪些地址区间、每段区间是什么状态、什么保护、\n多少长度，以及哪些区间背后是磁盘上的文件、文件在哪儿。\n\n支持工程师会把这些数字和自己的调试器对照，也会把报告里的映射文件路径直接\n贴进工单，让另一头的人打开。所以这个包的输出要么完全正确，要么毫无用处。\n\n本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。\n\n`docs/NOTES.md` 是当初写这个包时随手记的草稿，**已经和现在的实现对不上**，\n不要拿它当依据。\n\n## 现象（仓库 issue #216）\n\n1. **高地址全部对不上**。随便挑一个进程，把 `regions()` 报出来的 `base` 和\n   调试器/系统 API 在同一时刻给出的地址并排看，凡是高地址的区间都对不上，\n   报出来的数字明显偏小。\n2. **大区间的长度离谱**。目标进程专门保留了一段 6 GiB 的地址空间，\n   `regions()` 报出来的长度是个很小的数。\n3. **保留状态完全看不到**。无论目标进程做了多少次\n   `VirtualAlloc(..., MEM_RESERVE, ...)`，`regions()` 的结果里都不会出现\n   `state == \"reserve\"` 的区间；`include_reserved` 这个开关形同虚设。\n4. **映射文件路径没法用**。文件映射区间的 `path` 长这样：\n   `\\Device\\HarddiskVolume5\\Users\\...\\thing.dll`。把它贴进资源管理器打不开，\n   工单里的人也看不懂。\n5. **匿名映射被报成空文件名**。用 `CreateFileMapping(INVALID_HANDLE_VALUE, ...)`\n   建出来的匿名映射，`path` 是空字符串 `\"\"`，和\"没有文件背衬\"混为一谈。\n6. **进程不存在时抛裸异常**。pid 不存在时调用方收到的是 `OSError`，拿不到\n   `WVasError` 的错误分类。\n7. **模块列表严重重复**。`modules()` 会把同一个映像重复报上几百次。\n\n## 任务\n\n修复 `wvas` 包，使其满足下面的验收标准。公开 API 的名字和签名不得改变。\n\n## 验收标准\n\n### A. 区间描述\n\n`regions(pid, include_reserved=True)` 返回区间描述列表，按 `base` 升序排列。\n每个描述是一个字典，键恰好是：\n\n`base`、`size`、`state`、`type`、`protect`、`path`、`image`。\n\n取值要求：\n\n| 键 | 要求 |\n|---|---|\n| `base` | 区间起始地址，必须是**完整地址宽度**下的真值（64 位进程上的地址不得被截断到 32 位） |\n| `size` | 区间长度，同样不得截断：超过 4 GiB 的区间必须报出真实长度 |\n| `state` | `\"commit\"` 或 `\"reserve\"` |\n| `type` | `\"image\"`、`\"mapped\"` 或 `\"private\"` |\n| `protect` | `protection_name()` 给出的短名 |\n| `path` | 背衬该区间的文件路径；没有文件背衬、或者该文件无法还原成可打开路径时为 `None` |\n| `image` | 该区间是否属于已加载的映像（布尔） |\n\n`include_reserved=True` 时必须**同时**报出已提交区间和已保留区间；`include_reserved=False` 时只报已提交区间。\n\n对同一个进程、同一时刻，报出的 `base` / `size` 必须与系统 API\n（如 `VirtualQueryEx`）量到的结果逐个一致，不得有体系结构相关的取整或截断。\n\n### B. 文件背衬与路径\n\n1. `path` 必须是调用方**可以直接打开**的形式：DOS 盘符路径（`C:\\...`）或 UNC 路径（`\\\\server\\share\\...`）。任何 `\\Device\\...`、`\\??\\...`、`\\\\?\\...` 形式的前缀都算不合格。\n2. 文件映射区间的 `path` 必须等于该文件真实的磁盘路径。\n3. 没有文件背衬的区间（匿名映射、私有内存、保留内存），`path` 必须是 `None`，不得是空字符串或占位文本。\n4. `file_backed_regions(pid)` 返回 `regions(pid)` 中 `path` 不为 `None` 的\n   子集，顺序与 `regions()` 一致。\n\n### C. 模块清单\n\n`modules(pid)` 返回已加载的映像，按 `base` 升序；每个映像只出现一次，同一个文件路径不得重复出现，`path` 是映像文件真实的磁盘路径。\n\n清单必须是完整的：已加载的映像都要出现；如果某个映像的文件路径无法还原成\n调用方可直接打开的形式，该映像仍然必须出现，它的 `path` 允许为 `None`。\n\n### D. 错误分类\n\n所有失败路径都必须抛 `WVasError`，不得把 `OSError` 泄漏给调用方：\n\n| 情形 | `kind` |\n|---|---|\n| pid 不是有效的进程 ID（负数等） | `badarg` |\n| 进程不存在 | `no-such-process` |\n| 进程存在但无权打开 | `access-denied` |\n| 目标平台不支持该查询 | `unsupported` |\n| 查询本身失败 | `query-failed` |\n\n### E. 边界与回归\n\n1. `protection_name()`、`type_name()` 保持纯函数语义：只做常量到短名的映射，\n   不查任何进程。\n2. `C:\\testbed\\tests\\test_wvas_basic.py` 是当前可见的冒烟用例，必须继续全部\n   通过；不要为了通过它而改动它。\n3. 允许使用 `ctypes` 调用系统 API；不得引入标准库以外的依赖，不得联网。\n\n## 运行入口\n\n自测：\n\n```\npython -m pytest tests -q\n```\n\n评测用的行为用例由评测侧注入，不在 `C:\\testbed` 内，且会**另起一个目标进程**\n独立测量：它不会采信 `wvas` 自己报出的任何数字。地址空间审计必须对任意进程\n成立，不能只对当前进程成立。",
+        11,
+        null,
+        null,
+        "【2026-10-16 本轮质检】\n1. 现在包里的 Task 校验值和12份原始运行记录对不上，现有模型分数还不能直接证明这个交付版本已完成同版本跑分。请保留旧日志，提供可核验的原冻结资产与当前改动对应关系；按当前严格版本规则重新交付时，环境有改动需升版并用新版本的正式记录闭合，不能手改旧日志中的Hash。\n证据：normalized-jobs.json；delivery-layout.json；deep-audit.json\n\n2. 测试把候选模块和隐藏测试一起放进同一个 pytest 进程执行，当前配置没有把候选的权限和评分端分开。这样候选在验证时可以影响同一解释器里的测试和判分。请让候选在受限进程运行，由独立可信端检查结果和写分，并补读写测试/评分目录被拒绝的反例。没有证据表明这批模型已经实际利用了这个漏洞。\n证据：tests/run_tests.ps1；environment/Dockerfile；task.toml\n\n3. 评分脚本会把基础设施故障当成普通失败。本轮用原状态映射代码和原聚合器做探针，独立fixture在setup阶段报错时，仍输出 VALID/0。请把这类故障保留为 INVALID、正式分数为空；只有完整有效执行后的功能失败才能记0。探针不是完整Docker实测，也不表示现有模型的0分都已证实是环境错误。\n证据：fault-probes/；tests/run_tests.ps1；tests/aggregate_results.ps1\n\n4. 部分测试没有真正验到题面要求：只检查返回项属于 regions，没有检查非空背衬项是否全部返回。原断言探针：regions 有背衬项、file_backed_regions=[] 仍 PASS，违反题面 B.4。 请补真实行为/终态断言，保留独立系统观测作为预期，再复验标准解、NOP、错误实现与等价实现。\n证据：tests/test_wvas_semantics.py；fault-probes/\n\n5. 本次附件里没有找到作者写测试之前的具体用例设计，以及可核验的造测可见会话，因此94项里的“先设计用例”和“没有看分数循环改测试”还不能判通过。请补原始可见消息/工具记录、时间顺序和预处理说明；不需要交隐藏思考或私密无关会话，也不能事后补写成旧记录。\n证据：inventory.json；author-evidence-audit.json\n\n本轮结论：需要返修（已确认缺陷）。状态保持不变。目录和原始主模型分差已检查；GLM/Kimi免跑，不因缺evidence/metadata、source.json或未pin digest驳回。",
+        [
+          {
+            "file_token": "AJQjbnTgsoWVrcxYRqZcOpA3nwc",
+            "name": "oracle_nop_controls.png",
+            "size": 102505
+          }
+        ]
+      ]
+    ],
+    "field_id_list": [
+      "fldffCZZex",
+      "fld4L6XW9p",
+      "fld56Xs70o",
+      "flda4emMz7",
+      "fldd6UxkAs",
+      "fldFRWpFE1",
+      "fldg4yePGJ",
+      "fldIsqG5qU",
+      "fldiuFJbFr",
+      "fldlid4pGC",
+      "fldnki9xts",
+      "fldOv2xWDV",
+      "fldTBdxeDe",
+      "fldU9Zv4o6",
+      "fldvkmPVpM",
+      "fldWk8Ld9p",
+      "fldZI4BCU2"
+    ],
+    "field_type_list": [
+      "text",
+      "text",
+      "attachment",
+      "user",
+      "select",
+      "button",
+      "attachment",
+      "datetime",
+      "text",
+      "text",
+      "attachment",
+      "text",
+      "number",
+      "text",
+      "text",
+      "text",
+      "attachment"
+    ],
+    "fields": [
+      "文本",
+      "Qwen分数",
+      "质检通过截图",
+      "标注员",
+      "状态",
+      "提交/返修完成",
+      "分数截图",
+      "领取日期",
+      "题目方向",
+      "opus分数",
+      "作业压缩包",
+      "提示词",
+      "甲方ID",
+      "glm分数",
+      "Kimi分数",
+      "返修原因",
+      "oracle/nop截图"
+    ],
+    "has_more": false,
+    "record_id_list": [
+      "reczz28KQU8reW2k"
+    ],
+    "rev": 4129,
+    "timezone": "Asia/Shanghai"
+  }
+}

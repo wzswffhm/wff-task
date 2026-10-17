@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(r"C:\Users\Administrator\Desktop\wff-task")
-PKG = ROOT / "harbor-windows" / "wfflab__wsparse-215-v1.0.0-delivery"
+PKG = ROOT / "harbor-windows" / "wfflab__wsparse-215-v1.0.1-delivery"
 BUILD = ROOT / "harbor-windows" / "_qc_runs" / "wsparse-build"
 CONTROL_JOBS = BUILD / "controls" / "jobs"
 MODEL_JOBS = BUILD / "model-rounds" / "jobs"

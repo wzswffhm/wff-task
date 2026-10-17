@@ -1,0 +1,20 @@
+{
+  "alias": "opus",
+  "model": "claude-opus-5",
+  "label": "opus",
+  "protocol": "anthropic",
+  "base_url": "https://4router.net",
+  "auth": "x-api-key",
+  "runner": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wvas-build\\harbor_agent\\wvas_model_agent.py",
+  "runner_sha256": "e5b06376a70a44944f9228cc88d2b1cc9da4671a0c06d67092717a3f5dcd10eb",
+  "steps": 30,
+  "submitted": true,
+  "submit_summary": "修复 `wvas` 包的地址空间审计实现，只改了 `wvas/_winapi.py` 和 `wvas/vas.py`，公开 API 的名字和签名未变。\n\n`_winapi.py`\n- `MEMORY_BASIC_INFORMATION` 原来缺两个对齐填充字段，在 64 位下布局错位，`RegionSize`/`State`/`Protect`/`Type` 全都读错位置。补上 `__alignment1/2`，并为 32 位解释器保留无填充的变体。\n- 新增所需入口：`GetNativeSystemInfo`、`GetLogicalDriveStringsW`、`QueryDosDeviceW`、`EnumProcessModulesEx`、`GetModuleFileNameExW`、`GetModuleInformation`、`GetExitCodeProcess`，以及错误码/`LIST_MODULES_*`/`STILL_ACTIVE` 常量。\n- 用显式标量别名替代 `ctypes.wintypes`，并把 DLL 加载包进 try，非 Windows 下只是 `AVAILABLE=False` 而不是 import 就炸。\n\n`vas.py`\n- 去掉 `base`/`size` 上的 `& 0xFFFFFFFF`，按系统原值报出。高地址和 6 GiB 区间现在都正确。\n- `regions()` 按 `include_reserved` 同时收集 `MEM_COMMIT` 和 `MEM_RESERVE`，`state` 相应给出 `\"commit\"`/`\"reserve\"`。\n- 路径还原：按逻辑盘符建立 `\\Device\\...` → 盘符映射，并处理 `\\??\\`、`\\\\?\\`、`UNC\\`、MUP/LanmanRedirector 网络路径；无法还原成可打开形式时返回 `None`。匿名映射（`GetMappedFileNameW` 失败）现在是 `None` 而不是 `\"\"`。路径缓冲按 32767 字符上限增长，不再截断长路径。按 `AllocationBase` 缓存查询结果。\n- `file_backed_regions()` 判据改为 `path is not None`。\n- 错误分类：`_open_process` 不再抛裸 `OSError`，按 `ERROR_INVALID_PARAMETER` → `no-such-process`、`ERROR_ACCESS_DENIED` → `access-denied`（先尝试逐级降级的访问权限）分类；查询失败路径用 `GetExitCodeProcess` 区分\"进程已退出\"与\"无权读取\"，其余为 `query-failed`；非 Windows 为 `unsupported`。\n- `modules()` 不再对每个区间产出一条（原来同一映像重复几百次）：以 `AllocationBase` 聚合映像区间，再用 loader 的 `EnumProcessModulesEx` 补齐路径与镜像大小，按路径去重，按 `base` 升序；无法还原路径的映像仍然出现，`path` 为 `None`。\n- `protection_name()`/`type_name()` 保持纯函数，未改语义。\n- 遍历上界改为 `GetNativeSystemInfo` 的 `lpMaximumApplicationAddress`。\n\n验证：`python -m pytest tests -q` 8 项全通过。另外用临时脚本起了一个独立目标进程（预留 6 GiB、匿名映射、文件映射），与 `VirtualQueryEx` 独立量测逐条对比：218 个区间的 base/size 完全一致，6 GiB 预留长度精确、state 为 reserve，匿名映射 path 为 None，文件映射 path 等于真实磁盘路径（`os.path.samefile` 通过），无 `\\Device`/`\\??\\` 前缀、无空串路径、所有路径 `os.path.exists` 为真，模块列表 26 条且路径唯一、无遗漏映像，已退出 pid 抛 `no-such-process`。验证脚本已删除，工作区只剩这两个文件的改动。",
+  "input_tokens": 1,
+  "output_tokens": 28012,
+  "elapsed_sec": 958.25,
+  "last_stop_reason": "tool_use",
+  "workspace": "C:\\testbed",
+  "trajectory": "C:\\Users\\Administrator\\Desktop\\wff-task\\harbor-windows\\_qc_runs\\wvas-build\\model-rounds\\jobs\\model-opus-4\\wfflab__wvas-216-v1.0.1-delivery__7UjCmHo\\agent\\trajectory.jsonl",
+  "completed_at_utc": "2026-10-16T16:32:00.080053+00:00"
+}

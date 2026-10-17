@@ -1,0 +1,115 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "data": [
+      [
+        "wfflab__wcancel-219-v1.0.0-delivery.zip",
+        "1/3",
+        null,
+        [
+          {
+            "id": "ou_f4e4bc01ed9be1ef4cbaedcdf8f19d45",
+            "name": "wff"
+          }
+        ],
+        [
+          "返修待质检"
+        ],
+        null,
+        [
+          {
+            "file_token": "LFFpb7HSdokdPzxRJBAcV28Znne",
+            "name": "score_summary.png",
+            "size": 73328
+          }
+        ],
+        null,
+        "Windows/异步 I/O 与内核同步（重叠 I/O 精确取消：CancelIoEx 按 OVERLAPPED 精确定位且可跨线程、GetOverlappedResult 终态码 995/996/1168、CancelIo 的线程级局限、FILE_FLAG_OVERLAPPED 能力判定）/Python/缺陷修复",
+        "3/3",
+        [
+          {
+            "file_token": "SxwFblbU7oP9dfxGj4ucaMiGnJh",
+            "name": "wfflab__wcancel-219-v1.0.0-delivery.zip",
+            "size": 54420405
+          }
+        ],
+        "# wcancel：挂起的异步读取无法精确取消\n\n`wcancel` 是我们采集器的**异步读取层**。大文件会被切成多个重叠（后台）读取请求并行下发，读到一个分片就交付给下游；用户在界面上取消某一个分片时，只有那一个请求应该停下来，其余的必须照常把数据取回来。\n\n## 目标平台（范围声明）\n\n本任务的目标平台是真实的 Windows，验收不使用其他操作系统，也不需要实现其他操作系统的版本。\n\n`wcancel` 的验收建立在真实 Windows 异步 I/O 的取消语义上：「只停掉被点名的那个请求」必须在内核里**真的成立**，评测器会自己持有对象、自己发起挂起读取、自己从另一个线程发起取消，并以内核报告的终态为准，**不采信** `wcancel` 自己的返回值。\n\n跨平台兼容（POSIX 的 `aio_cancel`、`io_uring` 之类）不在验收范围内，也不构成替代实现。\n\n## 现象（仓库 issue #219）\n\n1. **取消一个，停一片**：界面上取消某一个分片，结果同一批下发的读取全部被中止，下游拿到一半数据就断了。\n2. **换个线程取消就静默失效**：负责取消的是另一个工作线程，调用看起来返回成功，但请求还在那儿挂着，直到超时才报错。\n3. **分不清「取消」和「失败」**：被取消的请求最终以一种普通的 I/O 错误抛出来，调用方无法把它和真正的读失败区分开，于是把用户主动取消记成了故障。\n4. **取消已经读完的请求也报成功**：请求其实早就完成了，取消照样返回成功，调用方以为数据被丢弃了。\n5. **不支持时不报错**：在不支持后台读取的对象上，模块不报错，退化成同步读取，调用方以为取消能力存在。\n\n## 任务\n\n修复 `wcancel` 包，使其满足下列验收标准。`docs/NOTES.md` 是早期草稿，与 Windows 的实际语义已经不一致，请以本说明的验收标准为准。\n\n## 验收标准\n\n### A. 精确取消（硬门槛）\n\n- `cancel(request)` 必须**只**停止 `request` 指向的那一个挂起请求。\n- 同一个对象上由本模块提交的**其它**挂起请求不得受影响：它们必须仍然能够正常完成，并交出与写入内容一致的字节。\n- `cancel_all(handle)` 是唯一允许成批停止的入口，它返回被它停止的请求数量。\n\n### B. 取消必须跨线程生效\n\n- 从**任意线程**调用 `cancel(request)` 都必须真的停止那个请求；不得出现「返回成功但请求仍在挂起」的情况。\n\n### C. 被取消的请求有独立终态\n\n- `wait(request)` 对收到取消的请求必须产出 `status == \"cancelled\"`，`bytes_read` 反映实际完成的字节数。\n- 被取消不得等同于普通 I/O 失败：不得以 `WCancelError(kind=\"os\")` 之类的形式上报取消。\n\n### D. 不得谎报取消\n\n- 只有确实发出了取消（请求当时仍挂起）才返回 `True`。\n- 对**已经完成**的请求调用 `cancel(request)` 必须返回 `False`；对同一个请求重复调用取消，第二次也必须返回 `False`。\n\n### E. 能力判定\n\n- 对不支持重叠读取的对象，`submit()` 必须抛出 `WCancelError`，且 `err.kind == \"unsupported\"`；不得静默退化成同步读取。\n\n### F. 错误分类\n\n- 参数或句柄不可用时抛 `WCancelError(kind=\"badarg\")`；底层调用失败抛 `WCancelError(kind=\"os\")`；`wait()` 等待超时抛 `WCancelError(kind=\"timeout\")`。\n- 不得出现静默成功，也不得只抛出无分类的 `OSError`。\n\n### G. 不得回归\n\n- 可见冒烟测试 `tests/test_wcancel_basic.py` 必须继续通过。\n- 公开 API 的名称与签名保持不变（`submit` / `cancel` / `cancel_all` / `wait` / `Request` / `Completion` / `WCancelError`）。\n\n## 提交\n\n直接修改 `wcancel/` 下的源码即可，无需改测试文件。\n",
+        null,
+        null,
+        null,
+        "【2026-10-16 本轮质检】\n1. 测试把候选模块和隐藏测试一起放进同一个 pytest 进程执行，当前配置没有把候选的权限和评分端分开。这样候选在验证时可以影响同一解释器里的测试和判分。请让候选在受限进程运行，由独立可信端检查结果和写分，并补读写测试/评分目录被拒绝的反例。没有证据表明这批模型已经实际利用了这个漏洞。\n证据：tests/run_tests.ps1；environment/Dockerfile；task.toml\n\n2. 评分脚本会把基础设施故障当成普通失败。本轮用原状态映射代码和原聚合器做探针，验证依赖缺失导致一个测试都没收集到时，仍输出 VALID/0。请把这类故障保留为 INVALID、正式分数为空；只有完整有效执行后的功能失败才能记0。探针不是完整Docker实测，也不表示现有模型的0分都已证实是环境错误。\n证据：fault-probes/；tests/run_tests.ps1；tests/aggregate_results.ps1\n\n3. 部分测试没有真正验到题面要求：只验取消数量及没有 timeout，没有要求 cancelled 终态。原断言探针中 wait 返回 completed 仍PASS，未验证题面所需真实取消。 请补真实行为/终态断言，保留独立系统观测作为预期，再复验标准解、NOP、错误实现与等价实现。\n证据：tests/test_wcancel_semantics.py；fault-probes/\n\n4. 本次附件里没有找到作者写测试之前的具体用例设计，以及可核验的造测可见会话，因此94项里的“先设计用例”和“没有看分数循环改测试”还不能判通过。请补原始可见消息/工具记录、时间顺序和预处理说明；不需要交隐藏思考或私密无关会话，也不能事后补写成旧记录。\n证据：inventory.json；author-evidence-audit.json\n\n本轮结论：需要返修（已确认缺陷）。状态保持不变。目录和原始主模型分差已检查；GLM/Kimi免跑，不因缺evidence/metadata、source.json或未pin digest驳回。",
+        [
+          {
+            "file_token": "QPnmbxZZZoTLoXxU7uPcGQ9Qnhg",
+            "name": "oracle_nop_controls.png",
+            "size": 99593
+          }
+        ]
+      ]
+    ],
+    "field_id_list": [
+      "fldffCZZex",
+      "fld4L6XW9p",
+      "fld56Xs70o",
+      "flda4emMz7",
+      "fldd6UxkAs",
+      "fldFRWpFE1",
+      "fldg4yePGJ",
+      "fldIsqG5qU",
+      "fldiuFJbFr",
+      "fldlid4pGC",
+      "fldnki9xts",
+      "fldOv2xWDV",
+      "fldTBdxeDe",
+      "fldU9Zv4o6",
+      "fldvkmPVpM",
+      "fldWk8Ld9p",
+      "fldZI4BCU2"
+    ],
+    "field_type_list": [
+      "text",
+      "text",
+      "attachment",
+      "user",
+      "select",
+      "button",
+      "attachment",
+      "datetime",
+      "text",
+      "text",
+      "attachment",
+      "text",
+      "number",
+      "text",
+      "text",
+      "text",
+      "attachment"
+    ],
+    "fields": [
+      "文本",
+      "Qwen分数",
+      "质检通过截图",
+      "标注员",
+      "状态",
+      "提交/返修完成",
+      "分数截图",
+      "领取日期",
+      "题目方向",
+      "opus分数",
+      "作业压缩包",
+      "提示词",
+      "甲方ID",
+      "glm分数",
+      "Kimi分数",
+      "返修原因",
+      "oracle/nop截图"
+    ],
+    "has_more": false,
+    "record_id_list": [
+      "reczz28N2IGu9XmA"
+    ],
+    "rev": 4129,
+    "timezone": "Asia/Shanghai"
+  }
+}

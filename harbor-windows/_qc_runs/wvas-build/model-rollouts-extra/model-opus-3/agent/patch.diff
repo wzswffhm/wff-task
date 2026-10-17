@@ -1,0 +1,216 @@
+diff --git a/wvas/_winapi.py b/wvas/_winapi.py
+index 82faf2f..dd499b3 100644
+--- a/wvas/_winapi.py
++++ b/wvas/_winapi.py
+@@ -1,13 +1,21 @@
+-"""ctypes bindings for the Win32 calls the auditor uses."""
++"""ctypes bindings for the Win32 calls the auditor uses.
++
++The module stays importable on platforms that do not have the Win32 API; in
++that case :data:`AVAILABLE` is false and the callers in :mod:`wvas.vas` turn
++the situation into a ``WVasError`` of kind ``unsupported``.
++"""
+ 
+ import ctypes
+-import ctypes.wintypes as wt
++import sys
+ 
+-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+-psapi = ctypes.WinDLL("psapi", use_last_error=True)
++try:  # pragma: no cover - exercised only on non-Windows hosts
++    import ctypes.wintypes as wt
++except (ImportError, ValueError):  # pragma: no cover
++    wt = None
+ 
+ # ---- access rights ---------------------------------------------------------
+ PROCESS_QUERY_INFORMATION = 0x0400
++PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ PROCESS_VM_READ = 0x0010
+ 
+ # ---- region state ----------------------------------------------------------
+@@ -31,41 +39,151 @@ PAGE_EXECUTE_READWRITE = 0x40
+ PAGE_EXECUTE_WRITECOPY = 0x80
+ PAGE_GUARD = 0x100
+ 
+-
+-class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+-    """MEMORY_BASIC_INFORMATION, as declared by the platform SDK."""
+-
+-    _fields_ = [
+-        ("BaseAddress", ctypes.c_void_p),
+-        ("AllocationBase", ctypes.c_void_p),
+-        ("AllocationProtect", wt.DWORD),
+-        ("RegionSize", ctypes.c_size_t),
+-        ("State", wt.DWORD),
+-        ("Protect", wt.DWORD),
+-        ("Type", wt.DWORD),
++# ---- module enumeration ----------------------------------------------------
++LIST_MODULES_DEFAULT = 0x00
++LIST_MODULES_32BIT = 0x01
++LIST_MODULES_64BIT = 0x02
++LIST_MODULES_ALL = 0x03
++
++# ---- error codes -----------------------------------------------------------
++ERROR_SUCCESS = 0
++ERROR_FILE_NOT_FOUND = 2
++ERROR_ACCESS_DENIED = 5
++ERROR_INVALID_HANDLE = 6
++ERROR_INVALID_PARAMETER = 87
++ERROR_INSUFFICIENT_BUFFER = 122
++ERROR_INVALID_ADDRESS = 487
++ERROR_PARTIAL_COPY = 299
++ERROR_FILE_INVALID = 1006
++ERROR_NOACCESS = 998
++
++AVAILABLE = sys.platform == "win32" and wt is not None
++
++kernel32 = None
++psapi = None
++
++if AVAILABLE:
++    try:
++        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++        psapi = ctypes.WinDLL("psapi", use_last_error=True)
++    except (OSError, AttributeError):  # pragma: no cover
++        AVAILABLE = False
++
++
++if AVAILABLE:
++
++    class MEMORY_BASIC_INFORMATION(ctypes.Structure):
++        """MEMORY_BASIC_INFORMATION, as declared by the platform SDK.
++
++        ``BaseAddress``/``AllocationBase`` are kept as ``c_void_p`` and
++        ``RegionSize`` as ``c_size_t`` so that the full pointer width of the
++        host is preserved; truncating either one to 32 bits would misreport
++        every high address and every reservation larger than 4 GiB.
++        """
++
++        _fields_ = [
++            ("BaseAddress", ctypes.c_void_p),
++            ("AllocationBase", ctypes.c_void_p),
++            ("AllocationProtect", wt.DWORD),
++            ("RegionSize", ctypes.c_size_t),
++            ("State", wt.DWORD),
++            ("Protect", wt.DWORD),
++            ("Type", wt.DWORD),
++        ]
++
++    class SYSTEM_INFO(ctypes.Structure):
++        _fields_ = [
++            ("wProcessorArchitecture", wt.WORD),
++            ("wReserved", wt.WORD),
++            ("dwPageSize", wt.DWORD),
++            ("lpMinimumApplicationAddress", ctypes.c_void_p),
++            ("lpMaximumApplicationAddress", ctypes.c_void_p),
++            ("dwActiveProcessorMask", ctypes.c_void_p),
++            ("dwNumberOfProcessors", wt.DWORD),
++            ("dwProcessorType", wt.DWORD),
++            ("dwAllocationGranularity", wt.DWORD),
++            ("wProcessorLevel", wt.WORD),
++            ("wProcessorRevision", wt.WORD),
++        ]
++
++    class MODULEINFO(ctypes.Structure):
++        _fields_ = [
++            ("lpBaseOfDll", ctypes.c_void_p),
++            ("SizeOfImage", wt.DWORD),
++            ("EntryPoint", ctypes.c_void_p),
++        ]
++
++    OpenProcess = kernel32.OpenProcess
++    OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
++    OpenProcess.restype = wt.HANDLE
++
++    CloseHandle = kernel32.CloseHandle
++    CloseHandle.argtypes = [wt.HANDLE]
++    CloseHandle.restype = wt.BOOL
++
++    VirtualQueryEx = kernel32.VirtualQueryEx
++    VirtualQueryEx.argtypes = [
++        wt.HANDLE,
++        ctypes.c_void_p,
++        ctypes.POINTER(MEMORY_BASIC_INFORMATION),
++        ctypes.c_size_t,
+     ]
+-
+-
+-OpenProcess = kernel32.OpenProcess
+-OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+-OpenProcess.restype = wt.HANDLE
+-
+-CloseHandle = kernel32.CloseHandle
+-CloseHandle.argtypes = [wt.HANDLE]
+-CloseHandle.restype = wt.BOOL
+-
+-VirtualQueryEx = kernel32.VirtualQueryEx
+-VirtualQueryEx.argtypes = [
+-    wt.HANDLE,
+-    ctypes.c_void_p,
+-    ctypes.POINTER(MEMORY_BASIC_INFORMATION),
+-    ctypes.c_size_t,
+-]
+-VirtualQueryEx.restype = ctypes.c_size_t
+-
+-GetMappedFileNameW = psapi.GetMappedFileNameW
+-GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
+-GetMappedFileNameW.restype = wt.DWORD
++    VirtualQueryEx.restype = ctypes.c_size_t
++
++    GetSystemInfo = kernel32.GetSystemInfo
++    GetSystemInfo.argtypes = [ctypes.POINTER(SYSTEM_INFO)]
++    GetSystemInfo.restype = None
++
++    QueryDosDeviceW = kernel32.QueryDosDeviceW
++    QueryDosDeviceW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
++    QueryDosDeviceW.restype = wt.DWORD
++
++    GetLogicalDriveStringsW = kernel32.GetLogicalDriveStringsW
++    GetLogicalDriveStringsW.argtypes = [wt.DWORD, wt.LPWSTR]
++    GetLogicalDriveStringsW.restype = wt.DWORD
++
++    GetMappedFileNameW = psapi.GetMappedFileNameW
++    GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
++    GetMappedFileNameW.restype = wt.DWORD
++
++    EnumProcessModulesEx = psapi.EnumProcessModulesEx
++    EnumProcessModulesEx.argtypes = [
++        wt.HANDLE,
++        ctypes.POINTER(wt.HMODULE),
++        wt.DWORD,
++        ctypes.POINTER(wt.DWORD),
++        wt.DWORD,
++    ]
++    EnumProcessModulesEx.restype = wt.BOOL
++
++    GetModuleFileNameExW = psapi.GetModuleFileNameExW
++    GetModuleFileNameExW.argtypes = [wt.HANDLE, wt.HMODULE, wt.LPWSTR, wt.DWORD]
++    GetModuleFileNameExW.restype = wt.DWORD
++
++    GetModuleInformation = psapi.GetModuleInformation
++    GetModuleInformation.argtypes = [
++        wt.HANDLE,
++        wt.HMODULE,
++        ctypes.POINTER(MODULEINFO),
++        wt.DWORD,
++    ]
++    GetModuleInformation.restype = wt.BOOL
++
++else:  # pragma: no cover - placeholders so that imports never explode
++
++    MEMORY_BASIC_INFORMATION = None
++    SYSTEM_INFO = None
++    MODULEINFO = None
++    OpenProcess = None
++    CloseHandle = None
++    VirtualQueryEx = None
++    GetSystemInfo = None
++    QueryDosDeviceW = None
++    GetLogicalDriveStringsW = None
++    GetMappedFileNameW = None
++    EnumProcessModulesEx = None
++    GetModuleFileNameExW = None
++    GetModuleInformation = None
+ 
+ 
+ def last_error():

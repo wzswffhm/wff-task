@@ -1,0 +1,1995 @@
+diff --git a/probe_tmp.py b/probe_tmp.py
+new file mode 100644
+index 0000000..bbd1593
+--- /dev/null
++++ b/probe_tmp.py
+@@ -0,0 +1,125 @@
++import ctypes
++import os
++import tempfile
++from ctypes import wintypes as W
++
++k = ctypes.WinDLL("kernel32", use_last_error=True)
++k.CreateFileW.restype = ctypes.c_void_p
++k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p, W.DWORD, W.DWORD, ctypes.c_void_p]
++k.DeviceIoControl.restype = W.BOOL
++k.DeviceIoControl.argtypes = [ctypes.c_void_p, W.DWORD, ctypes.c_void_p, W.DWORD, ctypes.c_void_p, W.DWORD, ctypes.POINTER(W.DWORD), ctypes.c_void_p]
++k.GetCompressedFileSizeW.restype = W.DWORD
++k.GetCompressedFileSizeW.argtypes = [W.LPCWSTR, ctypes.POINTER(W.DWORD)]
++k.SetFilePointerEx.argtypes = [ctypes.c_void_p, W.LARGE_INTEGER, ctypes.POINTER(W.LARGE_INTEGER), W.DWORD]
++k.SetFilePointerEx.restype = W.BOOL
++k.SetEndOfFile.argtypes = [ctypes.c_void_p]
++k.SetEndOfFile.restype = W.BOOL
++k.FlushFileBuffers.argtypes = [ctypes.c_void_p]
++k.FlushFileBuffers.restype = W.BOOL
++
++
++class R(ctypes.Structure):
++    _fields_ = [("FileOffset", W.LARGE_INTEGER), ("Length", W.LARGE_INTEGER)]
++
++
++def compressed(p):
++    lo = W.DWORD(0)
++    v = k.GetCompressedFileSizeW(p, ctypes.byref(lo))
++    return (lo.value << 32) | v
++
++
++def ranges_of(p, length):
++    h = k.CreateFileW(p, 0x80000000, 7, None, 3, 0x80, None)
++    q = R()
++    q.FileOffset = 0
++    q.Length = length
++    out = (R * 8)()
++    ret = W.DWORD(0)
++    ok = k.DeviceIoControl(h, 0x940CF, ctypes.byref(q), ctypes.sizeof(q), out, ctypes.sizeof(out), ctypes.byref(ret), None)
++    n = ret.value // ctypes.sizeof(R)
++    res = [(out[i].FileOffset, out[i].Length) for i in range(n)]
++    k.FlushFileBuffers(h)
++    k.CloseHandle(h)
++    return ok, res
++
++
++def preallocate(p, size):
++    h = k.CreateFileW(p, 0xC0000000, 7, None, 4, 0x80, None)
++    k.DeviceIoControl(h, 0x900C4, ctypes.byref(W.BOOL(True)), 4, None, 0, ctypes.byref(W.DWORD(0)), None)
++    k.SetFilePointerEx(h, W.LARGE_INTEGER(size), None, 0)
++    k.SetEndOfFile(h)
++    k.FlushFileBuffers(h)
++    k.CloseHandle(h)
++
++
++d = tempfile.mkdtemp()
++
++for label, size, writes in (
++    ("64MiB-two-writes", 64 * 1024 * 1024, [(1024, b"payload-one"), (32 * 1024 * 1024, b"payload-two")]),
++    ("1GiB-no-writes", 1 << 30, []),
++):
++    p = os.path.join(d, label + ".bin")
++    preallocate(p, size)
++    print("[%s] pre: attrs %s size %d compressed %d ranges %s" % (label, oct(k.GetFileAttributesW(p)), os.path.getsize(p), compressed(p), ranges_of(p, size)))
++    if writes:
++        with open(p, "r+b") as f:
++            for off, data in writes:
++                f.seek(off)
++                f.write(data)
++        print("[%s] post-python-write: compressed %d ranges %s" % (label, compressed(p), ranges_of(p, size)))
++        h = k.CreateFileW(p, 0x80000000, 7, None, 3, 0x80, None)
++        k.FlushFileBuffers(h)
++        k.CloseHandle(h)
++        print("[%s] after FlushFileBuffers: compressed %d ranges %s" % (label, compressed(p), ranges_of(p, size)))
++        with open(p, "rb") as f:
++            f.seek(writes[0][0])
++            print("[%s] readback %r" % (label, f.read(len(writes[0][1]))))
++            f.seek(size - 100)
++            print("[%s] tail zeros %r" % (label, f.read(100)[:20]))
++    print()
++
++# dense 64 MiB via normal python write
++p = os.path.join(d, "dense64.bin")
++with open(p, "wb") as f:
++    f.write(b"z" * (64 * 1024 * 1024))
++print("[dense64] size", os.path.getsize(p), "compressed", compressed(p), "ranges", ranges_of(p, 64 * 1024 * 1024))
++
++# dense 1GiB via our preallocate then sparse off? (sequential semantics test)
++p = os.path.join(d, "dense_then_sparse.bin")
++with open(p, "wb") as f:
++    f.write(b"z" * (2 * 1024 * 1024))
++print("[dense->sparse] before:", os.path.getsize(p), compressed(p), oct(k.GetFileAttributesW(p)))
++h = k.CreateFileW(p, 0xC0000000, 7, None, 3, 0x80, None)
++ok = k.DeviceIoControl(h, 0x900C4, ctypes.byref(W.BOOL(True)), 4, None, 0, ctypes.byref(W.DWORD(0)), None)
++print("[dense->sparse] SET_SPARSE ok", ok, "err", ctypes.get_last_error())
++k.CloseHandle(h)
++print("[dense->sparse] after flag: attrs", oct(k.GetFileAttributesW(p)), "compressed", compressed(p), "ranges", ranges_of(p, 2 * 1024 * 1024))
++
++# clearing the sparse flag
++p2 = os.path.join(d, "clear.bin")
++preallocate(p2, 8 * 1024 * 1024)
++print("[clear] attrs", oct(k.GetFileAttributesW(p2)), "compressed", compressed(p2))
++h = k.CreateFileW(p2, 0xC0000000, 7, None, 3, 0x80, None)
++ok = k.DeviceIoControl(h, 0x900C4, ctypes.byref(W.BOOL(False)), 4, None, 0, ctypes.byref(W.DWORD(0)), None)
++print("[clear] SET_SPARSE(False) ok", ok, "err", ctypes.get_last_error())
++k.CloseHandle(h)
++print("[clear] attrs after clear", oct(k.GetFileAttributesW(p2)), "compressed", compressed(p2), "ranges", ranges_of(p2, 8 * 1024 * 1024))
++
++# SET_SPARSE on a directory
++sub = os.path.join(d, "subdir")
++os.mkdir(sub)
++h = k.CreateFileW(sub, 0xC0000000, 7, None, 3, 0x02000000, None)
++print("[dir] handle", h, "err", ctypes.get_last_error())
++if h:
++    ok = k.DeviceIoControl(h, 0x900C4, ctypes.byref(W.BOOL(True)), 4, None, 0, ctypes.byref(W.DWORD(0)), None)
++    print("[dir] SET_SPARSE ok", ok, "err", ctypes.get_last_error())
++    ret = W.DWORD(0)
++    buf = W.LARGE_INTEGER(0)
++    ok2 = k.DeviceIoControl(h, 0x900FC, None, 0, ctypes.byref(buf), 8, ctypes.byref(ret), None)
++    print("[dir] GET_COMPRESSED ok", ok2, "err", ctypes.get_last_error())
++    q = R(); q.FileOffset = 0; q.Length = 100
++    out = (R * 4)()
++    ok3 = k.DeviceIoControl(h, 0x940CF, ctypes.byref(q), ctypes.sizeof(q), out, ctypes.sizeof(out), ctypes.byref(ret), None)
++    print("[dir] QUERY_RANGES ok", ok3, "err", ctypes.get_last_error())
++    k.CloseHandle(h)
++print("[dir] attrs", oct(k.GetFileAttributesW(sub)), "compressed-api", compressed(sub), "err", ctypes.get_last_error())
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..045ccac8cc3fadc828970b7afcfa1e397951898f
+GIT binary patch
+literal 125
+zcmX@j%ge<81WMn}Wr66&AOanHW&w&!XQ*V*Wb|9fP{ah}eFmxdCF5)rQ<7R-l9ZYP
+vri)|Z<1_OzOXB183My}L*yQG?l;)(`6|n*pGXilji1Cq`k&&^88OQ<vFFqRm
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/test_wsparse_basic.cpython-312-pytest-8.3.5.pyc b/tests/__pycache__/test_wsparse_basic.cpython-312-pytest-8.3.5.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e173364b80ee49dbda65a7d2167de47029ee753
+GIT binary patch
+literal 21820
+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
+XXzzojrqJ#O+ajSu4{^AQwe$Y~cvgB<
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsparse/__pycache__/_handles.cpython-312.pyc b/wsparse/__pycache__/_handles.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..dda15ac63f66fb7d33aac8efc7fb310c016bd392
+GIT binary patch
+literal 6137
+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
+KIrx{^^#1`h-^rx_
+
+literal 0
+HcmV?d00001
+
+diff --git a/wsparse/__pycache__/_winapi.cpython-312.pyc b/wsparse/__pycache__/_winapi.cpython-312.pyc
+index 960e19c7c9ba87d1ab93e8cf10a007794abd82f4..ae6d21d12d5adb14cbcc5c7c89bd6bdb98197e4c 100644
+GIT binary patch
+literal 18507
+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
+MA2rx*r<lh3zqWpsMgRZ+
+
+delta 571
+zcmXw#&ubGw6vyA}&vrv%Qe$fs%6K!NLE4M0CQxZnp;T=mLN3dinI@ZVcEZer5>c9i
+z2Xks+5A9X(5AZ(_z4l<h+j=SJ#alI356-0cV7@codBbPkd#6X}*sY#svmU7UlKtAb
+zX8`=r=6@(ZjY(B)$3UO~1Q8=b4Mfa_K~eH~xp<vedp7|Z7O~$#!zPYWXJC}vz(vU?
+z;~{#Il+8tilSk%_gO{uy6WpepmT|pJy)GmDh~iM-eI80lV=Ne!?LgwN+hbgYaSMkM
+zvls_BX7TM8VNBS*z`ZDtyNq|SkikIUW}61RHBYuF-q_mGxQGRW5*!7u!f0?y19n3$
+z3KI7PEqlLoTiYQRkVyN(!mM(6wZx2)A^gnDkF9y`CP&%DxjX7gwT=ix@CIH($4s8x
+zy`212bE`qg-sXBp$@|>Wfsr~*Ip|T5I;u=nM+xz)rXnSnYj!&8?@=DpXl0pSQvQlg
+zUsW=M?^fX~Q#h=QDks-IZoI2}%dC#ARqm=}$xU6~C#>oFslh~=uRUGgscrh}_4>}^
+z2hZ!9sTBv^4&}Cb%ylzUICu0(11|oaxqmV3Dle)#U6d#*IX4kPzYQB%lN=!L+=1fK
+c81iSi{9$X<Iw_9WF!RST(89zs(b|;v5C6cCZU6uP
+
+diff --git a/wsparse/__pycache__/alloc.cpython-312.pyc b/wsparse/__pycache__/alloc.cpython-312.pyc
+index 9599a518c62fdf04920980808deb90b224a3b7f2..65425488a5a15e3305e4eb711aff584805981f36 100644
+GIT binary patch
+literal 3537
+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
+G$bSGP=7*2~
+
+literal 2814
+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
+A=>Px#
+
+diff --git a/wsparse/__pycache__/errors.cpython-312.pyc b/wsparse/__pycache__/errors.cpython-312.pyc
+index ecec33dca139b3922a4b716faee4cc349bcced89..9cec3f109d30494f18b449d0b0a92e8a5a3dba46 100644
+GIT binary patch
+literal 4930
+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
+
+delta 465
+zcmXX?OH0E*5S~poY5GW%;;Xcj9*P(!9xN(85HH1BQF;(^S!xrZ(uZs+R4?`rXfJ{#
+zpufO_Nb%r5@G6K``ztD1>e1Q8h5cr}*_m%X_I3FoX1wWo1n?M>_p=YVZ!Bfg$nL=g
+z3nVxIn|NSL4tbJA7l0*Q$|mjKWs8-d5a9nSe6Jzz;=BVEK@G_!mTXHFwUr*65?l7d
+zR*+Fov(z56i4`h=slFVMXNj0Tp?Osp;!%H_Zl=PRUd<nu4$Iti3Y<6jDr40~wZ+(i
+ze?td(4I73b#@rTXj7O1~GLMNOJt?~mH!yXDyG*9TXE5@(Usn<&>35Y4V-^dh#1#xh
+zQ}YMv`nA}|;|N2Yu}ZD%x)rBZW6UIh7Qv_eKuO4Q0Tiz*{_WR;FG*LlQ5y7Ir!c0n
+zl9)uOk{ba67we`2MKrmHWEd{AE6#bV+H6egkFXOo38zDCx8AfbYR(={Ar*_=IfRi+
+T2>FDSA2msGw_9VtFrE4XF_B(t
+
+diff --git a/wsparse/__pycache__/flags.cpython-312.pyc b/wsparse/__pycache__/flags.cpython-312.pyc
+index 226babf71f7a112775889118814779fe9455c676..655e376e327c4b7d7491f5a50248157764c99d86 100644
+GIT binary patch
+literal 2521
+zcmai0&2Jk;6rc6_+fMAHN!p~P9a<vcsIk<P7E!87A*4_V0;&xNE0Vq59mngecdeP(
+znnX^Oq8?fmsjYfw4oGkWm45<p<kFC$wyQ|3M0(&>Xe3Y%h&TIT8>qx6-hDIs-kbM+
+z?<+qJ3?vb(H~#pk@kI=wU&JO@A)k157KqzOLnWk1TF8)^p^_{KS~kMXNGZ~cmZHsA
+zDdwJqjd(LrN;H$DB<v%XQ7NUxwdiH3lwOJD5~~x1mO>esRye16)#e1(6;m^Gb1DC;
+z1Q+EbCsuCjrqa@LvJ=+`Q-O~-3DcrY#n4xYld@XGEZZ$j;UpJw25Qu53K2r7MV*vw
+zGP~8XC?}dKGzKdSgbcrDAH(A|;@xi@bjPO`!RIw;EyM+%yE-8*<lNPW22}683X*|z
+z0gPXrKTo(#O<buIsZA;s+^!R`Ybm@AJJqI?nA}*wszRww80K|?nTrYTVv^5=skqh&
+zS1rqMWN^;O7CxLkUzjh?7K`W4z4cLX9^eTJt&UW7l3h{8gzXsP=lkbQEpozmm1v7?
+z?}o*ip)9d{YsE=>2W7?qL^=c_arm)Gc&wwHkpmmWTML)oU!PrH-A-k0B)=@&f9cpJ
+z{AG`ArDpDiXPyBgQiBu`8v%|B?_U5(KfH~8F2M=wj`u=rj7NMD5{g3#daD<b??QKc
+z`OhVu`0sZ&WT7>gr@G&yARucJALyQjf>T#QUJEDsQlK#y@b%uEa7PO6X1QLvG_pOO
+zfC~Isi|{?cStp{&9f^jtuqkPgRluhc0&o1(0&ltr*cb_9dhbp+uy-xm$2r#H2&f*X
+zggVjn6d&(?>H1tiefUIqz<?SPU9wC3Go_F8qx3(wx6x<vr>HIEqRLkgw4$hk7o|70
+zYQ2iEOl(m&spXSNNL%<oOr>fN4XQ;WHN`eK6p7U>s657AiTR}?64<?^rW*tkQ)Ad}
+zVcqoA6`{Pk#esE(DNzh4KhbrFCKL+`U0JrmIBCM3TJ}=iH|A_%uJ~TLFkdWt^;fB!
+z!aB!XS%%srwHi@5=*O0+lA{=O;^}EzC8}aG-zum$xYpIyt^=n*z@I5Yl-(3=Qyoea
+zt6-Gqgq8stPyiQb7LcaJg}rJWR~2;`obt?dl~q@SBo`_b3O*XZsI9=;uvAc{0Zy}+
+z>E^P>Q&$*XqE_1kP)$Yv0q~oWnnj7LZkdo4gNwl!!v-8EdsA>gn=%Z{Y*i%$kZtR{
+zZrL2SDB%D#bZt+&;DnB%db(7lNnDHl7<^D|08GBIs$vSaMEi4X=!=eU1#Wv)!J1A%
+z!lEljMRF+kf@RoEPr2)H7ahOV2OU(zk>y-KDDh?h2FELvzM)X5<Xw+fPxw~DIO;P3
+zQbfU@=%!}1nVT2WeqN{|#x0(csAwvyGeWvQZvadPx|>pyes2D&tvfO!+=-|LQD|<E
+zijL(ZbtYz)xQ&VyOhrF*n?Dt!nTodRBtfq1b!;bTD2$igSw}^`bcWmkO3K|VXHHr*
+zEJn)S2e-S^G_dAkuIWz9uP`TaK{0GXMe}o_9=8+mRA=Cf3H_obVNucboRmK{#2lfA
+z;6#YBC-7KDy9ZG^bN$TKGxt*aw+F``r02GWCN^HXb!aytXOd5moJj5_QFh-(_}axw
+z@2<~ZIkr7GeB<?N&GmP7vimpYx3Y&Xor8&U;b|xpd3ifCeEs6piyO7Cm+ocq+ar5#
+zFWg+%8hPc){Pysn2iegF*|#4aICAsEH+z4RrJ<R}qZ7M{$ezKcC^9g(n?_^f_eZBT
+zN2k6yxiva-CAkw%-H-3vjPKhRyBEigV?%di<2xB~Y3A_V_~94NxIcGOD3K22evaek
+zOho?sJ+mWoljw)Zy>qAKg`8B(4Zy!FWzAB{Wd~8w-@VYr{Qxj8oNi#<a7JB-nHxSY
+z=wbl7cz%oMu%KPE<ENXJW*g)TorE(nF4#eMJe4I$dWi57bl?#>xrt6bLiyjLvUGem
+Kos*8c@_z%Z*oCeD
+
+literal 1761
+zcmZux%}*Og6rcUD*IyV&fTp1&qm~{l1y@n1Xi!8&2!}ROnqpUJEhKyKj<M-_*P0p2
+z*fJH0I25H4+(2sofJXGdvBz+(R5^kJUC~o2wYgES)GEF7&Dv`_5hLyFoB6$uc{9KF
+ze(CEAAsEqreqH&}htLbL@P^zL&Zj}xK?X`8Lo#GjN=b%dsHR+0Qc6)xsS<*<&-4}j
+zDL=^m4V2Q1fT3+jsX$eZ1#4FmC7m)dp>s|POJz=QUbhUhU@gaAiXabON-)P{XCU!#
+zb|EpJo=qkfKDqlva^49QSh`ZM47<W&k`sB9cqly0Q)<(!F!F{U1O>kHzhK%yyo0TH
+zX?U9OucN&-zJ`Lmx@wP7TkO%5c%O&YB||lQdm<u?HHG)LB=D{90Z*<$6faT&y@$9s
+zr8~wE9b1!m&|CAcC)H)o!jS6dC)tZpmmkZ9vL=5cSELGBRlY(MDdw-uFA!d)7S3dn
+zv`jJ?T*(u$D(O5At8AH4VsW#IvpS^(!Z6Ph%-rX|o#%)<vdx~#j`}s+w4(~!2hJtN
+z)4764(j7HM#a+gNGyp%xp942M@2HIH+|fQuxQ{|bijKlKb+lyy2ngzuZJSiwZA_&i
+zQAaIUIonalYSsyL-7}$rVZ0ihn_lFE@g-s`R$8ZB%$fQ!i<hcSq_vS2aS443Y{WIP
+zB24S(k8t1C?akZU$tNGL-#e8R-#zK1e{id^S=r`K*1lDnest;W-J!<yTl=3M4o<Cq
+zdJ^v64jqk6JRg`i496R4{NJXABA3sQBut}Mf4H^FzW?aQ@%`jcbo!an2+aL=stD{A
+z6QOs8XT#_q9GtzW91LBVy`dc3@PVA|WgQe&i<@V{pqFpGT7Zes!#BiRTQIL&z|0k`
+z19yb3H5=@*OE9Sh4`ax{D8*ycW2wu!y|xDy?Xd!ezph`GUc>!w;yv}z!~2+4+eiwI
+zUPL`?=elgQEo@WR$;Cq<!GlbOSo)Gl3}CWBa(db1Kw!H=_Bh5Z`nPE<2;oK%yv4*a
+z7%rD^!HT=yY6F&ySvi}>0-nb2GndFzu&4Ing@-FJtm8+m_TySjuqxxEh_kkpB_-~J
+z%N8q_N;c)hs7+=~qEqN<7iS92ESuv(v1F1W6eTfmmGGF>I)!L0t>W;L)dJ(ptt2YA
+z<8nMEw@|HpB}{M!V>$vqC)_RxQ6uyn*cpP4Rbg63%@B%2yESnF1v0fcwKcOjvpaqi
+zz77;`j85#U&qpVJo_uB;MejEP_fNvZ-`xS^I5KxUc<p#_xT&fAp;M#=Lw|$2%Pw^H
+zO{f_~kt@6EVR)>ej-5kr6qAy%prfVJhMi5PTYW<l{ah~<+=k%h=lF@}=k1I|Rk=Al
+zg&rwnH^ac4qHUB-GDF{mJ<+|{C`?d_lJpzGFHrDLbn|zF&-?-DgXYMHbj>yXAHYec
+A4FCWD
+
+diff --git a/wsparse/__pycache__/ranges.cpython-312.pyc b/wsparse/__pycache__/ranges.cpython-312.pyc
+index 62d6a10b6f35ffef1db809348157e1f2a792668a..52303e0f84c5ff7e9144f689d48f17751878556a 100644
+GIT binary patch
+literal 3434
+zcma)8-)|Jh9iP3u-TVE^7z4(@gdYt@%%P~HMJXjgwrMH|KWu0emuS7do%1c;+r7@t
+z`8ao7nJQ9`1SyV!#8vGBk0A5FpU_r$sMHrb265S1N~)$0yjjIktGu+|+1>k*NL4zr
+zXXj?-`|C6F{e0&ysZ<<6`}AL*-C#+C{?31NS|}L27>B_<q@ih~30lYyDxqmn;A7DU
+zSEOmFB2UYe$aKV;3mef&Y&uqnPsic6^gfzSXfpK4MkF6y%%3$3tEe)f9jB@}M=&K-
+zi!$Au!zGJiTQ}!%NjHdHcrJj|yx>NZx^AjfJukXZjo3x1&k{FgTC}1X`XX^tR+X4a
+zg)mi9nVJu|$#<qMtJEeFlv>nHm8ezWDhU5s<Vrg&0s|5LUl<VSJ;b_eH#(7bcEWcx
+z7~8v;)S2dJFs{XG4q6Q~JQ7#AUTD7-Sj-<G)LXv}`j>>I5KDB|gpRDY7FrTx{r<qo
+ze7iYfM`9`LgqJbPbawQ`k?qX&zMVL<up>N@dVV@#O`ab{i0+!}w>;33?2LMr1vJ&a
+zcd)ag_jN=kyc(dnBstRZ;Q!~HDQNPN+_(2T`~b}-9GP_u-x%r+yMqNpGd+|XS&KMu
+zevhK7VSfvpRTo2lwI3h0r=!S`dNEC*L;VPRhnID9Q+yZIg?vn115hRjt5Flr%>4YQ
+zRVvwpjbekCbF7>n#f3uQy_p$ol`tz4JlkN9DLh|nJgXMxi3U@+Xw+;*s9lK1F|@0&
+zk-;XrL?|}Y2J|%>1Xx*z&cYfg>KeiIvR*9Xs!Ey7)vJEa*-SSKTviuAhvli8CAdUb
+zu}rkrVUwS%tgJE&+EjxQRcpXENM=51nOM{9`B6+32yK8>$Z2BO#M8!waM?0IJ=fuz
+zGYQdb%+t2uyKm^Wr{AI)p?;7vGd?x|hH7dY4NqSHhRJPV3pzusf|3btI&jv|A$Z-i
+zdC(k0PAf0l*s$jGqG|+C_hARf)j?U&s(>744LF%|Q)5>zC|9mcOunm}y>Q{u*x9QS
+z<I3dOi$9r|nwc5JwuN;D$ojOzvG(2LwmhSCwSg~QJvRl=f-?-xMc1%ZV;oZs$MF&+
+z#6N<DP7Hv<GJ~V`;w<vmIFdYqx(A?tM@Bm**Eti@@*$tCu@2OMM%DCGkxG>{Fozgq
+z0ZP@o1V#hbsm>TNv0YZFh65pTQ!O%B<aWtTScdDOGuzX|1pp}?lFckQsDd}WIM%%n
+z0lEL82F?STDkTsXXj2zd-B4!%9Jnnien&Sos}5*$xa<bp=8BuBnRczpivrPr&BODs
+z#|>9iR$km&R80sIYKH3F1Ya)58G&+^e9p6UvCuj1Kq>ADa=m@m*1tyikS9wy9p_W7
+z2-U)k>o%_%+&#)Eo^sZwoGPdcotv5?OyPbjHdG-R<#TaEwVC1-8aG)qESo50K-wVg
+z5J#e+bn#Jq!|uSfi&NJwU%oWSuhqol<fX|eH>w2JKOgbja-{{;s1a9CTscrD`!TyB
+zRqL+g8ML{RoCctMJu>$Cbw+G9OSJ2C8*<$y*L{nHYQxQb+YP!8WO)Skt5Cs~(e?;R
+zW<EM|`^=NX-p%xIJ9(v@+rOC`Zk_z(z;+~@iEp8BEWVvY+1;)1hrhb@*78L2)vvPq
+zT4W=8_|{LC&n_=)g%Z+Bo4LVfxr6JugZF>1kvrCu+lgHB%;vy>&FqeQ>5tPJS-f`e
+zjX#iWF|;GSg+i(HmW+}ED_1`FQG3VE?I?;RpG9}CM|Zb|o<{L@1Z4)ErH`(sk3JZB
+zJhYKM)fC%@U%r3-uE>==$>PUXn$lO%L`UXH6n`0sFaNTg$le`$Hh63u{u0Nw<7fwN
+zXLq)<Z?<<1w|5@gj!E3QluAQDnUQufx3**K&qu&19%l&RjH2Y=%2;b?BZ1e#_}|+{
+zzUkQ4HmChR#(q3Lg8np8fd12wUE|*ui~X;N?ptF45Wa`z&{D`j<LJGs2zeD><W*b~
+zyb3JbN%krq6G6GxdUaP5dNsB88gZn)z2Vj1EwTu*PH(^L$c_|PdBX|a=)PV8BYd~S
+z_bkG@uoUWO5zw8Vg%RxUzGiy+J1+`>M-_2G5Y@RLDhZ;B&`~F%g?Rb&B8@J^oTwAy
+zel5kpR^0PuxEHa*XTyBG8>I{q@bCM?wVj65J13pU|L{Nj4bR^K&m&VPFD{-NGt^3z
+z(>7-T;6RNW*J@P*3IY^ZP8yI<J-RcYYVt|VD%L8%fKZX(ky<Ix6qtYhA82{W6)WmZ
+zSJX`gBj62Lt-^a07>nD;Cn!9r5aq$Ua**?~U(j6Hr&U+785Cnz<Wh2l&^e;HnJOg<
+zx>d84U~_LGkV<xUfSk>l%S(N~qa)nv&QA9x4D7!_w~W3_WtPwVb$H+HbW>j83F&29
+zau8DT?pRCy<ox~IM)pus+DzwGj{N>mtMt29)(4K<U)V?&Al(w_l_MXVZYKxZ(ey{D
+z+o_dWt9XCnxASX5$DT%C*~*~3`?s=4O8n;ht@H1{?c3UO;C8AhH5Wcl<k}}*dp!Ga
+zaXmTOywp<KdyhR(*7u%nUT9|qTglHdhc}1zv_>CDkL8EyjiDc|i0%EyAJ~tT^%LW3
+z`zBW875Z_!o!#BDU0Si8M!&a}L&JD$0GMO>?H3Rvx(FN|Q4}~eMR5`32}IM-0kiu2
+zY5P3xF}g?QvQMEt(Q_j77|{dpA)*C7!4Y+%rz@6LGsqcw5`OXwvkySGB?^M@IXdwV
+cH1Y*HwT@1GflmBWeoc7kMOD}(40sCu3*lpP-T(jq
+
+delta 679
+zcmYLH&1(}u6n`_b`PequwA9*A6ibss77Bu1Y!xN69=udB1u+Cd%xq)Zw5c;A+sej-
+z>LJlXT6<`r{sBro2>t`+EJ#6-x_A>0_F^yvrM+|}cI$(A{NDHPJ!WrkOE*4*!(AZ7
+z`15hLjn|B5Vpv)mKp_njQCvi6L<!Z3c%GyQ0_uATX>A#s{<X!C3#xMRCz9GkZs<<x
+zR*rG&I%6f4S58m-5)k>?Utm3mhDRLOJ`R^b2jQi`tabuVz>BW_%KvoaAgawJ02nSn
+z3aI9wX<R@lh=B-tHF02P%UE=Kwg`L3!QNns9C(Ab6)PzYUcr=<@ndWw8<xmju#xG@
+zJ(DbNTjE`nJVBKqDK0K?6T8~n%mQ__#hkc5$*`<915EAc`lq>aGDXD=6fD7K9$9YS
+zW~y@&rq*)_7tAF8QnXH-SW9`Xn8*nSXU4}e!s6ndMKiYSCJ&lnxrM^|uRyfYBa>8b
+zUX-c|`#lgc8l&~m)v4##suL|td=uzfq_<($?M9_u*%Y55@tW51Loif(u(G@x>8<Iz
+zVPjRR-KbsO(N6!}*CEvR8<46q247y><Xe|s#otbSHpbqQo#6Oki>TNEACLn##JMDf
+zCf1V)((H~VW271LNo@MuKsHND`E2(143_!=yt6M;oL@s*YG4tm+~Ae@5`9>-uCjh<
+cs*k|?q>_^m`U>a2gZ=}C+WrU{V5g-22;7yOzyJUM
+
+diff --git a/wsparse/__pycache__/usage.cpython-312.pyc b/wsparse/__pycache__/usage.cpython-312.pyc
+index 657654c1c328d34f469c269880c84188b19d06af..510a4e771c789ef08f5140720710b35e7dc4a141 100644
+GIT binary patch
+literal 2177
+zcmah~&2Jk;6rZ)%pK)S`qP8?prlM3>B&J9`R8@&oQWvV0Qq_?vtVrwe?j+u3cgM`k
+z#&zT%x8e}Q0U;_i$6ir;;7<TfNEL_DqJ~wZB2f-K5h*!TJ@IBYYnxse*}L=c-tWEl
+zdvD&}A0N*n7~1pSuGKOK{iPQ1NbF5^W?^z0S*VUI%}O|$o2Vx>HBUOao2sYWbUp26
+z>X~p)cd~A-o^$i{Jgie+qWV}jUCyk&ebyGsGrk~86cf{Az9(&O2`@5^h3zflMcbjG
+z@=OC;Wi7}U9or*qyPOQN78NG9n>5IIjJw3KS7|WL+SD^#Dv3oTDJO!$)!Jpk1+8+<
+zcrd=mnX4eETAB(p9uOr;!hh!$?A}IlaCR+@H<pC=-MzUuAXD+S;y@~taP-jKJ%oG7
+zy9yV^O-<&a8A8MJ1;Ag^))I1TaHhq&;aOrWnH%+|5X%kUy=1JhruX#zt0Ue|45i{(
+z?7gR1`dVs4wiHVY-$P^#0rG_07oYV~R;s7nOAn*#>6X3>(eQ~8Rx(x=q((UC={5A$
+zXgvR8wS%rFKSLd@oFo4L_!TOB?qS)Y*z?^c<(MtvW>->y8;v%RtwsYg)AZXm>@W{o
+zP+paM9>bV#*#g6_(;_ki_}pibV9ANO3^>AXs;LxMRY@qY!W`eFxanI<R8C{Tuq|<m
+zh!9RP9G74yEZW4R(M%OCAo;{`y12z0OH5;rMMhutnuK7S5(|9jFyFDTptPdgrPyIh
+zwn-f9P;W`LupnKbfLiK`kS6mLB$20Z1k&bo223)OND3%zRrpx62)9(&L;#%96Ooe=
+zY`Q9-j_o+1m%t3%w$LAwiSQmW4<b-xn~pCe<v<`1)ZsSF6%!ahRFFb4POSmagXEaZ
+zg*=3WHX7$@bMqICkE-*=+^3&hzEZ8#s%MRJ=Py=`+WC65(U?{am@Ry1{#-5ef_S2%
+zY<6r2UU@N$Zr~53U!ABvfoEn^9AJ=MhjR-^Af6TR3ynps{WgZYb(GW~B;fiCq|yVj
+zLKJ}G6dDkP;M$Bsyb;w9d5HDjq)aOtm|zze10tx~mO#fS_c6+V%SGCWNFL?1O}Y*v
+z)}VMRp~&h7dx4HNM@VLfMOKLIkS2rzg--BQ+p|~)*j7}CE~Lv1#(YosZ50KzpdISV
+zAQR~7o;*_*dG+{!yGQ|>#8Z_T`TP>+0$OZY<EjCzR$f+&G!*67qf12ED}!{|%nK4s
+zl=DFndT)@oh3dh|SFRc+S3Q*L>XC*=un#Vq0fhtQECjU-Wj4q=L`Wm-+d;u}n4m@r
+zh<7N@f=)RddKIKrh~v{hGlFz<8t6Vi1gTI_D0tNgFn%#LcWMEehHO%6p%bNRA^Zwe
+z+T9?px`q)h`619zCd9As=%d}ks8IZ7_N&=PV^h0nRGiu@T-cmEyft}f<HUDw?q>92
+zejDkz{B8l24sPgQe{tjEes%r*r=>SG=)=;{8|V9H`YYQBJ#}QO_{!tru?NLtcUB%2
+zE9?5^(Rc1#yp_B?@$JN;68?d#r=DiV9%m0e$R6C-|0s+9%#8JWTN7Y#a<eeIIk|sm
+zY`cK6g>`cC`qspu&BEy)Py9l6lL_TXBA4Gzqe7{F;rZ?q$`xX~-?R9IP>K90H}m0f
+z^z-opbD89&asj@uhQ&<72oP7FEnb92klo{2L|F>+6{ad3@fxL3u@utvJ=%dO;;)6e
+tr(I_G4xQykV5vTeLhWxSHBI{iz56$M{Rukx0G)h--rGq}YbB21^k1xFTg(6e
+
+delta 681
+zcmYjP&ubGw6n-<a*(5bt6G}A|tV``7izuj<R)P|&*D9nS&1G4$8<M!mmYIp$NMfpZ
+zF!qp!9;)acpwxp$kJhUoJ$P{uJctKx!4xVA;!H@aAI!Jk`!Vz0o7wxx#}Vy)JU#&e
+z+QEm4gL_&kJu9qjuptjNvayTu$R@Vp;ws4#1a{~l<dp_C)LtchLGE1ojszPhh~3QH
+zuqbn`QR>lxbdI44LBtxogWjLnb`y3+(H2C3|I4f>;|+)3|8h|iRbq#cvC6?|;IhIH
+zb3jkFFprLHeq^kgcvLkl25Z7Aydzr@XyOOhCM|pq`^bkivI0Ib6ze?NdW!q)JC<8_
+z^fJ?_SFhQQt=Cs|?&+59mps?e3vQiphw8T)IxjhTvFth%x&UhkclF#*2iRi<4wT#F
+znjI*s7B4LsVJce=)FP91pfGOnAbdSHygVu|A|Q;@;8d7#la=o}2B8t@Rm!!Z7Z7Ky
+zz-0ehU(~bhq!2R5Rs^lXega}zccHVexx8^@eX);8Xc2urn(X==f0J*t9w~hlVu^01
+zli5>_|J)BjZ1M*nnWUX~e(?!=HveMo_3}sU(p$0@x%#_LWb7B45~puZ&BL2$c82Vt
+zRCb!|PKUBHCNV-m*fedgV49=39QhNl;UHAD_YwwzfhGh6kxbRI>#lQ|9uuZ~e>N#d
+V)IsPIocRjTZ=es<I7(4j^Dmzmo!<Ze
+
+diff --git a/wsparse/_handles.py b/wsparse/_handles.py
+new file mode 100644
+index 0000000..c561f8e
+--- /dev/null
++++ b/wsparse/_handles.py
+@@ -0,0 +1,127 @@
++"""Object handling shared by the public entry points.
++
++Every function in :mod:`wsparse` is handed a path by the collector.  Before
++anything else can happen the object behind that path has to be understood:
++
++* a sink file can be opened and asked about its layout,
++* a directory -- or anything else that is not a file -- can never carry the
++  sparse layout, and addressing one is an ``unsupported`` situation rather
++  than a transient I/O failure, and
++* a path that does not exist is an ``os`` failure: the caller mistyped, or the
++  file still has to be created.
++"""
++
++import os
++
++from . import _winapi as win
++from .errors import (
++    WSParseError,
++    check_path,
++    classify_winerror,
++    from_os_error,
++    from_winerror,
++    unsupported,
++)
++
++#: Access rights needed to change a file's sparse layout.
++UPDATE_ACCESS = win.GENERIC_READ | win.GENERIC_WRITE
++
++
++def normalize(path):
++    """Return ``path`` as a string, or raise a ``badarg`` error."""
++    try:
++        return check_path(path)
++    except TypeError as exc:
++        raise WSParseError(str(exc), kind="badarg") from exc
++
++
++def is_directory(attributes):
++    """Return ``True`` when the attribute word describes a directory."""
++    return bool(attributes & win.DIRECTORY_ATTRIBUTE)
++
++
++def describe(path, allow_missing=False):
++    """Return ``(path, attributes)`` for the object behind ``path``.
++
++    ``attributes`` is ``None`` when ``allow_missing`` is set and the object is
++    not there yet.  A directory is reported through
++    :class:`~wsparse.errors.WSParseError` with ``kind="unsupported"``, since no
++    sparse-file operation can ever succeed on it.
++    """
++    value = normalize(path)
++    attributes = win.get_file_attributes(value)
++    if attributes is None:
++        error = win.last_error()
++        missing = error in (win.ERROR_FILE_NOT_FOUND, win.ERROR_PATH_NOT_FOUND)
++        if missing and allow_missing:
++            return value, None
++        if missing:
++            raise from_winerror(error, "no such file", path=value, kind="os")
++        raise from_winerror(error, "cannot describe the object", path=value)
++    if is_directory(attributes):
++        raise unsupported("a directory cannot hold the sparse layout", path=value)
++    return value, attributes
++
++
++def open_update(path, create=False):
++    """Open ``path`` for read/write access and return ``(path, handle)``.
++
++    The handle is shared for reading, writing and deleting so that the writer
++    the collector keeps open on the same sink does not block the call.
++    """
++    value, _ = describe(path, allow_missing=create)
++    disposition = win.OPEN_ALWAYS if create else win.OPEN_EXISTING
++    handle = win.create_file(value, UPDATE_ACCESS, disposition=disposition)
++    if handle is None:
++        raise _open_error(value, win.last_error())
++    attributes = win.handle_attributes(handle)
++    if attributes is not None and is_directory(attributes):
++        win.close_handle(handle)
++        raise unsupported("a directory cannot hold the sparse layout", path=value)
++    return value, handle
++
++
++def open_metadata(path):
++    """Open ``path`` to query its layout and return ``(path, handle)``.
++
++    No data access is requested, so the query also works while the collector's
++    writer holds the sink.  If the file system still turns the request down
++    because of its sharing rules, a read-only handle is tried once.
++    """
++    value, _ = describe(path)
++    handle = win.create_file(value, 0)
++    if handle is None:
++        error = win.last_error()
++        if error != win.ERROR_ACCESS_DENIED:
++            raise _open_error(value, error)
++        handle = win.create_file(value, win.GENERIC_READ)
++        if handle is None:
++            raise _open_error(value, win.last_error())
++    return value, handle
++
++
++def length_of(path):
++    """Return the logical length of ``path``, classified when it fails."""
++    try:
++        return os.stat(path).st_size
++    except OSError as exc:
++        raise from_os_error(exc, path=str(path), message="cannot stat the file")
++
++
++def _open_error(path, error):
++    """Translate a ``CreateFileW`` failure into a classified error."""
++    if error == win.ERROR_ACCESS_DENIED and _is_directory_path(path):
++        return unsupported("a directory cannot hold the sparse layout", path=path)
++    if error in (win.ERROR_FILE_NOT_FOUND, win.ERROR_PATH_NOT_FOUND):
++        return from_winerror(error, "no such file", path=path, kind="os")
++    return from_winerror(
++        error,
++        "cannot open the file",
++        path=path,
++        kind=classify_winerror(error),
++    )
++
++
++def _is_directory_path(path):
++    attributes = win.get_file_attributes(path)
++    return attributes is not None and is_directory(attributes)
+diff --git a/wsparse/_winapi.py b/wsparse/_winapi.py
+index d16a526..4584a15 100644
+--- a/wsparse/_winapi.py
++++ b/wsparse/_winapi.py
+@@ -1,14 +1,102 @@
+ """Thin ctypes bindings for the Win32 calls that :mod:`wsparse` needs.
+ 
+-Only the calls the current implementation actually uses are bound here. The
+-module is written so that importing it on a non-Windows platform stays cheap:
+-the DLL is loaded lazily, on first use.
++The bindings are deliberately minimal: only the calls the current
++implementation actually uses are declared, and every function pointer is set
++up once, lazily, on first use.  Importing the module on a non-Windows platform
++stays cheap because the DLL is never loaded there.
++
++Nothing in this module raises a :class:`~wsparse.errors.WSParseError`.  The
++callers inspect the value returned by a Win32 function and classify
++:func:`last_error` themselves.
+ """
+ 
++import ctypes
+ import os
++from ctypes import wintypes
++
++# --------------------------------------------------------------------------
++# constants
++# --------------------------------------------------------------------------
+ 
+-# FILE_ATTRIBUTE_SPARSE_FILE
++#: FILE_ATTRIBUTE_SPARSE_FILE
+ SPARSE_ATTRIBUTE = 0x00000200
++#: FILE_ATTRIBUTE_DIRECTORY
++DIRECTORY_ATTRIBUTE = 0x00000010
++
++# CreateFileW generic access rights.
++GENERIC_READ = 0x80000000
++GENERIC_WRITE = 0x40000000
++
++# CreateFileW sharing modes.
++FILE_SHARE_READ = 0x00000001
++FILE_SHARE_WRITE = 0x00000002
++FILE_SHARE_DELETE = 0x00000004
++
++#: All sharing modes combined -- sinks are written by other handles too.
++SHARE_ALL = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
++
++# CreateFileW creation dispositions.
++CREATE_NEW = 1
++CREATE_ALWAYS = 2
++OPEN_EXISTING = 3
++OPEN_ALWAYS = 4
++TRUNCATE_EXISTING = 5
++
++# CreateFileW flags and attributes.
++FILE_ATTRIBUTE_NORMAL = 0x00000080
++FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
++
++# DeviceIoControl control codes.  They are built with CTL_CODE(), whose layout
++# is (device << 16) | (access << 14) | (function << 2) | method.
++#: Bytes the file really occupies on the volume, holes excluded.
++FSCTL_GET_COMPRESSED_FILE_SIZE = 0x900FC
++#: Marks a file as sparse, or stops marking it as sparse.
++FSCTL_SET_SPARSE = 0x900C4
++#: Deletes a range of a sparse file, turning it into a hole.
++FSCTL_SET_ZERO_DATA = 0x940C8
++#: Lists the ranges of a file that are backed by clusters.
++FSCTL_QUERY_ALLOCATED_RANGES = 0x940CF
++
++# GetLastError() codes the callers classify.
++ERROR_SUCCESS = 0
++ERROR_INVALID_FUNCTION = 1
++ERROR_FILE_NOT_FOUND = 2
++ERROR_PATH_NOT_FOUND = 3
++ERROR_ACCESS_DENIED = 5
++ERROR_INVALID_HANDLE = 6
++ERROR_SHARING_VIOLATION = 32
++ERROR_HANDLE_EOF = 38
++ERROR_NOT_SUPPORTED = 50
++ERROR_INVALID_PARAMETER = 87
++ERROR_CALL_NOT_IMPLEMENTED = 120
++ERROR_INSUFFICIENT_BUFFER = 122
++ERROR_MORE_DATA = 234
++ERROR_BAD_ARGUMENTS = 160
++ERROR_INVALID_DEVICE_REQUEST = 16
++ERROR_BAD_PATHNAME = 161
++ERROR_FILE_IS_A_DIRECTORY = 193
++ERROR_BAD_DEVICE = 1200
++
++#: ``GetLastError()`` values that mean "this object or volume cannot do this".
++UNSUPPORTED_ERRORS = frozenset(
++    {
++        ERROR_INVALID_FUNCTION,
++        ERROR_INVALID_DEVICE_REQUEST,
++        ERROR_NOT_SUPPORTED,
++        ERROR_CALL_NOT_IMPLEMENTED,
++        ERROR_FILE_IS_A_DIRECTORY,
++        ERROR_BAD_DEVICE,
++    }
++)
++
++#: ``FILE_SUPPORTS_SPARSE_FILES`` from GetVolumeInformationW.
++FILE_SUPPORTS_SPARSE_FILES = 0x00000040
++
++#: INVALID_HANDLE_VALUE, as Python sees it for a ``c_void_p`` result.
++_INVALID_HANDLE = ctypes.c_void_p(-1).value
++
++#: Largest buffer we hand to one range query (1 MiB of extents).
++_MAX_RANGE_BUFFER = 1 << 20
+ 
+ _IS_WINDOWS = os.name == "nt"
+ 
+@@ -18,7 +106,427 @@ def is_windows():
+     return _IS_WINDOWS
+ 
+ 
++# --------------------------------------------------------------------------
++# structures (ctypes.wintypes does not carry all of them)
++# --------------------------------------------------------------------------
++
++
++class WIN32_FILE_ATTRIBUTE_DATA(ctypes.Structure):
++    """``WIN32_FILE_ATTRIBUTE_DATA``."""
++
++    _fields_ = [
++        ("dwFileAttributes", wintypes.DWORD),
++        ("ftCreationTime", wintypes.FILETIME),
++        ("ftLastAccessTime", wintypes.FILETIME),
++        ("ftLastWriteTime", wintypes.FILETIME),
++        ("nFileSizeHigh", wintypes.DWORD),
++        ("nFileSizeLow", wintypes.DWORD),
++    ]
++
++
++class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
++    """``BY_HANDLE_FILE_INFORMATION``."""
++
++    _fields_ = [
++        ("dwFileAttributes", wintypes.DWORD),
++        ("ftCreationTime", wintypes.FILETIME),
++        ("ftLastAccessTime", wintypes.FILETIME),
++        ("ftLastWriteTime", wintypes.FILETIME),
++        ("dwVolumeSerialNumber", wintypes.DWORD),
++        ("nFileSizeHigh", wintypes.DWORD),
++        ("nFileSizeLow", wintypes.DWORD),
++        ("nNumberOfLinks", wintypes.DWORD),
++        ("nFileIndexHigh", wintypes.DWORD),
++        ("nFileIndexLow", wintypes.DWORD),
++    ]
++
++
++class FILE_ALLOCATED_RANGE_BUFFER(ctypes.Structure):
++    """``FILE_ALLOCATED_RANGE_BUFFER`` -- one allocated extent."""
++
++    _fields_ = [
++        ("FileOffset", wintypes.LARGE_INTEGER),
++        ("Length", wintypes.LARGE_INTEGER),
++    ]
++
++
++class FILE_ZERO_DATA_INFORMATION(ctypes.Structure):
++    """``FILE_ZERO_DATA_INFORMATION`` -- payload of ``FSCTL_SET_ZERO_DATA``."""
++
++    _fields_ = [
++        ("FileOffset", wintypes.LARGE_INTEGER),
++        ("BeyondFinalZero", wintypes.LARGE_INTEGER),
++    ]
++
++
++_RANGE_ITEM_SIZE = ctypes.sizeof(FILE_ALLOCATED_RANGE_BUFFER)
++
++
++# --------------------------------------------------------------------------
++# kernel32 access
++# --------------------------------------------------------------------------
++
++_KERNEL32 = None
++
++
+ def _kernel32():
+-    import ctypes
++    """Return the process-wide ``kernel32`` handle, loading it on first use."""
++    global _KERNEL32
++    if _KERNEL32 is None:
++        if not _IS_WINDOWS:
++            raise OSError("kernel32 is only available on Windows")
++        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
++        _configure(kernel)
++        _KERNEL32 = kernel
++    return _KERNEL32
++
++
++def _configure(kernel):
++    """Declare argument and result types for every call we make."""
++    c_void_p = ctypes.c_void_p
++
++    kernel.CreateFileW.argtypes = [
++        wintypes.LPCWSTR,  # lpFileName
++        wintypes.DWORD,  # dwDesiredAccess
++        wintypes.DWORD,  # dwShareMode
++        c_void_p,  # lpSecurityAttributes
++        wintypes.DWORD,  # dwCreationDisposition
++        wintypes.DWORD,  # dwFlagsAndAttributes
++        c_void_p,  # hTemplateFile
++    ]
++    kernel.CreateFileW.restype = c_void_p
++
++    kernel.CloseHandle.argtypes = [c_void_p]
++    kernel.CloseHandle.restype = wintypes.BOOL
++
++    kernel.GetFileAttributesExW.argtypes = [
++        wintypes.LPCWSTR,
++        wintypes.DWORD,
++        ctypes.POINTER(WIN32_FILE_ATTRIBUTE_DATA),
++    ]
++    kernel.GetFileAttributesExW.restype = wintypes.BOOL
++
++    kernel.GetFileSizeEx.argtypes = [c_void_p, ctypes.POINTER(wintypes.LARGE_INTEGER)]
++    kernel.GetFileSizeEx.restype = wintypes.BOOL
++
++    kernel.SetFilePointerEx.argtypes = [
++        c_void_p,
++        wintypes.LARGE_INTEGER,
++        ctypes.POINTER(wintypes.LARGE_INTEGER),
++        wintypes.DWORD,
++    ]
++    kernel.SetFilePointerEx.restype = wintypes.BOOL
++
++    kernel.SetEndOfFile.argtypes = [c_void_p]
++    kernel.SetEndOfFile.restype = wintypes.BOOL
++
++    kernel.FlushFileBuffers.argtypes = [c_void_p]
++    kernel.FlushFileBuffers.restype = wintypes.BOOL
++
++    kernel.GetFileInformationByHandle.argtypes = [
++        c_void_p,
++        ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
++    ]
++    kernel.GetFileInformationByHandle.restype = wintypes.BOOL
++
++    kernel.DeviceIoControl.argtypes = [
++        c_void_p,  # hDevice
++        wintypes.DWORD,  # dwIoControlCode
++        c_void_p,  # lpInBuffer
++        wintypes.DWORD,  # nInBufferSize
++        c_void_p,  # lpOutBuffer
++        wintypes.DWORD,  # nOutBufferSize
++        ctypes.POINTER(wintypes.DWORD),  # lpBytesReturned
++        c_void_p,  # lpOverlapped
++    ]
++    kernel.DeviceIoControl.restype = wintypes.BOOL
++
++    kernel.GetVolumeInformationW.argtypes = [
++        wintypes.LPCWSTR,
++        ctypes.c_wchar_p,
++        wintypes.DWORD,
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.POINTER(wintypes.DWORD),
++        ctypes.c_wchar_p,
++        wintypes.DWORD,
++    ]
++    kernel.GetVolumeInformationW.restype = wintypes.BOOL
++
++
++# --------------------------------------------------------------------------
++# handles and errors
++# --------------------------------------------------------------------------
++
++
++def invalid_handle():
++    """Return the ``INVALID_HANDLE_VALUE`` constant."""
++    return _INVALID_HANDLE
++
++
++def is_invalid_handle(handle):
++    """Return ``True`` when ``handle`` is unusable (``NULL`` or invalid)."""
++    return not handle or handle == _INVALID_HANDLE
++
++
++def last_error():
++    """Return the Win32 error code of the most recent call on this thread."""
++    return ctypes.get_last_error()
++
++
++def create_file(
++    path,
++    access,
++    share=SHARE_ALL,
++    disposition=OPEN_EXISTING,
++    flags=FILE_ATTRIBUTE_NORMAL,
++):
++    """Open ``path`` and return its handle, or ``None`` on failure.
++
++    The caller owns a successful handle and must pass it to
++    :func:`close_handle`.  On failure :func:`last_error` holds the Win32
++    error code.
++    """
++    handle = _kernel32().CreateFileW(
++        str(path), access, share, None, disposition, flags, None
++    )
++    if is_invalid_handle(handle):
++        return None
++    return handle
++
++
++def close_handle(handle):
++    """Release ``handle``.  Never raises."""
++    if is_invalid_handle(handle):
++        return False
++    try:
++        return bool(_kernel32().CloseHandle(handle))
++    except Exception:  # pragma: no cover - defensive
++        return False
++
++
++def get_file_attributes(path):
++    """Return the file attributes of ``path``, or ``None`` when unknown.
++
++    Directories are described successfully too.
++    """
++    data = WIN32_FILE_ATTRIBUTE_DATA()
++    if not _kernel32().GetFileAttributesExW(str(path), 0, ctypes.byref(data)):
++        return None
++    return int(data.dwFileAttributes)
++
++
++def handle_attributes(handle):
++    """Return the attributes of the file behind ``handle``, or ``None``."""
++    info = BY_HANDLE_FILE_INFORMATION()
++    if not _kernel32().GetFileInformationByHandle(handle, ctypes.byref(info)):
++        return None
++    return int(info.dwFileAttributes)
++
++
++def get_volume_information(path):
++    """Return ``(volume_name, file_system_name, flags)`` of ``path``'s volume.
++
++    ``None`` when the volume cannot be described.
++    """
++    name = ctypes.create_unicode_buffer(512)
++    file_system = ctypes.create_unicode_buffer(512)
++    flags = wintypes.DWORD()
++    max_component = wintypes.DWORD()
++    ok = _kernel32().GetVolumeInformationW(
++        _volume_root(str(path)),
++        name,
++        512,
++        None,
++        ctypes.byref(max_component),
++        ctypes.byref(flags),
++        file_system,
++        512,
++    )
++    if not ok:
++        return None
++    return name.value, file_system.value, int(flags.value)
++
++
++def volume_supports_sparse_files(path):
++    """Return ``True`` when ``path``'s volume advertises sparse-file support.
++
++    ``None`` when the volume cannot be described at all.
++    """
++    info = get_volume_information(path)
++    if info is None:
++        return None
++    return bool(info[2] & FILE_SUPPORTS_SPARSE_FILES)
++
++
++def _volume_root(path):
++    drive, _ = os.path.splitdrive(path)
++    if drive:
++        return drive + "\\"
++    return path
++
++
++# --------------------------------------------------------------------------
++# size and layout queries
++# --------------------------------------------------------------------------
++
++
++def get_file_size(handle):
++    """Return the logical length of the open file ``handle``, or ``None``."""
++    size = wintypes.LARGE_INTEGER(0)
++    if not _kernel32().GetFileSizeEx(handle, ctypes.byref(size)):
++        return None
++    return int(size.value)
++
++
++def get_compressed_size(handle):
++    """Return the bytes ``handle``'s file really occupies on the volume.
++
++    This is what ``FSCTL_GET_COMPRESSED_FILE_SIZE`` reports: allocated
++    clusters only, holes excluded, rounded up to whole clusters.
++
++    ``None`` is returned on failure and :func:`last_error` holds the Win32
++    error code.
++    """
++    size = wintypes.LARGE_INTEGER(0)
++    returned = wintypes.DWORD(0)
++    ok = _kernel32().DeviceIoControl(
++        handle,
++        FSCTL_GET_COMPRESSED_FILE_SIZE,
++        None,
++        0,
++        ctypes.byref(size),
++        ctypes.sizeof(size),
++        ctypes.byref(returned),
++        None,
++    )
++    if not ok:
++        return None
++    return int(size.value)
++
++
++def query_allocated_ranges(handle, file_length):
++    """Return ``[(offset, length), ...]`` for the allocated extents of ``handle``.
++
++    ``FSCTL_QUERY_ALLOCATED_RANGES`` walks the file's extents and reports only
++    the ranges that are really backed by clusters.  ``file_length`` bounds the
++    query and clamps the answer to the file.
++
++    ``None`` is returned when the file system rejects the request; the Win32
++    error code is then available through :func:`last_error`.
++    """
++    length = max(int(file_length), 0)
++    if length == 0:
++        return []
++
++    query = FILE_ALLOCATED_RANGE_BUFFER()
++    query.FileOffset = 0
++    query.Length = length
++
++    capacity = 16
++    count = 0
++    buffer = None
++    while True:
++        buffer = (FILE_ALLOCATED_RANGE_BUFFER * capacity)()
++        returned = wintypes.DWORD(0)
++        ok = _kernel32().DeviceIoControl(
++            handle,
++            FSCTL_QUERY_ALLOCATED_RANGES,
++            ctypes.byref(query),
++            ctypes.sizeof(query),
++            buffer,
++            ctypes.sizeof(buffer),
++            ctypes.byref(returned),
++            None,
++        )
++        if not ok:
++            return None
++        count = returned.value // _RANGE_ITEM_SIZE
++        if count < capacity or capacity * _RANGE_ITEM_SIZE >= _MAX_RANGE_BUFFER:
++            break
++        # The buffer came back completely filled, so more extents may follow.
++        capacity *= 2
++
++    ranges = []
++    for index in range(count):
++        entry = buffer[index]
++        offset = int(entry.FileOffset)
++        extent = int(entry.Length)
++        if extent <= 0:
++            continue
++        end = min(offset + extent, length)
++        if end <= offset:
++            continue
++        ranges.append((offset, end - offset))
++    return ranges
++
++
++# --------------------------------------------------------------------------
++# sparse-file operations
++# --------------------------------------------------------------------------
++
++
++def set_sparse(handle, enabled=True):
++    """Mark (or unmark) the file behind ``handle`` as sparse.
++
++    Returns ``True`` on success.  On failure ``False`` is returned and
++    :func:`last_error` holds the Win32 error code -- a file system without
++    sparse support answers with ``ERROR_INVALID_FUNCTION``.
++    """
++    payload = wintypes.BOOL(bool(enabled))
++    returned = wintypes.DWORD(0)
++    return bool(
++        _kernel32().DeviceIoControl(
++            handle,
++            FSCTL_SET_SPARSE,
++            ctypes.byref(payload),
++            ctypes.sizeof(payload),
++            None,
++            0,
++            ctypes.byref(returned),
++            None,
++        )
++    )
++
++
++def set_zero_data(handle, start, end):
++    """Turn ``[start, end)`` of ``handle``'s file into a hole.
++
++    On a sparse file the file system releases the clusters of the range; on a
++    dense file it only rewrites the range with zeros, which does *not* shrink
++    the on-disk footprint.  Returns ``True`` on success.
++    """
++    info = FILE_ZERO_DATA_INFORMATION()
++    info.FileOffset = int(start)
++    info.BeyondFinalZero = int(end)
++    returned = wintypes.DWORD(0)
++    return bool(
++        _kernel32().DeviceIoControl(
++            handle,
++            FSCTL_SET_ZERO_DATA,
++            ctypes.byref(info),
++            ctypes.sizeof(info),
++            None,
++            0,
++            ctypes.byref(returned),
++            None,
++        )
++    )
++
++
++def set_end_of_file(handle, size):
++    """Set the logical end of ``handle``'s file to ``size`` bytes.
++
++    On a sparse file the extension is satisfied with a hole: no clusters are
++    allocated for the new bytes.  Returns ``True`` on success.
++    """
++    kernel = _kernel32()
++    position = wintypes.LARGE_INTEGER(int(size))
++    if not kernel.SetFilePointerEx(handle, position, None, 0):  # FILE_BEGIN
++        return False
++    return bool(kernel.SetEndOfFile(handle))
++
+ 
+-    return ctypes.WinDLL("kernel32", use_last_error=True)
++def flush(handle):
++    """Push the file's buffers to the volume.  Returns ``True`` on success."""
++    return bool(_kernel32().FlushFileBuffers(handle))
+diff --git a/wsparse/alloc.py b/wsparse/alloc.py
+index 48598d9..03e11bb 100644
+--- a/wsparse/alloc.py
++++ b/wsparse/alloc.py
+@@ -1,33 +1,19 @@
+ """Pre-allocation of sink files."""
+ 
+-import os
+-
+-from .errors import WSParseError
+-
+-#: Size of one reservation block.  The tail of a sink is written out in whole
+-#: blocks so that the writer never has to grow the file while it streams.
+-_BLOCK = 1 << 20
++from . import _winapi as win
++from ._handles import describe, normalize, open_update
++from .errors import WSParseError, from_os_error, from_winerror, unsupported
+ 
+ 
+ def _check_size(size):
+     if isinstance(size, bool) or not isinstance(size, int):
+-        raise WSParseError("size must be an integer, got %r" % (size,), kind="badarg")
++        raise WSParseError(
++            "size must be an integer, got %r" % (size,), kind="badarg"
++        )
+     if size < 0:
+         raise WSParseError("size must not be negative, got %r" % (size,), kind="badarg")
+ 
+ 
+-def _open_for_update(path):
+-    try:
+-        return open(path, "r+b")
+-    except FileNotFoundError:
+-        try:
+-            return open(path, "w+b")
+-        except OSError as exc:
+-            raise WSParseError(str(exc), kind="os", path=path) from exc
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-
+-
+ def preallocate(path, size):
+     """Grow ``path`` to ``size`` bytes and reserve the space for it.
+ 
+@@ -37,25 +23,65 @@ def preallocate(path, size):
+     untouched.
+ 
+     Returns the resulting file length in bytes.
++
++    Reserving the space means marking the sink as an NTFS sparse file and
++    moving its end of file out to ``size``.  NTFS satisfies that extension
++    with a hole, so the sink is immediately as long as the writer needs it to
++    be while occupying no clusters at all for the bytes nobody has written
++    yet.  Writing zeros into the tail instead would allocate every cluster the
++    sink ever needs -- which is precisely the behaviour the collector cannot
++    afford when it pre-allocates dozens of shards on one volume.
+     """
+     _check_size(size)
+-    path = os.fspath(path)
+-    handle = _open_for_update(path)
++
++    if not win.is_windows():
++        raise unsupported(
++            "sparse pre-allocation is only available on a Windows file system",
++            path=normalize(path),
++        )
++
++    # A directory can never be a sink: report that as ``unsupported`` rather
++    # than as a confusing "permission denied".
++    describe(path, allow_missing=True)
++
++    value, handle = open_update(path, create=True)
+     try:
+-        handle.seek(0, os.SEEK_END)
+-        remaining = size - handle.tell()
+-        if remaining > 0:
+-            # Reserve the tail by writing it out.  The collector's writer fills
+-            # these bytes in later, so the intermediate content does not matter.
+-            block = b"\x00" * _BLOCK
+-            while remaining > 0:
+-                take = _BLOCK if remaining > _BLOCK else remaining
+-                handle.write(block[:take])
+-                remaining -= take
+-        handle.flush()
+-        os.fsync(handle.fileno())
+-        return handle.tell()
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
++        if not win.set_sparse(handle, True):
++            error = win.last_error()
++            raise from_winerror(
++                error,
++                "the file system cannot hold a sparse file here",
++                path=value,
++            )
++
++        length = win.get_file_size(handle)
++        if length is None:
++            raise from_winerror(
++                win.last_error(), "cannot read the file length", path=value
++            )
++
++        if size > length:
++            # Extending a sparse file leaves the new bytes unallocated; they
++            # read back as zeros and cost nothing on the volume until the
++            # writer really stores something there.
++            if not win.set_end_of_file(handle, size):
++                raise from_winerror(
++                    win.last_error(),
++                    "cannot extend the file to %d bytes" % (size,),
++                    path=value,
++                )
++            length = size
++
++        try:
++            win.flush(handle)
++        except OSError as exc:  # pragma: no cover - defensive
++            raise from_os_error(exc, path=value, message="cannot flush the file")
++
++        final = win.get_file_size(handle)
++        if final is None:
++            raise from_winerror(
++                win.last_error(), "cannot read the file length", path=value
++            )
++        return final
+     finally:
+-        handle.close()
++        win.close_handle(handle)
+diff --git a/wsparse/errors.py b/wsparse/errors.py
+index f9b43d7..a552a79 100644
+--- a/wsparse/errors.py
++++ b/wsparse/errors.py
+@@ -1,5 +1,9 @@
+ """Error taxonomy for :mod:`wsparse`."""
+ 
++import os
++
++from ._winapi import UNSUPPORTED_ERRORS, is_windows, last_error
++
+ 
+ class WSParseError(Exception):
+     """Raised when a space-management operation cannot be carried out.
+@@ -29,3 +33,79 @@ class WSParseError(Exception):
+         if self.path is None:
+             return base
+         return "%s: %s" % (self.path, base)
++
++    @property
++    def winerror(self):
++        """The Win32 error code behind this failure, when there was one."""
++        return getattr(self, "_winerror", None)
++
++
++def classify_winerror(code):
++    """Return ``"unsupported"`` or ``"os"`` for a Win32 error ``code``.
++
++    The file system answers sparse-file requests it cannot honour with
++    ``ERROR_INVALID_FUNCTION`` (and friends); those mean "this object or this
++    volume will never support what you asked for", which is a different
++    situation from a missing path or a sharing violation.
++    """
++    if code in UNSUPPORTED_ERRORS:
++        return "unsupported"
++    return "os"
++
++
++def from_winerror(code, message, path=None, kind=None):
++    """Build a :class:`WSParseError` out of a Win32 error ``code``."""
++    if kind is None:
++        kind = classify_winerror(code)
++    detail = "%s (winerror %d)" % (message, code)
++    error = WSParseError(detail, kind=kind, path=path)
++    error._winerror = code
++    return error
++
++
++def from_os_error(exc, path=None, kind=None, message=None):
++    """Build a :class:`WSParseError` out of an :class:`OSError`."""
++    code = getattr(exc, "winerror", None)
++    text = message or str(exc)
++    if code:
++        error = from_winerror(code, text, path=path, kind=kind)
++        error.__cause__ = exc
++        return error
++    if kind is None:
++        kind = "unsupported" if not is_windows() else "os"
++    error = WSParseError(text, kind=kind, path=path)
++    error.__cause__ = exc
++    return error
++
++
++def unsupported(message, path=None):
++    """Build a ``kind="unsupported"`` :class:`WSParseError`."""
++    return WSParseError(message, kind="unsupported", path=path)
++
++
++def bad_path(path):
++    """Build a ``kind="badarg"`` error for an unusable path argument."""
++    return WSParseError("path must be a string or os.PathLike, got %r" % (path,),
++                        kind="badarg")
++
++
++def check_path(path):
++    """Normalise ``path`` to a string, rejecting unusable arguments.
++
++    Raises ``TypeError`` -- the caller converts it to a ``badarg``
++    :class:`WSParseError` -- when ``path`` is not path-like.
++    """
++    if not isinstance(path, (str, bytes, os.PathLike)):
++        raise TypeError("path must be a string or os.PathLike, got %r" % (path,))
++    value = os.fspath(path)
++    if isinstance(value, bytes):
++        value = os.fsdecode(value)
++    return value
++
++
++def winerror_of(exc):
++    """Return the Win32 error code carried by ``exc``, or ``last_error()``."""
++    code = getattr(exc, "winerror", None)
++    if code:
++        return int(code)
++    return int(last_error())
+diff --git a/wsparse/flags.py b/wsparse/flags.py
+index c819d68..e3b3c51 100644
+--- a/wsparse/flags.py
++++ b/wsparse/flags.py
+@@ -1,42 +1,55 @@
+ """Sparse-attribute handling."""
+ 
+-import os
+-
+-from ._winapi import SPARSE_ATTRIBUTE, is_windows
+-from .errors import WSParseError
++from . import _winapi as win
++from ._handles import describe, normalize, open_update
++from .errors import from_winerror, unsupported
+ 
+ 
+ def sparse_state(path):
+     """Return ``True`` when ``path`` currently carries the sparse attribute."""
+-    path = os.fspath(path)
+-    try:
+-        info = os.stat(path)
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-    attributes = getattr(info, "st_file_attributes", 0)
+-    return bool(attributes & SPARSE_ATTRIBUTE)
++    _, attributes = describe(path)
++    return bool(attributes & win.SPARSE_ATTRIBUTE)
+ 
+ 
+ def sparse_flag(path, enabled=True):
+     """Turn the sparse attribute of ``path`` on or off.
+ 
+     ``enabled`` defaults to ``True``.  Returns the state the file ends up in.
++
++    The attribute is really handed to the file system through
++    ``FSCTL_SET_SPARSE``: it takes effect at once, and -- because the flag is
++    what lets *later* writes create holes -- it does not reach back into the
++    bytes that are already allocated.  A sink that has grown densely therefore
++    keeps its clusters; the call succeeds without pretending that the space
++    came back.
++
++    Objects that cannot carry the attribute at all (a directory, or a volume
++    that does not support sparse files) are reported as ``unsupported``.
+     """
+-    path = os.fspath(path)
+-    if not os.path.exists(path):
+-        raise WSParseError("no such file: %s" % path, kind="os", path=path)
+-    if not is_windows():
+-        raise WSParseError(
++    if not win.is_windows():
++        raise unsupported(
+             "the sparse attribute is a Windows file-system concept",
+-            kind="unsupported",
+-            path=path,
+-        )
+-    if not enabled:
+-        raise WSParseError(
+-            "clearing the sparse attribute is not implemented yet",
+-            kind="unsupported",
+-            path=path,
++            path=normalize(path),
+         )
+-    # The attribute is maintained by the file system while the file is being
+-    # written, so there is nothing left to do here but report where we stand.
+-    return sparse_state(path)
++
++    value, _ = describe(path)
++    enabled = bool(enabled)
++
++    _, handle = open_update(value)
++    try:
++        if not win.set_sparse(handle, enabled):
++            error = win.last_error()
++            raise from_winerror(
++                error,
++                "the file system refused to %s the sparse attribute"
++                % ("set" if enabled else "clear"),
++                path=value,
++            )
++        attributes = win.handle_attributes(handle)
++    finally:
++        win.close_handle(handle)
++
++    if attributes is None:
++        # The handle is gone by now; ask through the path instead.
++        return sparse_state(value)
++    return bool(attributes & win.SPARSE_ATTRIBUTE)
+diff --git a/wsparse/ranges.py b/wsparse/ranges.py
+index 5452117..ec676f9 100644
+--- a/wsparse/ranges.py
++++ b/wsparse/ranges.py
+@@ -1,8 +1,8 @@
+ """Allocated-range reporting for sink files."""
+ 
+-import os
+-
+-from .errors import WSParseError
++from . import _winapi as win
++from ._handles import describe, normalize, open_metadata
++from .errors import WSParseError, from_winerror
+ 
+ 
+ def allocated_ranges(path):
+@@ -12,12 +12,76 @@ def allocated_ranges(path):
+     be fetched: a range that is already allocated is on disk, everything else
+     is a hole that still needs data.  The list is ordered by ``offset`` and the
+     ranges never overlap.  Every range lies inside the file's logical length.
++
++    The answer comes from ``FSCTL_QUERY_ALLOCATED_RANGES``, so it describes the
++    file the way NTFS has it laid out: a hole-free sink yields one range
++    covering the whole length, a sink that is nothing but a hole yields an
++    empty list, and a partly written shard yields exactly the extents its
++    writer has stored.
+     """
+-    path = os.fspath(path)
++    if not win.is_windows():
++        raise WSParseError(
++            "allocated-range queries are only available on a Windows file system",
++            kind="unsupported",
++            path=normalize(path),
++        )
++
++    value, _ = describe(path)
++
++    _, handle = open_metadata(value)
+     try:
+-        size = os.path.getsize(path)
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-    if size == 0:
+-        return []
+-    return [(0, size)]
++        length = win.get_file_size(handle)
++        if length is None:
++            raise from_winerror(
++                win.last_error(), "cannot read the file length", path=value
++            )
++        if length <= 0:
++            return []
++        raw = win.query_allocated_ranges(handle, length)
++        error = win.last_error() if raw is None else 0
++    finally:
++        win.close_handle(handle)
++
++    if raw is None:
++        if error in win.UNSUPPORTED_ERRORS:
++            # The file system does not track allocated ranges for this object.
++            # Nothing is known about the layout, so reporting the whole file as
++            # allocated -- which is what a plain size read would amount to --
++            # would tell the transfer layer that the sink is complete.
++            raise from_winerror(
++                error,
++                "the file system cannot report allocated ranges",
++                path=value,
++                kind="unsupported",
++            )
++        raise from_winerror(
++            error, "the file system cannot report allocated ranges", path=value
++        )
++
++    return _ordered(raw, length)
++
++
++def _ordered(raw, length):
++    """Clamp, sort and de-duplicate the raw extents into the documented form."""
++    ranges = []
++    for offset, extent in raw:
++        if extent <= 0:
++            continue
++        start = max(int(offset), 0)
++        end = min(start + int(extent), length)
++        if end <= start:
++            continue
++        ranges.append((start, end - start))
++    ranges.sort()
++
++    merged = []
++    for start, extent in ranges:
++        if merged:
++            previous_offset, previous_extent = merged[-1]
++            previous_end = previous_offset + previous_extent
++            if start <= previous_end:
++                end = max(previous_end, start + extent)
++                merged[-1] = (previous_offset, end - previous_offset)
++                continue
++        merged.append((start, extent))
++    return merged
+diff --git a/wsparse/usage.py b/wsparse/usage.py
+index 4c0f135..6e6b6ad 100644
+--- a/wsparse/usage.py
++++ b/wsparse/usage.py
+@@ -1,8 +1,8 @@
+ """Disk-usage accounting for sink files."""
+ 
+-import os
+-
+-from .errors import WSParseError
++from . import _winapi as win
++from ._handles import describe, normalize, open_metadata
++from .errors import WSParseError, from_winerror
+ 
+ 
+ def disk_usage(path):
+@@ -10,12 +10,43 @@ def disk_usage(path):
+ 
+     This is what the quota tracker subtracts from the volume budget, so it has
+     to describe the space the sink actually holds, not the number of bytes a
+-    reader would see.  The value is rounded up to a whole cluster by the file
+-    system.
++    reader would see.  The logical length says nothing about that: a
++    pre-allocated sparse shard is as long as the stream it will hold while
++    costing only the clusters its writer has really stored.
++
++    The number comes from ``FSCTL_GET_COMPRESSED_FILE_SIZE``, which NTFS
++    answers with the allocated clusters of the file -- holes excluded and
++    rounded up to whole clusters.  A dense file therefore reports about its
++    logical length, and a mostly empty sparse shard reports only the few
++    clusters its payload occupies.
+     """
+-    path = os.fspath(path)
++    if not win.is_windows():
++        # Without a Windows file system there is no notion of allocated
++        # clusters separate from the logical length; refuse rather than lie.
++        raise WSParseError(
++            "cluster accounting is only available on a Windows file system",
++            kind="unsupported",
++            path=normalize(path),
++        )
++
++    value, _ = describe(path)
++
++    _, handle = open_metadata(value)
+     try:
+-        info = os.stat(path)
+-    except OSError as exc:
+-        raise WSParseError(str(exc), kind="os", path=path) from exc
+-    return info.st_size
++        used = win.get_compressed_size(handle)
++        error = win.last_error() if used is None else 0
++    finally:
++        win.close_handle(handle)
++
++    if used is None:
++        raise from_winerror(
++            error,
++            "the file system cannot report the allocated size",
++            path=value,
++        )
++
++    if used < 0:
++        raise WSParseError(
++            "the file system reported a negative allocation", kind="os", path=value
++        )
++    return used

@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(r"C:\Users\Administrator\Desktop\wff-task")
-PKG = ROOT / "harbor-windows" / "wfflab__wvas-216-v1.0.0-delivery"
+PKG = ROOT / "harbor-windows" / "wfflab__wvas-216-v1.0.1-delivery"
 STAGE = ROOT / "harbor-windows" / "_qc_runs" / "wvas-build" / "controls"
 HARBOR = Path(os.environ.get(
     "HARBOR_EXE",

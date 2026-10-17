@@ -1,0 +1,751 @@
+diff --git a/wvas/_winapi.py b/wvas/_winapi.py
+index 82faf2f..fea57d5 100644
+--- a/wvas/_winapi.py
++++ b/wvas/_winapi.py
+@@ -1,13 +1,19 @@
+-"""ctypes bindings for the Win32 calls the auditor uses."""
++"""ctypes bindings for the Win32 calls the auditor uses.
++
++The module imports cleanly on every platform; ``IS_WINDOWS`` tells the callers
++whether the bindings are actually usable, so that the public API can report an
++``unsupported`` failure instead of blowing up at import time.
++"""
+ 
+ import ctypes
+ import ctypes.wintypes as wt
++import sys
+ 
+-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+-psapi = ctypes.WinDLL("psapi", use_last_error=True)
++IS_WINDOWS = sys.platform == "win32"
+ 
+ # ---- access rights ---------------------------------------------------------
+ PROCESS_QUERY_INFORMATION = 0x0400
++PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ PROCESS_VM_READ = 0x0010
+ 
+ # ---- region state ----------------------------------------------------------
+@@ -31,9 +37,39 @@ PAGE_EXECUTE_READWRITE = 0x40
+ PAGE_EXECUTE_WRITECOPY = 0x80
+ PAGE_GUARD = 0x100
+ 
++# ---- module enumeration ----------------------------------------------------
++LIST_MODULES_32BIT = 0x01
++LIST_MODULES_64BIT = 0x02
++LIST_MODULES_ALL = 0x03
++
++# ---- error codes -----------------------------------------------------------
++ERROR_SUCCESS = 0
++ERROR_FILE_NOT_FOUND = 2
++ERROR_ACCESS_DENIED = 5
++ERROR_INVALID_HANDLE = 6
++ERROR_INVALID_PARAMETER = 87
++ERROR_INSUFFICIENT_BUFFER = 122
++ERROR_FILE_INVALID = 1006
++ERROR_PARTIAL_COPY = 299
++
++STILL_ACTIVE = 259
++
++# Safety net for the address space walk: the scan stops as soon as
++# ``VirtualQueryEx`` refuses an address, this bound only guarantees that a
++# misbehaving query cannot spin forever.  It is pointer sized, so a 64 bit
++# walk really does cover the whole user range.
++MAX_USER_ADDRESS = (
++    0xFFFFFFFF if ctypes.sizeof(ctypes.c_void_p) == 4 else 0x7FFFFFFFFFFFF
++)
++
+ 
+ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+-    """MEMORY_BASIC_INFORMATION, as declared by the platform SDK."""
++    """MEMORY_BASIC_INFORMATION, as declared by the platform SDK.
++
++    ``BaseAddress`` and ``AllocationBase`` are pointers and ``RegionSize`` is a
++    ``SIZE_T``: on a 64 bit build all three are 64 bit wide, which is what
++    keeps high addresses and multi-gigabyte reservations intact.
++    """
+ 
+     _fields_ = [
+         ("BaseAddress", ctypes.c_void_p),
+@@ -46,27 +82,105 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+     ]
+ 
+ 
+-OpenProcess = kernel32.OpenProcess
+-OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+-OpenProcess.restype = wt.HANDLE
++class MODULEINFO(ctypes.Structure):
++    """MODULEINFO, as declared by psapi.h."""
+ 
+-CloseHandle = kernel32.CloseHandle
+-CloseHandle.argtypes = [wt.HANDLE]
+-CloseHandle.restype = wt.BOOL
++    _fields_ = [
++        ("lpBaseOfDll", ctypes.c_void_p),
++        ("SizeOfImage", wt.DWORD),
++        ("EntryPoint", ctypes.c_void_p),
++    ]
+ 
+-VirtualQueryEx = kernel32.VirtualQueryEx
+-VirtualQueryEx.argtypes = [
+-    wt.HANDLE,
+-    ctypes.c_void_p,
+-    ctypes.POINTER(MEMORY_BASIC_INFORMATION),
+-    ctypes.c_size_t,
+-]
+-VirtualQueryEx.restype = ctypes.c_size_t
+ 
+-GetMappedFileNameW = psapi.GetMappedFileNameW
+-GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
+-GetMappedFileNameW.restype = wt.DWORD
++kernel32 = None
++psapi = None
++OpenProcess = None
++CloseHandle = None
++GetExitCodeProcess = None
++VirtualQueryEx = None
++QueryDosDeviceW = None
++GetLogicalDriveStringsW = None
++GetMappedFileNameW = None
++GetModuleFileNameExW = None
++GetModuleInformation = None
++EnumProcessModules = None
++EnumProcessModulesEx = None
++
++if IS_WINDOWS:  # pragma: no branch - the package only targets Windows
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    psapi = ctypes.WinDLL("psapi", use_last_error=True)
++
++    OpenProcess = kernel32.OpenProcess
++    OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
++    OpenProcess.restype = wt.HANDLE
++
++    CloseHandle = kernel32.CloseHandle
++    CloseHandle.argtypes = [wt.HANDLE]
++    CloseHandle.restype = wt.BOOL
++
++    GetExitCodeProcess = kernel32.GetExitCodeProcess
++    GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
++    GetExitCodeProcess.restype = wt.BOOL
++
++    VirtualQueryEx = kernel32.VirtualQueryEx
++    VirtualQueryEx.argtypes = [
++        wt.HANDLE,
++        ctypes.c_void_p,
++        ctypes.POINTER(MEMORY_BASIC_INFORMATION),
++        ctypes.c_size_t,
++    ]
++    VirtualQueryEx.restype = ctypes.c_size_t
++
++    QueryDosDeviceW = kernel32.QueryDosDeviceW
++    QueryDosDeviceW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
++    QueryDosDeviceW.restype = wt.DWORD
++
++    GetLogicalDriveStringsW = kernel32.GetLogicalDriveStringsW
++    GetLogicalDriveStringsW.argtypes = [wt.DWORD, wt.LPWSTR]
++    GetLogicalDriveStringsW.restype = wt.DWORD
++
++    GetMappedFileNameW = psapi.GetMappedFileNameW
++    GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
++    GetMappedFileNameW.restype = wt.DWORD
++
++    GetModuleFileNameExW = psapi.GetModuleFileNameExW
++    GetModuleFileNameExW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
++    GetModuleFileNameExW.restype = wt.DWORD
++
++    GetModuleInformation = psapi.GetModuleInformation
++    GetModuleInformation.argtypes = [
++        wt.HANDLE,
++        ctypes.c_void_p,
++        ctypes.POINTER(MODULEINFO),
++        wt.DWORD,
++    ]
++    GetModuleInformation.restype = wt.BOOL
++
++    EnumProcessModules = psapi.EnumProcessModules
++    EnumProcessModules.argtypes = [
++        wt.HANDLE,
++        ctypes.c_void_p,
++        wt.DWORD,
++        ctypes.POINTER(wt.DWORD),
++    ]
++    EnumProcessModules.restype = wt.BOOL
++
++    try:
++        EnumProcessModulesEx = psapi.EnumProcessModulesEx
++    except AttributeError:  # pragma: no cover - ancient platforms only
++        EnumProcessModulesEx = None
++    else:
++        EnumProcessModulesEx.argtypes = [
++            wt.HANDLE,
++            ctypes.c_void_p,
++            wt.DWORD,
++            ctypes.POINTER(wt.DWORD),
++            wt.DWORD,
++        ]
++        EnumProcessModulesEx.restype = wt.BOOL
+ 
+ 
+ def last_error():
++    if not IS_WINDOWS:
++        return 0
+     return ctypes.get_last_error()
+diff --git a/wvas/vas.py b/wvas/vas.py
+index 868a1c4..c1f794b 100644
+--- a/wvas/vas.py
++++ b/wvas/vas.py
+@@ -15,14 +15,26 @@ The answers are what the field engineers read when a machine reports
+ "something keeps the log file mapped" or "the process has no address space
+ left", so they have to describe the target process, not a snapshot of an
+ earlier call.
++
++Two properties matter for every answer:
++
++* addresses and lengths are reported at the full width the platform uses, so a
++  high address or a multi-gigabyte range survives the trip unchanged;
++* a file name is only reported when the caller can open it, which means the
++  native ``\\Device\\HarddiskVolumeN\\...`` form is translated into a drive
++  letter or UNC path first, and anything that cannot be translated is reported
++  as ``None`` rather than as a name nobody can use.
+ """
+ 
+ import ctypes
++import ctypes.wintypes as wintypes
+ 
+ from . import _winapi as w
+ from .errors import WVasError
+ 
+-PATH_BUFFER_CHARS = 260
++# ``MAX_PATH`` is not enough: mapped files can carry long paths and the native
++# device form is longer still.
++PATH_BUFFER_CHARS = 32768
+ 
+ _PROTECTION_NAMES = {
+     w.PAGE_NOACCESS: "none",
+@@ -41,87 +53,472 @@ _TYPE_NAMES = {
+     w.MEM_PRIVATE: "private",
+ }
+ 
++# Network redirector devices: the remainder of the path is a UNC name.
++_UNC_DEVICES = ("\\device\\mup", "\\device\\lanmanredirector")
++
+ 
+ def protection_name(protect):
+-    """Map a PAGE_* protection value onto its short textual name."""
+-    return _PROTECTION_NAMES.get(protect & 0xFF, "?")
++    """Map a PAGE_* protection value onto its short textual name.
++
++    Pure: the modifier bits (``PAGE_GUARD`` and friends) are masked off and the
++    remaining constant is looked up in a table.  No process is inspected.
++    """
++    try:
++        value = int(protect)
++    except (TypeError, ValueError):
++        return "?"
++    return _PROTECTION_NAMES.get(value & 0xFF, "?")
+ 
+ 
+ def type_name(region_type):
+-    """Map a MEM_* region type onto its short textual name."""
+-    return _TYPE_NAMES.get(region_type, "private")
++    """Map a MEM_* region type onto its short textual name.  Pure."""
++    try:
++        value = int(region_type)
++    except (TypeError, ValueError):
++        return "private"
++    return _TYPE_NAMES.get(value, "private")
+ 
+ 
+-def _open_process(pid):
+-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
++# ---------------------------------------------------------------------------
++# process handles
++# ---------------------------------------------------------------------------
++
++def _check_pid(pid):
++    if isinstance(pid, bool) or not isinstance(pid, int):
+         raise WVasError("pid must be a positive integer", kind="badarg", pid=pid)
+-    handle = w.OpenProcess(
+-        w.PROCESS_QUERY_INFORMATION | w.PROCESS_VM_READ, False, pid
++    if pid <= 0 or pid > 0xFFFFFFFF:
++        raise WVasError("pid must be a positive integer", kind="badarg", pid=pid)
++
++
++def _check_platform(pid=None):
++    if not w.IS_WINDOWS:
++        raise WVasError(
++            "address space auditing is only supported on Windows",
++            kind="unsupported",
++            pid=pid,
++        )
++
++
++def _process_has_exited(handle):
++    """True when the handle refers to a process that is no longer running."""
++    code = wintypes.DWORD(0)
++    if not w.GetExitCodeProcess(handle, ctypes.byref(code)):
++        return False
++    return code.value != w.STILL_ACTIVE
++
++
++def _open_process(pid):
++    """Open ``pid`` for reading, or raise a classified :class:`WVasError`."""
++    _check_pid(pid)
++    _check_platform(pid)
++
++    denied = False
++    for access in (
++        w.PROCESS_QUERY_INFORMATION | w.PROCESS_VM_READ,
++        w.PROCESS_QUERY_LIMITED_INFORMATION | w.PROCESS_VM_READ,
++        w.PROCESS_QUERY_INFORMATION,
++        w.PROCESS_QUERY_LIMITED_INFORMATION,
++    ):
++        handle = w.OpenProcess(access, False, pid)
++        if handle:
++            if _process_has_exited(handle):
++                w.CloseHandle(handle)
++                raise WVasError("no such process", kind="no-such-process", pid=pid)
++            return handle
++
++        error = w.last_error()
++        if error == w.ERROR_ACCESS_DENIED:
++            # The process exists, only this access mask was refused; a weaker
++            # mask may still be enough to answer the question.
++            denied = True
++            continue
++        if error in (w.ERROR_INVALID_PARAMETER, w.ERROR_FILE_NOT_FOUND):
++            raise WVasError("no such process", kind="no-such-process", pid=pid)
++        raise WVasError(
++            "OpenProcess failed (error %d)" % (error,),
++            kind="query-failed",
++            pid=pid,
++        )
++
++    if denied:
++        raise WVasError(
++            "the process cannot be opened for reading",
++            kind="access-denied",
++            pid=pid,
++        )
++    raise WVasError("OpenProcess failed", kind="query-failed", pid=pid)
++
++
++def _classify_failure(handle, pid, error, what):
++    """Turn a Win32 error on an opened process into a :class:`WVasError`."""
++    if _process_has_exited(handle):
++        return WVasError("no such process", kind="no-such-process", pid=pid)
++    if error in (w.ERROR_ACCESS_DENIED, w.ERROR_PARTIAL_COPY):
++        return WVasError(
++            "the process cannot be queried", kind="access-denied", pid=pid
++        )
++    return WVasError(
++        "%s failed (error %d)" % (what, error), kind="query-failed", pid=pid
+     )
+-    if not handle:
+-        raise OSError(w.last_error(), "OpenProcess failed")
+-    return handle
+ 
+ 
+-def _mapped_path(handle, mbi):
+-    """Return the file name backing this region, if any."""
+-    if mbi.Type not in (w.MEM_IMAGE, w.MEM_MAPPED):
++# ---------------------------------------------------------------------------
++# native path -> path the caller can open
++# ---------------------------------------------------------------------------
++
++def _device_map():
++    """Return ``[(lowercase device name, dos prefix), ...]``.
++
++    The map is rebuilt for every audit: drive letters come and go and a stale
++    map would hand out a path that cannot be opened.
++    """
++    entries = []
++    length = w.GetLogicalDriveStringsW(0, None)
++    if not length:
++        return entries
++    buffer = ctypes.create_unicode_buffer(length + 1)
++    written = w.GetLogicalDriveStringsW(length + 1, buffer)
++    if not written:
++        return entries
++
++    raw = buffer[:written]
++    target = ctypes.create_unicode_buffer(PATH_BUFFER_CHARS)
++    for drive in raw.split("\0"):
++        drive = drive.strip()
++        if not drive:
++            continue
++        letter = drive.rstrip("\\")
++        if not letter.endswith(":"):
++            continue
++        if not w.QueryDosDeviceW(letter, target, PATH_BUFFER_CHARS):
++            continue
++        device = target.value
++        if not device:
++            continue
++        entries.append((device.rstrip("\\").lower(), letter))
++
++    # Longest device name first, so that \Device\HarddiskVolume10 is not
++    # shadowed by \Device\HarddiskVolume1.
++    entries.sort(key=lambda item: len(item[0]), reverse=True)
++    return entries
++
++
++def _unc_from_redirector(rest):
++    """Turn the remainder of a redirector device path into a UNC path."""
++    parts = [part for part in rest.split("\\") if part]
++    # LanmanRedirector paths carry a ";Z:0000000000000000" component naming
++    # the local drive letter the share is bound to; it is not part of the name.
++    parts = [part for part in parts if not part.startswith(";")]
++    if len(parts) < 2:
+         return None
++    return "\\\\" + "\\".join(parts)
++
++
++def _dos_path(native, device_map):
++    """Translate a native path into a path the caller can open.
++
++    Accepts the ``\\Device\\...`` form returned by ``GetMappedFileNameW`` as
++    well as the ``\\??\\`` and ``\\\\?\\`` prefixed forms, and returns ``None``
++    when the name cannot be turned into a drive letter or UNC path.
++    """
++    if not native:
++        return None
++
++    path = native.replace("/", "\\")
++
++    # \\?\ and \??\ are namespace prefixes, not part of the file name.
++    for prefix in ("\\\\?\\", "\\??\\"):
++        if path[:len(prefix)].lower() == prefix.lower():
++            path = path[len(prefix):]
++            if path[:4].lower() == "unc\\":
++                path = "\\\\" + path[4:]
++            break
++
++    lowered = path.lower()
++
++    if lowered.startswith("\\device\\"):
++        for device, letter in device_map:
++            if lowered.startswith(device) and (
++                len(lowered) == len(device) or lowered[len(device)] == "\\"
++            ):
++                rest = path[len(device):]
++                return letter + (rest if rest else "\\")
++        for device in _UNC_DEVICES:
++            if lowered.startswith(device) and (
++                len(lowered) == len(device) or lowered[len(device)] == "\\"
++            ):
++                return _unc_from_redirector(path[len(device):])
++        # A device with neither a drive letter nor a share behind it: there is
++        # no name the caller could open.
++        return None
++
++    if path.startswith("\\\\"):
++        # Already a UNC path.
++        return path if path.strip("\\") else None
++
++    if len(path) >= 3 and path[0].isalpha() and path[1] == ":" and path[2] == "\\":
++        return path
++
++    return None
++
++
++def _mapped_path(handle, address, device_map):
++    """Return the openable path of the file backing ``address``, else ``None``."""
+     buffer = ctypes.create_unicode_buffer(PATH_BUFFER_CHARS)
+     written = w.GetMappedFileNameW(
+-        handle, ctypes.c_void_p(mbi.BaseAddress), buffer, PATH_BUFFER_CHARS
++        handle, ctypes.c_void_p(address), buffer, PATH_BUFFER_CHARS
++    )
++    if not written:
++        # Anonymous mappings, private memory and reserved ranges have no file
++        # behind them at all - that is reported as ``None``, never as "".
++        return None
++    return _dos_path(buffer.value, device_map)
++
++
++def _module_path(handle, address, device_map):
++    """Return the openable path of the image loaded at ``address``."""
++    buffer = ctypes.create_unicode_buffer(PATH_BUFFER_CHARS)
++    written = w.GetModuleFileNameExW(
++        handle, ctypes.c_void_p(address), buffer, PATH_BUFFER_CHARS
+     )
+     if not written:
+-        return ""
+-    return buffer.value
++        return None
++    return _dos_path(buffer.value, device_map)
++
++
++# ---------------------------------------------------------------------------
++# the audit itself
++# ---------------------------------------------------------------------------
++
++def _walk(handle, pid, include_reserved, device_map):
++    result = []
++    mbi = w.MEMORY_BASIC_INFORMATION()
++    size_of_mbi = ctypes.sizeof(mbi)
++    address = 0
++    first = True
++
++    while address <= w.MAX_USER_ADDRESS:
++        returned = w.VirtualQueryEx(
++            handle, ctypes.c_void_p(address), ctypes.byref(mbi), size_of_mbi
++        )
++        if not returned:
++            if first:
++                # Not a single region could be read: that is a failure, not an
++                # empty address space.
++                raise _classify_failure(
++                    handle, pid, w.last_error(), "VirtualQueryEx"
++                )
++            # The walk has reached the end of the user address space.
++            break
++        first = False
++
++        # ``BaseAddress`` and ``RegionSize`` are pointer sized; reporting them
++        # unmasked is what keeps high addresses and ranges beyond 4 GiB
++        # truthful.
++        base = mbi.BaseAddress or 0
++        size = mbi.RegionSize or 0
++        state = mbi.State
++
++        if state == w.MEM_COMMIT or (include_reserved and state == w.MEM_RESERVE):
++            if state == w.MEM_COMMIT:
++                path = _mapped_path(handle, base, device_map)
++            else:
++                # Nothing is mapped into a reserved range, so no file backs it.
++                path = None
++            result.append({
++                "base": base,
++                "size": size,
++                "state": "commit" if state == w.MEM_COMMIT else "reserve",
++                "type": type_name(mbi.Type),
++                "protect": protection_name(mbi.Protect),
++                "path": path,
++                "image": mbi.Type == w.MEM_IMAGE,
++            })
++
++        next_address = base + size
++        if next_address <= address:
++            break
++        address = next_address
++
++    result.sort(key=lambda item: item["base"])
++    return result
+ 
+ 
+ def regions(pid, include_reserved=True):
+-    """Return the regions of ``pid``'s virtual address space."""
++    """Return the regions of ``pid``'s virtual address space.
++
++    The list is ascending by ``base``.  With ``include_reserved`` the reserved
++    but uncommitted ranges are reported next to the committed ones; without it
++    only committed ranges are reported.
++    """
+     handle = _open_process(pid)
+     try:
+-        result = []
+-        mbi = w.MEMORY_BASIC_INFORMATION()
+-        address = 0
+-        while address < 0x7FFFFFFFFFFF:
+-            written = w.VirtualQueryEx(
+-                handle,
+-                ctypes.c_void_p(address),
+-                ctypes.byref(mbi),
+-                ctypes.sizeof(mbi),
+-            )
+-            if not written:
+-                break
+-            if mbi.State == w.MEM_COMMIT:
+-                base_address = mbi.BaseAddress or 0
+-                result.append({
+-                    "base": base_address & 0xFFFFFFFF,
+-                    "size": mbi.RegionSize & 0xFFFFFFFF,
+-                    "state": "commit",
+-                    "type": type_name(mbi.Type),
+-                    "protect": protection_name(mbi.Protect),
+-                    "path": _mapped_path(handle, mbi),
+-                    "image": mbi.Type == w.MEM_IMAGE,
+-                })
+-            next_address = (mbi.BaseAddress or 0) + mbi.RegionSize
+-            if next_address <= address:
+-                break
+-            address = next_address
+-        result.sort(key=lambda item: item["base"])
+-        return result
++        device_map = _device_map()
++        return _walk(handle, pid, bool(include_reserved), device_map)
++    except WVasError:
++        raise
++    except OSError as exc:
++        raise WVasError(
++            "the address space query failed: %s" % (exc,),
++            kind="query-failed",
++            pid=pid,
++        ) from exc
+     finally:
+         w.CloseHandle(handle)
+ 
+ 
+ def file_backed_regions(pid):
+-    """Return only the regions that have a file behind them."""
+-    return [item for item in regions(pid) if item["path"]]
++    """Return only the regions that have a file behind them, in audit order."""
++    return [item for item in regions(pid) if item["path"] is not None]
++
++
++# ---------------------------------------------------------------------------
++# modules
++# ---------------------------------------------------------------------------
++
++def _enumerate_modules(handle):
++    """Return ``(bases, error)``; ``bases`` is ``None`` when enumeration failed."""
++    count = 256
++    while True:
++        array = (ctypes.c_void_p * count)()
++        needed = wintypes.DWORD(0)
++        if w.EnumProcessModulesEx is not None:
++            ok = w.EnumProcessModulesEx(
++                handle,
++                ctypes.byref(array),
++                ctypes.sizeof(array),
++                ctypes.byref(needed),
++                w.LIST_MODULES_ALL,
++            )
++        else:  # pragma: no cover - only on platforms without the Ex variant
++            ok = w.EnumProcessModules(
++                handle,
++                ctypes.byref(array),
++                ctypes.sizeof(array),
++                ctypes.byref(needed),
++            )
++        if not ok:
++            return None, w.last_error()
++        pointer_size = ctypes.sizeof(ctypes.c_void_p)
++        available = needed.value // pointer_size
++        if available > count:
++            # The module list grew between the two calls; retry with room to
++            # spare so that no image is dropped from the report.
++            count = available + 16
++            continue
++        return [array[index] or 0 for index in range(available)], w.ERROR_SUCCESS
++
++
++def _modules_from_enumeration(handle, device_map):
++    bases, error = _enumerate_modules(handle)
++    if bases is None:
++        return None, error
++    found = []
++    for base in bases:
++        info = w.MODULEINFO()
++        if w.GetModuleInformation(
++            handle, ctypes.c_void_p(base), ctypes.byref(info), ctypes.sizeof(info)
++        ):
++            size = info.SizeOfImage
++            base = info.lpBaseOfDll or base
++        else:
++            size = 0
++        # An image whose name cannot be resolved still belongs in the report.
++        path = _module_path(handle, base, device_map)
++        if path is None:
++            path = _mapped_path(handle, base, device_map)
++        found.append({"path": path, "base": base, "size": size})
++    return found, w.ERROR_SUCCESS
++
++
++def _modules_from_regions(handle, device_map):
++    """Fall back to grouping the image regions by their allocation base.
++
++    Every image occupies several regions (headers, text, data, ...); keying on
++    the allocation base is what reports one entry per loaded image instead of
++    one entry per section.
++    """
++    found = {}
++    mbi = w.MEMORY_BASIC_INFORMATION()
++    size_of_mbi = ctypes.sizeof(mbi)
++    address = 0
++    while address <= w.MAX_USER_ADDRESS:
++        if not w.VirtualQueryEx(
++            handle, ctypes.c_void_p(address), ctypes.byref(mbi), size_of_mbi
++        ):
++            break
++        base = mbi.BaseAddress or 0
++        size = mbi.RegionSize or 0
++        if mbi.Type == w.MEM_IMAGE and mbi.State != w.MEM_FREE:
++            allocation_base = mbi.AllocationBase or base
++            end = base + size
++            entry = found.get(allocation_base)
++            if entry is None:
++                path = _module_path(handle, allocation_base, device_map)
++                if path is None:
++                    path = _mapped_path(handle, base, device_map)
++                found[allocation_base] = {
++                    "path": path,
++                    "base": allocation_base,
++                    "size": end - allocation_base,
++                }
++            else:
++                entry["size"] = max(entry["size"], end - allocation_base)
++                if entry["path"] is None:
++                    entry["path"] = _mapped_path(handle, base, device_map)
++        next_address = base + size
++        if next_address <= address:
++            break
++        address = next_address
++    return list(found.values())
+ 
+ 
+ def modules(pid):
+-    """Return the loaded executable images, lowest base address first."""
+-    return [
+-        {"path": item["path"], "base": item["base"], "size": item["size"]}
+-        for item in regions(pid)
+-        if item["image"]
+-    ]
++    """Return the loaded executable images, lowest base address first.
++
++    Every image appears exactly once and no file path is reported twice.  An
++    image whose file name cannot be turned into an openable path is still
++    listed, with ``path`` set to ``None``.
++    """
++    handle = _open_process(pid)
++    try:
++        device_map = _device_map()
++        found, error = _modules_from_enumeration(handle, device_map)
++        if not found:
++            # Either the enumeration failed outright or it came back empty;
++            # the image regions of the address space still describe the images.
++            from_regions = _modules_from_regions(handle, device_map)
++            if not from_regions and found is None:
++                raise _classify_failure(
++                    handle, pid, error, "EnumProcessModulesEx"
++                )
++            found = from_regions
++    except WVasError:
++        raise
++    except OSError as exc:
++        raise WVasError(
++            "the module query failed: %s" % (exc,),
++            kind="query-failed",
++            pid=pid,
++        ) from exc
++    finally:
++        w.CloseHandle(handle)
++
++    unique = []
++    seen_bases = set()
++    seen_paths = set()
++    for item in sorted(found, key=lambda entry: entry["base"]):
++        if item["base"] in seen_bases:
++            continue
++        if item["path"] is not None:
++            key = item["path"].lower()
++            if key in seen_paths:
++                continue
++            seen_paths.add(key)
++        seen_bases.add(item["base"])
++        unique.append({
++            "path": item["path"],
++            "base": item["base"],
++            "size": item["size"],
++        })
++    return unique

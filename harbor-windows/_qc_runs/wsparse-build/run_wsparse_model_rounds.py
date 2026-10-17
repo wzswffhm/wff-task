@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(r"C:\Users\Administrator\Desktop\wff-task")
-PKG = ROOT / "harbor-windows" / "wfflab__wsparse-215-v1.0.0-delivery"
+PKG = ROOT / "harbor-windows" / "wfflab__wsparse-215-v1.0.1-delivery"
 AGENT_DIR = ROOT / "harbor-windows" / "_qc_runs" / "wsparse-build" / "harbor_agent"
 STAGE = ROOT / "harbor-windows" / "_qc_runs" / "wsparse-build" / "model-rounds"
 HARBOR = Path(os.environ.get(
@@ -33,6 +33,8 @@ DOCKER_BIN = r"C:\Program Files\Docker\Docker\resources\bin"
 AGENT = "wsparse_model_agent:WindowsCodingModelAgent"
 
 # (alias, 端点 key, 轮数)
+# 交付方 2026-10-16 口径：Qwen 与 Opus 各跑 3 轮，jobs/ 直接放 3+3+3+3 = 12 个 job，
+# 不做任何轮次筛选。
 ROUNDS = [("qwen", "qwen3.8-max", 3), ("opus", "opus-5", 3)]
 
 
@@ -40,11 +42,21 @@ def endpoints() -> dict:
     ml = json.loads(MODELS_LOCAL.read_text(encoding="utf-8"))
     by_key = {e.get("key"): e for e in ml["endpoints"]}
     out = {}
+    # 模型侧参数按甲方《windows-qwen-opus 模型运行配置说明》：
+    #   temperature=1, top_p=0.95, top_k=20, max_tokens=65535；
+    #   Qwen 额外注入 enable_thinking=true 与 reasoning_effort=xhigh；
+    #   Claude/Opus 走标准 Anthropic thinking 对象，不注入上面两个参数
+    #   （同给会触发 "reasoning_effort and thinking_budget cannot be set
+    #   simultaneously"）。
+    qwen_extra = {"temperature": 1, "top_p": 0.95, "top_k": 20,
+                  "enable_thinking": True, "reasoning_effort": "xhigh"}
+    opus_extra = {"temperature": 1, "top_p": 0.95,
+                  "thinking": {"type": "enabled", "budget_tokens": 24000}}
     q = by_key["qwen3.8-max"]
     out["qwen"] = {"base_url": q["base_url"], "model": q["model"], "auth": q["auth"],
-                   "key": q["api_key"], "max_tokens": int(q["max_tokens"]),
+                   "key": q["api_key"], "max_tokens": 65535,
                    "timeout": 900,
-                   "extra_body": json.dumps(q.get("extra_body") or {}) or None}
+                   "extra_body": json.dumps(qwen_extra)}
     o = by_key["opus-5"]
     out["opus"] = {"base_url": o["base_url"],
                    # Harbor's model gate maps the model name onto an alias, and
@@ -52,8 +64,8 @@ def endpoints() -> dict:
                    # this endpoint serves the opus alias as claude-opus-5.
                    "model": os.environ.get("wsparse_OPUS_MODEL", "claude-opus-5"),
                    "auth": o["auth"],
-                   "key": o["api_key"], "max_tokens": int(os.environ.get("wsparse_OPUS_MAX_TOKENS", o["max_tokens"])),
-                   "timeout": 1800, "extra_body": None}
+                   "key": o["api_key"], "max_tokens": 65535,
+                   "timeout": 1800, "extra_body": json.dumps(opus_extra)}
     # 甲方已放宽 GLM/Kimi（2026-10-15 口径）；交付只包含 Qwen x3 与 Opus x3。
     for _alias, _key in (("glm", "glm-5.3"), ("kimi", "kimi-k3")):
         _e = by_key[_key]
